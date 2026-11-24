@@ -294,15 +294,29 @@ int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz
  * f32 rows of a fmt 0 tensor. fake_chain_fail_at: the n-th cc_submit fails (a lost
  * device); fake_chain_frames counts the submits. */
 #include "../cuda_chain.h"
+#include "../qwen36_cuda_profile.h"
 struct CcBuf { int kind; size_t bytes; float *d; };
 static int fake_chain_up, fake_chain_lost, fake_chain_dev = -1, fake_chain_frames, fake_chain_fail_at, fake_chain_ops, fake_chain_down_copies;
+static int fake_active_profile;
+static int fake_device_profile = Q36_GPU_L4;
+static unsigned fake_kernel_mask;
+static void fcc_set_kernel_mask(unsigned mask) { fake_kernel_mask = mask; }
 static int fake_chain_host_stores;   /* matmuls whose output is host memory: stored over the bus on a real card */
 static size_t fake_chain_dev_bytes;
 static size_t fake_chain_dev_cap;   /* 0: no limit; else the most CC_DEV bytes the card holds: cc_buf fails past it */
-static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; return 1; }
+static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; fake_active_profile = 0; fake_kernel_mask = 0; return 1; }
 static int fcc_ready(void) { return fake_chain_up && !fake_chain_lost; }
 static int fcc_lost(void) { return !fake_chain_up || fake_chain_lost; }
-static void fcc_shutdown(void) { fake_chain_up = 0; }
+static void fcc_shutdown(void) { fake_chain_up = 0; fake_active_profile = 0; fake_kernel_mask = 0; }
+static int fcc_probe_qwen36_profile(void) {
+    return fcc_ready() ? fake_device_profile : Q36_GPU_NONE;
+}
+static int fcc_select_qwen36_profile(int enable) {
+
+    fake_active_profile = enable && fcc_ready() ? fake_device_profile : Q36_GPU_NONE;
+    fake_kernel_mask = fake_active_profile ? q36_default_features(fake_active_profile) : 0;
+    return fake_active_profile;
+}
 static int fcc_device(int d) { int was = fake_chain_dev; fake_chain_dev = d; return was; }
 static int fcc_device_now(void) { return fake_chain_dev; }
 static CcBuf *fcc_buf(size_t bytes, int kind) {
@@ -355,7 +369,9 @@ static int fcc_read(CcBuf *src, size_t off, void *dst, size_t bytes) {
 }
 static int fcc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
     if (!fcc_ready() || !t || !x || !y || S < 1 || !t->w) return 0;
-    if ((xo + (size_t)S * t->I) * 4 > x->bytes || (yo + (size_t)S * t->O) * 4 > y->bytes) return 0;
+    size_t x_floats = x->bytes / sizeof(float), y_floats = y->bytes / sizeof(float);
+    if (xo > x_floats || (size_t)S * t->I > x_floats - xo ||
+        yo > y_floats || (size_t)S * t->O > y_floats - yo) return 0;
     fake_chain_ops++;
     if (y->kind != CC_DEV) fake_chain_host_stores++;
     for (int s = 0; s < S; s++) {
@@ -380,8 +396,8 @@ static int fcc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
         const float *xb = x->d + p->x_off + row * p->x_row + j * p->x_seg;
         float *yb = y->d + p->y_off + row * p->y_row + j * p->y_seg;
         const float *wb = w ? w->d + p->w_off + (p->w_mod > 0 ? (j % p->w_mod) * p->D : 0) : NULL;
-        float acc = 0.f; for (int i = 0; i < p->D; i++) acc += xb[i] * xb[i];
-        float r = (p->flags & 4) ? 1.f / sqrtf(acc + p->eps) : 1.f / sqrtf(acc / (float)p->D + p->eps);
+        float acc = 0.f, eps = fabsf(p->eps); for (int i = 0; i < p->D; i++) acc += xb[i] * xb[i];
+        float r = (p->flags & 4) ? 1.f / sqrtf(acc + eps) : 1.f / sqrtf(acc / (float)p->D + eps);
         for (int i = 0; i < p->D; i++) {
             float wv = (p->flags & 2) ? 1.f : ((p->flags & 1) ? 1.f + wb[i] : wb[i]);
             yb[i] = xb[i] * r * wv * p->post;
@@ -757,6 +773,54 @@ static int fcc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, in
     }
     return 1;
 }
+/* the backend's ew_norm: its layout checks, then ew and norm (one op, as one launch) */
+static int fake_ew_norms;
+static int fcc_ew_norm(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *pe, CcBuf *w, CcBuf *yn, const CcNorm *pn) {
+    if (!pe || !pn || pn->per_row != 1 || pn->x_off != pe->y_off || pn->x_row != pn->D || pe->D != pn->D ||
+        pe->n != pn->nseg * pn->D || (pn->flags & CC_NORM_PRESCALE) || (pe->op != CC_EW_ADD && pe->op != CC_EW_COMBINE)) return 0;
+    int ok = fcc_ew(y, a, b, c, e, pe) && fcc_norm(y, w, yn, pn);
+    if (ok && pe->op == CC_EW_ADD && (pe->flags & 4) && e && w) {
+        const float *sg = w->d + pn->w_off + pn->D;
+        for (int r = 0; r < pn->nseg; r++) {
+            const float *yb = yn->d + pn->y_off + r * pn->y_row;
+            float acc = 0.f;
+            for (int i = 0; i < pn->D; i++) acc += yb[i] * sg[i];
+            e->d[pe->e_off + r * pe->e_row] = acc;
+        }
+    }
+    fake_chain_ops--; fake_ew_norms += ok;
+    return ok;
+}
+static int fake_matmul_swiglus;
+static int fcc_matmul_swiglu(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
+    if (!fcc_ready() || !tg || !tu || !x || !y || S < 1 || !tg->w || !tu->w) return 0;
+    if (tg->fmt != tu->fmt || tg->I != tu->I || tg->O != tu->O) return 0;
+    if ((xo + (size_t)S * tg->I) * 4 > x->bytes || (yo + (size_t)S * tg->O) * 4 > y->bytes) return 0;
+    fake_chain_ops++; fake_matmul_swiglus++;
+    if (y->kind != CC_DEV) fake_chain_host_stores++;
+    for (int s = 0; s < S; s++) {
+        const float *xs = x->d + xo + (size_t)s * tg->I; float *ys = y->d + yo + (size_t)s * tg->O;
+        if (tg->fmt == 1 && tg->sc && tu->sc) {
+            const int8_t *qg = (const int8_t *)tg->w, *qu = (const int8_t *)tu->w;
+            for (int o = 0; o < tg->O; o++) {
+                const int8_t *wg = qg + (size_t)o * tg->I, *wu = qu + (size_t)o * tg->I;
+                float ag = 0.f, au = 0.f;
+                for (int i = 0; i < tg->I; i++) { ag += xs[i] * (float)wg[i]; au += xs[i] * (float)wu[i]; }
+                float g = ag * tg->sc[o], u = au * tu->sc[o];
+                ys[o] = (g / (1.f + expf(-g))) * u;
+            }
+        } else if (tg->fmt == 0) {
+            const float *wg0 = (const float *)tg->w, *wu0 = (const float *)tu->w;
+            for (int o = 0; o < tg->O; o++) {
+                const float *wg = wg0 + (size_t)o * tg->I, *wu = wu0 + (size_t)o * tg->I;
+                float g = 0.f, u = 0.f;
+                for (int i = 0; i < tg->I; i++) { g += xs[i] * wg[i]; u += xs[i] * wu[i]; }
+                ys[o] = (g / (1.f + expf(-g))) * u;
+            }
+        } else return 0;
+    }
+    return 1;
+}
 static const void *fcc_dev_addr(const CcBuf *b) { return b ? b->d : NULL; }   /* the host's: the fake's ops read it */
 static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; }
 static ColiCudaChainOps fake_chain_table = {
@@ -772,6 +836,9 @@ static ColiCudaChainOps fake_chain_table = {
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,        /* the encoders' */
     NULL, NULL, NULL,                                /* lfm3, matmul_glu, addnorm */
     fcc_pick_rows,
+    .ew_norm = fcc_ew_norm, .matmul_swiglu = fcc_matmul_swiglu, .select_qwen36_profile = fcc_select_qwen36_profile,
+    .set_kernel_mask = fcc_set_kernel_mask,
+    .probe_qwen36_profile = fcc_probe_qwen36_profile,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

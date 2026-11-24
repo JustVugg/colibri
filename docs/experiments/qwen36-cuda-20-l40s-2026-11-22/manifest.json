@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "hypothesis": "The selected full CUDA stack changes prompt throughput on NVIDIA L40S at 16,384 tokens while preserving dev logits.",
+  "commit": "05245ef45048b837fee5ed7b5b1ab2e59161fb80",
+  "commit_role": "Dev reference at the start of the measured campaign.",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64@c619aa594ad1e70af82168fb6b4878427896e21c",
+  "command": "COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=23 OMP_DISPLAY_AFFINITY=TRUE OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A /usr/bin/time -v ./qwen36-bench --model \"$MODEL_DIR\" --steps steps.tsv --text promessi_sposi.txt --lengths 2048,4096,8192,16384 --gen 128 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "gpu": "NVIDIA L40S",
+    "vram_mib": 46068,
+    "cuda_arch": "sm_89",
+    "cpu": "AMD EPYC 7453 28-Core Processor",
+    "threads": 23,
+    "ram": "116.4 GiB available to the workload",
+    "storage": "Model directory on overlay. Visible host disks: SAMSUNG MZQL21T9HCJR-00A07 nvme 1.7T, SAMSUNG MZQL21T9HCJR-00A07 nvme 1.7T",
+    "os": "Linux 6.8.0-52-generic x86_64, CUDA 12.4.131, NVIDIA driver 550.144.03"
+  },
+  "metric": "Prefill tok/s at 16,384 tokens, the fourth row of the 2,048 to 16,384 sequence.",
+  "warmup_runs": 1,
+  "warmup_policy": "One excluded warm-up per build and workload group.",
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "engine_build": "dev (source 05245ef45048b837fee5ed7b5b1ab2e59161fb80, compiled c/ tree 34355d8f798ffb5fdf6c1330d14f592cb5909205)"
+    },
+    "samples": {
+      "tok_s": [
+        5551.93,
+        5574.84,
+        5507.35
+      ],
+      "steady_decode_tok_s": [
+        135.388,
+        135.972,
+        135.196
+      ]
+    },
+    "median_tok_s": 5551.93,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-20-l40s-2026-11-22/correctness.txt",
+      "sha256": "370b862d28f3d0e38a7b11fa1eb418eac76674a3caeba6598c8e33868cbed397"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-20-l40s-2026-11-22/base.md",
+      "sha256": "361f11b8dc5c8fec2678124c2ca8510462a8c3e2ce6adb982021fddbadbf4286"
+    }
+  },
+  "trial": {
+    "config": {
+      "engine_build": "full stack (source da49a1611a76bfdf840b07cd326c31c4733c0e18, compiled c/ tree e7cb67d79e678045d4f9aaeb9fa9f745e1d5443b)"
+    },
+    "samples": {
+      "tok_s": [
+        10937.42,
+        10889.04,
+        10846.4
+      ],
+      "steady_decode_tok_s": [
+        148.26,
+        148.29,
+        148.359
+      ]
+    },
+    "median_tok_s": 10889.04,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-20-l40s-2026-11-22/correctness.txt",
+      "sha256": "370b862d28f3d0e38a7b11fa1eb418eac76674a3caeba6598c8e33868cbed397"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-20-l40s-2026-11-22/base.md",
+      "sha256": "361f11b8dc5c8fec2678124c2ca8510462a8c3e2ce6adb982021fddbadbf4286"
+    }
+  },
+  "outcome": "improvement",
+  "change_pct": 96.94408381526503,
+  "change_method": "Median of three paired percentage changes"
+}

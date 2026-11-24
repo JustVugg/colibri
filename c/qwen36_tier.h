@@ -211,6 +211,7 @@ void qt_note(int layer, int eid,
  * (async, all devices in parallel). Returns a bitmask of the k handled by
  * the GPU. Compute the misses on the CPU, then call qt_take(). */
 uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
+uint32_t qt_issue_mode(int layer, const int *eids, int K, const float *x, int skip_full_scan);
 
 /* Collect all GPU results and accumulate val[k]*y_k into out[hidden].
  * Returns 0 on collection failure, leaving out unchanged. The caller must
@@ -279,6 +280,8 @@ unsigned qt_chain_epoch(void);
 int  qt_chain_resident(int layer, int eid, int device, struct ColiCudaTensor **g, struct ColiCudaTensor **u, struct ColiCudaTensor **d);
 void qt_chain_hold(int on);
 void qt_chain_count(int layer, const int *eids, int K);
+/* One lock for consecutive rows of the same layer, with the same per-row accounting. */
+void qt_chain_count_rows(int layer, const int *eids, int rows, int K);
 int  qt_chain_format(int *fmt, int *gs);
 int  qt_chain_layer_format(int layer, int *fmt, int *fmt_d);
 /* a GGUF's arena for a chain that moves the experts itself (qwen36_tier.c's comment) */
@@ -387,6 +390,7 @@ struct ColiCudaTensor;
 static inline int  qt_chain_resident(int a,int b,int c,struct ColiCudaTensor**g,struct ColiCudaTensor**u,struct ColiCudaTensor**d){(void)a;(void)b;(void)c;(void)g;(void)u;(void)d;return 0;}
 static inline void qt_chain_hold(int a){(void)a;}
 static inline void qt_chain_count(int a,const int*b,int c){(void)a;(void)b;(void)c;}
+static inline void qt_chain_count_rows(int a,const int*b,int r,int k){(void)a;(void)b;(void)r;(void)k;}
 static inline int  qt_chain_format(int*a,int*b){(void)a;(void)b;return 0;}
 static inline int  qt_chain_layer_format(int a,int*b,int*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_chain_arena(void**a,size_t*b,size_t*c,size_t*d,int*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
@@ -421,6 +425,7 @@ static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline uint32_t qt_issue_mode(int a,const int*b,int c,const float*d,int e){(void)e;return qt_issue(a,b,c,d);}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
 static inline int qt_take_scaled(uint32_t a,const float*b,int c,float*d,const float*s,float e){(void)b;(void)c;(void)d;(void)s;(void)e;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}

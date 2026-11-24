@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "hypothesis": "The selected full CUDA stack changes prompt throughput on NVIDIA A100-SXM4-40GB at 16,384 tokens while preserving dev logits.",
+  "commit": "05245ef45048b837fee5ed7b5b1ab2e59161fb80",
+  "commit_role": "Dev reference at the start of the measured campaign.",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64@c619aa594ad1e70af82168fb6b4878427896e21c",
+  "command": "COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=6 OMP_DISPLAY_AFFINITY=TRUE OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A /usr/bin/time -v ./qwen36-bench --model \"$MODEL_DIR\" --steps steps.tsv --text promessi_sposi.txt --lengths 2048,4096,8192,16384 --gen 128 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "gpu": "NVIDIA A100-SXM4-40GB",
+    "vram_mib": 40960,
+    "cuda_arch": "sm_80",
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.20GHz",
+    "threads": 6,
+    "ram": "83.5 GiB available to the workload",
+    "storage": "Model directory on overlay. Visible host disks: PersistentDisk 250G, PersistentDisk 46G",
+    "os": "Linux 6.6.159+ x86_64, CUDA 13.0.88, NVIDIA driver 580.82.07"
+  },
+  "metric": "Prefill tok/s at 16,384 tokens, the fourth row of the 2,048 to 16,384 sequence.",
+  "warmup_runs": 1,
+  "warmup_policy": "One excluded warm-up per build and workload group.",
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "engine_build": "dev (source 05245ef45048b837fee5ed7b5b1ab2e59161fb80, compiled c/ tree 34355d8f798ffb5fdf6c1330d14f592cb5909205)"
+    },
+    "samples": {
+      "tok_s": [
+        5080.16,
+        5074.96,
+        5074.73
+      ],
+      "steady_decode_tok_s": [
+        100.566,
+        100.359,
+        100.946
+      ]
+    },
+    "median_tok_s": 5074.96,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-14-a100-sxm4-40gb-2026-11-22/correctness.txt",
+      "sha256": "b057212d6d7bc7ad912e0219b38000def1684634669d5966b038cefbd0402597"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-14-a100-sxm4-40gb-2026-11-22/base.md",
+      "sha256": "35d6f02e53d750a096fd06f6ee9c01ba5902c89f5cfc4b9489be197cf5f01a8d"
+    }
+  },
+  "trial": {
+    "config": {
+      "engine_build": "full stack (source da49a1611a76bfdf840b07cd326c31c4733c0e18, compiled c/ tree e7cb67d79e678045d4f9aaeb9fa9f745e1d5443b)"
+    },
+    "samples": {
+      "tok_s": [
+        8199.19,
+        8198.77,
+        8204.66
+      ],
+      "steady_decode_tok_s": [
+        131.054,
+        132.431,
+        132.817
+      ]
+    },
+    "median_tok_s": 8199.19,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-14-a100-sxm4-40gb-2026-11-22/correctness.txt",
+      "sha256": "b057212d6d7bc7ad912e0219b38000def1684634669d5966b038cefbd0402597"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-14-a100-sxm4-40gb-2026-11-22/base.md",
+      "sha256": "35d6f02e53d750a096fd06f6ee9c01ba5902c89f5cfc4b9489be197cf5f01a8d"
+    }
+  },
+  "outcome": "improvement",
+  "change_pct": 61.553391553825065,
+  "change_method": "Median of three paired percentage changes"
+}
