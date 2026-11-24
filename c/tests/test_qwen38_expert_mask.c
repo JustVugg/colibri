@@ -291,6 +291,80 @@ int main(int argc, char **argv) {
         tk(fx_run(tool_mask, NULL, NULL, lt[0], &nt[0]) != 0 && nt[0] == 0, "Q38_ROUTE_TAU with Q38_EXPERT_MASK: refused");
         unsetenv("Q38_ROUTE_TAU"); qt_shutdown();
     }
+    /* Q38_ROUTE_BIAS on the host's pick (q38_bias_pick): b added to the resident experts' terms
+     * for the pick only, the values the model's own terms */
+    printf(" Q38_ROUTE_BIAS: the host's pick\n");
+    {
+        /* terms of a softmax (all = 1): 0 .30, 1 .25, 2 .18, 3 .15, 4 .08, 5 .04 */
+        const float p[6] = {.30f, .25f, .18f, .15f, .08f, .04f};
+        const uint8_t on[6] = {0, 0, 1, 1, 1, 0}, all1[6] = {1, 1, 1, 1, 1, 1};
+        struct { double b; const uint8_t *res; int want[3]; unsigned long long moved; const char *what; } cs[] = {
+            {0.0, on, {0, 1, 2}, 0, "b = 0: the plain top-3"},
+            {.05, on, {0, 1, 2}, 0, "b = .05: 2 (.23) stays below 1 (.25), 3 (.20) below 2: the plain top-3"},
+            {.08, on, {0, 2, 1}, 0, "b = .08: 2 (.26) passes 1 (.25), 3 (.23) does not: the same three, 2 at rank 1"},
+            {.11, on, {0, 2, 3}, 1, "b = .11: 2 (.29) and 3 (.26) pass 1 (.25): 1 gives its slot to 3"},
+            {.50, on, {2, 3, 4}, 2, "b = .5: the three residents first, 0 and 1 dropped"},
+            {.50, all1, {0, 1, 2}, 0, "every expert resident: the plain top-3 (a uniform shift)"},
+        };
+        for (size_t i = 0; i < sizeof cs / sizeof *cs; i++) {
+            int idx[3]; float val[3];
+            g_q38_route_bias = cs[i].b; g_q38_rb_routed = g_q38_rb_moved = 0;
+            q38_bias_pick(cs[i].res, p, 6, 3, 0, 1.0, idx, val);
+            int ok = g_q38_rb_routed == 3 && g_q38_rb_moved == cs[i].moved;
+            for (int z = 0; z < 3; z++) ok &= idx[z] == cs[i].want[z] && val[z] == p[idx[z]];
+            if (!ok) printf("    got %d %d %d, moved %llu\n", idx[0], idx[1], idx[2], g_q38_rb_moved);
+            tk(ok, cs[i].what);
+        }
+        /* random rows: b = 0 is the plain pick bit for bit; with any b every value is the model's own term */
+        unsigned s = 20261124u; long bad0 = 0, badv = 0; const int T = 50000;
+#define FX_RND() (s = s * 1664525u + 1013904223u, s >> 8)
+        for (int t = 0; t < T; t++) {
+            float q[64]; uint8_t res[64]; int ia[Q38_MAX_TOPK], ib[Q38_MAX_TOPK]; float va[Q38_MAX_TOPK], vb[Q38_MAX_TOPK];
+            int E = 2 + (int)(FX_RND() % 62), K = 1 + (int)(FX_RND() % (E < 10 ? E : 10));
+            double tot = 0;
+            for (int e = 0; e < E; e++) { q[e] = (float)(FX_RND() % 100000) / 100000.f; tot += q[e]; res[e] = FX_RND() % 2; }
+            g_q38_route_bias = 0; q38_bias_pick(res, q, E, K, 0, tot, ia, va);
+            q38_mask_pick(NULL, q, E, K, 0, 1, tot, ib, vb);
+            bad0 += memcmp(ia, ib, (size_t)K * sizeof(int)) != 0;
+            g_q38_route_bias = (double)(FX_RND() % 100) / 1000.0;
+            q38_bias_pick(res, q, E, K, 0, tot, ia, va);
+            for (int z = 0; z < K; z++) badv += va[z] != q[ia[z]];
+        }
+#undef FX_RND
+        g_q38_route_bias = 0; g_q38_rb_routed = g_q38_rb_moved = 0;
+        tk(bad0 == 0, "random rows, b = 0: the plain top-k on every row");
+        tk(badv == 0, "random rows, any b: every value the model's own term");
+    }
+    printf(" Q38_ROUTE_BIAS on the engine (fake tier, room for 6 of 16 experts)\n");
+    {
+        static const char *val[3] = { NULL, "0", "0.5" };
+        float lb[3][256]; int nb[3], rcb[3]; unsigned long long moved[3], miss[3];
+        for (int a = 0; a < 3; a++) {
+            if (val[a]) setenv("Q38_ROUTE_BIAS", val[a], 1); else unsetenv("Q38_ROUTE_BIAS");
+            fake_ndev = 1;
+            rcb[a] = fx_run(NULL, NULL, NULL, lb[a], &nb[a]);
+            moved[a] = g_q38_rb_moved; miss[a] = G.miss;
+            qt_shutdown();
+        }
+        unsetenv("Q38_ROUTE_BIAS");
+        printf("  b 0.5: %llu of %llu decode picks moved onto the card; tier misses %llu (off %llu)\n",
+               moved[2], g_q38_rb_routed, miss[2], miss[0]);
+        tk(nb[0] > 0 && nb[0] == nb[1] && rcb[0] == rcb[1] && !memcmp(lb[0], lb[1], (size_t)nb[0] * sizeof(float)) && moved[1] == 0,
+           "Q38_ROUTE_BIAS=0 is the unset run to the bit");
+        tk(moved[2] > 0 && miss[2] <= miss[0], "b = 0.5: decode picks moved onto the card, no more tier misses than off");
+        const char *bad_rb[][2] = {{"Q38_ROUTE_BIAS", "1.5"}, {"Q38_ROUTE_BIAS_FILE", "-0.1"}, {"Q38_ROUTE_BIAS", "x"}};
+        for (int i = 0; i < 3; i++) {
+            setenv(bad_rb[i][0], bad_rb[i][1], 1);
+            char what[96]; snprintf(what, sizeof what, "refused: %s=%s", bad_rb[i][0], bad_rb[i][1]);
+            tk(fx_run(NULL, NULL, NULL, lb[0], &nb[0]) != 0 && nb[0] == 0, what);
+            unsetenv(bad_rb[i][0]);
+        }
+        setenv("Q38_ROUTE_BIAS", "0.05", 1);
+        tk(fx_run(tool_mask, NULL, NULL, lb[0], &nb[0]) != 0 && nb[0] == 0, "Q38_ROUTE_BIAS with Q38_EXPERT_MASK: refused");
+        setenv("Q38_ROUTE_TAU", "0.5", 1);
+        tk(fx_run(NULL, NULL, NULL, lb[0], &nb[0]) != 0 && nb[0] == 0, "Q38_ROUTE_BIAS with Q38_ROUTE_TAU: refused");
+        unsetenv("Q38_ROUTE_TAU"); unsetenv("Q38_ROUTE_BIAS"); qt_shutdown();
+    }
     /* the installed path: every layer on the CUDA chain, which routes on the card through the
      * mask's bias row (or hands the host the device's router logits) */
     printf(" fake CUDA chain (COLI_CUDA_CHAIN=1)\n");

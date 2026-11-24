@@ -90,6 +90,7 @@ typedef struct {
      * went chunk by chunk after all */
     CcBuf *mg_x, *mg_y, *mg_inj, *mg_ids, *mg_w; unsigned long long mg_groups, mg_chunks, mg_declined;
     CcBuf *hyper_up, *ones_at, *mask; int ones_n;     /* a step's streams on their way in (q38cc_hyper_in); the rows of ones written in ones_at; hard expert mask */
+    CcBuf *rbias; float *rbias_h; int rbias_dirty;     /* Q38_ROUTE_BIAS in the frame: a row a layer from the residency (q38cc_rbias_sync) */
     /* a lane chunk's layer's pooled experts lane A routes most, copied over for the card's call
      * (q38cc_lane_stage): ls_i the layer (-1 none), ls_e its ls_n experts (ls_mark by expert:
      * left out of the host's serves), ls_ent their entries in mapped memory (ls_cap of them and a
@@ -472,6 +473,7 @@ static void q38cc_free_own(Q38CChain *ch, Model *m) {
     cc_free(ch->ple_ring); ch->ple_ring = NULL;
     cc_free(ch->prm); ch->prm = NULL;
     cc_free(ch->mask); ch->mask = NULL;
+    cc_free(ch->rbias); ch->rbias = NULL; free(ch->rbias_h); ch->rbias_h = NULL;
 }
 
 /* The parameters the kernels read (norm weights, the DeltaNet constants, the PLE's), in
@@ -655,6 +657,15 @@ static Q38CChain *q38cc_setup(Model *m, int mux_slots) {
             q38cc_free_own(ch, m);
             return NULL;
         }
+    }
+    if (g_q38_route_bias > 0 || g_q38_route_bias_file > 0) {   /* Q38_ROUTE_BIAS(_FILE): the frame's bias table, from the residency (q38cc_rbias_sync) */
+        size_t nb = (size_t)L * c->experts * sizeof(float);
+        ch->rbias_h = (float *)calloc(1, nb);
+        ch->rbias = ch->rbias_h ? cc_buf(nb, CC_DEV) : NULL;
+        if (!ch->rbias || !cc_begin() || !cc_write(ch->rbias, 0, ch->rbias_h, nb) || !cc_submit(1)) {
+            cc_free(ch->rbias); ch->rbias = NULL; free(ch->rbias_h); ch->rbias_h = NULL;
+            fprintf(stderr, "[route-bias] no device memory for the frame's bias table: the frame routes without it\n");
+        } else ch->rbias_dirty = 1;
     }
     ch->dn_where = Q38CC_HOST;
     { const char *e = getenv("COLI_CUDA_CHAIN_FAULT"); ch->fault_at = e && *e ? strtoull(e, NULL, 10) : 0; }
@@ -1428,7 +1439,7 @@ static int q38cc_promote_settle(Q38CChain *ch, Model *m) {
     for (int p = 0; p < ch->npend; p++) {
         struct Q38CCPend *q = &ch->pend[p];
         if (!cc_host_up_done(q->ticket)) { ch->pend[w++] = *q; continue; }
-        ch->vslot[q->k] = q->slot; ch->busy[q->slot] = 0; ch->dm_res[q->k] = 1;
+        ch->vslot[q->k] = q->slot; ch->busy[q->slot] = 0; ch->dm_res[q->k] = 1; ch->rbias_dirty = 1;
         q38cc_vram_entry(ch, q->slot, q->k / E, &ch->dm_host[q->k]);
         ch->chg[ch->nchg++] = q->k;
     }
@@ -1476,7 +1487,7 @@ static int q38cc_up_flush(Q38CChain *ch, void **ud, const void **us, const size_
     *nu = 0;
     if (ok) { for (int p = b0; p < ch->npend; p++) ch->pend[p].ticket = tk; return 1; }
     for (int p = b0; p < ch->npend; p++) {
-        ch->owner[ch->pend[p].slot] = -1; ch->busy[ch->pend[p].slot] = 0; ch->dm_res[ch->pend[p].k] = 2; ch->promos--;
+        ch->owner[ch->pend[p].slot] = -1; ch->busy[ch->pend[p].slot] = 0; ch->dm_res[ch->pend[p].k] = 2; ch->promos--; ch->rbias_dirty = 1;
     }
     ch->npend = b0;
     return 0;
@@ -1546,7 +1557,7 @@ static void q38cc_promote_pick(Q38CChain *ch, Model *m, int n) {
                 ch->pend = np; ch->cpend = cap;
             }
             if (v >= 0) {   /* the victim to the pool, its entry rewritten before the next frame */
-                ch->vslot[v] = -1; ch->dm_res[v] = 2;
+                ch->vslot[v] = -1; ch->dm_res[v] = 2; ch->rbias_dirty = 1;
                 if (!q38cc_pool_entry(ch, m, v / E, ch->pool_of[v], &ch->dm_host[v])) memset(&ch->dm_host[v], 0, sizeof(CcExpert));
                 ch->chg[ch->nchg++] = v;
                 ch->promo_victims++;
@@ -1555,7 +1566,7 @@ static void q38cc_promote_pick(Q38CChain *ch, Model *m, int n) {
             ud[nu] = dst; us[nu] = src; ub[nu++] = (size_t)gb;   /* gate, up and down, sent together below */
             ud[nu] = dst + q38cc_slot_u(ch, i); us[nu] = src + Q38CC_PAD(gb); ub[nu++] = (size_t)gb;
             ud[nu] = dst + q38cc_slot_d(ch, i); us[nu] = src + 2 * Q38CC_PAD(gb); ub[nu++] = (size_t)db;
-            ch->owner[s] = k; ch->busy[s] = 1; ch->dm_res[k] = 3;
+            ch->owner[s] = k; ch->busy[s] = 1; ch->dm_res[k] = 3; ch->rbias_dirty = 1;
             ch->pend[ch->npend++] = (struct Q38CCPend){k, s, 0};
             ch->promos++; done++;
             if (nu == 3 * Q38CC_UP_BATCH) {
@@ -1969,6 +1980,7 @@ static int q38cc_dm_begin(Q38CChain *ch, Model *m, int n) {
         }
         ch->dm_part[i] = miss;
     }
+    ch->rbias_dirty = 1;   /* the table rebuilt from the tier: Q38_ROUTE_BIAS's rows with it */
     CcExpert *td = NULL;   /* the decode table: the pool's entries left to the CPU */
     if (ch->pool_cpu && ch->dm_tabd) {
         if (!(td = malloc(ne * sizeof(CcExpert)))) ch->pool_cpu = 0;
@@ -2157,6 +2169,18 @@ static CcBuf *q38cc_dm_tab(Q38CChain *ch, int n) {
     if (q38cc_pc_step(ch, n)) return ch->dm_tabd;   /* the pool's experts on the CPU */
     return n > Q38CC_DM_ROWS && ch->dm_stage && ch->dm_tabb ? ch->dm_tabb : ch->dm_tab;
 }
+/* Q38_ROUTE_BIAS(_FILE) in the frame: the bias table from the chain's residency (dm_res: 1 on the
+ * card +b, 0 neither on the card nor in the host pool -f, the pool's and those on their way 0),
+ * written when a residency changed; called after q38cc_dm_begin, before the frame. */
+static int q38cc_rbias_sync(Q38CChain *ch, Model *m) {
+    if (!ch->rbias || !ch->rbias_dirty || !ch->dm_res) return 1;
+    const size_t ne = (size_t)m->c.layers * m->c.experts;
+    const float b = (float)g_q38_route_bias, f = (float)g_q38_route_bias_file;
+    for (size_t k = 0; k < ne; k++) ch->rbias_h[k] = ch->dm_res[k] == 1 ? b : ch->dm_res[k] == 0 ? -f : 0.f;
+    if (!cc_write(ch->rbias, 0, ch->rbias_h, ne * sizeof(float))) return 0;
+    ch->rbias_dirty = 0;
+    return 1;
+}
 /* layer i has slots the host computes in a step of n rows */
 static int q38cc_dm_hosted(Q38CChain *ch, int i, int n) { return q38cc_pc_step(ch, n) ? ch->dm_partd[i] : ch->dm_part[i]; }
 /* a step's layer i up to its routes: the router, the routes (and their copy down), the host's
@@ -2164,8 +2188,10 @@ static int q38cc_dm_hosted(Q38CChain *ch, int i, int n) { return q38cc_pc_step(c
 static int q38cc_dm_route(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
     Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
     CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
-    if (ch->mask) { rp.b_off = i * E; rp.has_bias = 2; }
-    int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, ch->mask, ch->dm_ids, ch->dm_w, &rp) &&
+    /* the hard mask added to the logits (2); else Q38_ROUTE_BIAS to the pick only (1), a decode step's or a verify's rows only */
+    CcBuf *rb = ch->mask ? ch->mask : ch->rbias && n <= Q38_SPEC_ROWS ? ch->rbias : NULL;
+    if (rb) { rp.b_off = i * E; rp.has_bias = ch->mask ? 2 : 1; }
+    int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, rb, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
     *v = 0;
     if (ok && q38cc_dm_hosted(ch, i, n)) { *v = ++ch->dm_seq; ok = cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) && cc_signal(ch->dm_dfl, 0, *v); }
@@ -3663,6 +3689,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             q38cc_dm_end(ch); ch->dm_on = dm = 0;
             q38cc_dm_caps_back(ch, m);
         }
+        if (dm && !q38cc_rbias_sync(ch, m)) goto lost;   /* Q38_ROUTE_BIAS: the bias table as the residency now is */
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
         /* a short prompt's chunk with the pool's slots on the CPU: two lanes (q38cc_chunk_lanes) */
         int lanes = dm && q38cc_lanes_on() && n >= q38cc_lanes_min() && ns == 0 && q38cc_pc_step(ch, n) && q38cc_dm_tab(ch, n) == ch->dm_tabd;

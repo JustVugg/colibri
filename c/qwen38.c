@@ -2577,6 +2577,10 @@ static int q38_psd_on(Model *m){
         if(g_q38_route_tau>0){   /* Q38_ROUTE_TAU routes differently too; unset adds nothing */
             h=q38_psd_fnv(h,"route-tau",10);h=q38_psd_fnv(h,&g_q38_route_tau,sizeof g_q38_route_tau);
         }
+        if(g_q38_route_bias>0||g_q38_route_bias_file>0){   /* Q38_ROUTE_BIAS(_FILE) route differently as well; unset adds nothing */
+            h=q38_psd_fnv(h,"route-bias",11);h=q38_psd_fnv(h,&g_q38_route_bias,sizeof g_q38_route_bias);
+            h=q38_psd_fnv(h,&g_q38_route_bias_file,sizeof g_q38_route_bias_file);
+        }
         g_q38_psd_id=h;
     }
     return g_q38_psd_dir[0]!='-';
@@ -3833,7 +3837,7 @@ int main(int argc, char **argv) {
     }
     /* Q38_EXPERT_MASK: route among a per-layer allow-list only (qwen38_core.h), before the
      * tier starts so its warm start plans the allowed experts and nothing else */
-    if (!q38_mask_load(&m.c) || !q38_route_tau_load(&m.c)) { q38_model_free(&m); free_tokenizer(); return 1; }
+    if (!q38_mask_load(&m.c) || !q38_route_tau_load(&m.c) || !q38_route_bias_load(&m.c)) { q38_model_free(&m); free_tokenizer(); return 1; }
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
     if (g_q38_mux_slots>1 && m.dn_dev) {
         m.dn_dev=0;
