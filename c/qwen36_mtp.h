@@ -682,7 +682,7 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
             for (int i = 0; i < c->vocab; i++) logits[i] = -INFINITY;
             for (int j = 0; j < p->nvoc; j++) logits[p->vid[j]] = scores[j];
             free(scores);
-        } else if (p->voc) {
+        } else if (p->voc && p->voc->list_n > 0) {
             const int *ids = p->voc->list; int n = p->voc->list_n;
             float *scores = falloc(n);
             q36_mtp_lm_rows(m, last, ids, n, scores);
