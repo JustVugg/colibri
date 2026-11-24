@@ -1067,4 +1067,20 @@ static inline double compat_rss_gb(void){
 #endif
 }
 
+/* Overflow-checked float buffer allocator shared by the engines (PR #25):
+ * rejects negative counts and byte-count wrap on hostile model headers. */
+static inline float *coli_falloc(int64_t n){
+    if(n < 0 || (uint64_t)n > SIZE_MAX / sizeof(float)){
+        fprintf(stderr, "falloc: n=%lld is out of range\n", (long long)n);
+        exit(1);
+    }
+    float *p = (float *)malloc((size_t)n * sizeof(float));
+    if(!p && n){
+        fprintf(stderr, "OOM allocating %lld floats\n", (long long)n);
+        exit(1);
+    }
+    return p;
+}
+
+
 #endif /* COMPAT_H */

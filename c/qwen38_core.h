@@ -366,14 +366,7 @@ static Q38Timers q38_tm_delta(const Q38Timers *after,const Q38Timers *before) {
 
 static double rss_gb(void) { return compat_rss_gb(); }
 
-static float *falloc(int64_t n) {
-    if (n < 0 || (uint64_t)n > SIZE_MAX / sizeof(float)) {
-        fprintf(stderr, "invalid float allocation: %lld\n", (long long)n); exit(1);
-    }
-    float *p = (float *)malloc((size_t)n * sizeof(float));
-    if (!p && n) { fprintf(stderr, "OOM allocating %lld floats\n", (long long)n); exit(1); }
-    return p;
-}
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 
 /* W is row-major [O,I], y=x@W^T. */
 static void q38_matmul(float *y, const float *x, const float *W, int S, int I, int O) {

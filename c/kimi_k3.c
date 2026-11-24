@@ -306,9 +306,7 @@ static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_g
  * free+file-backed+purgeable. #855. */
 static double k3_mem_avail(void){ return compat_mem_available_gb(); }
 static double rss_gb(void) { return compat_rss_gb(); }
-static float *falloc(int64_t n){
-    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"alloc size overflow: %lld floats\n",(long long)n); exit(1); }
-    float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
+static inline float *falloc(int64_t n){ return coli_falloc(n); }
 static float *fcalloc(int64_t n){
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"alloc size overflow: %lld floats\n",(long long)n); exit(1); }
     float *p=calloc((size_t)n,sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }

@@ -286,7 +286,7 @@ typedef struct {
 /* ---------- utility ---------- */
 static double now_s(void) { return compat_now_s(); }
 static double rss_gb(void) { return compat_rss_gb(); }
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 static float siluf(float x) { return x / (1.f + expf(-x)); }
 /* A routed expert's activation over its gate and up rows (g <- act(g, u)): SwiGLU, or on
