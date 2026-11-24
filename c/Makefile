@@ -2079,7 +2079,7 @@ qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
 # vocabulary (--vocab 128), so a reply resent as text reads back as the ids the
 # engine generated. SPEC_ENV passes more settings to every run (the Vulkan family
 # in tests/vulkan_engines.sh runs the same gates in the dense chain).
-.PHONY: qwen36-tiny-v128-generate qwen36-seed-check qwen36-dump-check spec-drafts-check spec-drafts-run
+.PHONY: qwen36-tiny-v128-generate qwen36-seed-check qwen36-dump-check qwen36-tf-check spec-drafts-check spec-drafts-run
 qwen36-tiny-v128-generate:
 	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny_v128 --ref-mode full --vocab 128 \
 		--emit-ref ./qwen36_tiny_v128/ref_full.json
@@ -2101,6 +2101,12 @@ qwen36-echo-serve-check: qwen36-tiny-v128-generate qwen36$(EXE)
 # DUMP on the generated fixture: one row a sampled token, the argmax the token sent, requests append.
 qwen36-dump-check: qwen36-tiny-v128-generate qwen36$(EXE)
 	QWEN36_TINY=./qwen36_tiny_v128_c QWEN36_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_qwen36_dump
+
+# Teacher forcing on the generated fixture: every position's argmax against the reference's
+# tf_pred (the prompt's positions too), DUMP one row a position, a wrong entry fails the run.
+qwen36-tf-check: qwen36-tiny-v128-generate qwen36$(EXE)
+	QWEN36_TINY=./qwen36_tiny_v128_c QWEN36_TINY_REF=./qwen36_tiny_v128/ref_full.json QWEN36_TINY_REQUIRED=1 \
+		$(PYTHON) -m unittest -v tests.test_qwen36_tf
 
 tests/test_spec_draft$(EXE): tests/test_spec_draft.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
