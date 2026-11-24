@@ -1011,7 +1011,7 @@ def _parse_tool_calls(reply, tools, track_spans):
                 args = {key: payload}
                 salvaged.append(name)
         calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False, allow_nan=False)}})
     if tools and not calls and re.search(r"</?tool_call>|</?arg_key>|</?arg_value>", reply):
         # Diagnosi per la #401: il client ha dichiarato i tools e il modello ha PROVATO la
         # sintassi, ma il parse rigoroso non ha agganciato nulla (tipico output int4 storpiato).
@@ -2920,7 +2920,7 @@ def parse_muse_tool_calls(reply, tools):
                 key = _muse_unattr(key)
                 args[key] = _muse_value(raw, props.get(key), roots.get(name))
             calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False, allow_nan=False)}})
         rest = rest[end + len(MUSE_ATEM_CLOSE):]
     text = re.sub(re.escape(THINK_OPEN) + ".*?(?:" + re.escape(THINK_CLOSE) + "|$)", "", "".join(content), flags=re.S)
     text = text.replace(THINK_CLOSE, "").replace("<|eot|>", "")
@@ -3249,7 +3249,7 @@ def parse_qwen_tool_calls(reply, tools=None, *, strip_text=True):
             "type": "function",
             "function": {
                 "name": name,
-                "arguments": json.dumps(args, ensure_ascii=False),
+                "arguments": json.dumps(args, ensure_ascii=False, allow_nan=False),
             },
         }
 
@@ -5023,7 +5023,7 @@ def parse_mistral_tool_calls(reply, tools=None):
         if not isinstance(args, dict) or rest.lstrip()[end:].strip().replace(ML4_EOS, ""):
             return reply.strip(), []
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False, allow_nan=False)}})
     return reply[:first].strip(), calls
 
 
