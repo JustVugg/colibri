@@ -641,18 +641,19 @@ static Q38CChain *q38cc_setup(Model *m, int mux_slots) {
         return NULL;
     }
     ch->nl = L; ch->head = 1;
-    if (g_q38_mask && !g_q38_mask_from && L <= g_q38_mask_layers && c->experts <= g_q38_mask_experts) {
+    if (g_q38_mask) {   /* Q38_EXPERT_MASK on the card: -1e30 before the routes' softmax (cc_route's has_bias 2) */
         size_t nb = (size_t)L * c->experts * sizeof(float);
         float *mb = (float *)malloc(nb);
+        int up = 0;
         if (mb) {
-            for (int li = 0; li < L; li++)
-                for (int ei = 0; ei < c->experts; ei++)
-                    mb[(size_t)li * c->experts + ei] = g_q38_mask[(size_t)li * g_q38_mask_experts + ei] ? 0.f : -1e30f;
-            ch->mask = cc_buf(nb, CC_DEV);
-            if (!ch->mask || !cc_begin() || !cc_write(ch->mask, 0, mb, nb) || !cc_submit(1)) {
-                cc_free(ch->mask); ch->mask = NULL;
-            }
+            for (size_t j = 0; j < (size_t)L * c->experts; j++) mb[j] = g_q38_mask[j] ? 0.f : -1e30f;
+            up = (ch->mask = cc_buf(nb, CC_DEV)) && cc_begin() && cc_write(ch->mask, 0, mb, nb) && cc_submit(1);
             free(mb);
+        }
+        if (!up) {   /* the device would route outside the mask */
+            fprintf(stderr, "[chain] qwen38: Q38_EXPERT_MASK did not reach device %d; the chain stays off\n", ch->dev);
+            q38cc_free_own(ch, m);
+            return NULL;
         }
     }
     ch->dn_where = Q38CC_HOST;
@@ -3051,7 +3052,8 @@ static int q38cc_dm_layer_lm(Q38CChain *ch, Model *m, Layer *l, int i, int n, in
     CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
     CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
-    int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
+    if (ch->mask) { rp.b_off = i * E; rp.has_bias = 2; }   /* Q38_EXPERT_MASK */
+    int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, ch->mask, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
     ok = ok && q38cc_shared(ch, m, l, i, n) && (!stg || !first || cc_fetch_wait()) &&
          cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
@@ -3107,11 +3109,12 @@ static int q38cc_moe_group(Q38CChain *ch, Model *m, Layer *l, int i, int c0, int
     for (int r = 0; r < G; r += rows) {
         const int n = G - r < rows ? G - r : rows;
         CcRoute rp = {n, E, K, 0, 0, E, 0, 0, r * K, K, r * K, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
+        if (ch->mask) { rp.b_off = i * E; rp.has_bias = 2; }   /* Q38_EXPERT_MASK */
         if (!q38cc_frame_begin(ch)) return 0;
         ch->hyp = ch->hyper_all; ch->hoff = c0 + r - g0;
         int ok = q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m) &&
                  cc_copy(ch->mg_x, (size_t)r * H, ch->mixed, 0, (size_t)n * H) && cc_copy(ch->mg_inj, (size_t)r * C, ch->inj_m, 0, (size_t)n * C) &&
-                 cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->mg_ids, ch->mg_w, &rp);
+                 cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, ch->mask, ch->mg_ids, ch->mg_w, &rp);
         if (!ok || !cc_submit(0)) return 0;
     }
     CcMoe mp = {G, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 3, i * E, 0, H, 0, K, 0, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};

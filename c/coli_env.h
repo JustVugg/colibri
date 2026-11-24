@@ -798,6 +798,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q38_EXPERT_INT2", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_EXPERT_INT4", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_EXPERT_LOWBIT", CE_STR, CE_QWEN38, 0, NULL},
+    {"Q38_EXPERT_MASK", CE_PATH, CE_QWEN38, 0, NULL},
     {"Q38_EXPERT_PARALLEL_READS",        CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
     {"Q38_EXPERT_PARTIAL", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_EXPERT_PREFETCH",              CE_BOOL  , CE_QWEN38                                       , 0             , NULL},

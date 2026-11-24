@@ -1065,7 +1065,8 @@ static void q38_vocab_report(const Model *m, const char *scope) {
 
 static int q38_context_total(const Cfg *c, int prompt_tokens, int new_tokens,
                              const char *operation) {
-    int limit = QWEN38_ATTN_MAX_CTX;
+    int limit = c->max_positions < QWEN38_ATTN_MAX_CTX
+              ? c->max_positions : QWEN38_ATTN_MAX_CTX;
     if (prompt_tokens < 1 || new_tokens < 1 || prompt_tokens > limit ||
         new_tokens > limit - prompt_tokens) {
         fprintf(stderr, "[ctx] %s requires prompt=%d + new=%d tokens, capacity=%d\n",
@@ -2555,6 +2556,8 @@ static int q38_psd_on(Model *m){
         }
         { unsigned char kv=(unsigned char)q38_kv16(); h=q38_psd_fnv(h,&kv,1); }   /* Q38_KV unset follows SERVE: hash what the rows hold */
         h=q38_psd_fnv(h,__DATE__ " " __TIME__,sizeof(__DATE__ " " __TIME__));   /* this build: a kernel change changes a state's bits */
+        /* Q38_EXPERT_MASK routes differently: its allow table (not its path) in the identity; unset adds nothing */
+        if(g_q38_mask)h=q38_psd_fnv(h,g_q38_mask,(size_t)g_q38_mask_layers*g_q38_mask_experts);
         g_q38_psd_id=h;
     }
     return g_q38_psd_dir[0]!='-';
@@ -3807,6 +3810,9 @@ int main(int argc, char **argv) {
         if (head) fprintf(stderr, "[gguf] the MTP head's %d tensors (%s*) stay unread: it is not attached\n", head, hp);
         if (unused && getenv("GGUF_STRICT") && getenv("GGUF_STRICT")[0] == '1') return 3;
     }
+    /* Q38_EXPERT_MASK: route among a per-layer allow-list only (qwen38_core.h), before the
+     * tier starts so its warm start plans the allowed experts and nothing else */
+    if (!q38_mask_load(&m.c)) { q38_model_free(&m); free_tokenizer(); return 1; }
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
     if (g_q38_mux_slots>1 && m.dn_dev) {
         m.dn_dev=0;
@@ -3838,6 +3844,7 @@ int main(int argc, char **argv) {
         if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}
     }
     q38_vocab_decide(&m, snap);   /* the draft list or the whole vocabulary, before COLI_VK_DENSE_HOST releases the lm_head rows */
+    q38_mask_tier_report(&m.c);         /* Q38_EXPERT_MASK: did every allowed expert fit */
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
@@ -3892,6 +3899,7 @@ int main(int argc, char **argv) {
             q38_model_free(&m); rt_destroy(); return 1; }
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m);
+        q38_mask_report();
         rt_save(g_q38_usage, 0);
         q38_vocab_save(&m);
         q38_prefix_cache_release(&m);
@@ -3906,6 +3914,7 @@ int main(int argc, char **argv) {
         double tot = m.hits + m.miss;
         printf("TF-NLL: %.4f nats/token over %d tokens | ppl = %.2f\n", nll, scored, exp(nll));
         qt_stats();   /* VRAM tier hits/misses/swaps, if on */
+        q38_mask_report();
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
@@ -3996,6 +4005,7 @@ int main(int argc, char **argv) {
     tm_report(&m);
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     qt_stats();   /* VRAM tier hits/misses/swaps, if on */
+    q38_mask_report();
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);

@@ -1239,7 +1239,7 @@ static int q38c_pc_take(Q38Chain *ch, Model *m, int S, int rows) {
 }
 static int q38c_dmoe(Q38Chain *ch, Model *m, int rows, int S) {
     Cfg *c = &m->c;
-    if (ch->d || c->experts <= 0 || rt_fp || qt_ready()) return 0;
+    if (ch->d || c->experts <= 0 || rt_fp || qt_ready() || g_q38_mask) return 0;   /* the device's top-k knows no Q38_EXPERT_MASK */
     ch->dm.big = 1;   /* a prompt chunk too: a GGUF's experts and ours through the grouped GEMMs */
     ch->dm.pc_prompt = 0;
     int ok = vkc_dmoe_prepare(&ch->dm, ch->lo, ch->nl, c->experts, c->topk, c->hidden, c->inter, rows);

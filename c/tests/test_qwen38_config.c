@@ -87,6 +87,18 @@ static int expect_reference_failure(const char *document){
     int status=0;CHECK(waitpid(child,&status,0)==child);
     CHECK(WIFEXITED(status)&&WEXITSTATUS(status)!=0);return 0;
 }
+
+/* q38_context_total refuses (exits) past min(max_position_embeddings, QWEN38_ATTN_MAX_CTX) */
+static int expect_context_refused(int max_positions,int prompt,int fresh){
+    pid_t child=fork();CHECK(child>=0);
+    if(!child){
+        FILE *sink=fopen("/dev/null","wb");if(sink)dup2(fileno(sink),2);
+        Cfg config;memset(&config,0,sizeof config);config.max_positions=max_positions;
+        (void)q38_context_total(&config,prompt,fresh,"test");_exit(0);
+    }
+    int status=0;CHECK(waitpid(child,&status,0)==child);
+    CHECK(WIFEXITED(status)&&WEXITSTATUS(status)!=0);return 0;
+}
 #endif
 
 int main(void){
@@ -97,7 +109,14 @@ int main(void){
 #endif
     CHECK(valid_config()==0);
     Cfg config;q38_load_cfg(&config,directory);q38_validate_cfg(&config);
-    CHECK(config.rotary_dim==2);free(config.is_attn);
+    CHECK(config.rotary_dim==2);
+    /* the context: the model's own bound (128 here), the engine's ceiling above a larger one */
+    CHECK(config.max_positions==128&&q38_context_total(&config,100,28,"test")==128);
+    free(config.is_attn);
+    {
+        Cfg big;memset(&big,0,sizeof big);big.max_positions=1<<20;
+        CHECK(q38_context_total(&big,QWEN38_ATTN_MAX_CTX-1,1,"test")==QWEN38_ATTN_MAX_CTX);
+    }
     char *arena=NULL;jval *reference=json_parse(
         "{\"schema_version\":2,\"final_logits\":[0.0]}",&arena);
     CHECK(read_reference_logits(reference,1)!=NULL);
@@ -120,6 +139,9 @@ int main(void){
     config_hc_count="1";
     CHECK(expect_failure("\"silu\"","\"sigmoid\"","false","false","\"default\"","true","0.49","1","2")==0);
     config_hc_count="4";
+    CHECK(expect_context_refused(128,100,29)==0);
+    CHECK(expect_context_refused(262144,262144,262144)==0);   /* a 262144-position model takes no 512k request */
+    CHECK(expect_context_refused(1<<20,QWEN38_ATTN_MAX_CTX,1)==0);
     CHECK(expect_reference_failure("{}")==0);
     CHECK(expect_reference_failure("{\"schema_version\":\"2\",\"final_logits\":[0]}")==0);
     CHECK(expect_reference_failure("{\"schema_version\":1.5,\"final_logits\":[0]}")==0);

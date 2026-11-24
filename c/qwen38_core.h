@@ -4602,6 +4602,103 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
     q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
 }
 
+/* ---- Q38_EXPERT_MASK=<file>: routing restricted to a per-layer allow-list (default off) ----
+ * Before the softmax the router gives every expert outside its layer's list -inf and the
+ * top-k never picks one, so the top-k comes from the allowed experts and the gates are
+ * normalised as without the mask (over the top-k's sum with norm_topk_prob). The shared
+ * expert is untouched. With the CUDA tier up a GGUF's warm start plans the allowed experts
+ * only (qt_plan_allow, heat order kept) and a line says how many are resident; when all
+ * are, no routed expert misses VRAM. The exit report counts routes outside the mask (0)
+ * and the tier's misses.
+ * The CUDA chain routes on the card through the same table (qwen38_cuda_chain.h, a -1e30
+ * bias before the softmax); the Vulkan chain's in-frame route stays off under a mask.
+ * File (text; '#' starts a comment; blank lines ignored), one line per masked layer:
+ *     <layer> <expert> <expert> ...
+ * A layer without a line, and the MTP head's layer, keeps all of its experts. A listed
+ * layer needs at least num_experts_per_tok distinct ids, each listed once.
+ * tools/q38_expert_mask.py builds one from the .coli_usage history. */
+static uint8_t *g_q38_mask;                    /* layers x experts, 1 = allowed; NULL = off */
+static int g_q38_mask_layers,g_q38_mask_experts;
+static unsigned long long g_q38_mask_outside;  /* routes outside the list: rt_router_pick's NaN fallback only */
+/* the layer's allow row, NULL when the layer routes over every expert */
+static const uint8_t *q38_mask_row(int layer) {
+    if(!g_q38_mask||layer<0||layer>=g_q38_mask_layers)return NULL;
+    return g_q38_mask+(size_t)layer*g_q38_mask_experts;
+}
+static void q38_mask_logits(const uint8_t *allow,float *logits,int E) {
+    if(allow)for(int e=0;e<E;e++)if(!allow[e])logits[e]=-INFINITY;
+}
+static void q38_mask_count(const uint8_t *allow,const int *idx,int K) {
+    if(allow)for(int z=0;z<K;z++)if(!allow[idx[z]])__atomic_fetch_add(&g_q38_mask_outside,1ULL,__ATOMIC_RELAXED);
+}
+/* Reads Q38_EXPERT_MASK (unset: off). Returns 0 on a bad file (the engine stops). */
+static int q38_mask_load(const Cfg *c) {
+    free(g_q38_mask);g_q38_mask=NULL;g_q38_mask_outside=0;qt_plan_allow(NULL);
+    const char *path=getenv("Q38_EXPERT_MASK");
+    if(!path||!*path)return 1;
+    int L=c->layers,E=c->experts,ok=1,listed=0,lineno=0;
+    FILE *f=fopen(path,"r");
+    if(!f){fprintf(stderr,"[mask] Q38_EXPERT_MASK: cannot open %s\n",path);return 0;}
+    uint8_t *mask=(uint8_t*)calloc((size_t)L*E,1),*seen=(uint8_t*)calloc((size_t)L,1);
+    static char line[1<<16];
+    while(ok&&mask&&seen&&fgets(line,sizeof line,f)){
+        lineno++;
+        char *hash=strchr(line,'#');if(hash)*hash=0;
+        char *p=line,*end;long v=strtol(p,&end,10);
+        if(end==p){   /* blank, or not a layer number */
+            while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;
+            if(*p){fprintf(stderr,"[mask] %s:%d: a line starts with its layer number\n",path,lineno);ok=0;break;}
+            continue;
+        }
+        if(v<0||v>=L||seen[v]){fprintf(stderr,"[mask] %s:%d: layer %ld out of range or listed twice\n",path,lineno,v);ok=0;break;}
+        int layer=(int)v,n=0;seen[layer]=1;listed++;
+        for(p=end;;p=end){
+            v=strtol(p,&end,10);
+            if(end==p)break;
+            if(v<0||v>=E||mask[(size_t)layer*E+v]){fprintf(stderr,"[mask] %s:%d: expert %ld out of range or listed twice\n",path,lineno,v);ok=0;break;}
+            mask[(size_t)layer*E+v]=1;n++;
+        }
+        while(ok&&*p){if(*p!=' '&&*p!='\t'&&*p!='\r'&&*p!='\n'){fprintf(stderr,"[mask] %s:%d: not a number: %s",path,lineno,p);ok=0;}p++;}
+        if(ok&&n<c->topk){fprintf(stderr,"[mask] %s:%d: layer %d allows %d experts, fewer than the top-%d\n",path,lineno,layer,n,c->topk);ok=0;}
+    }
+    fclose(f);
+    if(!mask||!seen)ok=0;
+    if(!ok){fprintf(stderr,"[mask] Q38_EXPERT_MASK=%s refused\n",path);free(mask);free(seen);return 0;}
+    long long allowed=0;int lo=E,hi=0;
+    for(int l=0;l<L;l++){
+        int n=0;
+        if(!seen[l])memset(mask+(size_t)l*E,1,(size_t)E);
+        for(int e=0;e<E;e++)n+=mask[(size_t)l*E+e];
+        allowed+=n;if(seen[l]){if(n<lo)lo=n;if(n>hi)hi=n;}
+    }
+    free(seen);
+    g_q38_mask=mask;g_q38_mask_layers=L;g_q38_mask_experts=E;
+    qt_plan_allow(mask);
+    fprintf(stderr,"[mask] Q38_EXPERT_MASK=%s: %d of %d layers masked (%d-%d of %d experts allowed), %lld routed experts allowed in all\n",
+            path,listed,L,listed?lo:E,listed?hi:E,E,allowed);
+    /* saved, a masked run's picks would teach the history (the masks' and the placer's source) its own mask */
+    if(!getenv("USAGE_SAVE")){setenv("USAGE_SAVE","0",1);fprintf(stderr,"[mask] the routing history stays as it was (USAGE_SAVE=1 saves it)\n");}
+    return 1;
+}
+/* After the tier's start (a GGUF's warm start): how many allowed experts it holds. */
+static void q38_mask_tier_report(const Cfg *c) {
+    if(!g_q38_mask||!qt_ready())return;
+    long long allowed=0,resident=0;
+    for(int l=0;l<c->layers;l++)for(int e=0;e<c->experts;e++)
+        if(g_q38_mask[(size_t)l*c->experts+e]){allowed++;resident+=qt_is_resident(l,e);}
+    fprintf(stderr,"[mask] VRAM: %lld of %lld allowed experts resident at start: %s\n",resident,allowed,
+            resident==allowed?"all of them, no routed expert can miss":
+            "the rest reach VRAM at their first route while the tier's budget lasts (none outside the mask is planned)");
+}
+/* At exit: routes outside the list (must be 0) and the tier's misses (0 when all fit). */
+static void q38_mask_report(void) {
+    if(!g_q38_mask)return;
+    QtCounters q;int on=qt_counters(&q);
+    if(on)fprintf(stderr,"[mask] routes outside the mask: %llu; VRAM tier hits %llu, misses %llu\n",
+                  g_q38_mask_outside,(unsigned long long)q.hits,(unsigned long long)q.miss);
+    else fprintf(stderr,"[mask] routes outside the mask: %llu (no VRAM tier)\n",g_q38_mask_outside);
+}
+
 /* ---- decode rows grouped by expert --------------------------------------------
  * The decode loop below runs every routed expert of every row on its own: three
  * parallel regions per expert and row, about 90 a layer for an MTP verify of 3 rows,
@@ -4786,12 +4883,15 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     if(idx_in){memcpy(idx,idx_in,(size_t)np*sizeof(int));memcpy(gates,gates_in,(size_t)np*sizeof(float));}
     else if(logits_in)memcpy(logits,logits_in,(size_t)S*E*sizeof(float));
     else q38_dense_matmul(m,logits,x,&l->router,S,H,E);
+    const uint8_t *allow=q38_mask_row(layer);   /* Q38_EXPERT_MASK */
     for(int s=0;s<S&&!idx_in;s++){
         float *lg=logits+(int64_t)s*E;
+        q38_mask_logits(allow,lg,E);
         float mx=lg[0];for(int e=1;e<E;e++)if(lg[e]>mx)mx=lg[e];
         double all=0;for(int e=0;e<E;e++){lg[e]=expf(lg[e]-mx);all+=lg[e];}
         int *ix=idx+(int64_t)s*K;float val[Q38_MAX_TOPK];
-        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(ix[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}ix[z]=rt_router_pick(best,z,E,layer);val[z]=lg[ix[z]];}
+        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=allow&&!allow[e];for(int j=0;j<z;j++)if(ix[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}ix[z]=rt_router_pick(best,z,E,layer);val[z]=lg[ix[z]];}
+        q38_mask_count(allow,ix,K);
         double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
         for(int z=0;z<K;z++)gates[s*K+z]=(float)(val[z]/den);
         rt_route(layer,row0+s,ix,gates+(int64_t)s*K,K);
@@ -4972,10 +5072,13 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         if(g_q38_cov)q38_cov_add(layer,xs,1);
         if(logits_in)memcpy(logits,logits_in+(int64_t)s*E,(size_t)E*sizeof(float));
         else q38_dense_matmul(m,logits,xs,&l->router,1,H,E);
+        const uint8_t *allow=q38_mask_row(layer);   /* Q38_EXPERT_MASK */
+        q38_mask_logits(allow,logits,E);
         float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
         double all=0;for(int e=0;e<E;e++){logits[e]=expf(logits[e]-mx);all+=logits[e];}
         int idx[Q38_MAX_TOPK];float val[Q38_MAX_TOPK];
-        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(idx[j]==e)used=1;if(!used&&logits[e]>bv){bv=logits[e];best=e;}}idx[z]=rt_router_pick(best,z,E,layer);val[z]=logits[idx[z]];}
+        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=allow&&!allow[e];for(int j=0;j<z;j++)if(idx[j]==e)used=1;if(!used&&logits[e]>bv){bv=logits[e];best=e;}}idx[z]=rt_router_pick(best,z,E,layer);val[z]=logits[idx[z]];}
+        q38_mask_count(allow,idx,K);
         double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
         float route_gates[Q38_MAX_TOPK];
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
@@ -5151,8 +5254,10 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
          * deterministic fallback for invalid logits. */
         if(logits_in)memcpy(logits,logits_in+(int64_t)base*E,(size_t)rows*E*sizeof(float));
         else q38_dense_matmul(m,logits,x+(int64_t)base*H,&l->router,rows,H,E);
+        const uint8_t *allow=q38_mask_row(layer);   /* Q38_EXPERT_MASK, as the decode route */
         for(int s=0;s<rows;s++) {
             float *probabilities=logits+(int64_t)s*E;
+            q38_mask_logits(allow,probabilities,E);
             float maximum=probabilities[0];
             for(int e=1;e<E;e++)if(probabilities[e]>maximum)maximum=probabilities[e];
             double total=0.0;
@@ -5165,7 +5270,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             for(int rank=0;rank<K;rank++) {
                 int best=-1;float best_value=-1.f;
                 for(int e=0;e<E;e++) {
-                    int used=0;
+                    int used=allow&&!allow[e];
                     for(int previous=0;previous<rank;previous++)
                         if(selected[previous]==e){used=1;break;}
                     if(!used&&probabilities[e]>best_value){
@@ -5175,6 +5280,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                 selected[rank]=rt_router_pick(best,rank,E,layer);
                 selected_probability[rank]=probabilities[selected[rank]];
             }
+            q38_mask_count(allow,selected,K);
             double top=0.0;
             for(int rank=0;rank<K;rank++)top+=selected_probability[rank];
             double denominator=c->norm_topk?top:total;

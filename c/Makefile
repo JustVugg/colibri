@@ -576,7 +576,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_segment_adapters_registration test_segment_adapters_real test_olmoe_segment_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
-	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain test_qwen38_expert_mask \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 test_int_kernel_exact_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
@@ -1888,6 +1888,15 @@ qwen38-dn-gpu-check: qwen38-tiny-fp8-generate tests/test_qwen38_dn_gpu$(EXE)
 
 qwen38-cuda-chain-check: qwen38-tiny-fp8-generate qwen38-tiny-fp8-mtp-generate tests/test_qwen38_cuda_chain$(EXE)
 	./tests/test_qwen38_cuda_chain$(EXE)
+
+# Q38_EXPERT_MASK (routing restricted to a per-layer allow-list): tools/q38_expert_mask.py builds
+# the top-2 per layer of a known history, and the engine on the fixture (CPU, the fake tier, the
+# fake CUDA chain) must route inside it, load nothing else, and stay bit-identical unset or allowing all.
+.PHONY: qwen38-expert-mask-check
+qwen38-expert-mask-check: qwen38-tiny-fp8-generate tests/test_qwen38_expert_mask$(EXE)
+	printf -- '-1 4 4\n-2 1 0\n0 1 9\n0 3 5\n0 0 1\n1 0 7\n1 2 6\n2 2 8\n2 3 8\n2 1 1\n3 1 4\n3 0 3\n3 2 3\n' > ./qwen38_tiny_fp8/mask_usage.txt
+	$(PYTHON) tools/q38_expert_mask.py ./qwen38_tiny_fp8/mask_usage.txt --topk 2 --per-layer 2 --out ./qwen38_tiny_fp8/mask_tool.txt --heat-out ./qwen38_tiny_fp8/mask_heat.bin
+	./tests/test_qwen38_expert_mask$(EXE) ./qwen38_tiny_fp8/mask_tool.txt
 
 qwen38-tiny-fp8-mtp-generate:
 	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8_mtp --fp8-experts --mtp
@@ -3596,6 +3605,9 @@ tests/test_qwen38_dn_gpu$(EXE): tests/test_qwen38_dn_gpu.c qwen38.c qwen36_tier.
 
 # Qwen3.8's layers as one chain on the card (COLI_CUDA_CHAIN=1): the tiny FP8 fixture's oracle
 # on the fake tier, the chain's ops from the fake's host-side table (qwen38_cuda_chain.h).
+tests/test_qwen38_expert_mask$(EXE): tests/test_qwen38_expert_mask.c qwen38.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_qwen38_cuda_chain$(EXE): tests/test_qwen38_cuda_chain.c qwen38.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
