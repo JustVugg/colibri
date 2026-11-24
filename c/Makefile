@@ -2629,7 +2629,7 @@ tests/test_qwen36_attn_grouped$(EXE): tests/test_qwen36_attn_grouped.c $(VK_OBJ)
 tests/test_gq_f32_fused$(EXE): tests/test_gq_f32_fused.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # Single-region gq_matmul2_act (R16, TILE16_BIAS, F8) against two gq_matmul_act calls, to the bit
-tests/test_gq_matmul2$(EXE): tests/test_gq_matmul2.c ggml_quants.h
+tests/test_gq_matmul2$(EXE): tests/test_gq_matmul2.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The grid types' and Q2_K's row kernels (AVX-512's on a VNNI build, AVX2's otherwise) against
 # the unpack + gq_dot_i8 path, to the bit, one to eight activation rows
