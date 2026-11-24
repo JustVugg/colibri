@@ -12,6 +12,13 @@ import unittest
 @unittest.skipUnless(sys.platform.startswith("linux"), "uses ELF section GC")
 class GpuPlacementTests(unittest.TestCase):
     def test_cache_ownership_and_cleanup(self):
+        self.run_placement([])
+
+    def test_hip_placement(self):
+        """The HIP build's placement (-DCOLI_V4_HIP): --vram and the bank."""
+        self.run_placement(["-DCOLI_V4_HIP"])
+
+    def run_placement(self, defines):
         cc = shlex.split(os.environ.get("CC", "cc"))
         if not shutil.which(cc[0]):
             self.skipTest("C compiler unavailable")
@@ -20,7 +27,7 @@ class GpuPlacementTests(unittest.TestCase):
             binary = str(Path(tmp) / "gpu-placement")
             if "avx2" in Path("/proc/cpuinfo").read_text():
                 cc += ["-mavx2"]
-            subprocess.run(cc + ["-D_GNU_SOURCE", "-O1", "-ffunction-sections",
+            subprocess.run(cc + defines + ["-D_GNU_SOURCE", "-O1", "-ffunction-sections",
                                  "-fdata-sections", str(source), "-Wl,--gc-sections",
                                  "-pthread", "-lm", "-o", binary], check=True,
                            capture_output=True, text=True)
