@@ -149,15 +149,8 @@ int main(void) {
 #ifdef _OPENMP
     omp_set_num_threads(4);   /* a team of every core fights the loader's thread for them */
 #endif
-    /* Windows has no /tmp: the runner's TEMP, as test_own_file does */
-    const char *tmp = getenv("TMPDIR");
-#ifdef _WIN32
-    if (!tmp || !*tmp) tmp = getenv("TEMP");
-#endif
-    if (!tmp || !*tmp) tmp = "/tmp";
-    char path[1024];
-    snprintf(path, sizeof path, "%s/qwen36-gguf-hold-XXXXXX", tmp);
-    int fd = mkstemp(path); if (fd < 0) { perror(path); return 1; }
+    char path[] = "qwen36-gguf-hold-XXXXXX";   /* here: Windows has no /tmp */
+    int fd = mkstemp(path); if (fd < 0) { perror("mkstemp"); return 1; }
     close(fd);
     write_gguf(path);
     setup(path);
