@@ -4141,14 +4141,21 @@ static void q38_trunk_place_all(Model *m) {
  * tier reads that itself); it needs every layer's experts in native FP8 with
  * the block-scale bank resident, because the GPU kernels consume exactly the
  * checkpoint layout (e4m3 bytes + [ceil(O/128), ceil(I/128)] scales). */
-/* The CUDA tier's warm start for a GGUF's experts: the history's most used (.coli_usage,
- * qt_heat_order) until the budget is full, read by layer and expert as the file has them
- * (the three matrices' rows) in parallel and handed over (the tier copies them). Before,
- * the tier started empty and filled as the CPU's experts passed, converting each. */
+/* The CUDA tier's warm start: the history's most used (.coli_usage, qt_heat_order; without
+ * one HEAT_FILE's order, else expert by expert across the layers) until the budget is full,
+ * read in parallel and handed over (the tier copies them). A GGUF's experts are read by layer
+ * and expert as the file has them (the three matrices' rows); native FP8 experts as a RAM slot
+ * reads them (the e4m3 bytes, the scales from the layer's bank). Before, the tier started
+ * empty and filled as the CPU's experts passed, so each expert it ends up holding missed once.
+ * A GGUF warms unless COLI_CUDA_TIER_WARM=0; FP8 experts only with COLI_CUDA_TIER_WARM=1 (the
+ * tier was built to promote as experts pass, and that stays the default there). */
 static void q38_tier_warm(Model *m,int hist) {
     Cfg *c=&m->c; const int L=c->layers,E=c->experts,all=L*E;
     const char *w=getenv("COLI_CUDA_TIER_WARM");   /* 0: the tier fills as experts pass */
-    if(w&&w[0]=='0')return;
+    const int gg=g_q38_gguf_tier;
+    if(gg ? w&&w[0]=='0' : !(w&&w[0]=='1'&&!w[1]))return;
+    /* FP8: the tier holds experts (not the trunk alone), and they are native FP8 */
+    if(!gg&&(!qt_experts_on()||g_q38_gguf||m->x4||!m->native_fp8))return;
     /* hist: rt_load read selections. rt_init makes the counters with or without a history, and
      * their zeros would only replace the tier's order (HEAT_FILE's, or none) with a sort of ties. */
     if(hist)qt_heat_order(rt_counts_all(),L,E);
@@ -4166,6 +4173,30 @@ static void q38_tier_warm(Model *m,int hist) {
         free(in);
     }
     double t0=now_s();
+    if(!gg){
+        /* every layer's scale bank is resident (q38_tier_start), so the loaders only read
+         * the e4m3 bytes, each thread into its own slot */
+        #pragma omp parallel
+        {
+            Slot tmp; memset(&tmp,0,sizeof tmp);
+            #pragma omp for schedule(dynamic,4)
+            for(int i=0;i<n;i++){
+                st_tensor *t[3];
+                if(!q38_native_fp8_expert_tensors(m,pl[i],pe[i],t)){qt_note_planned(pl[i],pe[i],NULL,NULL,NULL,NULL,NULL,NULL);continue;}
+                q38_load_native_fp8_ranges(m,pl[i],pe[i],&tmp,t);
+                qt_note_planned(pl[i],pe[i],(const uint8_t*)tmp.gate.data,(const uint8_t*)tmp.up.data,(const uint8_t*)tmp.down.data,
+                                tmp.gate.scales,tmp.up.scales,tmp.down.scales);
+            }
+            q38_weight_free(&tmp.gate); q38_weight_free(&tmp.up); q38_weight_free(&tmp.down);
+            free(tmp.fp8_slab);
+        }
+        qt_fill_wait();
+        fprintf(stderr,"[qtier] qwen38: warm start, %d native FP8 experts in VRAM, %s -- %.1f s\n",n,
+                hist?"the history's most used first (.coli_usage)":qt_chain_history()?"HEAT_FILE's order":
+                "no history: expert by expert across the layers",now_s()-t0);
+        free(pl);free(pe);
+        return;
+    }
     #pragma omp parallel
     {
         uint8_t *buf=NULL; size_t cap=0;

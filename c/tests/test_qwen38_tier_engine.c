@@ -163,6 +163,62 @@ int main(int argc, char **argv_in) {
     qt_shutdown();
     setenv("COLI_CUDA_CHAIN", "0", 1);
 
+    /* COLI_CUDA_TIER_WARM=1: the FP8 tier's warm start. Through the load's own steps
+     * (model_init, q38_tier_start) and no forward yet, it makes the heat file's six experts
+     * resident, those and no other, one upload triple each; unset (the default) the tier starts
+     * empty as before. Then through main() with an expert history (COLI_USAGE) instead: the plan
+     * is the history's most used first, and the run still gives the oracle's tokens and logits. */
+    printf(" COLI_CUDA_TIER_WARM=1: the FP8 tier warm before the first prompt (6 of 16 experts fit)\n");
+    {
+        static const char hf[] = "./qwen38_tiny_fp8/warm_heat.bin", hist[] = "./qwen38_tiny_fp8/warm_usage.txt";
+        static const int hot[6][2] = { { 0, 1 }, { 1, 3 }, { 2, 0 }, { 2, 2 }, { 3, 1 }, { 3, 3 } };
+        uint32_t heat[3 + 16] = { 0x51544831u, 4, 4 };
+        for (int i = 0; i < 6; i++) heat[3 + hot[i][0] * 4 + hot[i][1]] = 100u + i;
+        setenv("Q38_TRUNK_GPU", "0", 1); setenv("COLI_PLACE", "off", 1); setenv("CUDA_EXPERT_GB", gb, 1);
+        fake_dense_compute = 0;
+        for (int a = 0; a < 2; a++) {
+            FILE *f = fopen(hf, "wb"); if (f) { fwrite(heat, 4, 19, f); fclose(f); }   /* qt_shutdown saves over it */
+            setenv("HEAT_FILE", hf, 1);
+            if (a) setenv("COLI_CUDA_TIER_WARM", "1", 1); else unsetenv("COLI_CUDA_TIER_WARM");
+            G_offer_n = 0;
+            Model m; model_init(&m, "./qwen38_tiny_fp8", 1, 8);
+            q38_tier_start(&m, 1);
+            int up0 = fake_uploads;
+            q38_tier_warm(&m, 0);
+            pthread_mutex_lock(&G.mx);
+            int on = G.on, res = 0, same = 1;
+            for (int l = 0; l < 4; l++) for (int e = 0; e < 4; e++) {
+                int r = qs(l, e)->resident; res += r; same &= r == (heat[3 + l * 4 + e] != 0);
+            }
+            pthread_mutex_unlock(&G.mx);
+            if (a) {
+                tk(on && res == 6 && same, "on: the heat file's six experts resident before any forward, and no other");
+                tk(fake_uploads - up0 == 18, "one gate/up/down upload triple each");
+            } else tk(on && res == 0 && fake_uploads == up0, "unset (the default): the FP8 tier starts empty, as before");
+            qt_shutdown();
+            q38_model_free(&m);
+        }
+        setenv("HEAT_FILE", "", 1); remove(hf);
+        FILE *f = fopen(hist, "wb");
+        if (f) {
+            fprintf(f, "-1 4 4\n-2 1 %u\n", rt_hash("qwen38"));
+            for (int l = 0; l < 4; l++) for (int e = 0; e < 4; e++) fprintf(f, "%d %d %d\n", l, e, l >= 2 ? 10 * (l * 4 + e) : 1);
+            fclose(f);
+        }
+        setenv("COLI_USAGE", hist, 1); setenv("COLI_CUDA_TIER_WARM", "1", 1);
+        G_offer_n = 0;
+        rc =qwen38_main_unused(4, argv);
+        tk(rc == 0, "on, through main() with an expert history: the oracle's tokens and logits");
+        pthread_mutex_lock(&G.mx);
+        int order = G.on && G.heat0 && G.fill_order;
+        for (int i = 0; order && i < 6; i++) order = G.fill_order[i] == 15 - i;
+        pthread_mutex_unlock(&G.mx);
+        tk(order, "the warm start planned the history's most used first: layer 3's four, then (2,3) (2,2)");
+        qt_shutdown();
+        unsetenv("COLI_USAGE"); unsetenv("COLI_CUDA_TIER_WARM"); remove(hist);
+        setenv("Q38_TRUNK_GPU", "1", 1); setenv("COLI_PLACE", "auto", 1); setenv("CUDA_EXPERT_GB", "0.5", 1);
+    }
+
     if (argc > 1) {
         /* Third pass: the int4-g64 sidecar. The tier must stay off -- no
          * upload, no routed expert ever consulted -- and the CPU must answer

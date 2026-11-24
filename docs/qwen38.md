@@ -640,8 +640,13 @@ that carries over between prompts: the 1,400 experts (5.8 % of the model) that
 were hottest in one 100-token run covered a different prompt's routes at
 chance level (4.7 %; two cards, 2,800 experts: 9.3 % against 11.5 % chance;
 rank correlation of expert frequency per layer between the two runs -0.2). A
-heat file from an earlier run therefore does not help, and the engine does no
-warmstart of the fp8 tier. (A GGUF is another case: the tier holds its experts
+heat file from an earlier run therefore does not help, and by default the engine
+does no warmstart of the fp8 tier. `COLI_CUDA_TIER_WARM=1` asks for one: before
+the first prompt the tier is filled up to its budget with the experts the
+expert history (`.coli_usage`, many runs' routes rather than one prompt's) used
+most, else in `HEAT_FILE`'s order, else expert by expert across the layers,
+read in parallel; those experts then do not miss once each on their first pass.
+(A GGUF is another case: the tier holds its experts
 as the file has them and fills the card at the start, the history's most used
 first, `.coli_usage`; `COLI_CUDA_TIER_WARM=0` turns that off. See
 [gguf.md](gguf.md#what-the-engines-do-with-the-blocks).) Inside a run the
