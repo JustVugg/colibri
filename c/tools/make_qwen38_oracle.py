@@ -46,11 +46,12 @@ def _load_model(model_dir):
         from transformers import AutoConfig, Qwen4ExpForCausalLM
     except ImportError as exc:
         sys.exit(
-            f"Missing Qwen4-Exp support. Install transformers=={TRANSFORMERS_VERSION}: {exc}"
+            f"Missing Qwen4-Exp support. Install transformers>={TRANSFORMERS_VERSION}: {exc}"
         )
-    if transformers.__version__ != TRANSFORMERS_VERSION:
+    from packaging.version import Version
+    if Version(transformers.__version__) < Version(TRANSFORMERS_VERSION):
         sys.exit(
-            f"Qwen3.8 oracle generation requires transformers=={TRANSFORMERS_VERSION}; "
+            f"Qwen3.8 oracle generation requires transformers>={TRANSFORMERS_VERSION}; "
             f"found {transformers.__version__}."
         )
     try:
