@@ -805,26 +805,26 @@ coding agents. What it does and how: [ui/README.md](../ui/README.md).
 
 ## Unresponsive text engines
 
-The gateway watchdog also bounds requests handled by the text/decision engine
-protocol. `COLI_ENGINE_STALL_TIMEOUT` is a progress deadline in seconds: a request
-that receives no ACCEPT, DATA, ECHO, TOOL or DECISION frame for that long counts as
-stalled. The clock starts when the request registers with the engine, so a blocked
-pipe submission counts. A slow engine that keeps producing is never retired,
-however long the whole request runs. It is off by default (`0`), because most
-engines send nothing while they read the prompt: a model streamed from disk can
-spend fifteen minutes in a 4096-token prefill before its first token. Set it above
-the longest prefill you expect.
+The gateway watchdog can also retire a text or decision engine that is alive but no
+longer answers. Three deadlines, in seconds, all **off unless set** (unset or `0`):
+when one expires the engine is killed and every request on it fails, and no value is
+safe for every machine. A model streamed from a slow disk can read a prompt for
+fifteen minutes without a frame, take minutes over a single token, and answer a
+CANCEL only when the step it is in ends. That engine is working, not stuck.
 
-Once a request's first DATA frame arrives, the prompt is read and every token
-sends one, a second or two apart on the slowest models. From then on
-`COLI_ENGINE_DECODE_STALL_TIMEOUT` applies instead (default `300` seconds, `0`
-turns it off), so an engine that freezes mid-answer while `/health` keeps
-answering is retired without any setting. Queue waiting is governed separately by
-`--queue-timeout`. `COLI_ENGINE_CANCEL_TIMEOUT` bounds the wait for a terminal frame
-after CANCEL or STOP once the request is decoding (default `30` seconds, must be
-positive): from the first DATA frame on, every engine reads commands between
-tokens, while before it some read a CANCEL only when the prompt is done. All three
-settings must be finite.
+| variable | expires when | where to start |
+|---|---|---|
+| `COLI_ENGINE_DECODE_STALL_TIMEOUT` | a request that has had its first DATA frame gets no further frame for this long | `300` on a server whose model writes a token every second or two; several times your slowest token otherwise |
+| `COLI_ENGINE_CANCEL_TIMEOUT` | a request that has had its first DATA frame gets no terminal frame this long after CANCEL or STOP (from the later of the two) | `30` under the same condition; above your slowest step otherwise |
+| `COLI_ENGINE_STALL_TIMEOUT` | a request that has had no DATA frame yet gets no ACCEPT, ECHO, TOOL or DECISION frame for this long, from its registration with the engine (a blocked pipe submission counts) | above the longest prompt you expect to be read; most engines send nothing while they read one |
+
+The first is the one that catches an engine frozen mid-answer while `/health` keeps
+answering: once the prompt is read every token sends a DATA frame, so a long
+silence there is not a slow prompt. The cancel deadline does not run before the
+first DATA frame, because until then some engines read a CANCEL only when the prompt
+is done. A slow engine that keeps producing frames is never retired, however long
+the whole request runs. Queue waiting is governed separately by `--queue-timeout`.
+Each value must be finite and not negative.
 
 On expiry, admission pauses and the old process is killed and reaped before a
 replacement is loaded. All requests on that process fail; they are not replayed.

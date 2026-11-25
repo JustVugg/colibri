@@ -7393,17 +7393,19 @@ class Engine:
         self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
-        # 0 = off: an engine streaming from disk can prefill silently for many minutes,
-        # while once decoding it sends a DATA frame every token, a second or two at worst
-        self.stall_timeout = float(child_env.get("COLI_ENGINE_STALL_TIMEOUT", "0"))
-        self.decode_stall_timeout = float(child_env.get("COLI_ENGINE_DECODE_STALL_TIMEOUT", "300"))
-        self.cancel_timeout = float(child_env.get("COLI_ENGINE_CANCEL_TIMEOUT", "30"))
+        # All three are off unless set (0 = off). When one fires the engine is killed and
+        # every request on it fails, and no default is safe for every machine this runs
+        # on: an engine streaming from a slow disk can read a prompt silently for many
+        # minutes and take minutes over one token, and it answers a CANCEL only when the
+        # step it is in ends. A server that knows its model's pace sets them (docs/api.md).
+        self.stall_timeout = float(child_env.get("COLI_ENGINE_STALL_TIMEOUT") or "0")
+        self.decode_stall_timeout = float(child_env.get("COLI_ENGINE_DECODE_STALL_TIMEOUT") or "0")
+        self.cancel_timeout = float(child_env.get("COLI_ENGINE_CANCEL_TIMEOUT") or "0")
         for name, value in (("COLI_ENGINE_STALL_TIMEOUT", self.stall_timeout),
-                            ("COLI_ENGINE_DECODE_STALL_TIMEOUT", self.decode_stall_timeout)):
+                            ("COLI_ENGINE_DECODE_STALL_TIMEOUT", self.decode_stall_timeout),
+                            ("COLI_ENGINE_CANCEL_TIMEOUT", self.cancel_timeout)):
             if not (math.isfinite(value) and value >= 0):
                 raise ValueError(f"{name} must be finite and not negative")
-        if not (math.isfinite(self.cancel_timeout) and self.cancel_timeout > 0):
-            raise ValueError("COLI_ENGINE_CANCEL_TIMEOUT must be finite and positive")
         self._stall_error = None
         tune_child_env(child_env, arch)
         decision_head_env(child_env, model)
@@ -7514,7 +7516,7 @@ class Engine:
     def stalled_reason(self):
         """A request with no frame for stall_timeout (decode_stall_timeout once it is
         decoding), or no terminal frame cancel_timeout after CANCEL/STOP once it is
-        decoding. Before the first DATA frame an engine may read a CANCEL only when the
+        decoding; each only when set. Before the first DATA frame an engine may read a CANCEL only when the
         prompt is done, so the cancel deadline starts there. Timed here, not on stdout,
         so a blocked pipe write counts too."""
         with self.pending_lock:
@@ -7523,7 +7525,7 @@ class Engine:
             now = time.monotonic()
             for request_id, entry in self.pending.items():
                 decoding = entry.decoding_at is not None
-                if (entry.cancel_at is not None and decoding
+                if (self.cancel_timeout and entry.cancel_at is not None and decoding
                         and now - max(entry.cancel_at, entry.decoding_at) >= self.cancel_timeout):
                     self._stall_error = f"engine cancellation timed out for request {request_id}"
                     return self._stall_error

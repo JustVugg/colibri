@@ -3519,14 +3519,39 @@ class EngineRestartTest(unittest.TestCase):
         finally:
             engine.close()
 
-    def test_default_stall_deadline_waits_out_the_prompt_and_bounds_decoding(self):
-        for decode, expected in ((None, "while decoding"), ("0", None)):
+    def test_no_deadline_is_on_unless_set(self):
+        # a day on the prompt, a day between two tokens, a day after a CANCEL: a slow engine
+        # that is working is not the watchdog's to kill until the server says what slow is
+        for unset in (None, "0", ""):
+            with self.subTest(unset=unset):
+                process = FakeProcess(lambda process, frame: None)
+                names = ("COLI_ENGINE_STALL_TIMEOUT", "COLI_ENGINE_DECODE_STALL_TIMEOUT",
+                         "COLI_ENGINE_CANCEL_TIMEOUT")
+                env = {k: v for k, v in os.environ.items() if k not in names}
+                if unset is not None:
+                    env.update(dict.fromkeys(names, unset))
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("olmoe", "model", env=env)
+                entry = openai_server._Pending()
+                entry.progress_at -= 86400
+                with engine.pending_lock:
+                    engine.pending["7"] = entry
+                try:
+                    self.assertIsNone(engine.stalled_reason())
+                    entry.decoding_at = entry.progress_at
+                    self.assertIsNone(engine.stalled_reason())
+                    entry.cancel_at = entry.progress_at
+                    self.assertIsNone(engine.stalled_reason())
+                finally:
+                    engine.close()
+
+    def test_decode_stall_deadline_waits_out_the_prompt_and_bounds_decoding(self):
+        for decode, expected in (("300", "while decoding"), ("0", None)):
             with self.subTest(decode=decode):
                 process = FakeProcess(lambda process, frame: None)
                 env = {k: v for k, v in os.environ.items()
                        if k not in ("COLI_ENGINE_STALL_TIMEOUT", "COLI_ENGINE_DECODE_STALL_TIMEOUT")}
-                if decode is not None:
-                    env["COLI_ENGINE_DECODE_STALL_TIMEOUT"] = decode
+                env["COLI_ENGINE_DECODE_STALL_TIMEOUT"] = decode
                 with patch("openai_server.subprocess.Popen", return_value=process):
                     engine = Engine("olmoe", "model", env=env)
                 entry = openai_server._Pending()
@@ -3541,7 +3566,7 @@ class EngineRestartTest(unittest.TestCase):
                         time.sleep(0.01)
                     self.assertIsNotNone(entry.decoding_at)
                     self.assertIsNone(engine.stalled_reason())
-                    entry.progress_at -= 301   # past the default 300 s between tokens
+                    entry.progress_at -= 301   # past the 300 s between tokens
                     reason = engine.stalled_reason()
                     if expected is None:
                         self.assertIsNone(reason)
@@ -3553,7 +3578,7 @@ class EngineRestartTest(unittest.TestCase):
     def test_cancel_deadline_starts_with_the_first_token(self):
         process = FakeProcess(lambda process, frame: None)
         with patch("openai_server.subprocess.Popen", return_value=process):
-            engine = Engine("olmoe", "model")
+            engine = Engine("olmoe", "model", env=dict(os.environ, COLI_ENGINE_CANCEL_TIMEOUT="30"))
         entry = openai_server._Pending()
         now = time.monotonic()
         entry.cancel_at = now - 3600   # cancelled during a long prompt: not timed
@@ -3571,7 +3596,7 @@ class EngineRestartTest(unittest.TestCase):
     def test_engine_timeout_settings_reject_unbounded_values(self):
         for name, values in (("COLI_ENGINE_STALL_TIMEOUT", ("-1", "nan", "inf")),
                              ("COLI_ENGINE_DECODE_STALL_TIMEOUT", ("-1", "nan", "inf")),
-                             ("COLI_ENGINE_CANCEL_TIMEOUT", ("0", "-1", "nan", "inf"))):
+                             ("COLI_ENGINE_CANCEL_TIMEOUT", ("-1", "nan", "inf"))):
             for value in values:
                 with self.subTest(name=name, value=value), \
                      patch("openai_server.subprocess.Popen") as popen:
