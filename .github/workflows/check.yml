@@ -27,8 +27,9 @@ jobs:
     # more engines' GGUF code: the builds now use every core (make test runs the C and
     # Python suites one after the other, so only the compiling is parallel).
     # 2026-11-11: 30.0 minutes on #2750, then cancelled at 35 twice on #2759, which adds
-    # a GGUF MTP suite. 50.
-    timeout-minutes: 50
+    # a GGUF MTP suite. 50. 2026-11-25: 44 minutes on #3069, then cancelled at 50 on #3077
+    # in its last Python suites. 75.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - name: make check
