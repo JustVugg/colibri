@@ -6491,11 +6491,19 @@ static int v4_views_fetch_host(ColiExpertStore *store, ColiExpertView *views,
  *                             mirror cache (default 0 = RAM only)
  *   V4_NEXT_PREFETCH_AVX2=1   run the predictor's gate GEMV in AVX2+FMA
  *                             (v4_np_route.h: bit-identical to scalar)
+ *   V4_NEXT_PREFETCH_GATES=p  experimental model-specific V4PG v1 learned
+ *                             predictor sidecar (never used by routing)
+ *   V4_NP_ONLINE=1|2          online per-layer logit adaptation for guesses
+ *                             (1: V4PG entries only; 2: own gate fallback)
+ *   V4_NP_ONLINE_{ETA,DECAY,BETA,HL}  online adaptation hyperparameters
  *   V4_PREDICT_STATS=1        log prediction recall, fresh recall, route
  *                             latency, queue traffic, and confidence buckets
  *   V4_NP_MIN_CONF=x          minimum predicted confidence (0..1) to move bytes
  *   V4_NP_TOKEN_MB=n          per-forward prefetch byte budget in MB */
 #include "v4_np_route.h"
+#include "v4_np_gates.h"
+static V4NpGates v4_np_gates;
+static int v4_np_gates_checked;
 #define V4_NP_MAXK 16
 #define V4_NP_LAYERS 128
 #define V4_NP_QUEUE 256
@@ -6532,7 +6540,7 @@ static int v4_np_decode;
 enum { V4_NPQ_QUEUED, V4_NPQ_DROPPED, V4_NPQ_KEPT, V4_NPQ_STALE, V4_NPQ_FULL, V4_NPQ_COUNT };
 static unsigned long long v4_np_qstat[V4_NPQ_COUNT];
 static unsigned long long v4_np_route_ns, v4_np_route_calls, v4_np_route_refined,
-                          v4_np_route_vector;
+                          v4_np_route_vector, v4_np_route_learned_avx2;
 static unsigned long long v4_np_fresh_hits, v4_np_fresh_total, v4_np_fresh_layers,
                           v4_np_fresh_missing;
 static int v4_np_pred[V4_NP_LAYERS][V4_NP_MAXK];
@@ -6807,6 +6815,9 @@ static void v4_np_publish_ex(ColiExpertStore *store, int next,
     v4_np_publish_w(store, next, indices, NULL, k, stamp, issue);
 }
 
+/* V4_NP_ONLINE state (defined with the update further down), for the stats line */
+static int v4_np_online_on;
+static unsigned long long v4_np_online_updates, v4_np_online_skipped;
 static void v4_np_score_fresh(const ColiDeepSeekV4LayerWeights *weights,
                               const int *expert_ids, int selected) {
     int layer = weights->plan.layer;
@@ -6833,20 +6844,152 @@ static void v4_np_score_fresh(const ColiDeepSeekV4LayerWeights *weights,
     pthread_mutex_unlock(&v4_np.mutex);
     unsigned long long calls = __atomic_load_n(&v4_np_route_calls, __ATOMIC_RELAXED);
     unsigned long long vector = __atomic_load_n(&v4_np_route_vector, __ATOMIC_RELAXED);
+    unsigned long long learned_vector =
+        __atomic_load_n(&v4_np_route_learned_avx2, __ATOMIC_RELAXED);
     double ns = (double)__atomic_load_n(&v4_np_route_ns, __ATOMIC_RELAXED);
     double refined = (double)__atomic_load_n(&v4_np_route_refined, __ATOMIC_RELAXED);
     fprintf(stderr, "v4_next_predict_fresh recall=%.1f%% notready=%.1f%% "
-                    "route_ms=%.3f avx2=%llu refined=%.1f queued=%llu "
+                    "route_ms=%.3f avx2=%llu learned_avx2=%llu refined=%.1f queued=%llu "
                     "dropped=%llu kept=%llu stale=%llu full=%llu layers=%llu\n",
             100.0 * (double)v4_np_fresh_hits / (double)v4_np_fresh_total,
             100.0 * (double)v4_np_fresh_missing / (double)v4_np_fresh_layers,
-            calls ? ns / (double)calls * 1e-6 : 0.0, vector,
+            calls ? ns / (double)calls * 1e-6 : 0.0, vector, learned_vector,
             vector ? refined / (double)vector : 0.0,
             q[V4_NPQ_QUEUED], q[V4_NPQ_DROPPED], q[V4_NPQ_KEPT], q[V4_NPQ_STALE],
             q[V4_NPQ_FULL], v4_np_fresh_layers);
+    if (v4_np_online_on > 0)
+        fprintf(stderr, "v4_next_predict_online updates=%llu skipped=%llu\n",
+                v4_np_online_updates, v4_np_online_skipped);
 }
 
 #define V4_NP_SELF_CHECK 16
+/* V4_NP_ONLINE (default off): online adaptation of predictor guesses. Per
+ * (depth, target layer N) the guess ranks sqrt(softplus(z)) + bias with
+ * z = c + G x + delta + beta * e. When layer N routes in a decode forward, with
+ * p = softmax(z) from this forward's guess and q uniform over the routed experts:
+ * delta -= eta * (p - q); delta *= 1 - decay; then e = (1 - alpha) * e + alpha * M,
+ * where M scatters layer N's routing weights over experts (alpha from half-life HL).
+ * Guesses only: real routing never reads this state. Every loop runs over the model's
+ * n_routed_experts (up to 256). V4_NP_ONLINE=2 also adapts layers without a V4PG entry
+ * using their own gate with a zero intercept; =1 adapts V4PG entries only. */
+typedef struct {
+    pthread_mutex_t mutex;
+    float delta[2][256], e[256], z[2][256];
+    uint32_t z_stamp[2];
+    int z_ready[2];
+} V4NpOnline;
+static V4NpOnline v4_np_online[V4_NP_LAYERS];
+static int v4_np_online_on = -1;
+static float v4_np_online_eta = 0.1f, v4_np_online_decay = 0.01f, v4_np_online_beta = 2.0f,
+             v4_np_online_alpha = 0.0f;
+static unsigned long long v4_np_online_updates, v4_np_online_skipped;
+static float v4_np_online_parse(const char *e, float fallback) {
+    return e && *e ? (float)atof(e) : fallback;
+}
+static int v4_np_online_enabled(void) {
+    if (v4_np_online_on < 0) {
+        const char *e = getenv("V4_NP_ONLINE");
+        int on = e && *e ? atoi(e) : 0;
+        on = on == 2 ? 2 : on != 0;
+        if (on) {
+            v4_np_online_eta = v4_np_online_parse(getenv("V4_NP_ONLINE_ETA"), 0.1f);
+            v4_np_online_decay = v4_np_online_parse(getenv("V4_NP_ONLINE_DECAY"), 0.01f);
+            v4_np_online_beta = v4_np_online_parse(getenv("V4_NP_ONLINE_BETA"), 2.0f);
+            float hl = v4_np_online_parse(getenv("V4_NP_ONLINE_HL"), 4.0f);
+            v4_np_online_alpha = hl > 0.0f ? 1.0f - powf(0.5f, 1.0f / hl) : 1.0f;
+            for (int l = 0; l < V4_NP_LAYERS; l++)
+                pthread_mutex_init(&v4_np_online[l].mutex, NULL);
+            fprintf(stderr, "v4_next_prefetch online=%d eta=%g decay=%g beta=%g alpha=%g\n",
+                    on, v4_np_online_eta, v4_np_online_decay, v4_np_online_beta,
+                    v4_np_online_alpha);
+        }
+        v4_np_online_on = on;
+    }
+    return v4_np_online_on;
+}
+/* Decode thread, right after layer `layer` routed (router rank order). */
+static void v4_np_online_observe(int layer, const int *ids, const float *weights, int k,
+                                 int n) {
+    if (!v4_np_online_enabled() || layer < 0 || layer >= V4_NP_LAYERS || k < 1 || k > n ||
+        n > 256)
+        return;
+    V4NpOnline *o = &v4_np_online[layer];
+    uint32_t forward = __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED);
+    float q = 1.0f / (float)k;
+    pthread_mutex_lock(&o->mutex);
+    for (int depth = 0; depth < 2; depth++) {
+        if (!o->z_ready[depth] || o->z_stamp[depth] != forward) {
+            if (o->z_ready[depth]) {   /* a guess from an older forward: drop it once */
+                v4_np_online_skipped++;
+                o->z_ready[depth] = 0;
+            }
+            continue;
+        }
+        o->z_ready[depth] = 0;
+        float *z = o->z[depth], *delta = o->delta[depth];
+        float m = z[0];
+        for (int i = 1; i < n; i++) m = z[i] > m ? z[i] : m;
+        float p[256], sum = 0.0f;
+        for (int i = 0; i < n; i++) { p[i] = expf(z[i] - m); sum += p[i]; }
+        float inv = 1.0f / sum;
+        for (int i = 0; i < n; i++) delta[i] -= v4_np_online_eta * p[i] * inv;
+        for (int j = 0; j < k; j++)
+            if (ids[j] >= 0 && ids[j] < n) delta[ids[j]] += v4_np_online_eta * q;
+        for (int i = 0; i < n; i++) delta[i] *= 1.0f - v4_np_online_decay;
+        v4_np_online_updates++;
+    }
+    for (int i = 0; i < n; i++) o->e[i] *= 1.0f - v4_np_online_alpha;
+    for (int j = 0; j < k; j++)
+        if (ids[j] >= 0 && ids[j] < n) o->e[ids[j]] += v4_np_online_alpha * weights[j];
+    pthread_mutex_unlock(&o->mutex);
+}
+static int v4_np_learned_route(const V4NpGate *learned, float *weights, int *indices,
+                               const float *hidden, float *scratch, const float *bias,
+                               int n, int d, int k, float scale, int target, int depth,
+                               uint32_t stamp) {
+    int stats = v4_np_mode > 0 && (v4_np_mode & 2);
+    double began = stats ? v4_np_now() : 0.0;
+    int vector = v4_np_avx2;   /* the self-check in v4_np_route may clear it meanwhile */
+    int result;
+    if (v4_np_online_enabled() && n >= 1 && n <= 256 && target >= 0 && target < V4_NP_LAYERS &&
+        depth >= 1 && depth <= 2) {
+        V4NpOnline *o = &v4_np_online[target];
+        float add[256], z[256];
+        pthread_mutex_lock(&o->mutex);
+        for (int i = 0; i < n; i++) add[i] = o->delta[depth - 1][i] + v4_np_online_beta * o->e[i];
+        pthread_mutex_unlock(&o->mutex);
+        result = v4_np_gates_route_ex(learned, weights, indices, hidden, scratch, bias, n, d, k,
+                                      scale, vector, add, z);
+        if (!result) {
+            pthread_mutex_lock(&o->mutex);
+            memcpy(o->z[depth - 1], z, (size_t)n * sizeof *z);
+            o->z_stamp[depth - 1] = stamp;
+            o->z_ready[depth - 1] = 1;
+            pthread_mutex_unlock(&o->mutex);
+        }
+    } else {
+        result = v4_np_gates_route(learned, weights, indices, hidden, scratch, bias, n, d, k,
+                                   scale, vector);
+    }
+    if (stats) {
+        __atomic_fetch_add(&v4_np_route_ns, (unsigned long long)((v4_np_now() - began) * 1e9),
+                           __ATOMIC_RELAXED);
+        __atomic_fetch_add(&v4_np_route_calls, 1ull, __ATOMIC_RELAXED);
+        if (vector && !result)
+            __atomic_fetch_add(&v4_np_route_learned_avx2, 1ull, __ATOMIC_RELAXED);
+    }
+    return result;
+}
+/* V4_NP_ONLINE=2: no V4PG entry for this target, so the online terms ride on its own
+ * gate (zero intercept: the logits are the original guess's). Router thread. */
+static const V4NpGate *v4_np_online_own(const V4NpGate *learned, const uint16_t *gate,
+                                        V4NpGate *own) {
+    static float zero[256];
+    if (learned || !gate || v4_np_online_on != 2) return learned;
+    own->gate = (uint16_t *)gate;
+    own->intercept = zero;
+    return own;
+}
 static int v4_np_route(float *route_weights, int *indices, const float *hidden,
                        float *scratch, const uint16_t *gate, const float *bias,
                        int n, int d, int k, float scale) {
@@ -6945,8 +7088,14 @@ static void *v4_np_router_worker(void *argument) {
         const float *bias = value(following, "ffn.gate.bias", NULL);
         int indices[V4_NP_MAXK];
         float route_weights[V4_NP_MAXK], conf[V4_NP_MAXK];
-        if (gate && v4_np_route(route_weights, indices, hidden,
-                                scratch, gate, bias, n, d, deep, scale) == 0) {
+        V4NpGate own;
+        const V4NpGate *learned =
+            v4_np_online_own(v4_np_gates_get(&v4_np_gates, next, 1), gate, &own);
+        int routed = learned ? v4_np_learned_route(learned, route_weights, indices,
+                        hidden, scratch, bias, n, d, deep, scale, next, 1, stamp) : -1;
+        if (routed && gate) routed = v4_np_route(route_weights, indices, hidden,
+                                                 scratch, gate, bias, n, d, deep, scale);
+        if (!routed) {
             v4_np_confs(conf, route_weights, k, topk);
             v4_np_publish_w(store, next, indices, conf, k, stamp, 1);
         }
@@ -6959,6 +7108,24 @@ static void v4_np_predict(ColiExpertStore *store,
                           const float *input, int token) {
     v4_np_init();
     if (!v4_np_mode) return;
+    (void)v4_np_online_enabled();   /* decode thread, before the router thread starts */
+    if (v4_np_online_on > 0 && config->n_routed_experts > 256) {   /* V4NpOnline holds 256 */
+        fprintf(stderr, "v4_next_prefetch online=0: its state holds up to 256 experts, "
+                        "this model routes %d\n", config->n_routed_experts);
+        v4_np_online_on = 0;
+    }
+    /* Decode thread only, before pthread_create publishes the immutable tables.
+     * V1 has architecture metadata only: user must supply this model's gates. */
+    if (!v4_np_gates_checked) {
+        v4_np_gates_checked = 1;
+        const char *path = getenv("V4_NEXT_PREFETCH_GATES");
+        if (path && *path) {
+            int loaded = v4_np_gates_load(&v4_np_gates, path, config->num_hidden_layers,
+                                          config->n_routed_experts, config->hidden_size);
+            fprintf(stderr, "v4_next_prefetch gates=%s (experimental model-specific V4PG v1; no model fingerprint)\n",
+                    loaded ? "rejected; original predictor kept" : "loaded");
+        }
+    }
     int next = layer + 1;
     uint32_t stamp = __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED);
     if (v4_np_keep) v4_np_issue_ex(store, next, NULL, 0, V4_NP_PRUNE, stamp);
@@ -7109,7 +7276,575 @@ void coli_v4_np_test_work(ColiExpertStore *store, ColiExpertKey key, int rank, f
     V4NpItem item = {store, key, rank, stamp, conf};
     v4_np_work(item);
 }
+/* V4_NP_ONLINE: its state cleared, the env read again at the next use */
+void coli_v4_np_test_online_reset(void) {
+    memset(v4_np_online, 0, sizeof v4_np_online);
+    v4_np_online_updates = v4_np_online_skipped = 0;
+    v4_np_online_on = -1;
+}
+void coli_v4_np_test_online_observe(int layer, const int *ids, const float *weights, int k,
+                                    int n) {
+    v4_np_online_observe(layer, ids, weights, k, n);
+}
+void coli_v4_np_test_online_state(int layer, float *e, float *delta,
+                                  unsigned long long *updates) {
+    memcpy(e, v4_np_online[layer].e, sizeof v4_np_online[layer].e);
+    memcpy(delta, v4_np_online[layer].delta[0], sizeof v4_np_online[layer].delta[0]);
+    *updates = v4_np_online_updates;
+}
 #endif
+
+/* ==== V4_DUMP_MOE2=<file>: the predictor-training dump, format v2 ==========
+ * One fixed-size record per routed row, hash layers included: every
+ * moe_token_pipeline call (decode and per-row prefill) and every row of a
+ * multi-row prefill chunk whose MoE ran batched (v4_moe_batch_union /
+ * coli_v4_gpu_moe_batch_union, flag bit6, layer-major across the chunk).
+ * Layout (little-endian, packed):
+ *   header  32 bytes     V4Dump2Header ("V4D2", version 2)
+ *   record  41152 bytes  V4Dump2Record
+ * Off unless V4_DUMP_MOE2 is set (one atomic load + branch when unset).
+ * Independent of the older V4_DUMP_MOE, with which it shares v4_dump_mutex. */
+#include <stddef.h>
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "V4_DUMP_MOE2 writes its records in host order, which must be little-endian"
+#endif
+#define V4D2_HIDDEN 4096
+#define V4D2_HC 4
+#define V4D2_TOPK 6
+#define V4D2_STDIO_BUFFER ((size_t)64 << 20)
+enum {
+    V4D2_F_DECODE = 1u << 0,
+    V4D2_F_STREAMS = 1u << 1,
+    V4D2_F_MHC = 1u << 2,
+    V4D2_F_HASH = 1u << 3,
+    V4D2_F_PREFILL_ROW = 1u << 4,
+    V4D2_F_GPU_MHC = 1u << 5,
+    V4D2_F_BATCH_ROW = 1u << 6,
+    V4D2_F_GPU_ROUTE = 1u << 7
+};
+#define V4D2_BATCH_ROWS 128
+#define V4D2_QUEUE 4
+#pragma pack(push, 1)
+typedef struct {
+    char magic[4];
+    uint32_t version;
+    uint32_t layers, hidden, hc_mult, topk;
+    uint32_t record_bytes;
+    uint32_t reserved;
+} V4Dump2Header;
+typedef struct {
+    int32_t layer;
+    int32_t token;
+    int32_t position;
+    uint32_t forward;
+    uint32_t flags;
+    int32_t count;
+    int32_t ids[V4D2_TOPK];
+    float w[V4D2_TOPK];
+    float score[V4D2_TOPK];
+    float ffn_pre[V4D2_HC];
+    float ffn_post[V4D2_HC];
+    float ffn_comb[V4D2_HC * V4D2_HC];
+    uint16_t x_bf16[V4D2_HIDDEN];
+    uint16_t streams_bf16[V4D2_HC][V4D2_HIDDEN];
+} V4Dump2Record;
+#pragma pack(pop)
+_Static_assert(sizeof(V4Dump2Header) == 32, "V4D2 header is 32 bytes");
+_Static_assert(sizeof(V4Dump2Record) == 24 + 24 + 24 + 24 + 16 + 16 + 64 + 8192 + 32768,
+               "V4D2 record is 41152 bytes");
+
+static pthread_mutex_t v4_dump_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int v4d2_state = -1;
+static FILE *v4d2_file;
+static char *v4d2_buffer;
+static int v4d2_layers;
+typedef struct {
+    const float *streams;
+    const float *post;
+    const float *comb;
+    int position;
+    uint32_t flags;
+    int device_pre;
+    int set;
+} V4Dump2Context;
+static __thread V4Dump2Context v4d2_ctx;
+static __thread V4Dump2Record *v4d2_record;
+
+typedef struct {
+    int armed;
+    int filled;
+    int ids[V4D2_BATCH_ROWS * V4D2_TOPK];
+    float weights[V4D2_BATCH_ROWS * V4D2_TOPK];
+} V4Dump2Routes;
+static __thread V4Dump2Routes *v4d2_routes;
+
+typedef struct {
+    V4Dump2Record *records;
+    int count;
+    int flush;
+} V4Dump2Job;
+static pthread_mutex_t v4d2_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t v4d2_queue_filled = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t v4d2_queue_freed = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t v4d2_builder_mutex = PTHREAD_MUTEX_INITIALIZER;
+static V4Dump2Job v4d2_jobs[V4D2_QUEUE];
+static int v4d2_job_head, v4d2_job_count;
+static int v4d2_writer_on;
+static int v4d2_writer_stop;
+static pthread_t v4d2_writer;
+static double v4d2_stat_build, v4d2_stat_stall, v4d2_stat_write;
+static unsigned long long v4d2_stat_chunks, v4d2_stat_rows;
+
+static void v4d2_emit(const V4Dump2Record *records, int count, int flush) {
+    pthread_mutex_lock(&v4_dump_mutex);
+    if (v4d2_file) {
+        int failed = count > 0 &&
+                     fwrite(records, sizeof *records, (size_t)count, v4d2_file) !=
+                         (size_t)count;
+        if (!failed && flush) failed = fflush(v4d2_file) != 0;
+        if (failed) {
+            fprintf(stderr, "v4_dump_moe2: write failed (layer %d, forward %u): dump off\n",
+                    count > 0 ? records[0].layer : -1,
+                    count > 0 ? records[0].forward : 0u);
+            fclose(v4d2_file);
+            v4d2_file = NULL;
+            free(v4d2_buffer);
+            v4d2_buffer = NULL;
+            __atomic_store_n(&v4d2_state, 0, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&v4_dump_mutex);
+}
+
+static void *v4d2_writer_main(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&v4d2_queue_mutex);
+    for (;;) {
+        while (!v4d2_job_count && !v4d2_writer_stop)
+            pthread_cond_wait(&v4d2_queue_filled, &v4d2_queue_mutex);
+        if (!v4d2_job_count) break;
+        V4Dump2Job job = v4d2_jobs[v4d2_job_head];
+        pthread_mutex_unlock(&v4d2_queue_mutex);
+        double began = v4_now_mono();
+        v4d2_emit(job.records, job.count, job.flush);
+        double spent = v4_now_mono() - began;
+        pthread_mutex_lock(&v4d2_queue_mutex);
+        v4d2_stat_write += spent;
+        v4d2_job_head = (v4d2_job_head + 1) % V4D2_QUEUE;
+        v4d2_job_count--;
+        pthread_cond_broadcast(&v4d2_queue_freed);
+    }
+    pthread_mutex_unlock(&v4d2_queue_mutex);
+    return NULL;
+}
+
+static void v4d2_drain(void) {
+    if (__atomic_load_n(&v4d2_writer_on, __ATOMIC_ACQUIRE) <= 0) return;
+    pthread_mutex_lock(&v4d2_queue_mutex);
+    while (v4d2_job_count && v4d2_writer_on > 0)
+        pthread_cond_wait(&v4d2_queue_freed, &v4d2_queue_mutex);
+    pthread_mutex_unlock(&v4d2_queue_mutex);
+}
+
+static void v4d2_shutdown(void) {
+    pthread_mutex_lock(&v4d2_builder_mutex);
+    pthread_mutex_lock(&v4d2_queue_mutex);
+    int running = v4d2_writer_on > 0;
+    v4d2_writer_stop = 1;
+    pthread_cond_broadcast(&v4d2_queue_filled);
+    pthread_mutex_unlock(&v4d2_queue_mutex);
+    if (running) pthread_join(v4d2_writer, NULL);
+    pthread_mutex_lock(&v4d2_queue_mutex);
+    __atomic_store_n(&v4d2_writer_on, 0, __ATOMIC_RELEASE);
+    if (v4d2_stat_chunks)
+        fprintf(stderr, "v4_dump_moe2 batched: chunk_layers=%llu rows=%llu build_s=%.3f "
+                        "stall_s=%.3f write_s=%.3f\n", v4d2_stat_chunks, v4d2_stat_rows,
+                v4d2_stat_build, v4d2_stat_stall, v4d2_stat_write);
+    v4d2_stat_chunks = 0;
+    for (int slot = 0; slot < V4D2_QUEUE; slot++) {
+        free(v4d2_jobs[slot].records);
+        v4d2_jobs[slot].records = NULL;
+    }
+    v4d2_job_head = v4d2_job_count = 0;
+    pthread_mutex_unlock(&v4d2_queue_mutex);
+    pthread_mutex_unlock(&v4d2_builder_mutex);
+    pthread_mutex_lock(&v4_dump_mutex);
+    if (v4d2_file) {
+        fflush(v4d2_file);
+        fclose(v4d2_file);
+        v4d2_file = NULL;
+        free(v4d2_buffer);
+        v4d2_buffer = NULL;
+    }
+    __atomic_store_n(&v4d2_state, 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&v4_dump_mutex);
+}
+
+static long long v4d2_size(FILE *file) {
+#ifdef _WIN32
+    if (_fseeki64(file, 0, SEEK_END) != 0) return -1;
+    return (long long)_ftelli64(file);
+#else
+    if (fseeko(file, 0, SEEK_END) != 0) return -1;
+    return (long long)ftello(file);
+#endif
+}
+
+__attribute__((noinline, cold))
+static void v4d2_open_locked(const ColiDeepSeekV4Config *config) {
+    const char *path = getenv("V4_DUMP_MOE2");
+    if (!path || !*path) return;
+    if (!config || config->hidden_size != V4D2_HIDDEN || config->hc_mult != V4D2_HC ||
+        config->num_experts_per_tok != V4D2_TOPK || config->num_hidden_layers < 1) {
+        fprintf(stderr, "v4_dump_moe2: hidden=%d hc_mult=%d topk=%d is not the record's "
+                        "%d/%d/%d: dump off\n", config ? config->hidden_size : -1,
+                config ? config->hc_mult : -1, config ? config->num_experts_per_tok : -1,
+                V4D2_HIDDEN, V4D2_HC, V4D2_TOPK);
+        return;
+    }
+    V4Dump2Header want;
+    memset(&want, 0, sizeof want);
+    memcpy(want.magic, "V4D2", 4);
+    want.version = 2;
+    want.layers = (uint32_t)config->num_hidden_layers;
+    want.hidden = V4D2_HIDDEN;
+    want.hc_mult = V4D2_HC;
+    want.topk = V4D2_TOPK;
+    want.record_bytes = (uint32_t)sizeof(V4Dump2Record);
+    long long existing = 0;
+    FILE *probe = fopen(path, "rb");
+    if (probe) {
+        existing = v4d2_size(probe);
+        V4Dump2Header have;
+        const char *why = NULL;
+        if (existing < 0) why = "its size cannot be read";
+        else if (existing > 0 &&
+                 (existing < (long long)sizeof have || fseek(probe, 0, SEEK_SET) != 0 ||
+                  fread(&have, sizeof have, 1, probe) != 1))
+            why = "its header cannot be read";
+        else if (existing > 0 && memcmp(&have, &want, sizeof want) != 0)
+            why = "its header is not this engine's V4D2 v2 header";
+        else if (existing > 0 &&
+                 (existing - (long long)sizeof want) % (long long)sizeof(V4Dump2Record))
+            why = "it ends inside a record (a torn tail)";
+        fclose(probe);
+        if (why) {
+            fprintf(stderr, "v4_dump_moe2: %s: %s; not appending, dump off\n", path, why);
+            return;
+        }
+    }
+    FILE *file = fopen(path, "ab");
+    if (!file) {
+        fprintf(stderr, "v4_dump_moe2: cannot open %s for appending: dump off\n", path);
+        return;
+    }
+    v4d2_buffer = malloc(V4D2_STDIO_BUFFER);
+    setvbuf(file, v4d2_buffer, _IOFBF, V4D2_STDIO_BUFFER);
+    if (existing == 0 && (fwrite(&want, sizeof want, 1, file) != 1 || fflush(file) != 0)) {
+        fprintf(stderr, "v4_dump_moe2: cannot write the header of %s: dump off\n", path);
+        fclose(file);
+        free(v4d2_buffer);
+        v4d2_buffer = NULL;
+        return;
+    }
+    v4d2_file = file;
+    v4d2_layers = config->num_hidden_layers;
+    atexit(v4d2_shutdown);
+    fprintf(stderr, "v4_dump_moe2 path=%s record_bytes=%u layers=%d existing_records=%lld\n",
+            path, want.record_bytes, v4d2_layers,
+            existing > 0 ? (existing - (long long)sizeof want) /
+                           (long long)sizeof(V4Dump2Record) : 0LL);
+}
+
+__attribute__((noinline, cold))
+static int v4d2_ready_slow(const ColiDeepSeekV4Config *config) {
+    pthread_mutex_lock(&v4_dump_mutex);
+    if (v4d2_state < 0) {
+        v4d2_open_locked(config);
+        __atomic_store_n(&v4d2_state, v4d2_file ? 1 : 0, __ATOMIC_RELEASE);
+    }
+    int state = v4d2_state;
+    pthread_mutex_unlock(&v4_dump_mutex);
+    return state;
+}
+
+__attribute__((always_inline))
+static inline int v4d2_ready(const ColiDeepSeekV4Config *config) {
+    int state = __atomic_load_n(&v4d2_state, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(state >= 0, 1)) return state;
+    return v4d2_ready_slow(config);
+}
+
+static void v4d2_context(const float *streams, const float *post, const float *comb,
+                         int position, uint32_t flags, int device_pre) {
+    v4d2_ctx.streams = streams;
+    v4d2_ctx.post = post;
+    v4d2_ctx.comb = comb;
+    v4d2_ctx.position = position;
+    v4d2_ctx.flags = flags;
+    v4d2_ctx.device_pre = device_pre != 0;
+    v4d2_ctx.set = 1;
+}
+
+static void v4d2_context_clear(void) {
+    memset(&v4d2_ctx, 0, sizeof v4d2_ctx);
+}
+
+static uint16_t v4d2_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((bits >> 16) | 0x0040u);
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t)(bits >> 16);
+}
+
+static float v4d2_softplus(float value) {
+    return fmaxf(value, 0.0f) + log1pf(expf(-fabsf(value)));
+}
+
+typedef struct {
+    const float *function, *scale, *base;
+} V4Dump2Mhc;
+
+static void v4d2_mhc_tensors(V4Dump2Mhc *mhc, const ColiDeepSeekV4LayerWeights *weights) {
+    mhc->function = value(weights, "hc_ffn_fn", NULL);
+    mhc->scale = value(weights, "hc_ffn_scale", NULL);
+    mhc->base = value(weights, "hc_ffn_base", NULL);
+}
+
+static int v4d2_ffn_pre_from(float *pre, const float *streams, const V4Dump2Mhc *mhc,
+                             const ColiDeepSeekV4Config *config) {
+    const float *function = mhc->function, *scale = mhc->scale, *base = mhc->base;
+    if (!function || !scale || !base) return -1;
+    int hc = config->hc_mult, flattened = hc * config->hidden_size;
+    float mean_square = 0.0f;
+    for (int index = 0; index < flattened; index++)
+        mean_square += streams[index] * streams[index];
+    float inverse_rms = 1.0f / sqrtf(mean_square / flattened + config->rms_norm_eps);
+    for (int row = 0; row < hc; row++) {
+        float sum = 0.0f;
+        for (int column = 0; column < flattened; column++)
+            sum += function[(size_t)row * flattened + column] * streams[column];
+        float mix = sum * inverse_rms;
+        float logit = mix * scale[0] + base[row];
+        float sigmoid;
+        if (logit >= 0.0f) {
+            float decay = expf(-logit);
+            sigmoid = 1.0f / (1.0f + decay);
+        } else {
+            float growth = expf(logit);
+            sigmoid = growth / (1.0f + growth);
+        }
+        pre[row] = sigmoid + config->hc_eps;
+    }
+    return 0;
+}
+
+static void v4d2_fill(V4Dump2Record *record, const ColiDeepSeekV4LayerWeights *weights,
+                      const ColiDeepSeekV4Config *config, const float *input, int token,
+                      const int *ids, const float *route_weights,
+                      const uint16_t *gate, const float *bias,
+                      const V4Dump2Context *context, const V4Dump2Mhc *mhc,
+                      uint32_t forward) {
+    int hash = weights->plan.uses_hash_router;
+    uint32_t flags = context->set ? context->flags : 0;
+    if (hash) flags |= V4D2_F_HASH;
+    record->layer = weights->plan.layer;
+    record->token = token;
+    record->position = context->set ? context->position : -1;
+    record->forward = forward;
+    record->count = V4D2_TOPK;
+    for (int i = 0; i < V4D2_TOPK; i++) {
+        record->ids[i] = ids[i];
+        record->w[i] = route_weights[i];
+        record->score[i] = NAN;
+    }
+    if (!hash && gate) {
+        float logits[V4D2_TOPK];
+        coli_v4_route_bf16_rows(logits, gate, input, ids, V4D2_TOPK, V4D2_HIDDEN);
+        for (int i = 0; i < V4D2_TOPK; i++)
+            record->score[i] = sqrtf(v4d2_softplus(logits[i])) +
+                               (bias ? bias[ids[i]] : 0.0f);
+    }
+    int coefficients = 0;
+    float pre[V4D2_HC] = {0};
+    if (context->set && context->streams) {
+        flags |= V4D2_F_STREAMS;
+        for (int copy = 0; copy < V4D2_HC; copy++)
+            for (int i = 0; i < V4D2_HIDDEN; i++)
+                record->streams_bf16[copy][i] =
+                    v4d2_bf16(context->streams[(size_t)copy * V4D2_HIDDEN + i]);
+        coefficients = context->post && context->comb &&
+                       v4d2_ffn_pre_from(pre, context->streams, mhc, config) == 0;
+    } else {
+        memset(record->streams_bf16, 0, sizeof record->streams_bf16);
+    }
+    if (coefficients) {
+        memcpy(record->ffn_pre, pre, sizeof record->ffn_pre);
+        memcpy(record->ffn_post, context->post, sizeof record->ffn_post);
+        memcpy(record->ffn_comb, context->comb, sizeof record->ffn_comb);
+        flags |= V4D2_F_MHC;
+    } else {
+        for (int i = 0; i < V4D2_HC; i++) record->ffn_pre[i] = record->ffn_post[i] = NAN;
+        for (int i = 0; i < V4D2_HC * V4D2_HC; i++) record->ffn_comb[i] = NAN;
+    }
+    if (context->set && context->device_pre) flags |= V4D2_F_GPU_MHC;
+    record->flags = flags;
+    for (int i = 0; i < V4D2_HIDDEN; i++) record->x_bf16[i] = v4d2_bf16(input[i]);
+}
+
+__attribute__((noinline))
+static void v4d2_write(const ColiDeepSeekV4LayerWeights *weights,
+                       const ColiDeepSeekV4Config *config, const float *input, int token,
+                       const int *ids, const float *route_weights,
+                       const uint16_t *gate, const float *bias, int gpu_route) {
+    V4Dump2Record *record = v4d2_record;
+    if (!record) {
+        record = v4d2_record = malloc(sizeof *record);
+        if (!record) return;
+    }
+    V4Dump2Mhc mhc = {NULL, NULL, NULL};
+    if (v4d2_ctx.set && v4d2_ctx.streams) v4d2_mhc_tensors(&mhc, weights);
+    v4d2_fill(record, weights, config, input, token, ids, route_weights, gate, bias,
+              &v4d2_ctx, &mhc, __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED));
+    if (gpu_route) record->flags |= V4D2_F_GPU_ROUTE;
+    v4d2_drain();
+    v4d2_emit(record, 1, record->layer == v4d2_layers - 1 &&
+                         !(record->flags & V4D2_F_BATCH_ROW));
+}
+
+static void v4d2_flush(void) {
+    v4d2_emit(NULL, 0, 1);
+}
+
+void coli_v4_dump2_sync(void) {
+    if (__atomic_load_n(&v4d2_state, __ATOMIC_ACQUIRE) <= 0) return;
+    v4d2_drain();
+    v4d2_flush();
+}
+
+static int v4d2_batch_acquire(void) {
+    pthread_mutex_lock(&v4d2_queue_mutex);
+    if (v4d2_writer_stop) {
+        pthread_mutex_unlock(&v4d2_queue_mutex);
+        return -1;
+    }
+    if (!v4d2_writer_on) {
+        int started = pthread_create(&v4d2_writer, NULL, v4d2_writer_main, NULL) == 0;
+        __atomic_store_n(&v4d2_writer_on, started ? 1 : -1, __ATOMIC_RELEASE);
+        if (!started)
+            fprintf(stderr, "v4_dump_moe2: no writer thread, batched rows are written "
+                            "by the prefill thread\n");
+    }
+    int slot = 0;
+    if (v4d2_writer_on > 0) {
+        while (v4d2_job_count == V4D2_QUEUE)
+            pthread_cond_wait(&v4d2_queue_freed, &v4d2_queue_mutex);
+        slot = (v4d2_job_head + v4d2_job_count) % V4D2_QUEUE;
+    }
+    pthread_mutex_unlock(&v4d2_queue_mutex);
+    if (!v4d2_jobs[slot].records)
+        v4d2_jobs[slot].records = malloc((size_t)V4D2_BATCH_ROWS * sizeof(V4Dump2Record));
+    return v4d2_jobs[slot].records ? slot : -1;
+}
+
+static void v4d2_batch_publish(int slot, int count, int flush) {
+    pthread_mutex_lock(&v4d2_queue_mutex);
+    int queued = v4d2_writer_on > 0;
+    if (queued) {
+        v4d2_jobs[slot].count = count;
+        v4d2_jobs[slot].flush = flush;
+        v4d2_job_count++;
+        pthread_cond_signal(&v4d2_queue_filled);
+    }
+    pthread_mutex_unlock(&v4d2_queue_mutex);
+    if (!queued) v4d2_emit(v4d2_jobs[slot].records, count, flush);
+}
+
+__attribute__((noinline, cold))
+static void v4d2_write_batch(const ColiDeepSeekV4LayerWeights *weights,
+                             const ColiDeepSeekV4Config *config, const float *inputs,
+                             const int *tokens, const V4Dump2Routes *routes,
+                             const float *states, const float *posts, const float *combs,
+                             int start_position, int batch, int device_pre) {
+    if (!routes || !routes->filled || batch < 1 || batch > V4D2_BATCH_ROWS ||
+        config->num_experts_per_tok != V4D2_TOPK)
+        return;
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+    const uint16_t *gate = value(weights, "ffn.gate.weight", NULL);
+#else
+    const uint16_t *gate = NULL;
+#endif
+    const float *bias = value(weights, "ffn.gate.bias", NULL);
+    V4Dump2Mhc mhc;
+    v4d2_mhc_tensors(&mhc, weights);
+    uint32_t forward = __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED);
+    int d = config->hidden_size, hc = config->hc_mult;
+    size_t hd = (size_t)hc * d;
+    int last = weights->plan.layer == v4d2_layers - 1;
+    uint32_t row_flags = V4D2_F_BATCH_ROW | (routes->filled == 2 ? V4D2_F_GPU_ROUTE : 0u);
+    pthread_mutex_lock(&v4d2_builder_mutex);
+    double t_wait = v4_now_mono();
+    int slot = v4d2_batch_acquire();
+    double t_build = v4_now_mono();
+    if (slot >= 0) {
+        V4Dump2Record *records = v4d2_jobs[slot].records;
+        #pragma omp parallel for schedule(static)
+        for (int item = 0; item < batch; item++) {
+            V4Dump2Context context = {
+                .streams = states + (size_t)item * hd,
+                .post = posts + (size_t)item * hc,
+                .comb = combs + (size_t)item * hc * hc,
+                .position = start_position + item,
+                .flags = row_flags,
+                .device_pre = device_pre != 0,
+                .set = 1};
+            v4d2_fill(records + item, weights, config, inputs + (size_t)item * d,
+                      tokens[item], routes->ids + (size_t)item * V4D2_TOPK,
+                      routes->weights + (size_t)item * V4D2_TOPK, gate, bias,
+                      &context, &mhc, forward);
+        }
+        v4d2_batch_publish(slot, batch, last);
+        v4d2_stat_chunks++;
+        v4d2_stat_rows += (unsigned long long)batch;
+    }
+    double t_built = v4_now_mono();
+    if (last) v4d2_drain();
+    v4d2_stat_stall += (t_build - t_wait) + (v4_now_mono() - t_built);
+    v4d2_stat_build += t_built - t_build;
+    pthread_mutex_unlock(&v4d2_builder_mutex);
+}
+
+static V4Dump2Routes *v4d2_routes_arm(void) {
+    V4Dump2Routes *routes = v4d2_routes;
+    if (!routes) routes = v4d2_routes = malloc(sizeof *routes);
+    if (!routes) return NULL;
+    routes->armed = 1;
+    routes->filled = 0;
+#ifdef COLI_V4_GPU_TIER
+    coli_v4_gpu_moe_batch_routes_out(routes->ids, routes->weights, &routes->filled);
+#endif
+    return routes;
+}
+
+static void v4d2_routes_disarm(V4Dump2Routes *routes) {
+#ifdef COLI_V4_GPU_TIER
+    coli_v4_gpu_moe_batch_routes_out(NULL, NULL, NULL);
+#endif
+    routes->armed = 0;
+    routes->filled = 0;
+}
+
+static void v4d2_routes_keep(const int *ids, const float *route_weights, int rows,
+                             int topk) {
+    V4Dump2Routes *routes = v4d2_routes;
+    if (!routes || !routes->armed || topk != V4D2_TOPK || rows < 1 ||
+        rows > V4D2_BATCH_ROWS)
+        return;
+    memcpy(routes->ids, ids, (size_t)rows * V4D2_TOPK * sizeof *ids);
+    memcpy(routes->weights, route_weights, (size_t)rows * V4D2_TOPK * sizeof *route_weights);
+    routes->filled = 1;
+}
 
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
@@ -7181,6 +7916,7 @@ static int moe_token_pipeline(float *output,
     if (!result && weights->plan.uses_hash_router)
         for (int i = 0; i < topk; i++)
             indices[i] = (int)table[(size_t)token * topk + i];
+    int gpu_route = 0;
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
@@ -7189,7 +7925,9 @@ static int moe_token_pipeline(float *output,
          * mismatch returns non-zero and the CPU bf16 route below takes over. */
         if (coli_v4_gpu_route(route_weights, indices, input, weights, bias,
                               weights->plan.uses_hash_router ? indices : NULL,
-                              n, d, topk, config->routed_scaling_factor) != 0)
+                              n, d, topk, config->routed_scaling_factor) == 0)
+            gpu_route = 1;
+        else
 #endif
             result = coli_v4_route_bf16(
                 route_weights, indices, input, raw_gate, bias,
@@ -7207,6 +7945,9 @@ static int moe_token_pipeline(float *output,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
 #endif
+    /* V4_NP_ONLINE: the router's own top-k */
+    if (!result && v4_np_decode && !weights->plan.uses_hash_router)
+        v4_np_online_observe(weights->plan.layer, indices, route_weights, topk, n);
 
     int selected = 0;
     for (int expert_id = 0; !result && expert_id < n; expert_id++) {
@@ -7225,6 +7966,32 @@ static int moe_token_pipeline(float *output,
         v4_np_score_fresh(weights, expert_ids, selected);
     if (!result)
         v4_np_score(weights, expert_ids, selected);
+    /* V4_DUMP_MOE=<file>: append every MoE call as a record
+     * {int32 layer, int32 token, int32 count, int32 ids[count],
+     *  float weights[count], float input[hidden]} for offline routing
+     * studies. Diagnostic only; off unless the variable is set. */
+    if (!result) {
+        static FILE *dump;
+        static int dump_init;
+        if (!dump_init) {
+            const char *path = getenv("V4_DUMP_MOE");
+            dump_init = 1;
+            if (path && *path) dump = fopen(path, "ab");
+        }
+        if (dump) {
+            int32_t head[3] = {weights->plan.layer, token, selected};
+            pthread_mutex_lock(&v4_dump_mutex);
+            fwrite(head, sizeof(head), 1, dump);
+            for (int i = 0; i < selected; i++) {
+                int32_t id = expert_ids[i];
+                fwrite(&id, sizeof(id), 1, dump);
+            }
+            fwrite(expert_weights, sizeof(float), (size_t)selected, dump);
+            fwrite(input, sizeof(float), (size_t)d, dump);
+            fflush(dump);
+            pthread_mutex_unlock(&v4_dump_mutex);
+        }
+    }
 #if (defined(COLI_VULKAN) || defined(COLI_CUDA)) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
     /* the Vulkan tier first: what it takes is never read from the store */
     V4VkToken vk_step;
@@ -7360,6 +8127,14 @@ static int moe_token_pipeline(float *output,
 #endif
     if (!result)
         v4_np_predict(store, config, weights->plan.layer, input, token);
+    if (__builtin_expect(v4d2_ready(config) > 0, 0) && !result && topk == V4D2_TOPK)
+        v4d2_write(weights, config, input, token, indices, route_weights,
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+                   raw_gate,
+#else
+                   NULL,
+#endif
+                   bias, gpu_route);
     ColiTensorView w1, w2, w3;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
@@ -7942,9 +8717,12 @@ static int block_token_pipeline(float *output_hc,
                                                  "ffn_norm.weight", team);
     DP_MARK(dp_hc);
     if (!result) stage = "MoE";
+    int dump2 = v4d2_ready(config) > 0;
     v4_np_decode = 1;
+    if (dump2) v4d2_context(state, post, comb, position, V4D2_F_DECODE, 0);
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
+    if (dump2) v4d2_context_clear();
     v4_np_decode = 0;
     DP_MARK(dp_moe);
     if (!result) stage = "FFN hyper-connection post";
@@ -8365,6 +9143,8 @@ static int v4_moe_batch_union(
             }
     }
     free(logits);
+    if (__builtin_expect(__atomic_load_n(&v4d2_state, __ATOMIC_RELAXED) > 0, 0) && !result)
+        v4d2_routes_keep(indices, route_weights, batch, topk);
 #if (defined(COLI_VULKAN) || defined(COLI_CUDA)) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
     /* the Vulkan tier first: the union below reads only what it did not take */
     V4VkBatch vk_batch;
@@ -8644,6 +9424,8 @@ int coli_v4_block_window_batch_ref(
     }
     V4_BLOCK_PROF_MARK(prof_hc2);
     if (!result) phase = "MoE";
+    int dump2 = v4d2_ready(config) > 0;
+    V4Dump2Routes *d2_routes = dump2 && batch > 1 ? v4d2_routes_arm() : NULL;
 #ifdef COLI_V4_GPU_TIER
     /* Whole-chunk GPU MoE (expert bank; COLI_CUDA_MOE_BATCH=1). The backend
      * sums routed + shared like the CPU union; only the final bf16 rounding
@@ -8662,11 +9444,28 @@ int coli_v4_block_window_batch_ref(
         result = v4_moe_batch_union(
             ffn_branch, weights, config, experts,
             ffn_normalized, tokens, batch);
-    else
-        for (int item = 0; !result && item < batch; item++)
+    else {
+        for (int item = 0; !result && item < batch; item++) {
+            if (dump2)
+                v4d2_context(states + (size_t)item * hd, ffn_post + (size_t)item * hc,
+                             ffn_comb + (size_t)item * hc * hc, start_position + item,
+                             batch > 1 ? V4D2_F_BATCH_ROW : V4D2_F_PREFILL_ROW, gpu_hc2);
             result = moe_token_pipeline(
                 ffn_branch + (size_t)item * d, weights, config, experts,
                 ffn_normalized + (size_t)item * d, tokens[item]);
+        }
+        if (dump2) {
+            v4d2_context_clear();
+            if (batch > 1 && !result && weights->plan.layer == v4d2_layers - 1)
+                v4d2_flush();
+        }
+    }
+    if (d2_routes) {
+        if (!result && d2_routes->filled)
+            v4d2_write_batch(weights, config, ffn_normalized, tokens, d2_routes, states,
+                             ffn_post, ffn_comb, start_position, batch, gpu_hc2);
+        v4d2_routes_disarm(d2_routes);
+    }
     V4_BLOCK_PROF_MARK(prof_moe);
     if (!result) phase = "FFN hyper-connection post";
     int gpu_hc3 = 0;
@@ -16254,6 +17053,16 @@ static int v4_gpu_mirrors_make_room(ColiExpertStore *store, int device) {
     return released;
 }
 
+static int *v4_moe_batch_dump_ids;
+static float *v4_moe_batch_dump_weights;
+static int *v4_moe_batch_dump_filled;
+
+void coli_v4_gpu_moe_batch_routes_out(int *ids, float *weights, int *filled) {
+    v4_moe_batch_dump_ids = ids;
+    v4_moe_batch_dump_weights = weights;
+    v4_moe_batch_dump_filled = filled;
+}
+
 int coli_v4_gpu_moe_batch_union(float *outputs,
                                 const ColiDeepSeekV4LayerWeights *weights,
                                 const ColiDeepSeekV4Config *config,
@@ -16759,6 +17568,12 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
      * path (the union, or per token), whose lookups count it. */
     coli_v4_expert_store_note_union(store, weights->plan.layer, ids,
                                     batch * topk);
+    if (__builtin_expect(v4_moe_batch_dump_ids != NULL, 0)) {
+        memcpy(v4_moe_batch_dump_ids, ids, (size_t)batch * topk * sizeof(*ids));
+        memcpy(v4_moe_batch_dump_weights, route_weights,
+               (size_t)batch * topk * sizeof(*route_weights));
+        *v4_moe_batch_dump_filled = weights->plan.uses_hash_router ? 1 : 2;
+    }
     return 0;
 #undef in_mirror
 #undef out_mirror
@@ -21482,6 +22297,7 @@ static int v4_serve_abort(void *user_data) {
 }
 
 static void v4_serve_error(FILE *output, const char *id, const char *message) {
+    coli_v4_dump2_sync();
     coli_serve_write_error(output, id,
                            message && *message ? message : "engine request failed");
 }

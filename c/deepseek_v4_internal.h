@@ -1195,6 +1195,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                                 ColiExpertStore *store,
                                 const float *inputs, const int *tokens,
                                 int batch);
+void coli_v4_gpu_moe_batch_routes_out(int *ids, float *weights, int *filled);
+void coli_v4_dump2_sync(void);
 /* Resident experts: 0 = done (or a budget fallback under auto), -1 = a hard
  * failure the engine must reject. */
 int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size);

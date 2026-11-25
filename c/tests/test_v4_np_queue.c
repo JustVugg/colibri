@@ -342,6 +342,50 @@ static void test_router(int experts, int biased, uint32_t forward) {
     }
 }
 
+void coli_v4_np_test_online_reset(void);
+void coli_v4_np_test_online_observe(int layer, const int *ids, const float *weights, int k,
+                                    int n);
+void coli_v4_np_test_online_state(int layer, float *e, float *delta,
+                                  unsigned long long *updates);
+/* V4_NP_ONLINE=2 on a 192-expert model with no V4PG gates: the first guess
+ * (online terms zero) is the original guess, bit for bit (test_router's checks); once
+ * layer 5 routes expert 191 with a large weight, its next guess ranks 191 first; the
+ * state past expert 191 is never touched. */
+static void test_online(void) {
+    setenv("V4_NP_ONLINE", "2", 1);
+    coli_v4_np_test_online_reset();
+    test_router(192, 1, 60);
+    int ids[TOPK] = {191, 0, 1, 2, 3, 4};
+    float w[TOPK] = {100.0f, 0, 0, 0, 0, 0}, e[256], delta[256];
+    unsigned long long updates = 0;
+    coli_v4_np_test_online_observe(5, ids, w, TOPK, 192);
+    coli_v4_np_test_online_state(5, e, delta, &updates);
+    CHECK(updates == 1, "online: %llu updates after layer 5 routed, want 1", updates);
+    CHECK(e[191] > 15.0f && delta[191] > 0.0f, "online: e %g delta %g at 191", e[191],
+          delta[191]);
+    int untouched = 1;
+    for (int i = 192; i < 256; i++) untouched &= e[i] == 0.0f && delta[i] == 0.0f;
+    CHECK(untouched, "online: state past expert 191 written");
+    layers[5].plan.tensor_count = 2;
+    config.n_routed_experts = 192;
+    coli_v4_np_test_setup(0, 1);
+    coli_v4_np_test_gate(0.0f, 0.0);
+    coli_v4_np_test_router(8);
+    coli_v4_np_test_set_forward(61);
+    coli_v4_np_test_predict(STORE, &config, 4, hidden, 0);
+    float conf[16];
+    int got = 0;
+    for (int waited = 0; waited < 5000 && (got = coli_v4_np_test_confs(conf, 16)) < 8; waited++)
+        usleep(1000);
+    Queue q = snap();
+    CHECK(got == 8 && q.expert[0] == 191, "online: layer 5 guess starts %d (n %d), want 191",
+          q.n ? q.expert[0] : -1, got);
+    config.n_routed_experts = 256;
+    layers[5].plan.tensor_count = 0;
+    setenv("V4_NP_ONLINE", "0", 1);
+    coli_v4_np_test_online_reset();
+}
+
 /* A one-layer expert checkpoint like tests/test_deepseek_v4.c's: per expert
  * w1/w2/w3, an E8M0 [1,1] scale and an I8 [1,16] weight, one 51-byte record */
 static int write_experts(const char *path, int experts) {
@@ -524,7 +568,9 @@ int main(void) {
     test_conf();
     test_budget();
     test_router(256, 0, 50);
+    test_router(192, 1, 51);
     test_router(256, 1, 52);
+    test_online();
     test_work();
     test_no_credit();
     if (failures) {
