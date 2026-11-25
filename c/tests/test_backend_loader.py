@@ -929,7 +929,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 26)  # +ink_ops (inkling's bf16 matrices, backend_cuda_ink.h); +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tensor_upload_view (QT_ARENA FP8/int4/int8 slab slots); +tier_ops (the routed-expert tier's table, cu_tier_ops.h); +vision_attention (the Qwen vision tower's attention); +tensor_upload_rows (qwen36's GGUF matrices read straight to the device)
+        self.assertEqual(len(f.optional), 31)  # +ink_ops (inkling's bf16 matrices, backend_cuda_ink.h); +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +tensor_overwrite_async/host_alloc/host_free/copy_async/expert_group_append (QT_GPU_MISS / QT_GPU_MISS_FOLD); +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tensor_upload_view (QT_ARENA FP8/int4/int8 slab slots); +tier_ops (the routed-expert tier's table, cu_tier_ops.h); +vision_attention (the Qwen vision tower's attention); +tensor_upload_rows (qwen36's GGUF matrices read straight to the device)
         self.assertEqual(len(f.exports), 73)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)

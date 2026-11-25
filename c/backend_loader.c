@@ -104,8 +104,12 @@ typedef int            (*fn_dn_set_state)(ColiCudaDn *d, const float *ring, cons
 typedef int            (*fn_dn_get_state)(ColiCudaDn *d, float *ring, float *rec);
 typedef int            (*fn_dn_step)(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz, ColiCudaTensor *outp, const float *x, float *out, const float *egh, const float *beta);
 typedef int            (*fn_tensor_overwrite)(ColiCudaTensor *tensor, const void *weights, const float *scales);
+typedef int            (*fn_tensor_overwrite_async)(ColiCudaTensor *tensor, const void *weights, const float *scales);
+typedef void *         (*fn_host_alloc)(size_t bytes);
+typedef void           (*fn_host_free)(void *p);
 typedef int            (*fn_host_register)(void *p, size_t bytes);
 typedef void           (*fn_host_unregister)(void *p);
+typedef int            (*fn_copy_async)(int device, void *dst, const void *src, size_t bytes);
 typedef int            (*fn_planar_rows)(int device, int D, int I);
 typedef int            (*fn_block_elems)(int fmt);
 typedef int            (*fn_tensor_upload_at)(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device);
@@ -197,12 +201,14 @@ static struct {
     fn_expert_group_pinned expert_group_pinned;
     fn_expert_group_issue expert_group_issue;
     fn_expert_group_take expert_group_take;
+    fn_expert_group_issue expert_group_append;   /* optional: QT_GPU_MISS_FOLD */
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
     fn_dn_create dn_create; fn_dn_free dn_free; fn_dn_set_state dn_set_state; fn_dn_get_state dn_get_state; fn_dn_step dn_step;   /* optional: gated delta layer on the device */
     fn_tensor_overwrite tensor_overwrite;   /* optional: DLLs before it leave it NULL */
-    fn_host_register host_register; fn_host_unregister host_unregister; fn_planar_rows planar_rows;   /* optional: the tier's RAM staged for a prompt chunk */
+    fn_tensor_overwrite_async tensor_overwrite_async; fn_host_alloc host_alloc; fn_host_free host_free;   /* optional: QT_GPU_MISS */
+    fn_host_register host_register; fn_host_unregister host_unregister; fn_copy_async copy_async; fn_planar_rows planar_rows;   /* optional: QT_GPU_MISS=2 and the tier's host pool */
     fn_block_elems block_elems;   /* optional: a GGUF's block formats on the device */
     fn_tensor_upload_at tensor_upload_at;   /* optional: a block-format tensor in an arena's slot */
     fn_tensor_upload_view tensor_upload_view;   /* optional: the tier's arena slots (QT_ARENA) */
@@ -1459,6 +1465,7 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(expert_group_pinned, fn_expert_group_pinned)
     RESOLVE(expert_group_issue, fn_expert_group_issue)
     RESOLVE(expert_group_take, fn_expert_group_take)
+    RESOLVE_OPT(expert_group_append, fn_expert_group_issue)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_upload_g, fn_tensor_upload_g)
@@ -1468,8 +1475,12 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(dn_get_state, fn_dn_get_state)
     RESOLVE_OPT(dn_step, fn_dn_step)
     RESOLVE_OPT(tensor_overwrite, fn_tensor_overwrite)
+    RESOLVE_OPT(tensor_overwrite_async, fn_tensor_overwrite_async)
+    RESOLVE_OPT(host_alloc, fn_host_alloc)
+    RESOLVE_OPT(host_free, fn_host_free)
     RESOLVE_OPT(host_register, fn_host_register)
     RESOLVE_OPT(host_unregister, fn_host_unregister)
+    RESOLVE_OPT(copy_async, fn_copy_async)
     RESOLVE_OPT(planar_rows, fn_planar_rows)
     RESOLVE_OPT(block_elems, fn_block_elems)
     RESOLVE_OPT(tensor_upload_at, fn_tensor_upload_at)
@@ -1674,6 +1685,13 @@ const float *coli_cuda_expert_group_take(int device){
     return g_cuda.expert_group_take(device);
 }
 
+int coli_cuda_expert_group_append(ColiCudaTensor *const *gates,
+                                  ColiCudaTensor *const *ups,
+                                  ColiCudaTensor *const *downs,
+                                  const int *rows, int count, const float *x){
+    return g_cuda.available && g_cuda.expert_group_append ? g_cuda.expert_group_append(gates, ups, downs, rows, count, x) : 0;
+}
+
 int coli_cuda_attention_absorb(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                const float *latent, const float *rope, int H, int Q,
                                int R, int V, int K, int T, float attention_scale){
@@ -1710,12 +1728,23 @@ int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const void *weights, cons
     return g_cuda.tensor_overwrite(tensor, weights, scales);
 }
 
+/* QT_GPU_MISS needs all three: an older DLL answers the probe 0 and the switch stays off */
+int coli_cuda_tensor_overwrite_async(ColiCudaTensor *tensor, const void *weights, const float *scales){
+    if(!g_cuda.available || !g_cuda.tensor_overwrite_async || !g_cuda.host_alloc || !g_cuda.host_free) return 0;
+    return g_cuda.tensor_overwrite_async(tensor, weights, scales);
+}
+void *coli_cuda_host_alloc(size_t bytes){ return g_cuda.available && g_cuda.host_alloc ? g_cuda.host_alloc(bytes) : NULL; }
+void coli_cuda_host_free(void *p){ if(p && g_cuda.host_free) g_cuda.host_free(p); }
+
 int coli_cuda_host_register(void *p, size_t bytes){
-    if(!g_cuda.available || !g_cuda.host_register) return 0;   /* older DLL: the host's step for those experts */
+    if(!g_cuda.available || !g_cuda.host_register || !g_cuda.host_unregister) return 0;   /* older DLL: the host's step for those experts */
     return g_cuda.host_register(p, bytes);
 }
 void coli_cuda_host_unregister(void *p){
-    if(g_cuda.available && g_cuda.host_unregister) g_cuda.host_unregister(p);
+    if(p && g_cuda.available && g_cuda.host_unregister) g_cuda.host_unregister(p);
+}
+int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes){
+    return g_cuda.available && g_cuda.copy_async ? g_cuda.copy_async(device, dst, src, bytes) : 0;
 }
 int coli_cuda_planar_rows(int device, int D, int I){
     return g_cuda.available && g_cuda.planar_rows ? g_cuda.planar_rows(device, D, I) : 0;

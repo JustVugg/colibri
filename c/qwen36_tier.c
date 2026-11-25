@@ -23,6 +23,7 @@
  * must all agree: #1339 was three of these disagreeing, each spelling the
  * same literal 32 separately. Name it once. */
 #define QT_MAX_ROWS 32
+#define QT_GROUP_ROWS 32      /* coli_cuda_expert_group_issue cap */
 #define QT_QCAP 48            /* upload queue depth (staging ~1.6 MB/entry) */
 #define QT_CHG_CAP 512        /* residency changes the chain reads between two of its forwards */
 #define QT_PM_CAP 4096        /* a step's misses the chain may promote */
@@ -76,8 +77,11 @@ static struct {
     /* statistics */
     uint64_t hits[QT_MAX_DEV], miss, uploads, q_full_skips;
     /* issue state of the (single) decode thread */
-    int is_cnt[QT_MAX_DEV];
-    int is_k[QT_MAX_DEV][QT_MAX_ROWS];
+    int is_cnt[QT_MAX_DEV], is_ne[QT_MAX_DEV];
+    int is_k[QT_MAX_DEV][QT_MAX_ROWS], is_r[QT_MAX_DEV][QT_MAX_ROWS], is_rows[QT_MAX_DEV][QT_MAX_ROWS];
+    ColiCudaTensor *is_tg[QT_MAX_DEV][QT_MAX_ROWS], *is_tu[QT_MAX_DEV][QT_MAX_ROWS], *is_td[QT_MAX_DEV][QT_MAX_ROWS];
+    uint32_t is_m[QT_MAX_ROWS]; int is_n, is_K, is_taken, is_ok;
+    const float *is_xp, *is_res[QT_MAX_DEV];
     float *is_x; size_t is_x_floats;      /* QT_MAX_ROWS*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
@@ -440,6 +444,225 @@ static int up_one(ColiCudaTensor **t, const uint8_t *w, const float *s, int I, i
                                                (m<2?G_ar.o_s[m+1]:G_ar.slot)-G_ar.o_s[m]);
     if(fmt==4) return coli_cuda_tensor_upload_g(t,w,s,4,I,O,dv,G.egs);
     return coli_cuda_tensor_upload(t,w,s,fmt,I,O,dv);
+}
+
+static size_t qt_mb(void){ return (size_t)G.D*G.Ih/(G.wfmt==4||G.wfmt==7?2:1); }
+
+/* QT_GPU_MISS=1: per expert device, n = topk (QT_GPU_MISS_SLOTS: more) transient arena slots
+ * (never resident, never a victim, out of the expert budget) and one pinned staging buffer
+ * each. Slot j takes the j-th qt_miss_stage of the open group and is free again after its
+ * qt_take: one group per device per layer; a stage past n goes to the CPU. */
+static struct {
+    int on, n;
+    size_t wb, stride;                    /* pinned bytes per slot: weights (wb), then scales */
+    uint8_t *h[QT_MAX_DEV];               /* n*stride pinned bytes */
+    ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
+    int ar[QT_MAX_DEV][QT_MAX_ROWS];      /* arena slot + 1 */
+    int used[QT_MAX_DEV];                 /* slots staged into the open group */
+    int staged[QT_MAX_DEV];               /* its rows staged, counted at the commit */
+    uint64_t miss, fallback;
+    /* QT_GPU_MISS_PROMOTE=1: slot j holds (sl, se) of the open group (se -1: none); a
+     * swap qt_note decides for it is pending (transient slot, victim, newcomer slot
+     * indices) until the group is launched, then copied on the device */
+    int promote, sl[QT_MAX_DEV][QT_MAX_ROWS], se[QT_MAX_DEV][QT_MAX_ROWS];
+    int pn[QT_MAX_DEV], pj[QT_MAX_DEV][QT_MAX_ROWS], pv[QT_MAX_DEV][QT_MAX_ROWS], pi[QT_MAX_DEV][QT_MAX_ROWS];
+    uint64_t promoted;
+    /* a transient slot's matrices (ow) and scales (os) in its arena slot: the arena's
+     * layout, or with QT_GPU_MISS=2 and qt_miss_src_layout the engine's record (lay = 1:
+     * a miss from a pinned record goes up in one copy of span bytes) */
+    size_t ow[3], os[3], span; int lay;
+    /* QT_GPU_MISS=2 (mode 2): the hits launch at routing (launched); misses staged after
+     * that form a second group per device. c1/e1: the hit group's rows/entries; at the
+     * second commit a device with misses takes its hit group into hy (ht) and issues the
+     * misses (mp); the take appends their rows to hy. bad: a hit take failed. */
+    int mode, launched, bad, c1[QT_MAX_DEV], e1[QT_MAX_DEV], ht[QT_MAX_DEV], mp[QT_MAX_DEV];
+    float *hy[QT_MAX_DEV];
+    uint64_t direct, one;                 /* misses copied straight from pinned RAM; in one copy */
+    /* QT_GPU_MISS_FOLD=1 (mode 2, default off): a device's miss group is appended behind
+     * its hit group still in flight (coli_cuda_expert_group_append) and one take returns
+     * both, hit rows then miss rows, with no take of the hits in between */
+    int fold; uint64_t folded;
+} G_gm;
+/* qt_miss_src_layout, before qt_init: the engine's record layout (kept across gm_init) */
+static struct { size_t off[6], span; } G_lay;
+/* qt_pin_host: RAM the engine page-locked for QT_GPU_MISS=2 (cap from QT_GPU_MISS_PIN_GB) */
+static struct { size_t bytes, cap; int n, fail, off; pthread_mutex_t mx; } G_pin={.mx=PTHREAD_MUTEX_INITIALIZER};
+/* the gate/up/down scales of a staged expert, as stage() lays them out */
+static void sc_parts(const float *sc, const float **su, const float **sd){
+    *su=(const float*)((const uint8_t*)sc+qt_scb(G.sc_gu)); *sd=(const float*)((const uint8_t*)sc+2*qt_scb(G.sc_gu));
+}
+static void gm_free(void){
+    for(int i=0;i<QT_MAX_DEV;i++){
+        for(int j=0;j<QT_MAX_ROWS;j++){
+            if(G_gm.tg[i][j]) coli_cuda_tensor_free(G_gm.tg[i][j]);
+            if(G_gm.tu[i][j]) coli_cuda_tensor_free(G_gm.tu[i][j]);
+            if(G_gm.td[i][j]) coli_cuda_tensor_free(G_gm.td[i][j]);
+            if(G_gm.ar[i][j]) ar_give(i,G_gm.ar[i][j]-1);
+        }
+        coli_cuda_host_free(G_gm.h[i]);
+        free(G_gm.hy[i]);
+    }
+    memset(&G_gm,0,sizeof G_gm);
+}
+/* qt_init, before the first upload: any shortfall leaves the switch off, one line */
+static void gm_init(void){
+    memset(&G_gm,0,sizeof G_gm);
+    const char *e=getenv("QT_GPU_MISS");
+    if(!e || !*e || *e=='0' || G_trunk_only) return;
+    int mode=*e=='2' && !e[1] ? 2 : 1;
+    const char *why=NULL;
+    /* topk covers one row; a verify's rows can miss up to rows*topk distinct experts, the
+     * rest then run on the CPU: QT_GPU_MISS_SLOTS raises it (30 for MTP's 3 rows on Qwen3.8,
+     * ~2.5 MB of VRAM and of pinned RAM each), at most QT_GROUP_ROWS */
+    int n=G.topk<QT_GROUP_ROWS?G.topk:QT_GROUP_ROWS;
+    const char *ns=getenv("QT_GPU_MISS_SLOTS");
+    if(ns && atoi(ns)>n) n=atoi(ns)<QT_GROUP_ROWS?atoi(ns):QT_GROUP_ROWS;
+    size_t mb=qt_mb(), A=QT_AR_ALIGN;
+    G_gm.wb=(3*mb+A-1)/A*A; G_gm.stride=G_gm.wb+(qt_scb(2*G.sc_gu+G.sc_d)+A-1)/A*A;
+    for(int m=0;m<3;m++){ G_gm.ow[m]=m*G_ar.o_w; G_gm.os[m]=G_ar.o_s[m]; }
+    /* mode 2: the transient slots take the engine's record layout when it fits the arena
+     * slot, every part aligned, and the format goes up byte for byte (no int4 XOR). MXFP4's
+     * group kernels read a weight row 16 bytes at a time (mx4_group_w) and scales by the byte;
+     * other formats keep the arena's 256 */
+    size_t pb[6]={mb,mb,mb,qt_scb(G.sc_gu),qt_scb(G.sc_gu),qt_scb(G.sc_d)}, LA=G.wfmt==7?16:A;
+    int lay=mode==2 && G_lay.span && G_lay.span<=G_ar.slot && G.wfmt!=4;
+    for(int i=0;i<6 && lay;i++) lay=G_lay.off[i]%LA==0 && G_lay.off[i]+pb[i]<=G_lay.span;
+    if(lay){ for(int m=0;m<3;m++){ G_gm.ow[m]=G_lay.off[m]; G_gm.os[m]=G_lay.off[3+m]; } G_gm.span=G_lay.span; G_gm.lay=1; }
+    if(!G_ar.on) why="needs the arena (QT_ARENA=1)";
+    else if(!coli_cuda_tensor_overwrite_async(NULL,NULL,NULL)) why="needs coli_cuda_tensor_overwrite_async (older backend DLL)";
+    for(int i=0;i<G.ndev && !why;i++){
+        if(G.used[i]+(size_t)n*G.exp_bytes>G.budget[i]){ why="expert budget smaller than the transient slots"; break; }
+        if(!(G_gm.h[i]=coli_cuda_host_alloc((size_t)n*G_gm.stride))){ why="pinned staging allocation failed"; break; }
+        memset(G_gm.h[i],0,(size_t)n*G_gm.stride);
+        if(mode==2 && !(G_gm.hy[i]=malloc((size_t)QT_GROUP_ROWS*G.D*sizeof(float)))){ why="hit-row buffer allocation failed"; break; }
+        for(int j=0;j<n;j++){
+            int id=ar_take(i,G.dev[i],n-j);   /* a slab of n slots, not a full one */
+            if(id<0){ why="arena slot allocation failed"; break; }
+            G_gm.ar[i][j]=id+1;
+            uint8_t *w=G_gm.h[i]+(size_t)j*G_gm.stride, *at=ar_ptr(i,id);
+            const float *sg=(const float*)(w+G_gm.wb),*su,*sd; sc_parts(sg,&su,&sd);
+            int ok;
+            if(G_gm.lay){   /* views at the record's offsets, each part its exact size */
+                ColiCudaTensor **t[3]={&G_gm.tg[i][j],&G_gm.tu[i][j],&G_gm.td[i][j]}; const float *sp[3]={sg,su,sd};
+                ok=1;
+                for(int m=0;m<3 && ok;m++)
+                    ok=coli_cuda_tensor_upload_view(t[m],w+m*mb,sp[m],G.wfmt,m<2?G.D:G.Ih,m<2?G.Ih:G.D,G.dev[i],0,
+                                                     at+G_gm.ow[m],pb[m],at+G_gm.os[m],pb[3+m]);
+            } else
+                ok=up_one(&G_gm.tg[i][j],w,sg,G.D,G.Ih,G.dev[i],at,0) && up_one(&G_gm.tu[i][j],w+mb,su,G.D,G.Ih,G.dev[i],at,1)
+                   && up_one(&G_gm.td[i][j],w+2*mb,sd,G.Ih,G.D,G.dev[i],at,2);
+            if(!ok){ why="transient slot upload failed"; break; }
+        }
+    }
+    if(why){ fprintf(stderr,"[qtier] QT_GPU_MISS=%d %s: misses stay on the CPU\n",mode,why); gm_free(); return; }
+    for(int i=0;i<G.ndev;i++) G.used[i]+=(size_t)n*G.exp_bytes;
+    G_gm.n=n; G_gm.on=1; G_gm.mode=mode;
+    /* int4 is converted on the device after its copy: a device-side copy of the
+     * converted bytes would convert them twice */
+    e=getenv("QT_GPU_MISS_PROMOTE");
+    G_gm.promote=e && *e=='1' && G.wfmt!=4;
+    fprintf(stderr,"[qtier] QT_GPU_MISS=%d: routed misses computed on the GPU, %d transient slots + %.1f MB pinned staging per device%s\n",
+            mode,n,(double)n*G_gm.stride/1048576.0,G_gm.promote?", promotions of staged misses copied on the device":"");
+    if(mode==2){
+        e=getenv("QT_GPU_MISS_PIN_GB");
+        G_pin.off=e && *e && !(atof(e)>0); G_pin.fail=0;
+        G_pin.cap=e && *e ? (atof(e)>0 ? (size_t)(atof(e)*1073741824.0) : 0) : SIZE_MAX;
+        fprintf(stderr,"[qtier] QT_GPU_MISS=2: the hits launch at routing and the misses run as a second group per device; "
+                       "a miss from a pinned RAM slot goes up %s with no staging copy; RAM slots pinned as misses use them, %s\n",
+                G_gm.lay?"in one copy":"matrix by matrix",
+                G_pin.off?"none (QT_GPU_MISS_PIN_GB=0)":G_pin.cap==SIZE_MAX?"no cap past the engine's RAM cache (QT_GPU_MISS_PIN_GB caps it)":"up to QT_GPU_MISS_PIN_GB");
+        e=getenv("QT_GPU_MISS_FOLD");
+        if(e && *e=='1' && !e[1]){
+            G_gm.fold=G.wfmt==7 && coli_cuda_expert_group_append(NULL,NULL,NULL,NULL,0,NULL);
+            fprintf(stderr,"[qtier] QT_GPU_MISS_FOLD=1: %s\n",G_gm.fold?"a layer's miss group queues behind its hit group, one take for both":
+                    G.wfmt==7?"needs coli_cuda_expert_group_append (older backend DLL): off":"MXFP4 experts only: off");
+        }
+    }
+}
+
+/* QT_GPU_MISS=2: page-lock one engine RAM slot (its whole allocation) so a miss read
+ * into it goes up by DMA from where it lies. Pinned memory is not trimmable: the cap
+ * (QT_GPU_MISS_PIN_GB, 0 = none) bounds it. A driver refusal stops further attempts. Any thread. */
+int qt_pin_host(void *p,size_t bytes){
+    if(!G.on || G_gm.mode!=2 || !p || !bytes) return 0;
+    pthread_mutex_lock(&G_pin.mx);
+    int ok=!G_pin.off && !G_pin.fail && bytes<=G_pin.cap-G_pin.bytes;
+    if(ok) G_pin.bytes+=bytes;   /* reserved before the (slow) call, made outside the lock */
+    pthread_mutex_unlock(&G_pin.mx);
+    if(!ok) return 0;
+    ok=coli_cuda_host_register(p,bytes);
+    pthread_mutex_lock(&G_pin.mx);
+    if(ok) G_pin.n++;
+    else {
+        G_pin.bytes-=bytes;
+        if(!G_pin.fail) fprintf(stderr,"[qtier] QT_GPU_MISS=2: pinning a RAM slot failed after %d slots (%.2f GB): "
+                                       "the rest stage through the pinned buffers\n",G_pin.n,(double)G_pin.bytes/1073741824.0);
+        G_pin.fail=1;
+    }
+    pthread_mutex_unlock(&G_pin.mx);
+    return ok;
+}
+void qt_unpin_host(void *p,size_t bytes){
+    if(!p) return;
+    coli_cuda_host_unregister(p);
+    pthread_mutex_lock(&G_pin.mx);
+    G_pin.bytes-=bytes<G_pin.bytes?bytes:G_pin.bytes; if(G_pin.n) G_pin.n--;
+    pthread_mutex_unlock(&G_pin.mx);
+}
+void qt_miss_src_layout(const size_t off[6],size_t span){
+    memcpy(G_lay.off,off,sizeof G_lay.off); G_lay.span=span;
+}
+
+/* G.mx held, from qt_note in copy mode: a swap of an expert staged in the open group
+ * is taken over here -- the victim is picked as stream_promote_locked picks it, and its
+ * slot gets the transient slot's bytes device to device once the group is launched
+ * (gm_promote_run), with no host staging copy and no upload. A plain upload (room in
+ * the budget) stays with the uploader, whose ar_take this thread may not call. */
+static int gm_promote_locked(int layer,int eid){
+    if(!G_gm.promote) return 0;
+    int di=home2(layer,eid), j=-1;
+    for(int t=0;t<G_gm.used[di];t++) if(G_gm.sl[di][t]==layer && G_gm.se[di][t]==eid) j=t;
+    QSlot *s=qs(layer,eid);
+    if(j<0 || s->resident || s->queued || G.th_stop || G_gm.pn[di]>=QT_MAX_ROWS) return 0;
+    if(G.used[di]+G.exp_bytes<=G.budget[di]) return 0;
+    uint32_t ch; int cold=coldest_locked(di,&ch);
+    if(cold<0 || !tier_should_promote(s->heat,ch) || !G.slot[cold].ar || !G.slot[cold].tg || !swap_ok(layer,cold/G.ne)) return 0;
+    res_set(&G.slot[cold],0);
+    s->queued=1; G.swaps++;
+    int p=G_gm.pn[di]++;
+    G_gm.pj[di][p]=j; G_gm.pv[di][p]=cold; G_gm.pi[di][p]=layer*G.ne+eid;
+    return 1;
+}
+/* Decode thread, after the group launch (or at the take): the pending swaps, each victim's
+ * three matrices overwritten from the transient slot on the group stream, so after the
+ * group read the victim and before the next group reuses the transient slot. */
+static void gm_promote_run(void){
+    for(int di=0;di<G.ndev;di++){
+        for(int p=0;p<G_gm.pn[di];p++){
+            pthread_mutex_lock(&G.mx);
+            QSlot *v=&G.slot[G_gm.pv[di][p]], *s=&G.slot[G_gm.pi[di][p]];
+            ColiCudaTensor *t[3]={v->tg,v->tu,v->td}; uint32_t ar=v->ar;
+            v->tg=v->tu=v->td=NULL; v->ar=0;
+            pthread_mutex_unlock(&G.mx);
+            const uint8_t *src=ar_ptr(di,G_gm.ar[di][G_gm.pj[di][p]]-1);
+            int ok=1;
+            for(int m=0;m<3 && ok;m++)
+                ok=coli_cuda_tensor_overwrite_async(t[m],src+G_gm.ow[m],(const float*)(src+G_gm.os[m]));
+            pthread_mutex_lock(&G.mx);
+            if(ok){ s->tg=t[0]; s->tu=t[1]; s->td=t[2]; s->ar=ar; res_set(s,1);
+                    G.uploads++; G.inplace++; G_gm.promoted++; }
+            else {
+                for(int m=0;m<3;m++) coli_cuda_tensor_free(t[m]);
+                G.used[di]-=G.exp_bytes; G.budget[di]=G.used[di];
+                fprintf(stderr,"[qtier] dev %d: device-side promotion failed, expert budget clamped to %.2f GB\n",
+                        G.dev[di],(double)G.used[di]/1e9);
+            }
+            s->queued=0;
+            pthread_cond_broadcast(&G.cv_take);
+            pthread_mutex_unlock(&G.mx);
+        }
+        G_gm.pn[di]=0;
+    }
 }
 
 static void *uploader(void *arg){
@@ -1389,6 +1612,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     qt_aff_restore(&aff);
     if(!th_ok) goto fail_cv_take;
     G.on=1;
+    gm_init();   /* nothing is enqueued yet: the uploader does not touch the arena */
     if(G_trunk_only)
         fprintf(stderr,"[qtier] CUDA: the dense trunk only, the experts of this container stay on the CPU\n");
     else
@@ -2245,7 +2469,7 @@ void qt_note_n(int layer,int eid,uint32_t n,
     if(G_stream){
         heat_add_locked(i,n);
         stream_point(s,g4,u4,d4,gs,us,ds);
-        int qi=stream_promote_locked(layer,eid);
+        int qi=gm_promote_locked(layer,eid) ? 0 : stream_promote_locked(layer,eid);
         stream_forget(s);
         stage_deferred(qi);
         pthread_mutex_unlock(&G.mx);
@@ -2549,8 +2773,12 @@ int qt_counters(QtCounters *out){
     pthread_mutex_lock(&G.mx);
     for(int i=0;i<G.ndev;i++) out->hits+=G.hits[i];
     out->miss=G.miss; out->uploads=G.uploads; out->swaps=G.swaps; out->q_full_skips=G.q_full_skips;
+    out->gpu_miss=G_gm.miss; out->gpu_miss_fallback=G_gm.fallback;
     pthread_mutex_unlock(&G.mx);
     return 1;
+}
+void qt_gpu_miss_more(uint64_t *promoted,uint64_t *folded){
+    *promoted=G.on?G_gm.promoted:0; *folded=G.on?G_gm.folded:0;
 }
 
 static void qt_lfru_tick_locked(int skip_full_scan){
@@ -2601,16 +2829,11 @@ static void qt_lfru_tick_locked(int skip_full_scan){
     }
 }
 
-uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
-    return qt_issue_mode(layer,eids,K,x,0);
-}
-uint32_t qt_issue_mode(int layer,const int *eids,int K,const float *x,int skip_full_scan){
-    if(!G.on||K>QT_MAX_ROWS||G_chain_own) return 0;
-    uint32_t mask=0;
-    ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
-    static int rows[QT_MAX_ROWS]={0};
-    if(!rows[0]) for(int i=0;i<QT_MAX_ROWS;i++) rows[i]=1;
-    for(int i=0;i<G.ndev;i++) G.is_cnt[i]=0;
+static void qt_issue_begin_rows_mode(int layer,const int *eids,int n,int K,const float *x,uint32_t *mask,int skip_full_scan){
+    G.is_xp=x; G.is_K=K; G.is_n=0;
+    for(int r=0;r<n;r++) mask[r]=0;
+    if(!G.on||K<1||K>QT_MAX_ROWS||n<1||n>QT_MAX_ROWS||G_chain_own) return;
+    for(int i=0;i<G.ndev;i++) G.is_cnt[i]=G.is_ne[i]=0;
 
     pthread_mutex_lock(&G.mx);
     /* QT_UPLOAD_SYNC=1: everything enqueued so far is resident before this
@@ -2621,73 +2844,250 @@ uint32_t qt_issue_mode(int layer,const int *eids,int K,const float *x,int skip_f
      * six entries still queued). No group is open here, so the wait cannot
      * meet a swap parked on issue_open. */
     if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
-    if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
-    if(layer==0) qt_lfru_tick_locked(skip_full_scan);
+    if(G.th_stop){ pthread_mutex_unlock(&G.mx); return; }
+    if(layer==0) for(int r=0;r<n;r++) qt_lfru_tick_locked(skip_full_scan);   /* a tick per token, as n one-row issues */
     G.issue_open=1;
-    for(int k=0;k<K;k++){
-        QSlot *s=qs(layer,eids[k]);
-        if(s->resident){
+    uint8_t done[QT_MAX_ROWS*QT_MAX_ROWS]={0};
+    for(int a=0;a<n*K;a++){
+        if(done[a]) continue;
+        QSlot *s=qs(layer,eids[a]);
+        if(!s->resident){ G.miss++; continue; }
+        int di=home2(layer,eids[a]), e=G.is_ne[di], c0=G.is_cnt[di];
+        /* the rows routed to one resident share its entry, so the kernel reads its
+         * weights once for all of them; a single row keeps one entry per rank */
+        for(int b=a;b<n*K;b++){
+            if(b>a && (n==1 || done[b] || eids[b]!=eids[a])) continue;
+            done[b]=1;
+            if(G.is_cnt[di]>=QT_GROUP_ROWS){
+                G.miss++;
+                continue;
+            }
             /* a hit is routed heat too: the engine notes (qt_note) only what the
              * CPU computes, so without this a resident in copy mode never warmed
              * again and the coldest-resident test let any newcomer evict it */
-            heat_add_locked((size_t)layer*G.ne+eids[k],1);
-            int di=home2(layer,eids[k]); int c=G.is_cnt[di];
-            tg[di][c]=s->tg; tu[di][c]=s->tu; td[di][c]=s->td;
-            G.is_k[di][c]=k; G.is_cnt[di]=c+1;
-            mask|=1u<<k; G.hits[di]++;
-        } else G.miss++;
+            heat_add_locked((size_t)layer*G.ne+eids[b],1);
+            int c=G.is_cnt[di];
+            G.is_k[di][c]=b%K; G.is_r[di][c]=b/K; G.is_cnt[di]=c+1;
+            mask[b/K]|=1u<<(b%K); G.hits[di]++;
+        }
+        if(G.is_cnt[di]>c0){
+            G.is_tg[di][e]=s->tg; G.is_tu[di][e]=s->tu; G.is_td[di][e]=s->td;
+            G.is_rows[di][e]=G.is_cnt[di]-c0; G.is_ne[di]=e+1;
+        }
     }
     pthread_mutex_unlock(&G.mx);
+    memcpy(G.is_m,mask,(size_t)n*sizeof *mask); G.is_n=n;
+}
 
+void qt_issue_begin_rows(int layer,const int *eids,int n,int K,const float *x,uint32_t *mask){
+    qt_issue_begin_rows_mode(layer,eids,n,K,x,mask,0);
+}
+
+uint32_t qt_issue_begin(int layer,const int *eids,int K,const float *x){
+    uint32_t mask;
+    qt_issue_begin_rows(layer,eids,1,K,x,&mask);
+    return mask;
+}
+
+int qt_gpu_miss_on(int rows){ return G.on && G_gm.on && rows>=1 && rows<=QT_GROUP_ROWS ? G_gm.mode : 0; }
+
+int qt_miss_stage(int layer,const int *as,int na,int eid,
+                  const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
+                  const float *gs,const float *us,const float *ds){
+    return qt_miss_stage_src(layer,as,na,eid,g4,u4,d4,gs,us,ds,0);
+}
+
+int qt_miss_stage_src(int layer,const int *as,int na,int eid,
+                      const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
+                      const float *gs,const float *us,const float *ds,int pinned){
+    if(!G.on || !G_gm.on || !g4 || !G.is_n || na<1) return 0;
+    for(int i=0;i<na;i++) if(as[i]<0 || as[i]>=G.is_n*G.is_K) return 0;
+    int di=home2(layer,eid), c=G.is_cnt[di], j=G_gm.used[di];
+    if(c+na>QT_GROUP_ROWS || j>=G_gm.n){ G_gm.fallback+=(uint64_t)na; return 0; }
+    G_gm.used[di]=j+1;   /* even on failure: a half-queued copy may read the buffer until the take */
+    G_gm.se[di][j]=-1;
+    int ok;
+    /* mode 2, a pinned source the device can read as it lies (no int4 XOR, no planar
+     * repack): no staging copy. The engine keeps it unchanged until the commit's take. */
+    if(pinned && G_gm.mode==2 && G.wfmt!=4){
+        uintptr_t b=(uintptr_t)g4-G_gm.ow[0];
+        ok=0;
+        if(G_gm.lay && (uintptr_t)u4==b+G_gm.ow[1] && (uintptr_t)d4==b+G_gm.ow[2] && (uintptr_t)gs==b+G_gm.os[0]
+           && (uintptr_t)us==b+G_gm.os[1] && (uintptr_t)ds==b+G_gm.os[2]){
+            ok=coli_cuda_copy_async(G.dev[di],ar_ptr(di,G_gm.ar[di][j]-1),(const void*)b,G_gm.span);
+            if(ok) G_gm.one++; else G_gm.lay=0;   /* an older DLL has no single copy: matrix by matrix from now on */
+        }
+        if(!ok) ok=coli_cuda_tensor_overwrite_async(G_gm.tg[di][j],g4,gs) && coli_cuda_tensor_overwrite_async(G_gm.tu[di][j],u4,us)
+                   && coli_cuda_tensor_overwrite_async(G_gm.td[di][j],d4,ds);
+        if(ok) G_gm.direct++;
+    } else {
+        uint8_t *w=G_gm.h[di]+(size_t)j*G_gm.stride; float *sc=(float*)(w+G_gm.wb);
+        stage(w,sc,layer,g4,u4,d4,gs,us,ds);
+        const float *su,*sd; sc_parts(sc,&su,&sd); size_t mb=qt_mb();
+        ok=coli_cuda_tensor_overwrite_async(G_gm.tg[di][j],w,sc) && coli_cuda_tensor_overwrite_async(G_gm.tu[di][j],w+mb,su)
+           && coli_cuda_tensor_overwrite_async(G_gm.td[di][j],w+2*mb,sd);
+    }
+    if(!ok){ G_gm.fallback+=(uint64_t)na; return 0; }
+    int e=G.is_ne[di];
+    G.is_tg[di][e]=G_gm.tg[di][j]; G.is_tu[di][e]=G_gm.tu[di][j]; G.is_td[di][e]=G_gm.td[di][j];
+    G.is_rows[di][e]=na; G.is_ne[di]=e+1;
+    for(int i=0;i<na;i++){
+        int r=as[i]/G.is_K, k=as[i]%G.is_K;
+        G.is_k[di][c+i]=k; G.is_r[di][c+i]=r; G.is_m[r]|=1u<<k;
+    }
+    G.is_cnt[di]=c+na; G_gm.staged[di]+=na;
+    G_gm.sl[di][j]=layer; G_gm.se[di][j]=eid;
+    return 1;
+}
+
+/* QT_GPU_MISS=2, the second commit: per device with misses staged after its hit group
+ * launched, take that group (its rows to hy) and launch the misses as a group of their
+ * own; a device without misses keeps its hit group in flight until the take. The sum
+ * order matches mode 1's single group: hit rows, then staged rows. */
+static void gm_commit2(uint32_t *mask){
+    for(int di=0;di<G.ndev;di++){
+        int c=G.is_cnt[di], c1=G_gm.c1[di], e1=G_gm.e1[di];
+        if(c<=c1) continue;
+        float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D;     /* the hit group's input went up at its issue */
+        for(int j=c1;j<c;j++) memcpy(xr+(size_t)(j-c1)*G.D, G.is_xp+(size_t)G.is_r[di][j]*G.D, (size_t)G.D*sizeof(float));
+        /* QT_GPU_MISS_FOLD: behind the hits in flight; the take's rows are then the hits', then these (ht stays 0).
+         * A refusal (no room in the backend's buffers) leaves the hit group as it was: the old way below. */
+        if(c1 && G_gm.fold && !G_gm.bad &&
+           coli_cuda_expert_group_append(G.is_tg[di]+e1,G.is_tu[di]+e1,G.is_td[di]+e1,G.is_rows[di]+e1,G.is_ne[di]-e1,xr)){
+            G_gm.mp[di]=1; G_gm.miss+=(uint64_t)G_gm.staged[di]; G_gm.folded++; G_gm.staged[di]=0;
+            continue;
+        }
+        if(c1){
+            const float *r=coli_cuda_expert_group_take(G.dev[di]);
+            if(r) memcpy(G_gm.hy[di],r,(size_t)c1*G.D*sizeof(float));
+            else { fprintf(stderr,"[qtier] dev %d: expert group result unavailable\n",G.dev[di]); G_gm.bad=1; }
+            G_gm.ht[di]=1;
+        }
+        if(!G_gm.bad && coli_cuda_expert_group_issue(G.is_tg[di]+e1,G.is_tu[di]+e1,G.is_td[di]+e1,G.is_rows[di]+e1,G.is_ne[di]-e1,xr)){
+            G_gm.mp[di]=1; G_gm.miss+=(uint64_t)G_gm.staged[di];
+        } else {
+            coli_cuda_pipe_sync(G.dev[di]);   /* the staged copies end before the CPU takes their ranks (and may reload a slot) */
+            for(int j=c1;j<c;j++) G.is_m[G.is_r[di][j]] &= ~(1u<<G.is_k[di][j]);
+            G_gm.fallback+=(uint64_t)G_gm.staged[di];
+            G.is_cnt[di]=c1; G.is_ne[di]=e1;
+        }
+        G_gm.staged[di]=0;
+    }
+    memcpy(mask,G.is_m,(size_t)G.is_n*sizeof *mask);
+    gm_promote_run();
+}
+
+void qt_issue_commit_rows(uint32_t *mask){
+    if(!G.on || !G.is_n) return;
+    if(G_gm.launched){ gm_commit2(mask); return; }
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
         float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D;     /* per-device input block */
-        for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
-        if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
-            /* issue failed -> hand these k back to the CPU */
-            for(int j=0;j<c;j++) mask &= ~(1u<<G.is_k[di][j]);
-            G.is_cnt[di]=0;
+        for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, G.is_xp+(size_t)G.is_r[di][j]*G.D, (size_t)G.D*sizeof(float));
+        if(coli_cuda_expert_group_issue(G.is_tg[di],G.is_tu[di],G.is_td[di],G.is_rows[di],G.is_ne[di],xr))
+            G_gm.miss+=(uint64_t)G_gm.staged[di];
+        else {
+            /* issue failed -> hand these ranks back to the CPU, the staged ones too */
+            for(int j=0;j<c;j++) G.is_m[G.is_r[di][j]] &= ~(1u<<G.is_k[di][j]);
+            G_gm.fallback+=(uint64_t)G_gm.staged[di];
+            G.is_cnt[di]=G.is_ne[di]=0;
         }
+        G_gm.staged[di]=0;
     }
+    memcpy(mask,G.is_m,(size_t)G.is_n*sizeof *mask);
+    if(G_gm.mode==2){   /* the hits are out; x stays for the misses' group until the take */
+        for(int di=0;di<G.ndev;di++){ G_gm.c1[di]=G.is_cnt[di]; G_gm.e1[di]=G.is_ne[di]; }
+        G_gm.launched=1;
+    } else G.is_xp=NULL;
+    gm_promote_run();
+}
+
+uint32_t qt_issue_commit(void){
+    uint32_t mask=0;
+    qt_issue_commit_rows(&mask);
     return mask;
 }
 
-int qt_take(uint32_t mask,const float *val,int K,float *out){ return qt_take_scaled(mask,val,K,out,NULL,0.f); }
-int qt_take_scaled(uint32_t mask,const float *val,int K,float *out,const float *s,float eps){
-    (void)K;
-    if(!G.on) return mask==0;
-    const float *result[QT_MAX_DEV]={0};
-    int ok=1;
+uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
+    return qt_issue_mode(layer,eids,K,x,0);
+}
+uint32_t qt_issue_mode(int layer,const int *eids,int K,const float *x,int skip_full_scan){
+    uint32_t mask=0;
+    qt_issue_begin_rows_mode(layer,eids,1,K,x,&mask,skip_full_scan);
+    if(G.on && K<=QT_MAX_ROWS) mask=qt_issue_commit();
+    if(!G_gm.launched) G.is_xp=NULL;
+    return mask;
+}
+
+static int qt_take_row_s(int r,int last,const float *val,float *out,const float *s,float eps){
+    if(!G.on) return 1;
     /* Drain every device before deciding whether this layer is usable. */
-    if(mask) for(int di=0;di<G.ndev;di++){
-        if(!G.is_cnt[di]) continue;
-        result[di]=coli_cuda_expert_group_take(G.dev[di]);
-        if(!result[di]){
-            fprintf(stderr,"[qtier] dev %d: expert group result unavailable\n",G.dev[di]);
-            ok=0;
+    if(!G.is_taken){
+        G.is_ok=1; G.is_taken=1;
+        if(G_gm.bad) G.is_ok=0;
+        for(int di=0;di<G.ndev;di++){
+            G.is_res[di]=NULL;
+            if(!G.is_cnt[di]) continue;
+            if(G_gm.ht[di]){   /* mode 2: the hit rows are in hy, the misses' rows follow them */
+                int c1=G_gm.c1[di];
+                const float *res=G_gm.mp[di]?coli_cuda_expert_group_take(G.dev[di]):NULL;
+                if(res) memcpy(G_gm.hy[di]+(size_t)c1*G.D,res,(size_t)(G.is_cnt[di]-c1)*G.D*sizeof(float));
+                else if(G_gm.mp[di]){ fprintf(stderr,"[qtier] dev %d: expert group result unavailable\n",G.dev[di]); G.is_ok=0; }
+                G.is_res[di]=G_gm.hy[di];
+                continue;
+            }
+            G.is_res[di]=coli_cuda_expert_group_take(G.dev[di]);
+            if(!G.is_res[di]){
+                fprintf(stderr,"[qtier] dev %d: expert group result unavailable\n",G.dev[di]);
+                G.is_ok=0;
+            }
         }
     }
     /* Do not publish a partial contribution when any device failed. */
-    for(int di=0;di<G.ndev;di++){
-        if(ok && result[di]) for(int j=0;j<G.is_cnt[di];j++){
+    if(G.is_ok) for(int di=0;di<G.ndev;di++){
+        if(G.is_res[di]) for(int j=0;j<G.is_cnt[di];j++){
+            if(G.is_r[di][j]!=r) continue;
             float w=val[G.is_k[di][j]];
-            const float *row=result[di]+(size_t)j*G.D;
+            const float *row=G.is_res[di]+(size_t)j*G.D;
             if(s){   /* Muse Spark: w * rmsnorm(row * s) */
                 double ms=0; for(int d=0;d<G.D;d++){ double v=(double)row[d]*s[d]; ms+=v*v; }
-                const float r=1.f/sqrtf((float)(ms/G.D)+eps);
-                for(int d=0;d<G.D;d++) out[d]+=w*(row[d]*s[d]*r);
+                const float rn=1.f/sqrtf((float)(ms/G.D)+eps);
+                for(int d=0;d<G.D;d++) out[d]+=w*(row[d]*s[d]*rn);
                 continue;
             }
             for(int d=0;d<G.D;d++) out[d]+=w*row[d];
         }
-        G.is_cnt[di]=0;
     }
+    int ok=G.is_ok;
+    if(!last) return ok;
+    gm_promote_run();   /* a swap noted after the commit (a refused group's rank recomputed): its copies too */
+    for(int di=0;di<G.ndev;di++){
+        /* staged copies of a group never issued or taken may still be queued on the
+         * stream: drain it before the next group reuses their buffers */
+        if(G_gm.used[di] && !G.is_res[di]) coli_cuda_pipe_sync(G.dev[di]);
+        G.is_cnt[di]=G.is_ne[di]=0; G_gm.used[di]=0; G_gm.staged[di]=0; G.is_res[di]=NULL;
+        G_gm.c1[di]=G_gm.e1[di]=G_gm.ht[di]=G_gm.mp[di]=0;
+    }
+    G.is_taken=0; G.is_n=0; G_gm.launched=G_gm.bad=0; G.is_xp=NULL;
     pthread_mutex_lock(&G.mx);
     G.issue_open=0;
     pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
     return ok;
+}
+
+int qt_take_row(int r,int last,const float *val,float *out){ return qt_take_row_s(r,last,val,out,NULL,0.f); }
+
+int qt_take(uint32_t mask,const float *val,int K,float *out){
+    (void)K;
+    if(!G.on) return mask==0;
+    return qt_take_row(0,1,val,out);
+}
+int qt_take_scaled(uint32_t mask,const float *val,int K,float *out,const float *s,float eps){
+    (void)K;
+    if(!G.on) return mask==0;
+    return qt_take_row_s(0,1,val,out,s,eps);
 }
 
 void qt_stats(void){
@@ -2714,6 +3114,15 @@ void qt_stats(void){
         fprintf(stderr,"[qtier] decode VRAM hit rate: %.1f %% (%llu hits, %llu misses after the prefill)\n",
                 dh+dm? 100.0*dh/(dh+dm) : 0.0, (unsigned long long)dh, (unsigned long long)dm);
     }
+    if(G_gm.on)
+        fprintf(stderr,"[qtier] QT_GPU_MISS: %llu misses computed on the GPU, %llu fell back to the CPU, %llu promoted on the device\n",
+                (unsigned long long)G_gm.miss,(unsigned long long)G_gm.fallback,(unsigned long long)G_gm.promoted);
+    if(G_gm.on && G_gm.mode==2)
+        fprintf(stderr,"[qtier] QT_GPU_MISS=2: %llu staged experts went up straight from pinned RAM (%llu in one copy); "
+                       "%d RAM slots pinned, %.2f GB\n",(unsigned long long)G_gm.direct,(unsigned long long)G_gm.one,
+                G_pin.n,(double)G_pin.bytes/1073741824.0);
+    if(G_gm.fold)
+        fprintf(stderr,"[qtier] QT_GPU_MISS_FOLD: %llu miss groups queued behind their hit group\n",(unsigned long long)G_gm.folded);
     if(G.rp_planned)
         fprintf(stderr,"[qtier] replan: %llu swaps planned, %llu done, %d still pending\n",
                 (unsigned long long)G.rp_planned, (unsigned long long)G.rp_done, G.rp_n-G.rp_i);
@@ -2776,6 +3185,7 @@ void qt_shutdown(void){
         G_arena[i]=NULL; free(G_afree[i]); G_afree[i]=NULL; G_aslots[i]=G_anfree[i]=0;
     }
     G_arena_on=0; G_chain_own=0;
+    gm_free();
     ar_free_all();   /* QT_ARENA slabs, after the views into them */
     for(int i=0;i<QT_QCAP;i++){ free(G.q[i].w); free(G.q[i].s); G.q[i].w=NULL; G.q[i].s=NULL; }
     free(G.up_w); free(G.up_s); G.up_w=NULL; G.up_s=NULL;

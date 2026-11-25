@@ -22,8 +22,10 @@
 #include <stdint.h>
 
 /* The tier's running counters (qt_counters): hits = routed experts computed on the card, miss =
- * routed experts the CPU computed instead. A request's share is the difference of two reads. */
-typedef struct { uint64_t hits, miss, uploads, swaps, q_full_skips; } QtCounters;
+ * routed experts the CPU computed instead. A request's share is the difference of two reads.
+ * QT_GPU_MISS: gpu_miss = misses the device computed after all (counted in miss too),
+ * gpu_miss_fallback = misses offered to it that went to the CPU (no slot, copy failed). */
+typedef struct { uint64_t hits, miss, uploads, swaps, q_full_skips, gpu_miss, gpu_miss_fallback; } QtCounters;
 
 /* A block-format matrix's rows read as they upload, a range at a time through one bounded
  * buffer (qwen36 reads a GGUF's straight from the file): read(ctx, row0, n, buf) puts rows
@@ -224,6 +226,47 @@ void qt_note_n(int layer, int eid, uint32_t n,
 uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
 uint32_t qt_issue_mode(int layer, const int *eids, int K, const float *x, int skip_full_scan);
 
+/* Split of qt_issue for QT_GPU_MISS (default off):
+ * qt_issue_begin picks the residents without launching yet (same mask, same heat);
+ * qt_miss_stage copies the expert (qt_note's pointers) into a transient VRAM slot
+ * (out of the expert budget, freed on qt_take) and adds it to the device's group
+ * (returns 1 = staged, 0 = CPU fallback); qt_issue_commit launches the combined
+ * group (returns the final bitmask: hits plus staged, minus any refused device).
+ * Multi-row form (verify rows): qt_issue_begin_rows takes n rows x K eids and n
+ * input rows x[n*D], shares one group entry per resident hit across its rows, one
+ * qt_miss_stage per missed expert carries all its rows, qt_issue_commit_rows
+ * launches, and qt_take_row(r, last, ...) accumulates row r's hits and staged
+ * ranks (the first drains, the last closes the group). qt_gpu_miss_on(rows): the
+ * mode (1 or 2) when active and `rows` fits one group, else 0.
+ *
+ * QT_GPU_MISS=2: the hits launch at routing (qt_issue, or qt_issue_begin_rows +
+ * qt_issue_commit_rows); misses staged after that launch on a second
+ * qt_issue_commit(_rows) as a second group per device, overlapping the hits with
+ * the miss reads. With QT_GPU_MISS_FOLD=1 (MXFP4) the miss group queues behind
+ * the hit group still in flight (one take for both).
+ * qt_miss_stage_src(..., pinned = 1): the six pointers lie in memory qt_pin_host
+ * page-locked and will stay untouched until qt_take, so the copy goes straight
+ * from them with no staging copy -- in one copy when their offsets match the call
+ * to qt_miss_src_layout (before qt_init: offsets of gate/up/down weights then
+ * gate/up/down scales from the record start, and the bytes to copy). qt_pin_host
+ * caps the pinned bytes at QT_GPU_MISS_PIN_GB (0 = none); qt_unpin_host undoes it
+ * before the caller frees or reallocates the memory. */
+int      qt_gpu_miss_on(int rows);
+uint32_t qt_issue_begin(int layer, const int *eids, int K, const float *x);
+void     qt_issue_begin_rows(int layer, const int *eids, int n, int K, const float *x, uint32_t *mask);
+int      qt_miss_stage(int layer, const int *as, int na, int eid,
+                       const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
+                       const float *gs, const float *us, const float *ds);
+int      qt_miss_stage_src(int layer, const int *as, int na, int eid,
+                           const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
+                           const float *gs, const float *us, const float *ds, int pinned);
+void     qt_miss_src_layout(const size_t off[6], size_t span);
+int      qt_pin_host(void *p, size_t bytes);
+void     qt_unpin_host(void *p, size_t bytes);
+uint32_t qt_issue_commit(void);
+void     qt_issue_commit_rows(uint32_t *mask);
+int      qt_take_row(int r, int last, const float *val, float *out);
+
 /* Collect all GPU results and accumulate val[k]*y_k into out[hidden].
  * Returns 0 on collection failure, leaving out unchanged. The caller must
  * stop inference: experts selected by qt_issue were not computed on CPU. */
@@ -268,6 +311,9 @@ int  qt_evicted_take(int *layers, int *eids, int max);
 void qt_stats_mark(void);
 /* The counters now; 0 (all zero) when the tier is off. */
 int  qt_counters(QtCounters *out);
+/* QT_GPU_MISS's other totals (decode thread): swaps copied on the device (QT_GPU_MISS_PROMOTE)
+ * and miss groups queued behind their hit group (QT_GPU_MISS_FOLD). */
+void qt_gpu_miss_more(uint64_t *promoted, uint64_t *folded);
 
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
@@ -439,6 +485,17 @@ static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uin
 static inline void qt_note_n(int a,int b,uint32_t n,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)n;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline uint32_t qt_issue_mode(int a,const int*b,int c,const float*d,int e){(void)e;return qt_issue(a,b,c,d);}
+static inline int  qt_gpu_miss_on(int a){(void)a;return 0;}
+static inline uint32_t qt_issue_begin(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline void qt_issue_begin_rows(int a,const int*b,int n,int c,const float*d,uint32_t*m){(void)a;(void)b;(void)c;(void)d;for(int i=0;i<n;i++)m[i]=0;}
+static inline int  qt_miss_stage(int a,const int*k,int n,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)k;(void)n;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
+static inline int  qt_miss_stage_src(int a,const int*k,int n,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h,int p){(void)a;(void)k;(void)n;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)p;return 0;}
+static inline void qt_miss_src_layout(const size_t*a,size_t b){(void)a;(void)b;}
+static inline int  qt_pin_host(void*a,size_t b){(void)a;(void)b;return 0;}
+static inline void qt_unpin_host(void*a,size_t b){(void)a;(void)b;}
+static inline uint32_t qt_issue_commit(void){return 0;}
+static inline void qt_issue_commit_rows(uint32_t*m){(void)m;}
+static inline int  qt_take_row(int r,int l,const float*b,float*d){(void)r;(void)l;(void)b;(void)d;return 1;}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
 static inline int qt_take_scaled(uint32_t a,const float*b,int c,float*d,const float*s,float e){(void)b;(void)c;(void)d;(void)s;(void)e;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
@@ -450,7 +507,8 @@ static inline void qt_fill_wait(void){}
 static inline int  qt_replan(int l,const uint32_t*a,int b){(void)l;(void)a;(void)b;return 0;}
 static inline int  qt_evicted_take(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_stats_mark(void){}
-static inline int  qt_counters(QtCounters *out){QtCounters z={0,0,0,0,0};*out=z;return 0;}
+static inline int  qt_counters(QtCounters *out){QtCounters z={0,0,0,0,0,0,0};*out=z;return 0;}
+static inline void qt_gpu_miss_more(uint64_t *a,uint64_t *b){*a=0;*b=0;}
 static inline void qt_stats(void){}
 
 #endif /* COLI_CUDA */

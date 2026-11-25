@@ -1369,6 +1369,14 @@ expert-group-rows-test: tests/test_expert_group_rows_cuda.cu backend_cuda.cu bac
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
 	./expert_group_rows_test$(EXE)
+# coli_cuda_expert_group_append (QT_GPU_MISS_FOLD): an MXFP4 group appended behind the one
+# in flight gives the bits of one issue and of two issue/take pairs. Needs a GPU.
+expert_group_append_test$(EXE): tests/test_expert_group_append_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_append_cuda.cu -o expert_group_append_test$(EXE) $(GPU_TEST_LIBS)
+.PHONY: expert-group-append-test
+expert-group-append-test: expert_group_append_test$(EXE)
+	./expert_group_append_test$(EXE)
 
 cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu tests/test_vision_attention_cuda.cu tests/test_gemv_sk_part_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -3532,6 +3540,10 @@ tests/test_qwen36_tier_mxfp4_gpu$(EXE): tests/test_qwen36_tier_mxfp4_gpu.c qwen3
 
 # QT_ARENA=1 exact-size slab slots for FP8/int4 experts + copy-mode coldest cache.
 tests/test_qwen36_tier_arena$(EXE): tests/test_qwen36_tier_arena.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# QT_GPU_MISS / QT_GPU_MISS_PROMOTE / QT_GPU_MISS_FOLD / QT_GPU_MISS_SLOTS / QT_GPU_MISS_PIN_GB.
+tests/test_qwen36_tier_gpu_miss$(EXE): tests/test_qwen36_tier_gpu_miss.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 # Same fake backend, qwen36 below full residency (#2090): cap < n_experts in copy
 # mode, the engine's planar int4 staged as the container's pairs, hits keeping

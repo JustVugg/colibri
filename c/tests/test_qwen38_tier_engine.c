@@ -75,20 +75,35 @@ static double dump_rel(const char *a, const char *b, int *same) {
 /* The fake card computing a group of MXFP4 residents as the engine computes an expert
  * (matmul_mxfp4, silu(gate) * up, down), from the bytes the tier uploaded. */
 static float mx_out[QT_MAX_ROWS * 256];
-static int mx_groups;
-static int mx_compute(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
-                      int count, const float *x) {
+static int mx_groups, mx_rows, mx_appends;
+static int mx_compute_at(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                         int count, const float *x, int off0) {
     const int D = g[0]->I, I = g[0]->O;
     float eg[256], eu[256];
-    if (D > 256 || I > 256) return 0;
+    if (D > 256 || I > 256 || off0 + count > QT_MAX_ROWS) return -1;
     for (int j = 0; j < count; j++) {
-        if (g[j]->fmt != 7 || !g[j]->owned || !u[j]->owned || !d[j]->owned) return 0;
+        if (g[j]->fmt != 7 || !g[j]->owned || !u[j]->owned || !d[j]->owned) return -1;
         matmul_mxfp4(eg, x + (size_t)j * D, (const uint8_t *)g[j]->w, (const uint8_t *)g[j]->sc, 1, D, I);
         matmul_mxfp4(eu, x + (size_t)j * D, (const uint8_t *)u[j]->w, (const uint8_t *)u[j]->sc, 1, D, I);
         for (int i = 0; i < I; i++) eg[i] = q38_silu(eg[i]) * eu[i];
-        matmul_mxfp4(mx_out + (size_t)j * D, eg, (const uint8_t *)d[j]->w, (const uint8_t *)d[j]->sc, 1, I, D);
+        matmul_mxfp4(mx_out + (size_t)(off0 + j) * D, eg, (const uint8_t *)d[j]->w, (const uint8_t *)d[j]->sc, 1, I, D);
     }
-    fake_group_out = mx_out; mx_groups++;
+    return off0 + count;
+}
+static int mx_compute(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                      int count, const float *x) {
+    int off = mx_compute_at(g, u, d, count, x, 0);
+    if (off < 0) return 0;
+    mx_rows = off; fake_group_out = mx_out; mx_groups++;
+    return 1;
+}
+static int mx_append(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                     const int *rows, int count, const float *x) {
+    (void)rows;
+    if (!g && !x) return 1;
+    int off = mx_compute_at(g, u, d, count, x, mx_rows);
+    if (off < 0) return 0;
+    mx_rows = off; mx_appends++;
     return 1;
 }
 
@@ -306,6 +321,54 @@ int main(int argc, char **argv_in) {
         tk(rel >= 0 && rel <= 1e-6, "within 1e-6 of the CPU's (the device's rows join the sum after the CPU's)");
         dump_rel(dev2, dev1, &same);
         tk(same, "two runs with the same residency give the same bits");
+
+        /* QT_GPU_MISS=2 + QT_GPU_MISS_PROMOTE=1 + QT_GPU_MISS_FOLD=1 + Q38_ASYNC_MISS=1 on MXFP4 */
+        printf(" QT_GPU_MISS=2 + PROMOTE + FOLD + Q38_ASYNC_MISS on MXFP4\n");
+        char gm2_base[2048], gm2_fold[2048], gm2_async[2048];
+        snprintf(gm2_base, sizeof gm2_base, "%s/tier_gm2.f32", snap);
+        snprintf(gm2_fold, sizeof gm2_fold, "%s/tier_gm2_fold.f32", snap);
+        snprintf(gm2_async, sizeof gm2_async, "%s/tier_gm2_async.f32", snap);
+        char *argvm2[] = { (char *)"qwen38", (char *)"2", (char *)"8", ref };
+        size_t A = QT_AR_ALIGN, aw = (32 * 8 / 2 + A - 1) / A * A, asg = (8 + A - 1) / A * A, asd = (32 + A - 1) / A * A;
+        size_t ar_slot = 3 * aw + 2 * asg + asd;
+        int per_slab = ar_slot >= QT_AR_SLAB ? 1 : (int)(QT_AR_SLAB / ar_slot);
+        size_t ar_exp = ar_slot + (2 * 1048576u + per_slab - 1) / per_slab;
+        snprintf(gb, sizeof gb, "%.15f", (double)(8 * ar_exp + ar_exp / 2) / 1073741824.0);
+        setenv("CUDA_EXPERT_GB", gb, 1);
+        setenv("QT_ARENA", "1", 1); setenv("QT_GPU_MISS", "2", 1);
+        setenv("QT_GPU_MISS_PROMOTE", "1", 1);
+        G_offer_n = 0;
+        fake_host_reg_ok = 1; fake_own_mx4 = 1; fake_group_hook = mx_compute; fake_append_hook = mx_append;
+        setenv("DUMP", gm2_base, 1);
+        rc = qwen38_main_unused(4, argvm2);
+        QtCounters gmc; qt_counters(&gmc);
+        uint64_t gm_prom = 0, gm_fld = 0; qt_gpu_miss_more(&gm_prom, &gm_fld);
+        tk(rc == 0, "QT_GPU_MISS=2 + PROMOTE on MXFP4 reproduces the oracle");
+        tk(gmc.gpu_miss > 0 && gmc.gpu_miss_fallback == 0, "all routed misses computed on the GPU");
+        qt_shutdown();
+
+        setenv("QT_GPU_MISS_FOLD", "1", 1);
+        mx_appends = 0;
+        setenv("DUMP", gm2_fold, 1);
+        rc = qwen38_main_unused(4, argvm2);
+        qt_gpu_miss_more(&gm_prom, &gm_fld);
+        tk(rc == 0 && mx_appends > 0 && gm_fld > 0, "QT_GPU_MISS_FOLD=1 folds miss groups behind hit groups");
+        qt_shutdown();
+        dump_rel(gm2_fold, gm2_base, &same);
+        tk(same, "QT_GPU_MISS_FOLD=1 matches QT_GPU_MISS=2 to the bit");
+
+        setenv("Q38_ASYNC_MISS", "1", 1);
+        g_q38_async_miss_layers = 0;
+        setenv("DUMP", gm2_async, 1);
+        rc = qwen38_main_unused(4, argvm2);
+        tk(rc == 0 && g_q38_async_miss_layers > 0, "Q38_ASYNC_MISS=1 stages decode misses as reads land");
+        qt_shutdown();
+        dump_rel(gm2_async, gm2_base, &same);
+        tk(same, "Q38_ASYNC_MISS=1 matches QT_GPU_MISS=2 to the bit");
+
+        fake_append_hook = NULL; fake_group_hook = NULL; fake_group_out = NULL; fake_own_mx4 = 0; fake_host_reg_ok = 0;
+        unsetenv("Q38_ASYNC_MISS"); unsetenv("QT_GPU_MISS_FOLD"); unsetenv("QT_GPU_MISS_PROMOTE");
+        unsetenv("QT_GPU_MISS"); unsetenv("QT_ARENA");
         unsetenv("Q38_EXPERT_LOWBIT"); unsetenv("DUMP");
     } else if (argc > 1) {
         /* Third pass: the int4-g64 sidecar. The tier must stay off -- no

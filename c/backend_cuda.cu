@@ -156,6 +156,7 @@ typedef struct {
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
+    int group_pending_rows,group_pending_count,group_pending_mx4;   /* its rows and entries; MXFP4: its I (else 0), for coli_cuda_expert_group_append */
     void *moe_tab; size_t moe_tab_cap; float *moe_host; size_t moe_host_cap;   /* group_moe_launch's table and row ids */
     bd_u32 *bdtab;          /* blockdec_host.h's table, made with the first block-format tensor */
     size_t smem_optin;      /* shared bytes a block may ask for (the block GEMVs past 48 KiB) */
@@ -2294,6 +2295,39 @@ extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights
         !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale overwrite")) return 0;
     return upload_settled("tensor overwrite");
 }
+/* On ctx->stream, where coli_cuda_expert_group_issue launches: the group kernel
+ * runs after these copies without a host sync. cudaMemcpyDefault: the source may
+ * also be device memory of this card (QT_GPU_MISS_PROMOTE copies a transient slot
+ * into a resident's), unified addressing tells the two apart. */
+extern "C" int coli_cuda_tensor_overwrite_async(ColiCudaTensor *t, const void *weights, const float *scales) {
+    if (!t) return 1;                       /* probe */
+    if (!weights || !t->weights || !(t->weights_owned || t->view)) return 0;
+#ifdef COLI_ANS
+    if (t->compressed) return 0;
+#endif
+    if (t->fmt && t->fmt != 6 && (!scales || !t->scales)) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(t->weights, weights, t->weight_bytes, cudaMemcpyDefault, ctx->stream), "tensor overwrite async")) return 0;
+    if (t->fmt==2||t->fmt==4) {
+        offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256,0,ctx->stream>>>((uint8_t*)t->weights,t->weight_bytes);
+        if (!cuda_ok(cudaGetLastError(),"int4 weight conversion")) return 0;
+    }
+    if (t->fmt && t->fmt != 6 &&
+        !cuda_ok(cudaMemcpyAsync(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyDefault, ctx->stream), "scale overwrite async")) return 0;
+    return 1;
+}
+/* cudaMallocHost memory is portable across devices under unified addressing */
+extern "C" void *coli_cuda_host_alloc(size_t bytes) {
+    void *p = nullptr;
+    return cuda_ok(cudaMallocHost(&p, bytes), "pinned host allocation") ? p : nullptr;
+}
+extern "C" void coli_cuda_host_free(void *p) { if (p) cudaFreeHost(p); }
+extern "C" int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!dst || !src || !select_ctx(ctx)) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, ctx->stream), "copy async");
+}
 
 #ifdef COLI_ANS
 struct AnsSidecarHeader {
@@ -3367,6 +3401,80 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                 "expert group issue download")) return 0;
     ctx->group_pending=1; ctx->group_pending_bytes=xb;
+    ctx->group_pending_rows=total; ctx->group_pending_count=count; ctx->group_pending_mx4=all_mx4?I:0;
+    { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+      int index=(int)(ctx-g_ctx);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
+      g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
+      g_device_group_rows[index]+=(uint64_t)total; }
+    return 1;
+}
+
+/* A second group behind the one in flight on a device (QT_GPU_MISS_FOLD: a layer's routed
+ * misses behind its hits), MXFP4 experts only: its rows follow the pending group's in x and
+ * y and its kernels queue on the stream with no host wait; coli_cuda_expert_group_take then
+ * returns the pending group's rows followed by these. Each row is computed by
+ * coli_cuda_expert_group_issue's kernels from the same inputs, so its bits are the same.
+ * 0 = nothing appended (no MXFP4 group pending, more than 32 rows in all, an allocation
+ * failure): the pending group's rows are still its take's, and the caller takes it and
+ * issues as before. All-NULL arguments: the probe, 1. */
+extern "C" int coli_cuda_expert_group_append(ColiCudaTensor *const *gates,
+                                               ColiCudaTensor *const *ups,
+                                               ColiCudaTensor *const *downs,
+                                               const int *rows, int count,
+                                               const float *x) {
+    if (!gates && !ups && !downs && !rows && !x) return 1;
+    if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64 || !gates[0]) return 0;
+    int device=gates[0]->device,D=gates[0]->I,I=gates[0]->O,total=0;
+    DeviceContext *ctx=find_ctx(device);
+    if(!ctx||!ctx->group_pending||ctx->group_pending_mx4!=I) return 0;
+    int r0=ctx->group_pending_rows,c0=ctx->group_pending_count;
+    if(c0+count>64) return 0;
+    GroupDesc host[64];
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
+        if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
+           g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D||g->fmt!=7||u->fmt!=7||d->fmt!=7) return 0;
+#ifdef COLI_ANS
+        if(g->compressed||u->compressed||d->compressed) return 0;
+#endif
+        host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
+                 g->fmt,u->fmt,d->fmt,rows[c],r0+total,
+                 g->gs,u->gs,d->gs};
+        total+=rows[c];
+    }
+    size_t xb=(size_t)total*D*sizeof(float),x0=(size_t)r0*D*sizeof(float);
+    if(r0+total>32||ctx->group_pending_bytes!=x0||!select_ctx(ctx)) return 0;
+    if(ctx->x_cap<x0+xb||ctx->y_cap<x0+xb||ctx->gate_cap<(size_t)(r0+total)*I*sizeof(float)||
+       ctx->host_x_cap<x0+xb||ctx->host_y_cap<x0+xb||
+       ctx->group_desc_cap<(size_t)(c0+count)*sizeof(GroupDesc)){
+        /* The scratch buffers were sized by smaller groups and cannot grow under a group in
+         * flight: wait for the pending group once, keep its rows, and size everything for a
+         * full group (32 rows, 64 entries) so no later append comes here. host_y first: after
+         * a failure it either holds the pending rows or is NULL, and the take says so. */
+        if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group append regrow")) return 0;
+        std::vector<float> keep(ctx->host_y,ctx->host_y+(size_t)r0*D);
+        size_t fx=(size_t)32*D*sizeof(float),fi=(size_t)32*I*sizeof(float);
+        if(!reserve_pinned(&ctx->host_y,&ctx->host_y_cap,fx)) return 0;
+        std::memcpy(ctx->host_y,keep.data(),x0);
+        if(!reserve_pinned(&ctx->host_x,&ctx->host_x_cap,fx)||
+           !reserve(&ctx->x,&ctx->x_cap,fx)||!reserve(&ctx->y,&ctx->y_cap,fx)||
+           !reserve(&ctx->gate,&ctx->gate_cap,fi)||
+           !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,64*sizeof(GroupDesc))) return 0;
+    }
+    GroupDesc *dev=(GroupDesc*)ctx->group_desc+c0;
+    float *hx=ctx->host_x+(size_t)r0*D,*px=ctx->x+(size_t)r0*D,*py=ctx->y+(size_t)r0*D;
+    std::memcpy(hx,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(dev,host,(size_t)count*sizeof(GroupDesc),
+                                cudaMemcpyHostToDevice,ctx->stream),
+                "expert group append descriptors")||
+       !cuda_ok(cudaMemcpyAsync(px,hx,xb,cudaMemcpyHostToDevice,ctx->stream),
+                "expert group append upload")) return 0;
+    mx4_group_launch(ctx,dev,I,D,count);
+    if(!cuda_ok(cudaGetLastError(),"expert group append launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y+(size_t)r0*D,py,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                "expert group append download")) return 0;
+    ctx->group_pending_rows=r0+total; ctx->group_pending_count=c0+count; ctx->group_pending_bytes=x0+xb;
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       int index=(int)(ctx-g_ctx);
       g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
