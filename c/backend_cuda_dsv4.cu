@@ -3689,6 +3689,12 @@ static int init_fail(const int *dev,int n,int touched,int a,int b){
     dev_release(touched);
     for(int i=1;i<n;i++)if(dev[i]!=dev[0]&&cudaSetDevice(dev[i])==cudaSuccess)cudaDeviceReset();
     cudaGetLastError();return 0;}
+/* DSV4_CUDA_STREAM_PRIORITY=1: the inference streams (stream, aux) take the current
+ * device's highest priority. Background kernels on default-priority streams (e.g.
+ * concurrent copy or helper streams) then yield the SMs to attention/mHC/MoE as
+ * their blocks retire instead of running whole grids ahead of them. Unset or 0 keeps
+ * the default priority (the historical behaviour). */
+static int inference_stream_priority(void){const char*s=getenv("DSV4_CUDA_STREAM_PRIORITY");int least=0,greatest=0;if(!s||!atoi(s)||cudaDeviceGetStreamPriorityRange(&least,&greatest)!=cudaSuccess){(void)cudaGetLastError();return 0;}static int said;if(!said){said=1;fprintf(stderr,"[DSV4 CUDA] inference streams at priority %d (range %d..%d)\n",greatest,least,greatest);}return greatest;}
 extern "C" int dsv4_cuda_init(const int *dev,int n){if(!dev||n<1||n>16||g_cuda_lost||ng)return 0;
     for(int i=0;i<n;i++){
         cudaDeviceProp p{};
@@ -3698,7 +3704,7 @@ extern "C" int dsv4_cuda_init(const int *dev,int n){if(!dev||n<1||n>16||g_cuda_l
             cudaGetLastError();return 0;}
         for(int j=0;j<i;j++)if(dev[j]==dev[i])return 0;
     }
-    float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return init_fail(dev,n,i+1,dev[i],-1);g[i].sms=p.multiProcessorCount;g[i].sm=p.major*10+p.minor;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){
+    float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithPriority(&g[i].stream,cudaStreamNonBlocking,inference_stream_priority()),"stream")||!ok(cudaStreamCreateWithPriority(&g[i].aux,cudaStreamNonBlocking,inference_stream_priority()),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return init_fail(dev,n,i+1,dev[i],-1);g[i].sms=p.multiProcessorCount;g[i].sm=p.major*10+p.minor;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){
     int can=0;cudaError_t q=cudaDeviceCanAccessPeer(&can,dev[i],dev[j]);
     if(q!=cudaSuccess){if(!g_peer_best_effort)return init_fail(dev,n,n,dev[i],dev[j]);const char*why=cudaGetErrorString(q);cudaGetLastError();fprintf(stderr,"[DSV4 CUDA] peer query %d -> %d unavailable (%s); continuing without peer access\n",dev[i],dev[j],why);continue;}
     if(!can)continue;
