@@ -316,8 +316,8 @@ endif
 # CUDA target selection. Default `native` builds SASS for the build machine's GPU
 # only (fast local dev). A headless CI/Docker build has no GPU, so `-arch=native`
 # there detects nothing and the shipped coli_cuda.dll fails at first kernel dispatch.
-# For a portable/release DLL that runs on any Ampere..Blackwell card AND JITs on
-# newer archs, build with CUDA_ARCH=portable: it emits SASS for sm_80/86/89/90/120
+# For a portable/release DLL that runs on any Turing..Blackwell card AND JITs on
+# newer archs, build with CUDA_ARCH=portable: it emits SASS for sm_75/80/86/89/90/120
 # plus a compute_120 PTX fallback (sm_120 / RTX 50-series needs CUDA >= 12.8).
 # sm_121 (GB10 Spark) needs CUDA >= 12.9, so its gencode joins only when the
 # detected toolkit supports it — the portable floor stays 12.8. The version
@@ -325,7 +325,8 @@ endif
 # compute_120 PTX still JITs on sm_121).
 CUDA_ARCH ?= native
 ifeq ($(CUDA_ARCH),portable)
-CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
+CUDA_GENCODE = -gencode arch=compute_75,code=sm_75 \
+               -gencode arch=compute_80,code=sm_80 \
                -gencode arch=compute_86,code=sm_86 \
                -gencode arch=compute_89,code=sm_89 \
                -gencode arch=compute_90,code=sm_90 \

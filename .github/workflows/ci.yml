@@ -2315,11 +2315,11 @@ jobs:
           cd c
           # CUDA_ARCH is explicit: the default is `native`, which asks the driver
           # what card is present, and there is none here. `portable` is the DLL
-          # a Windows user can download and run: SASS for sm_80/86/89/90/120
-          # plus PTX, one file for the 30xx, 40xx and 50xx cards (#1405). The
+          # a Windows user can download and run: SASS for sm_75/80/86/89/90/120
+          # plus PTX, one file for the 16xx, 20xx, 30xx, 40xx and 50xx cards (#1405). The
           # runner cannot execute it; the artifact below is for the people who
           # can, until the release ships it.
-          # --threads 0: nvcc compiles the portable fatbin's five architectures at once
+          # --threads 0: nvcc compiles the portable fatbin's six architectures at once
           NVCC_APPEND_FLAGS="--threads 0" make cuda-dll CUDA_ARCH=portable
           test -f coli_cuda.dll || { echo "cuda-dll reported success but produced no DLL" >&2; exit 1; }
           ls -l coli_cuda.dll

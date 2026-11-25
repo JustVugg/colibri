@@ -39,7 +39,7 @@ The engines are built with Vulkan, their shaders in `shaders\`: `coli.cmd
 setup` runs them on a GPU with a Vulkan driver (NVIDIA's, AMD's and Intel's
 drivers all install one) and on the CPU everywhere else, with nothing to build.
 
-**NVIDIA, CUDA.** For an RTX 30, 40 or 50 series card (compute capability 8.0
+**NVIDIA, CUDA.** For a GTX 16, RTX 20, 30, 40 or 50 series card (compute capability 7.5
 and newer: A100, H100 and later too) the release also has
 **`colibri-<version>-windows-x86_64-cuda.zip`**. Unpack it into the same folder:
 it replaces `colibri.exe`, `glm53.exe`, `qwen36.exe`, `qwen38.exe`,

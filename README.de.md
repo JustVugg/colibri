@@ -398,7 +398,7 @@ Qwen3.8-Flash-Next, Qwen3.6 mit den Modellen, die es ausführt, OLMoE und die
 Entscheidungs-Engines (Laya, GLiNER2.5-Decide). Unter Windows ist die
 CUDA-Engine eine eigene DLL ([windows.md](docs/windows.md)), und jedes Release liefert
 sie bereits gebaut mit: `colibri-<version>-windows-x86_64-cuda.zip` enthält
-`coli_cuda.dll` (Karten mit Compute Capability 8.0 oder neuer) und die Engines colibri,
+`coli_cuda.dll` (Karten mit Compute Capability 7.5 oder neuer) und die Engines colibri,
 glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya und gliner_decide, die sie laden, mit den CUDA-DLLs von DeepSeek V4. Entpacke
 es über das Hauptarchiv, dann wählt die Einrichtung CUDA.
 

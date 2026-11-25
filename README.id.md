@@ -409,7 +409,7 @@ dan Qwen3.6 dengan model yang dijalankannya; juga OLMoE dan engine keputusan
 (Laya, GLiNER2.5-Decide). Di Windows, engine CUDA adalah DLL terpisah
 ([windows.md](docs/windows.md)), dan setiap rilis menyertakannya dalam bentuk
 siap pakai: `colibri-<versi>-windows-x86_64-cuda.zip` berisi `coli_cuda.dll`
-(kartu dengan compute capability 8.0 ke atas) dan engine colibri, glm53, qwen36, qwen38,
+(kartu dengan compute capability 7.5 ke atas) dan engine colibri, glm53, qwen36, qwen38,
 kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya, dan gliner_decide yang memuatnya, beserta DLL CUDA milik DeepSeek V4. Ekstrak di atas
 arsip utama, dan setup akan memilih CUDA.
 

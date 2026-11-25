@@ -175,9 +175,12 @@ class BackendChoice(unittest.TestCase):
 
     def test_nvidia_with_toolkit_takes_cuda(self):
         self.assertEqual(self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]))["backend"], "cuda")
-        # The Windows CUDA build is a separate MSVC build: Vulkan there.
-        self.assertEqual(self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]), platform="win32")["backend"],
-                         "vulkan")
+        # With MSVC+nvcc (can_build_cuda=True), Windows builds CUDA from source
+        tc = dict(TC_ALL, can_build=True, can_build_cuda=True, msvc_vcvars="C:/vcvars64.bat", nvcc="C:/cuda/bin/nvcc.exe")
+        self.assertEqual(self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]), tc=tc, platform="win32")["backend"], "cuda")
+        # Without compiler: falls back to Vulkan (release DLL only supports sm_80+)
+        tc_no_cuda = dict(TC_ALL, can_build=False, can_build_cuda=False)
+        self.assertEqual(self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]), tc=tc_no_cuda, platform="win32")["backend"], "vulkan")
 
     def test_nvidia_without_toolkit_falls_to_vulkan_and_says_how(self):
         tc = dict(TC_ALL, nvcc=None, can_build_cuda=False)
@@ -266,7 +269,7 @@ class BackendChoice(unittest.TestCase):
 
     def test_windows_cuda_package_takes_cuda_on_an_ampere_card(self):
         tc = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
-                  can_build_vulkan=False, can_build_cuda=False)
+                  can_build_vulkan=False, can_build_cuda=False, nvcc=None, msvc_vcvars=None)
         rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
                   "api_version_raw": (1 << 22) | (3 << 12) | 289}
         with tempfile.TemporaryDirectory() as here:
@@ -275,16 +278,11 @@ class BackendChoice(unittest.TestCase):
             decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), tc=tc, platform="win32", here=here)
             self.assertEqual(decision["backend"], "cuda")
             self.assertIn("coli_cuda.dll beside the engine", decision["reason"])
-            # a card older than the DLL's sm_80: Vulkan, saying why
+            # a 7.5 card works with the local DLL too (the portable floor is 7.5)
             old = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
             decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[old]), tc=tc, platform="win32", here=here)
-            self.assertEqual(decision["backend"], "vulkan")
-            self.assertIn("compute 8.0 and newer, and the NVIDIA GeForce RTX 2070 is compute 7.5",
-                          decision["reason"])
-            # unless CUDA is asked for by name
-            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[old]), tc=tc, platform="win32",
-                                   here=here, requested="cuda")
             self.assertEqual(decision["backend"], "cuda")
+            self.assertIn("coli_cuda.dll beside the engine", decision["reason"])
             # an engine without a CUDA path in that archive: Vulkan
             with no_cuda_path("olmoe"):
                 decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), family="olmoe", tc=tc,
@@ -294,9 +292,36 @@ class BackendChoice(unittest.TestCase):
             self.windows_cuda_here(here, dll=False)
             decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[dict(RTX, compute_cap="8.9")]),
                                    tc=tc, platform="win32", here=here)
-            self.assertEqual(decision["backend"], "vulkan")
-            self.assertEqual(decision["missing"][0][0], "cuda")
-            self.assertIn("windows-x86_64-cuda.zip", decision["missing"][0][1])
+            # with no DLL but Ampere card (8.9), the release CUDA package is fetched
+            self.assertEqual(decision["backend"], "cuda")
+            self.assertIn("release's CUDA backend", decision["reason"])
+
+    def test_windows_gcc_only_box_takes_the_release_cuda_package_above_the_floor(self):
+        # A local compiler but no CUDA toolchain (can_build, not can_build_cuda) lands
+        # in the release-CUDA branch of choose_backend: cards at or above the portable
+        # floor (7.5) take the package; older cards get the floor's reason instead.
+        tc = dict(TC_ALL, nvcc=None, msvc_vcvars=None, can_build=True, can_build_cuda=False,
+                  can_build_vulkan=True)
+        old = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
+        pascal = dict(RTX, name="NVIDIA GeForce GTX 1080", compute_cap="6.1")
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[old]), tc=tc, platform="win32")
+        self.assertEqual(decision["backend"], "cuda")
+        self.assertIn("release's CUDA backend", decision["reason"])
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[pascal]), tc=tc, platform="win32")
+        self.assertNotEqual(decision["backend"], "cuda")
+        self.assertIn("runs on compute 7.5", decision["reason"])
+
+    def test_a_blocked_local_toolkit_falls_back_to_the_release_cuda_package(self):
+        # can_build_cuda but the toolkit cannot build for the card (CUDA 11.0 vs sm_90):
+        # the release package runs on the card, so auto takes it (prebuilt_cuda) instead
+        # of failing inside make
+        tc = dict(TC_ALL, can_build=True, can_build_cuda=True, msvc_vcvars="C:/vcvars64.bat",
+                  nvcc="C:/cuda/bin/nvcc.exe", cuda_version="11.0", cuda_archs=None)
+        card = dict(RTX, compute_cap="9.0")
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), tc=tc, platform="win32")
+        self.assertEqual(decision["backend"], "cuda")
+        self.assertTrue(decision.get("prebuilt_cuda"))
+        self.assertIn("release's CUDA backend", decision["reason"])
 
     def test_windows_without_engines_takes_the_release_cuda_backend(self):
         # #2091: with nothing here, the setup takes the Windows release, whose CUDA
@@ -317,17 +342,18 @@ class BackendChoice(unittest.TestCase):
                                        platform="win32")
             self.assertEqual(decision["backend"], backend, version)
         self.assertEqual(decision["missing"], [])
+        # a 7.5 card takes the release CUDA package too (the portable floor is 7.5)
         old = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[old]), family="kimi", tc=tc, platform="win32")
-        self.assertEqual(decision["backend"], "vulkan")
-        self.assertIn("the release's coli_cuda.dll runs on compute 8.0", decision["reason"])
+        self.assertEqual(decision["backend"], "cuda")
+        self.assertIn("release's CUDA backend", decision["reason"])
         # an engine the release carries no CUDA build of, or a compiler here: as before
         with no_cuda_path("olmoe"):
             decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="olmoe", tc=tc, platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
-        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", platform="win32")
-        self.assertEqual(decision["backend"], "vulkan")
-        self.assertEqual(decision["missing"][0][0], "cuda")
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", tc=tc, platform="win32")
+        self.assertEqual(decision["backend"], "cuda")
+        self.assertIn("release's CUDA backend", decision["reason"])
         # and on Linux the release has no CUDA backend to fetch
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", tc=tc)
         self.assertNotEqual(decision["backend"], "cuda")
@@ -340,7 +366,7 @@ class BackendChoice(unittest.TestCase):
         release = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
                        can_build_vulkan=False, can_build_cuda=False)
         with mock.patch.object(setup_flow, "current_version", return_value="2.1.0"):
-            decision = self.choose(hw, family="glm53", platform="win32")
+            decision = self.choose(hw, family="glm53", tc=release, platform="win32")
             self.assertEqual(decision["backend"], "vulkan")
             self.assertEqual(decision["missing"], [])
             with tempfile.TemporaryDirectory() as here:
@@ -354,10 +380,11 @@ class BackendChoice(unittest.TestCase):
                 decision = self.choose(hw, family="glm53", tc=release, platform="win32", here=here)
                 self.assertEqual(decision["backend"], "cuda")
                 self.assertIn("coli_cuda.dll beside the engine", decision["reason"])
-        # with the release after it, the hint the other three engines get
+        # with the release after it, prebuilt CUDA works for 8.9 (floor is 7.5)
         with mock.patch.object(setup_flow, "current_version", return_value="2.2.0"):
-            decision = self.choose(hw, family="glm53", platform="win32")
-        self.assertEqual(decision["missing"], [("cuda", setup_flow.TEXT_HINTS["cuda-win32-release"])])
+            decision = self.choose(hw, family="glm53", tc=release, platform="win32")
+        self.assertEqual(decision["backend"], "cuda")
+        self.assertIn("release's CUDA backend", decision["reason"])
 
     def test_an_nvidia_card_with_no_path_says_why(self):
         # #2846: an A100 in TCC mode has no Vulkan device on Windows. Qwen3.8 takes the
@@ -402,9 +429,9 @@ class BackendChoice(unittest.TestCase):
         self.assertEqual(decision["missing"][0][0], "cuda")
         self.assertNotIn("gpu_unused", decision)
         # a card below the CUDA floor keeps its own reason
-        old = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
+        old = dict(RTX, name="NVIDIA GeForce GTX 1080", compute_cap="6.1")
         decision = self.choose(hw_report(nvidia=[old]), family="kimi", tc=tc, platform="win32")
-        self.assertIn("runs on compute 8.0", decision["reason"])
+        self.assertIn("runs on compute 7.5", decision["reason"])
         self.assertNotIn("gpu_unused", decision)
 
     def test_backend_vulkan_without_a_device_stops(self):
@@ -496,6 +523,68 @@ RTX5080 = {"index": 0, "name": "NVIDIA GeForce RTX 5080", "total_bytes": 16303 *
            "free_bytes": 15000 * 2**20, "driver": "580.65", "compute_cap": "12.0"}
 GTX970 = {"index": 0, "name": "NVIDIA GeForce GTX 970", "total_bytes": 4096 * 2**20,
           "free_bytes": 3900 * 2**20, "driver": "535.183", "compute_cap": "5.2"}
+
+
+class NvccDetectionTests(unittest.TestCase):
+    """_nvcc finds the toolkit where the CUDA installer put it: PATH, then on Windows
+    CUDA_PATH and the versioned CUDA_PATH_V<major>_<minor>[_64] variables (newest
+    first), then CUDA_HOME — with nvcc.exe on Windows, plain nvcc elsewhere."""
+
+    def _nvcc_with_env(self, platform, extra):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CUDA_")}
+        env.update(extra)
+        with mock.patch.object(setup_flow.sys, "platform", platform), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(setup_flow.shutil, "which", return_value=None):
+            return setup_flow._nvcc()
+
+    def test_windows_versioned_cuda_path_vars_newest_first(self):
+        with tempfile.TemporaryDirectory() as root:
+            for ver in ("11_8", "12_6"):
+                bin_dir = os.path.join(root, ver, "bin")
+                os.makedirs(bin_dir)
+                Path(bin_dir, "nvcc.exe").write_bytes(b"")
+            env = {"CUDA_PATH_V11_8_64": os.path.join(root, "11_8"),
+                   "CUDA_PATH_V12_6_64": os.path.join(root, "12_6"),
+                   "CUDA_PATH": "", "CUDA_HOME": ""}
+            self.assertEqual(self._nvcc_with_env("win32", env),
+                             os.path.join(root, "12_6", "bin", "nvcc.exe"))
+
+    def test_windows_cuda_path_uses_nvcc_exe(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "bin"))
+            Path(root, "bin", "nvcc.exe").write_bytes(b"")
+            env = {"CUDA_PATH": root, "CUDA_HOME": ""}
+            self.assertEqual(self._nvcc_with_env("win32", env),
+                             os.path.join(root, "bin", "nvcc.exe"))
+
+    def test_linux_cuda_home_uses_plain_nvcc(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "bin"))
+            Path(root, "bin", "nvcc").write_bytes(b"")
+            self.assertEqual(self._nvcc_with_env("linux", {"CUDA_HOME": root}),
+                             os.path.join(root, "bin", "nvcc"))
+
+    def test_no_toolkit_anywhere(self):
+        self.assertIsNone(self._nvcc_with_env("win32", {"CUDA_PATH": "", "CUDA_HOME": ""}))
+
+
+class CudaDllFreshnessTests(unittest.TestCase):
+    """_cuda_dll_fresh: a refresh skips the cuda-dll build when coli_cuda.dll is newer
+    than everything `make cuda-dll` compiles."""
+
+    def test_cuda_dll_freshness(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(setup_flow, "HERE", d):
+                dll = os.path.join(d, "coli_cuda.dll")
+                src = os.path.join(d, "backend_cuda.cu")
+                Path(src).write_bytes(b"//")
+                Path(dll).write_bytes(b"MZ")
+                os.utime(src, (1000, 1000))
+                os.utime(dll, (2000, 2000))
+                self.assertTrue(setup_flow._cuda_dll_fresh(dll))
+                os.utime(src, (3000, 3000))
+                self.assertFalse(setup_flow._cuda_dll_fresh(dll))
 
 
 class CudaToolkit(unittest.TestCase):
@@ -1197,8 +1286,8 @@ class Releases(HomeTestCase):
         sums = f"{hashlib.sha256(archive).hexdigest()}  {name}\n".encode()
         urls = self.serve_release({name: archive, "SHA256SUMS.txt": sums}, folder=os_name)
         getter = lambda url: {"tag_name": tag, "assets": [{"name": n, "browser_download_url": u}
-                                                          for n, u in urls.items()]}
-        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+                                                           for n, u in urls.items()]}
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False, can_build_cuda=False)
         empty = os.path.join(self.tmp.name, f"nothing-here-{os_name}-{vulkan}")
         os.makedirs(empty)
         home = os.path.join(self.tmp.name, f"home-{os_name}-{vulkan}")
@@ -1254,7 +1343,7 @@ class Releases(HomeTestCase):
     def test_the_windows_release_brings_its_cuda_backend(self):
         # #2091: a CUDA choice on Windows with no engine here takes the release's
         # engines and unpacks its CUDA backend over them
-        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False, can_build_cuda=False)
         # The modeled host's processor, not the one running the test (as in
         # prebuilt_download above): a host whose detect_cpu reports no AVX2 is
         # rightly refused the prebuilt engine, which this download must not hit.
@@ -1287,7 +1376,7 @@ class Releases(HomeTestCase):
         # GLM-5.3-Flash with that release runs the main archive's Vulkan build, as with
         # no package at all, and downloads no package; before, the engine fell to the
         # CPU ("no cuda build"). The package of a later release has glm53.exe
-        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False, can_build_cuda=False)
         for tag, carried in (("v2.1.0", False), ("v2.2.0", True)):
             with self.subTest(tag=tag):
                 empty = os.path.join(self.tmp.name, f"nothing-here-{tag}")
@@ -1944,7 +2033,7 @@ class WholeSetup(HomeTestCase):
         self.assertNotIn("status", result)                     # --no-start
 
     def test_no_compiler_and_no_prebuilt_says_what_to_install(self):
-        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False, can_build_cuda=False)
         os.remove(os.path.join(self.engines, "qwen36"))
         with modeled("linux", machine="riscv64"):               # no release archive for it
             with self.assertRaises(setup_flow.SetupError) as caught:
@@ -1956,7 +2045,7 @@ class WholeSetup(HomeTestCase):
         # #1979: the prebuilt engines assume x86-64-v3 and stopped on their first AVX2
         # instruction on a Xeon E3-1230 V2. Without a compiler setup says so, with what
         # to install, instead of fetching an archive that cannot run.
-        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False, can_build_cuda=False)
         os.remove(os.path.join(self.engines, "qwen36"))
         old = {"arch": "x86_64", "name": "Intel Xeon E3-1230 V2", "features": []}
         fetched = setup_flow.SetupError("fetched")
@@ -2528,7 +2617,7 @@ class ConfiguredCuda(Releases):
         engines = os.path.join(self.tmp.name, "colibri-2.1.0")
         self.windows_engines(engines)
         for kwargs in ({"requested": "vulkan"}, {"requested": "cpu", "backend": "cpu"},
-                       {"cards": [{"name": "NVIDIA GeForce RTX 2070", "compute_cap": "7.5"}]},
+                       {"cards": [{"name": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1"}]},
                        {"cards": []}):
             with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
                 cfg = self.configured(engines, **kwargs)
