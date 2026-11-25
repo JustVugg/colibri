@@ -2522,7 +2522,7 @@ static int q38_psd_on(Model *m){
 #endif
         /* the knobs that pick the prefill's kernels: their states' bits are not the same */
         static const char *knobs[]={"COLI_CUDA","COLI_CUDA_CHAIN","COLI_VULKAN","COLI_VK_CHAIN","Q38_TRUNK_GPU","Q38_DN_GPU",
-                                    "Q38_EXPERT_INT4","Q38_EXPERT_INT2","Q38_EXPERT_LOWBIT","Q38_TRUNK_CPU_INT8",
+                                    "Q38_INT4_TIER","Q38_EXPERT_INT4","Q38_EXPERT_INT2","Q38_EXPERT_LOWBIT","Q38_TRUNK_CPU_INT8",
                                     "Q38_TRUNK_CPU_INT4","Q38_TRUNK_MIN_KB","Q38_FP8_KERNEL","Q38_NATIVE_FP8",
                                     "Q38_NATIVE_BF16","Q38_PREFILL_BATCH","Q38_MTP","Q38_KV","GQ_EXACT","Q38_ILV16",
                                     "Q38_MOE_GROUPED","Q38_TRUNK_INT4_HEAD"};
@@ -3842,7 +3842,7 @@ int main(int argc, char **argv) {
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     if(is_ref){g_q38_mtp_oracle=full;g_q38_mtp_oracle_n=nfull;}   /* Q38_MTP_FORCE=accept|mixed */
     int64_t hist = q38_telemetry_init(snap, &m);
-    if (g_q38_gguf_tier || g_q38_mx4_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
+    if (g_q38_gguf_tier || g_q38_mx4_tier || g_q38_int4_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
 #ifdef COLI_CUDA
     if (g_cuda_chain) q38cc_dm_recheck(&m);   /* every expert on the card: the frame takes them, whatever the RAM cache's size */
     if (g_cuda_chain) q38cc_pool_init(&m);    /* the experts the card leaves, in RAM it reads over the bus */

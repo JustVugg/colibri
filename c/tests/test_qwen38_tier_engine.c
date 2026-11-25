@@ -308,23 +308,94 @@ int main(int argc, char **argv_in) {
         tk(same, "two runs with the same residency give the same bits");
         unsetenv("Q38_EXPERT_LOWBIT"); unsetenv("DUMP");
     } else if (argc > 1) {
-        /* Third pass: the int4-g64 sidecar. The tier must stay off -- no
-         * upload, no routed expert ever consulted -- and the CPU must answer
-         * every expert from the sidecar, matching the int4 reference. */
-        printf(" int4-g64 experts (%s)\n", argv_in[1]);
-        char ref[2048]; snprintf(ref, sizeof ref, "%s/ref_int4.json", argv_in[1]);
+        /* Third pass: the int4-g64 sidecar. By default (Q38_INT4_TIER unset) the
+         * tier stays off -- opt-in only -- and the CPU reproduces ref_int4.json.
+         * With Q38_INT4_TIER=1: unaligned geometries (hidden/inter not multiples
+         * of 64) are declined; aligned geometries start in fmt 4 gs 64 copy mode
+         * (qt_source_planar(1)), upload planar-to-pairs triples, route residents,
+         * match the CPU run bit-for-bit when groups are refused, and refuse
+         * pointer mode (cap >= experts). */
+        const char *snap = argv_in[1];
+        Cfg cfg; q38_load_cfg(&cfg, snap);
+        printf(" int4-g64 experts (%s, hidden=%d inter=%d experts=%d)\n", snap, cfg.hidden, cfg.inter, cfg.experts);
+        char ref[2048]; snprintf(ref, sizeof ref, "%s/ref_int4.json", snap);
         char *argv4[] = { (char *)"qwen38", (char *)"2", (char *)"8", ref };
-        setenv("SNAP", argv_in[1], 1);
+        setenv("SNAP", snap, 1);
         setenv("Q38_EXPERT_INT4", "1", 1);
+        setenv("Q38_TRUNK_GPU", "0", 1);
+        setenv("COLI_PLACE", "off", 1);
+        unsetenv("Q38_TRUNK_MIN_KB");
+        unsetenv("Q38_INT4_TIER");
         fake_uploads = 0; fake_dense_compute = 0;
         unsigned long long before = G.miss; for (int i = 0; i < QT_MAX_DEV; i++) before += G.hits[i];
         rc = qwen38_main_unused(4, argv4);
-        tk(rc == 0, "engine with int4 experts under COLI_CUDA=1 reproduces the int4 reference");
-        tk(!G.on && !G_fp8_stream, "the tier declined: it streams native FP8 experts only");
+        tk(rc == 0, "engine with int4 experts under COLI_CUDA=1 (Q38_INT4_TIER unset) reproduces the int4 reference");
+        tk(!G.on && !G_fp8_stream, "the tier declined by default (Q38_INT4_TIER is opt-in)");
         tk(fake_uploads == 0 && qt_dense_count() == 0, "nothing was uploaded, experts or trunk");
         unsigned long long consulted = G.miss; for (int i = 0; i < QT_MAX_DEV; i++) consulted += G.hits[i];
         tk(consulted == before, "qt_issue never took a routed expert off the CPU");
+
+        setenv("Q38_INT4_TIER", "1", 1);
+        if (cfg.hidden % 64 || cfg.inter % 64) {
+            fake_uploads = 0;
+            rc = qwen38_main_unused(4, argv4);
+            tk(rc == 0, "Q38_INT4_TIER=1 on unaligned geometry reproduces the int4 reference on CPU");
+            tk(!G.on && fake_uploads == 0, "Q38_INT4_TIER=1 declines hidden/inter not multiples of 64");
+        } else {
+            char cpu[2048], refused[2048], cap_full[32];
+            snprintf(cpu, sizeof cpu, "%s/tier_int4_cpu.f32", snap);
+            snprintf(refused, sizeof refused, "%s/tier_int4_refused.f32", snap);
+            snprintf(cap_full, sizeof cap_full, "%d", cfg.experts);
+            char *argv4_c1[] = { (char *)"qwen38", (char *)"1", (char *)"8", ref };
+            char *argv4_full[] = { (char *)"qwen38", cap_full, (char *)"8", ref };
+            size_t int4_bytes = 3 * dev_alloc_footprint((size_t)cfg.hidden * cfg.inter / 2)
+                              + 2 * dev_alloc_footprint((size_t)cfg.inter * (cfg.hidden / 64) * sizeof(float))
+                              + dev_alloc_footprint((size_t)cfg.hidden * (cfg.inter / 64) * sizeof(float));
+            snprintf(gb, sizeof gb, "%.15f", (double)(6 * int4_bytes + int4_bytes / 2) / 1073741824.0);
+            setenv("CUDA_EXPERT_GB", gb, 1);
+            G_offer_n = 0;
+
+            setenv("COLI_CUDA", "0", 1); setenv("DUMP", cpu, 1);
+            rc = qwen38_main_unused(4, argv4_c1);
+            tk(rc == 0, "the CPU on the int4-g64 sidecar reproduces the int4 reference (cap 1)");
+
+            setenv("COLI_CUDA", "1", 1); setenv("DUMP", refused, 1);
+            fake_uploads = 0;
+            rc = qwen38_main_unused(4, argv4_c1);
+            qt_fill_wait();
+            tk(rc == 0, "Q38_INT4_TIER=1 on the fake tier reproduces the int4 reference");
+            tk(G.on && G.wfmt == 4 && G.egs == 64 && qt_streaming() && G_src_planar,
+               "tier started from q38_tier_start in fmt 4 gs 64 copy mode with planar source");
+            tk(G.exp_bytes == int4_bytes, "exp_bytes: three int4 nibble matrices and three f32 group-scale tables");
+            tk(fake_uploads > 0 && fake_uploads % 3 == 0 && last_fmt == 4 && last_bytes == (size_t)G.D * G.Ih / 2,
+               "fmt 4 uploads in triples, half a byte per weight");
+            pthread_mutex_lock(&G.mx);
+            unsigned long long ihits = 0; for (int i = 0; i < G.ndev; i++) ihits += G.hits[i];
+            int ires = 0, istale = 0;
+            for (int l = 0; l < G.nl; l++) for (int e = 0; e < G.ne; e++) {
+                ires += qs(l, e)->resident;
+                istale += (qs(l, e)->g4 != NULL || qs(l, e)->gs != NULL);
+            }
+            size_t iused = G.used[0];
+            pthread_mutex_unlock(&G.mx);
+            tk(ihits > 0 && ires > 0 && ires <= 6 && iused == (size_t)ires * G.exp_bytes,
+               "int4 residents routed (hits), within the six-expert budget, bytes accounted per resident");
+            tk(istale == 0, "no int4 slot keeps a pointer into the engine's recycled RAM slab");
+            int same = 0; double rel = dump_rel(refused, cpu, &same);
+            tk(rel >= 0 && same, "every int4 group refused: the last logits are the CPU run's to the bit");
+            qt_shutdown();
+            tk(!G.on && !G_src_planar, "shutdown leaves int4 tier mode and clears planar flag");
+
+            /* Pointer mode (cap >= experts) must be refused because LRU slabs are recycled */
+            unsetenv("DUMP");
+            fake_uploads = 0;
+            rc = qwen38_main_unused(4, argv4_full);
+            tk(rc == 0, "Q38_INT4_TIER=1 with cap >= experts falls back to CPU and reproduces the reference");
+            tk(!G.on && fake_uploads == 0, "Q38_INT4_TIER=1 refuses pointer mode (cap >= experts)");
+        }
+        unsetenv("Q38_INT4_TIER");
         unsetenv("Q38_EXPERT_INT4");
+        unsetenv("DUMP");
     }
 
     if (t_fails) { printf("test_qwen38_tier_engine: %d failure(s)\n", t_fails); return 1; }

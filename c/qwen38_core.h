@@ -3618,6 +3618,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
  * is what q38_bind_fp8_slot() produces, an expanded slot points elsewhere. */
 static int g_q38_gguf_tier;   /* the tier holds a GGUF's experts as the file has them (q38_tier_start) */
 static int g_q38_mx4_tier;    /* the tier holds the experts-mxfp4/ records' matrices, fmt 7 (q38_tier_start) */
+static int g_q38_int4_tier;   /* the tier holds the experts-int4g64/ records' matrices, fmt 4 gs 64 (q38_tier_start) */
 static void q38_tier_note(int layer,int eid,const Slot *ex) {
     if(g_q38_mx4_tier){
         /* the record's codes and ue8m0 bytes, where the slot points into it (the tier copies them
@@ -3625,6 +3626,36 @@ static void q38_tier_note(int layer,int eid,const Slot *ex) {
         if(!qt_ready()||ex->gate.kind!=Q38_WEIGHT_MXFP4)return;
         qt_note(layer,eid,(const uint8_t*)ex->gate.data,(const uint8_t*)ex->up.data,(const uint8_t*)ex->down.data,
                 (const float*)ex->gate.x2q,(const float*)ex->up.x2q,(const float*)ex->down.x2q);
+        return;
+    }
+    if(g_q38_int4_tier){
+        /* planar int4-g64 codes and f32 group scales (the tier converts planar -> pairs and copies
+         * before qt_note returns); an xf16-interleaved slot is unpacked only when the tier wants it */
+        if(!qt_ready()||ex->gate.kind!=Q38_WEIGHT_INT4G64)return;
+#ifdef XF16_ON
+        if(ex->gate.r16){
+            if(!qt_note_wanted(layer,eid)){ qt_note_heat(layer,eid); return; }
+            const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down};
+            static __thread uint8_t *buf; static __thread size_t cap;
+            size_t off[4]={0},cb[3]={0};
+            for(int k=0;k<3;k++){
+                cb[k]=(size_t)w[k]->rows*xf_row_bytes(w[k]->cols);
+                off[k+1]=off[k]+cb[k]+(size_t)w[k]->rows*xf_groups(w[k]->cols)*sizeof(float);
+            }
+            if(off[3]>cap){ uint8_t *nb=(uint8_t*)realloc(buf,off[3]); if(!nb)return; buf=nb; cap=off[3]; }
+            const uint8_t *cd[3]; const float *sc[3];
+            for(int k=0;k<3;k++){
+                uint8_t *b=buf+off[k]; float *s=(float*)(b+cb[k]);
+                xf16_unpack(b,s,(const uint8_t*)w[k]->data,w[k]->rows,w[k]->cols);
+                cd[k]=b; sc[k]=s;
+            }
+            qt_note(layer,eid,cd[0],cd[1],cd[2],sc[0],sc[1],sc[2]);
+            return;
+        }
+#endif
+        if(!ex->gate.data||!ex->up.data||!ex->down.data||!ex->gate.scales||!ex->up.scales||!ex->down.scales)return;
+        qt_note(layer,eid,(const uint8_t*)ex->gate.data,(const uint8_t*)ex->up.data,(const uint8_t*)ex->down.data,
+                ex->gate.scales,ex->up.scales,ex->down.scales);
         return;
     }
     if(g_q38_gguf_tier){
@@ -4199,6 +4230,16 @@ static void q38_tier_warm(Model *m,int hist) {
                                 (const float*)(buf+so[0]),(const float*)(buf+so[1]),(const float*)(buf+so[2]));
                 continue;
             }
+            if(g_q38_int4_tier){   /* one int4-g64 record: planar codes then f32 group scales */
+                const Q38Int4Experts *x=m->x4; const size_t rb=(size_t)x->record_bytes;
+                if(rb>cap){uint8_t *nb=(uint8_t*)realloc(buf,rb);if(nb){buf=nb;cap=rb;}}
+                if(rb>cap||!q38_layer_int4(m,pl[i])){qt_note_planned(pl[i],pe[i],NULL,NULL,NULL,NULL,NULL,NULL);continue;}
+                q38_x4_read(m,pl[i],pe[i],buf,(int64_t)rb,"pread Qwen3.8 int4-g64 expert (tier warm start)");
+                const uint8_t *g=buf,*u=g+x->code_bytes[0],*d=u+x->code_bytes[1];
+                const float *gs=(const float*)(buf+x->scale_off),*us=gs+x->scale_count[0],*ds=us+x->scale_count[1];
+                qt_note_planned(pl[i],pe[i],g,u,d,gs,us,ds);
+                continue;
+            }
             const gguf_tensor *t[3]; q38_gg_expert_tensors(m,pl[i],t);
             int64_t eb[3]; size_t tot=0;
             for(int k=0;k<3;k++){eb[k]=t[k]->nbytes/E;tot+=(size_t)eb[k];}
@@ -4210,7 +4251,7 @@ static void q38_tier_warm(Model *m,int hist) {
     }
     qt_fill_wait();
     fprintf(stderr,"[qtier] qwen38: warm start, %d of the %s experts in VRAM, the history's most used first (%s) -- %.1f s\n",
-            n,g_q38_mx4_tier?"mxfp4":"GGUF's",hist?".coli_usage":"no history: expert by expert across the layers",now_s()-t0);
+            n,g_q38_mx4_tier?"mxfp4":g_q38_int4_tier?"int4-g64":"GGUF's",hist?".coli_usage":"no history: expert by expert across the layers",now_s()-t0);
     free(pl);free(pe);
 }
 #ifdef COLI_CUDA
@@ -4231,7 +4272,7 @@ static int q38_tier_offer_chain(Model *m) {
 #endif
 static void q38_tier_up(Model *m);
 static void q38_tier_start(Model *m,int cap) {
-    g_q38_mx4_tier=0;   /* per load: a process may open another model (the tests do) */
+    g_q38_mx4_tier=0; g_q38_int4_tier=0;   /* per load: a process may open another model (the tests do) */
     const char *on=getenv("COLI_CUDA");
     if(!on||on[0]!='1'||on[1])return;
     Cfg *c=&m->c;
@@ -4287,6 +4328,40 @@ static void q38_tier_start(Model *m,int cap) {
         } else
             fprintf(stderr,"[qtier] qwen38: the CUDA expert tier did not start; the mxfp4 experts stay on the CPU\n");
         return;
+    }
+    if(m->x4&&!m->x4->lb){
+        /* Opt-in int4-g64 sidecar on the CUDA tier (Q38_INT4_TIER=1): wfmt 4, groups of 64,
+         * in copy mode, fed by q38_tier_note and q38_tier_warm. The records are expert_ffn.h
+         * planar v+8, so qt_source_planar(1) is mandatory (staging converts planar -> pairs).
+         * Pointer mode (cap >= experts) would keep raw pointers into LRU slabs that a later
+         * miss reallocates, so it is refused. Off by default (0/unset). */
+        const char *t4=getenv("Q38_INT4_TIER");
+        if(t4&&t4[0]=='1'&&!t4[1]){
+            if(c->hidden%64||c->inter%64){
+                fprintf(stderr,"[qtier] qwen38: int4 tier needs hidden and moe_intermediate multiples of 64 (%d, %d); staying on the CPU\n",
+                        c->hidden,c->inter);
+                return;
+            }
+            if(cap>=c->experts){
+                fprintf(stderr,"[qtier] qwen38: int4 tier needs a RAM LRU smaller than the %d experts per layer (cap %d); staying on the CPU\n",
+                        c->experts,cap);
+                return;
+            }
+            q38_trunk_offer_all(m);
+#ifdef COLI_CUDA
+            q38_tier_offer_chain(m);
+#endif
+            qt_source_planar(1);
+            if(qt_init(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,64,1)){
+                g_q38_int4_tier=1;
+                fprintf(stderr,"[qtier] qwen38: int4-g64 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
+                q38_tier_up(m);
+            } else {
+                qt_source_planar(0);
+                fprintf(stderr,"[qtier] qwen38: the CUDA expert tier did not start; the int4-g64 experts stay on the CPU\n");
+            }
+            return;
+        }
     }
     if(m->x4){
         /* The tier streams e4m3 bytes (fmt 8) and copies them at qt_note; its
