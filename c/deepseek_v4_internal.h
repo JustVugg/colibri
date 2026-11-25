@@ -818,6 +818,12 @@ void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
 extern void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                               unsigned char *held, int experts);
 
+/* Count a routing the device served (pin ranking, HITS and EMAP heat, the
+ * .coli_usage history) without touching RAM cache hit/miss counters, and query
+ * an expert's persistent routing frequency for VRAM priority (V4_GPU_HOT_CACHE). */
+void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key);
+uint64_t coli_v4_expert_store_frequency(ColiExpertStore *store, ColiExpertKey key);
+
 /* Bytes a slab holds past its record. A direct read lands a 4 KiB-aligned
  * window of the file in the slab, and the record's weights stay where that
  * window put them (V4_SLAB_SHIFT): the scale run rounded up to a page, the
@@ -846,13 +852,10 @@ typedef struct {
 extern const ColiV4VkTier *coli_v4_vk_tier;
 
 /* The hot store's side of the tier (no-ops on another ExpertStore backend):
- * count a routing the device served (pin ranking, HITS and EMAP heat, the
- * .coli_usage history), its history as [layers][experts] counts, whether an
- * expert sits in the RAM cache now, and one expert read from disk into `buffer`
- * (record_bytes + 8192 bytes, 4096-aligned), outside the cache and its books,
- * row-major. device_tier, when set, marks an expert the device holds as tier 2
- * in EMAP. */
-void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key);
+ * its history as [layers][experts] counts, whether an expert sits in the RAM
+ * cache now, and one expert read from disk into `buffer` (record_bytes + 8192
+ * bytes, 4096-aligned), outside the cache and its books, row-major.
+ * device_tier, when set, marks an expert the device holds as tier 2 in EMAP. */
 uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store);
 int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key);
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);

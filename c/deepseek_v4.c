@@ -11634,15 +11634,6 @@ void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
     pthread_mutex_unlock(&state->mutex);
 }
 
-#if defined(COLI_VULKAN) || defined(COLI_CUDA)
-/* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
- * routing the device served never comes through lookup_hot, so it is counted here
- * the way lookup_hot counts one -- the pin ranking, the dashboard's HITS and heat,
- * the .coli_usage history -- and the history the next run reads stays the
- * routing's, whichever side computed it. The store's hit and miss counters are not
- * touched: they describe the RAM cache. */
-int (*coli_v4_expert_store_device_tier)(int layer, int expert);
-
 void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key) {
     if (!store || !store->state) return;
     V4ExpertStoreState *state = store->state;
@@ -11652,6 +11643,32 @@ void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key)
     hot_count_locked(policy, state, key);
     pthread_mutex_unlock(&state->mutex);
 }
+
+uint64_t coli_v4_expert_store_frequency(ColiExpertStore *store, ColiExpertKey key) {
+    if (!store || !store->state) return 0;
+    V4ExpertStoreState *state = store->state;
+    V4HotPolicy *policy = hot_find(store);
+    if (!policy || !get_record(state, key)) return 0;
+    pthread_mutex_lock(&state->mutex);
+    /* Persistent routing counts do not undergo the CPU pin policy's local
+     * decay, so resident GPU and incoming CPU scores stay on the same scale. */
+    uint32_t *const *history = rt_counts_all();
+    size_t index = (size_t)key.layer * state->experts_per_layer + key.expert;
+    uint64_t count = history && history[key.layer]
+        ? history[key.layer][key.expert]
+        : policy->usage[index];
+    pthread_mutex_unlock(&state->mutex);
+    return count;
+}
+
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
+ * routing the device served never comes through lookup_hot, so it is counted here
+ * the way lookup_hot counts one -- the pin ranking, the dashboard's HITS and heat,
+ * the .coli_usage history -- and the history the next run reads stays the
+ * routing's, whichever side computed it. The store's hit and miss counters are not
+ * touched: they describe the RAM cache. */
+int (*coli_v4_expert_store_device_tier)(int layer, int expert);
 
 uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store) {
     return store && hot_find(store) ? rt_counts_all() : NULL;
@@ -12958,6 +12975,43 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
+
+/* Opt-in GPU/RAM tier deduplication (V4_GPU_HOT_CACHE=1, default off):
+ * tracks resident VRAM expert mirrors in a bitmap so the RAM expert store's
+ * existing coli_v4_expert_store_ram_first hook evicts GPU-resident duplicates
+ * before unique RAM-only experts. */
+static ColiExpertStore *v4_cuda_priority_store;
+static uint8_t *v4_cuda_priority_bits;
+static int v4_cuda_priority_rows, v4_cuda_priority_cols;
+
+static int v4_gpu_hot_cache_wanted(void) {
+    const char *setting = getenv("V4_GPU_HOT_CACHE");
+    return setting && atoi(setting) != 0;
+}
+
+static int v4_cuda_ram_duplicate(int layer, int expert) {
+    if (!v4_cuda_priority_bits || layer < 0 || expert < 0 ||
+        layer >= v4_cuda_priority_rows || expert >= v4_cuda_priority_cols)
+        return 0;
+    size_t cell = (size_t)layer * v4_cuda_priority_cols + expert;
+    return (__atomic_load_n(v4_cuda_priority_bits + (cell >> 3), __ATOMIC_RELAXED) &
+            (1u << (cell & 7))) != 0;
+}
+
+static int v4_cuda_priority_owns_cache(const V4GpuExpertMirrorCache *cache);
+static void v4_cuda_priority_mark(const V4GpuExpertMirrorCache *cache,
+                                  int layer, int expert, int present) {
+    if (!v4_cuda_priority_bits || !v4_cuda_priority_owns_cache(cache) ||
+        layer < 0 || expert < 0 ||
+        layer >= v4_cuda_priority_rows || expert >= v4_cuda_priority_cols)
+        return;
+    size_t cell = (size_t)layer * v4_cuda_priority_cols + expert;
+    uint8_t mask = (uint8_t)(1u << (cell & 7));
+    if (present)
+        __atomic_fetch_or(v4_cuda_priority_bits + (cell >> 3), mask, __ATOMIC_RELAXED);
+    else
+        __atomic_fetch_and(v4_cuda_priority_bits + (cell >> 3), (uint8_t)~mask, __ATOMIC_RELAXED);
+}
 static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
                                        int bank_possible);
 static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb);
@@ -13182,6 +13236,16 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         v4_hot_mirrors_cap(engine->experts, mirrors);
     }
 #endif
+    if (engine->experts && engine->experts->gpu && v4_gpu_hot_cache_wanted()) {
+        v4_cuda_priority_store = engine->experts;
+        v4_cuda_priority_rows = engine->config.num_hidden_layers;
+        v4_cuda_priority_cols = engine->config.n_routed_experts;
+        v4_cuda_priority_bits = calloc(
+            ((size_t)v4_cuda_priority_rows * v4_cuda_priority_cols + 7) / 8, 1);
+        if (v4_cuda_priority_bits)
+            coli_v4_expert_store_ram_first = v4_cuda_ram_duplicate;
+        fprintf(stderr, "v4_gpu priority=frequency hot=VRAM next=RAM cold=disk\n");
+    }
     /* VRAM-first decode never asks the store for a mirrored expert: its RAM
      * pin ranking leaves them out (the peer pool's too, once there is one). */
     if (engine->experts && engine->experts->gpu &&
@@ -13240,6 +13304,15 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
         engine->gpu.layer_ready[layer] = 0;
     }
     coli_v4_expert_store_vram_held = NULL;   /* it scans the caches freed here */
+    if (v4_cuda_priority_store == engine->experts) {
+        if (coli_v4_expert_store_ram_first == v4_cuda_ram_duplicate)
+            coli_v4_expert_store_ram_first = NULL;
+        v4_cuda_priority_store = NULL;
+        free(v4_cuda_priority_bits);
+        v4_cuda_priority_bits = NULL;
+        v4_cuda_priority_rows = 0;
+        v4_cuda_priority_cols = 0;
+    }
     if (engine->experts && engine->experts->gpu) {
         v4_gpu_expert_mirrors_free(
             (V4GpuExpertMirrorCache *)engine->experts->gpu);
@@ -13953,8 +14026,11 @@ typedef struct {
     Dsv4CudaTensor *up;
     Dsv4CudaTensor *down;
     uint64_t clock;
+    uint64_t frequency;
     int block;   /* V4_MIRROR_BLOCK: the three tensors share one weight run and one scale run */
 } V4GpuExpertMirror;
+
+enum { V4_GPU_STREAM_SLOTS = 16 };
 
 /* Every entry in [0, count) holds a live mirror (gate, up and down): a
  * failed upload rolls its slot back instead of leaving a dead entry. */
@@ -13962,6 +14038,8 @@ struct V4GpuExpertMirrorCache {
     V4GpuExpertMirror *entries;
     int capacity;
     int count;
+    int resident_count;
+    int stream_cursor;
     int device;
     int first_layer, end_layer;
     int experts_per_layer; /* nonzero: immutable, directly indexed resident table */
@@ -14002,6 +14080,137 @@ static uint64_t g_v4_mirror_clock;
 static uint64_t v4_mirror_tick(void) {
     return __atomic_add_fetch(&g_v4_mirror_clock, 1, __ATOMIC_RELAXED);
 }
+
+static int v4_cuda_priority_owns_cache(const V4GpuExpertMirrorCache *cache) {
+    if (!v4_cuda_priority_store || !cache) return 0;
+    for (const V4GpuExpertMirrorCache *c =
+             (const V4GpuExpertMirrorCache *)v4_cuda_priority_store->gpu;
+         c; c = c->next)
+        if (c == cache) return 1;
+    return 0;
+}
+
+/* Frequency determines residency, with a short recency window protecting
+ * the views attached by the current forward. LRU breaks frequency ties. */
+static int v4_gpu_mirror_victim_range(const V4GpuExpertMirrorCache *cache,
+                                      int start, int limit, uint64_t now) {
+    if (limit <= start) return start >= 0 ? start : 0;
+    int victim = -1, oldest = -1;
+    int count = limit - start;
+    uint64_t protect = count > 40 ? 32 : (uint64_t)(count > 1 ? count - 1 : 0);
+    for (int i = start; i < limit; i++) {
+        const V4GpuExpertMirror *entry = &cache->entries[i];
+        if (oldest < 0 || entry->clock < cache->entries[oldest].clock) oldest = i;
+        if (protect && now >= entry->clock && now - entry->clock < protect) continue;
+        if (victim < 0 || entry->frequency < cache->entries[victim].frequency ||
+            (entry->frequency == cache->entries[victim].frequency &&
+             entry->clock < cache->entries[victim].clock))
+            victim = i;
+    }
+    return victim >= 0 ? victim : oldest;
+}
+
+#ifdef COLI_V4_TEST_HOOKS
+int coli_v4_test_gpu_frequency_victim(const uint64_t *frequency,
+                                      const uint64_t *clock, int count,
+                                      uint64_t now) {
+    if (count < 1) return -1;
+    V4GpuExpertMirrorCache cache = {0};
+    cache.count = count;
+    cache.entries = calloc((size_t)count, sizeof(*cache.entries));
+    if (!cache.entries) return -1;
+    for (int i = 0; i < count; i++) {
+        cache.entries[i].frequency = frequency[i];
+        cache.entries[i].clock = clock[i];
+    }
+    int victim = v4_gpu_mirror_victim_range(&cache, 0, count, now);
+    free(cache.entries);
+    return victim;
+}
+
+int coli_v4_test_gpu_ram_dedupe_ring(void) {
+    int fail = 0;
+    unsetenv("V4_GPU_HOT_CACHE");
+    if (v4_gpu_hot_cache_wanted()) return 1;
+    setenv("V4_GPU_HOT_CACHE", "1", 1);
+    if (!v4_gpu_hot_cache_wanted()) { unsetenv("V4_GPU_HOT_CACHE"); return 2; }
+    if (V4_GPU_STREAM_SLOTS != 16) { unsetenv("V4_GPU_HOT_CACHE"); return 3; }
+
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(0, 48);
+    if (!cache) { unsetenv("V4_GPU_HOT_CACHE"); return 4; }
+    ColiExpertStore store = {0};
+    store.gpu = cache;
+
+    ColiExpertStore *saved_store = v4_cuda_priority_store;
+    uint8_t *saved_bits = v4_cuda_priority_bits;
+    int saved_rows = v4_cuda_priority_rows, saved_cols = v4_cuda_priority_cols;
+    int (*saved_ram_first)(int, int) = coli_v4_expert_store_ram_first;
+
+    v4_cuda_priority_store = &store;
+    v4_cuda_priority_rows = 2;
+    v4_cuda_priority_cols = 64;
+    v4_cuda_priority_bits = calloc(((size_t)2 * 64 + 7) / 8, 1);
+    coli_v4_expert_store_ram_first = v4_cuda_ram_duplicate;
+    if (!v4_cuda_priority_bits) fail = 5;
+
+    const int resident_cap = cache->capacity - V4_GPU_STREAM_SLOTS; /* 32 */
+    if (!fail && resident_cap != 32) fail = 6;
+
+    /* Fill 32 resident slots with experts 0..31 at frequency 10 (expert 5 at freq 2). */
+    for (int i = 0; !fail && i < resident_cap; i++) {
+        cache->entries[i].layer = 0;
+        cache->entries[i].expert = i;
+        cache->entries[i].frequency = (i == 5) ? 2 : 10;
+        cache->entries[i].clock = (uint64_t)(i + 1);
+        v4_cuda_priority_mark(cache, 0, i, 1);
+    }
+    cache->count = resident_cap;
+    cache->resident_count = resident_cap;
+
+    if (!fail && (!coli_v4_expert_store_ram_first(0, 5) ||
+                  coli_v4_expert_store_ram_first(0, 40)))
+        fail = 7;
+
+    /* Cold expert (freq 1 <= victim freq 2): routes to 16 transient ring slots [32..47],
+     * does NOT evict expert 5 and does NOT set the resident bitmap bit. */
+    uint64_t now = 100;
+    int victim = v4_gpu_mirror_victim_range(cache, 0, cache->resident_count, now);
+    if (!fail && victim != 5) fail = 8;
+    for (int k = 0; !fail && k < V4_GPU_STREAM_SLOTS + 2; k++) {
+        int sidx = cache->resident_count + (cache->stream_cursor++ % V4_GPU_STREAM_SLOTS);
+        if (sidx != resident_cap + (k % V4_GPU_STREAM_SLOTS)) fail = 9;
+        cache->entries[sidx].layer = 0;
+        cache->entries[sidx].expert = 40 + (k % 8);
+        cache->entries[sidx].frequency = 1;
+        if (sidx >= cache->count) cache->count = sidx + 1;
+    }
+    if (!fail && (cache->count != 48 || !coli_v4_expert_store_ram_first(0, 5) ||
+                  coli_v4_expert_store_ram_first(0, 40)))
+        fail = 10;
+
+    /* Hot expert (freq 50 > victim freq 2): promotes into victim slot 5, clears bit 5, sets bit 50. */
+    if (!fail) {
+        v4_cuda_priority_mark(cache, cache->entries[victim].layer,
+                              cache->entries[victim].expert, 0);
+        cache->entries[victim].layer = 0;
+        cache->entries[victim].expert = 50;
+        cache->entries[victim].frequency = 50;
+        v4_cuda_priority_mark(cache, 0, 50, 1);
+        if (coli_v4_expert_store_ram_first(0, 5) || !coli_v4_expert_store_ram_first(0, 50))
+            fail = 11;
+    }
+
+    free(v4_cuda_priority_bits);
+    v4_cuda_priority_store = saved_store;
+    v4_cuda_priority_bits = saved_bits;
+    v4_cuda_priority_rows = saved_rows;
+    v4_cuda_priority_cols = saved_cols;
+    coli_v4_expert_store_ram_first = saved_ram_first;
+    v4_gpu_expert_mirrors_free(cache);
+    unsetenv("V4_GPU_HOT_CACHE");
+    return fail;
+}
+#endif
 /* Mirror uploads, every cache (coli_v4_gpu_expert_uploads). Uploads happen on
  * the generation thread, or on the uploader thread (V4_UPLOAD_THREAD) while
  * the generation thread waits to join it: read it after the join. */
@@ -14427,14 +14636,14 @@ static int v4_mirror_block_fill(V4GpuExpertMirrorCache *cache, V4GpuExpertMirror
 
 static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                                             ColiExpertView *view, int sync,
-                                            int grow_only);
+                                            int grow_only, uint64_t frequency);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync) {
-    return v4_gpu_expert_attach_cached_mode(cache, view, sync, 0);
+    return v4_gpu_expert_attach_cached_mode(cache, view, sync, 0, 0);
 }
 static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                                             ColiExpertView *view, int sync,
-                                            int grow_only) {
+                                            int grow_only, uint64_t frequency) {
     if (!cache || !view || dsv4_cuda_lost()) return -1;   /* no mirror after a sticky CUDA fault */
     if (view->gate.block_rows != 1 || view->up.block_rows != 1 ||
         view->down.block_rows != 1)
@@ -14471,13 +14680,17 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
         block_wanted = v4_view_block_runs(view, &runs);
         if (!block_wanted) cache->block_scattered++;
     }
+    const int hot_cache = v4_gpu_hot_cache_wanted();
+    const int stream_slots = (hot_cache && cache->capacity > 32) ? V4_GPU_STREAM_SLOTS : 0;
+    const int resident_cap = cache->capacity > stream_slots
+        ? cache->capacity - stream_slots : cache->capacity;
     if (found < 0) {
         /* Growth guard: new mirrors may only claim VRAM while a reserve
          * stays free for the transient prefill allocations (the expert
          * bank(s) + attention buffers). Below the reserve, recycle the LRU
          * slot instead of growing — decode keeps its hottest experts and
          * the next large prefill still fits. */
-        int grow = cache->count < cache->capacity;
+        int grow = cache->count < resident_cap;
         /* fp4 nibbles plus one UE8M0 scale per 32, as uploaded */
         long long elements = (long long)view->gate.rows * view->gate.columns +
                              (long long)view->up.rows * view->up.columns +
@@ -14560,11 +14773,42 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
             return -2;
         }
         int appended = 0;
-        if (!grow || cache->count >= cache->capacity) {
-            found = 0;
-            for (int i = 1; i < cache->count; i++)
-                if (cache->entries[i].clock < cache->entries[found].clock)
-                    found = i;
+        int is_resident = 1;
+        if (!grow || cache->count >= resident_cap) {
+            if (hot_cache) {
+                if (cache->resident_count <= 0)
+                    cache->resident_count = cache->count < resident_cap
+                        ? cache->count : resident_cap;
+                int victim = v4_gpu_mirror_victim_range(
+                    cache, 0, cache->resident_count,
+                    __atomic_load_n(&g_v4_mirror_clock, __ATOMIC_RELAXED));
+                uint64_t victim_freq = (victim >= 0 && victim < cache->count)
+                    ? cache->entries[victim].frequency : 0;
+                if (victim >= 0 && (frequency > victim_freq || stream_slots <= 0)) {
+                    /* PROMOTION (frequency > victim): promote incoming expert to
+                     * resident VRAM mirror, demoting the victim from VRAM -> RAM. */
+                    found = victim;
+                    is_resident = 1;
+                } else {
+                    /* TRANSIENT STREAMING (frequency <= victim): expert is colder
+                     * than resident mirrors, so its persistent residence stays in
+                     * RAM and it executes on GPU via a transient ring slot. */
+                    int sidx = cache->resident_count +
+                               (cache->stream_cursor++ % stream_slots);
+                    for (int i = cache->count; i < sidx; i++) {
+                        cache->entries[i].layer = -1;
+                        cache->entries[i].expert = -1;
+                    }
+                    if (sidx >= cache->count) cache->count = sidx + 1;
+                    found = sidx;
+                    is_resident = 0;
+                }
+            } else {
+                found = 0;
+                for (int i = 1; i < cache->count; i++)
+                    if (cache->entries[i].clock < cache->entries[found].clock)
+                        found = i;
+            }
             /* RECYCLE IN PLACE: every routed expert has the same shape, so
              * refill the victim's device buffers (pinned DMA) instead of
              * cudaFree + cudaMalloc + pageable copy x3 — at long context
@@ -14600,9 +14844,15 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                     (int)view->down.columns, sync))
                 refilled = 1;
             if (refilled) {
+                if (is_resident)
+                    v4_cuda_priority_mark(cache, cache->entries[found].layer,
+                                          cache->entries[found].expert, 0);
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
                 cache->entries[found].clock = v4_mirror_tick();
+                cache->entries[found].frequency = frequency;
+                if (is_resident)
+                    v4_cuda_priority_mark(cache, view->key.layer, view->key.expert, 1);
                 g_v4_mirror_uploads++;
                 view->gate.gpu = cache->entries[found].gate;
                 view->up.gpu = cache->entries[found].up;
@@ -14610,6 +14860,9 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                 pthread_mutex_unlock(&cache->mutex);
                 return 0;
             }
+            if (is_resident)
+                v4_cuda_priority_mark(cache, cache->entries[found].layer,
+                                      cache->entries[found].expert, 0);
             if (cache->entries[found].gate)
                 dsv4_cuda_tensor_free(cache->entries[found].gate);
             if (cache->entries[found].up)
@@ -14619,9 +14872,12 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
         } else {
             found = cache->count++;
             appended = 1;
+            if (hot_cache && cache->resident_count < cache->count)
+                cache->resident_count = cache->count;
         }
         cache->entries[found].layer = view->key.layer;
         cache->entries[found].expert = view->key.expert;
+        cache->entries[found].frequency = frequency;
         cache->entries[found].gate = NULL;
         cache->entries[found].up = NULL;
         cache->entries[found].down = NULL;
@@ -14674,10 +14930,21 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
              * entry would match its expert with NULL mirrors, look like the
              * oldest LRU victim (clock 0) and need a fresh cudaMalloc on
              * every recycle. An appended slot is dropped; a recycled one
-             * (its old mirror already freed) takes the last entry. Until the
-             * next probe the card counts as full. */
-            if (appended) cache->count--;
-            else cache->entries[found] = cache->entries[--cache->count];
+             * (its old mirror already freed) takes the last entry (or stays
+             * unkeyed when V4_GPU_HOT_CACHE separates resident and ring).
+             * Until the next probe the card counts as full. */
+            if (hot_cache) {
+                cache->entries[found].layer = -1;
+                cache->entries[found].expert = -1;
+                if (appended && found == cache->count - 1) {
+                    cache->count--;
+                    if (cache->resident_count > cache->count)
+                        cache->resident_count = cache->count;
+                }
+            } else {
+                if (appended) cache->count--;
+                else cache->entries[found] = cache->entries[--cache->count];
+            }
             cache->last_free_mb = 0;
             cache->grown_bytes = 0;
             cache->upload_failed = 1;
@@ -14689,9 +14956,15 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
         cache->entries[found].down = down;
         cache->entries[found].block = made_block;
         if (appended) cache->grown_bytes += mirror_bytes;
+        if (is_resident && found < resident_cap)
+            v4_cuda_priority_mark(cache, view->key.layer, view->key.expert, 1);
         g_v4_mirror_uploads++;
     }
     cache->entries[found].clock = v4_mirror_tick();
+    if (frequency > cache->entries[found].frequency)
+        cache->entries[found].frequency = frequency;
+    if (hot_cache && found < (cache->resident_count > 0 ? cache->resident_count : cache->count))
+        v4_cuda_priority_mark(cache, view->key.layer, view->key.expert, 1);
     view->gate.gpu = cache->entries[found].gate;
     view->up.gpu = cache->entries[found].up;
     view->down.gpu = cache->entries[found].down;
@@ -14768,14 +15041,16 @@ static uint64_t v4_mirror_lru_clock(V4GpuExpertMirrorCache *cache) {
  * VRAM-starved or failing pool cannot send to the CPU an expert the primary
  * cache alone would have taken. */
 static int v4_gpu_expert_attach_tiered(V4GpuExpertMirrorCache *primary,
-                                       ColiExpertView *view, int sync) {
+                                       ColiExpertView *view, int sync,
+                                       uint64_t frequency) {
     V4GpuExpertMirrorCache *peer = v4_peer_pool();   /* the only read here */
-    if (!peer || !primary) return v4_gpu_expert_attach_cached_ex(primary, view, sync);
+    if (!peer || !primary)
+        return v4_gpu_expert_attach_cached_mode(primary, view, sync, 0, frequency);
     if (v4_mirror_peek_cache(primary, view) == 0 ||
         v4_mirror_peek_cache(peer, view) == 0) return 0;
-    int primary_r = v4_gpu_expert_attach_cached_mode(primary, view, sync, 1);
+    int primary_r = v4_gpu_expert_attach_cached_mode(primary, view, sync, 1, frequency);
     if (primary_r == 0) return 0;
-    int r = v4_gpu_expert_attach_cached_mode(peer, view, sync, 1);
+    int r = v4_gpu_expert_attach_cached_mode(peer, view, sync, 1, frequency);
     if (r == 0) return 0;
     /* the LRU scans only once neither cache could grow */
     uint64_t primary_lru =
@@ -14783,15 +15058,17 @@ static int v4_gpu_expert_attach_tiered(V4GpuExpertMirrorCache *primary,
     uint64_t peer_lru = r == -2 ? v4_mirror_lru_clock(peer) : UINT64_MAX;
     if (primary_lru == UINT64_MAX && peer_lru == UINT64_MAX) return -1;
     int peer_first = peer_lru < primary_lru;
-    r = v4_gpu_expert_attach_cached_ex(peer_first ? peer : primary, view, sync);
+    r = v4_gpu_expert_attach_cached_mode(peer_first ? peer : primary, view, sync, 0, frequency);
     if (r == 0 || (peer_first ? primary_lru : peer_lru) == UINT64_MAX) return r;
-    return v4_gpu_expert_attach_cached_ex(peer_first ? primary : peer, view, sync);
+    return v4_gpu_expert_attach_cached_mode(peer_first ? primary : peer, view, sync, 0, frequency);
 }
 
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
     if (!store || !view) return -1;
+    uint64_t frequency = v4_gpu_hot_cache_wanted()
+        ? coli_v4_expert_store_frequency(store, view->key) : 0;
     return v4_gpu_expert_attach_tiered(
-        v4_gpu_expert_cache(store, view->key.layer), view, 1);
+        v4_gpu_expert_cache(store, view->key.layer), view, 1, frequency);
 }
 
 /* Async twin: the upload is ENQUEUED on the device stream and may still be
@@ -14802,8 +15079,10 @@ int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
 int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
                                     ColiExpertView *view) {
     if (!store || !view) return -1;
-    return v4_gpu_expert_attach_cached_ex(
-        v4_gpu_expert_cache(store, view->key.layer), view, 0);
+    uint64_t frequency = v4_gpu_hot_cache_wanted()
+        ? coli_v4_expert_store_frequency(store, view->key) : 0;
+    return v4_gpu_expert_attach_cached_mode(
+        v4_gpu_expert_cache(store, view->key.layer), view, 0, 0, frequency);
 }
 
 static int v4_hot_mirrors(ColiExpertStore *store) {
@@ -14856,7 +15135,7 @@ int coli_v4_gpu_expert_admit_hot(ColiExpertStore *store, ColiExpertView *view) {
     if (!cache) return -1;
     uint32_t uses = v4_hot_uses(view->key.layer, view->key.expert);
     if (uses < V4_HOT_MIN_USES) return -1;
-    int r = v4_gpu_expert_attach_cached_mode(cache, view, 1, 1);
+    int r = v4_gpu_expert_attach_cached_mode(cache, view, 1, 1, 0);
     if (r != -2) return r;
     pthread_mutex_lock(&cache->mutex);
     int victim = -1;
@@ -14871,7 +15150,7 @@ int coli_v4_gpu_expert_admit_hot(ColiExpertStore *store, ColiExpertView *view) {
     int replace = victim >= 0 && uses >= 2 * least;
     if (replace) cache->entries[victim].clock = 0;   /* the recycle's choice */
     pthread_mutex_unlock(&cache->mutex);
-    return replace ? v4_gpu_expert_attach_cached_mode(cache, view, 1, 0) : -1;
+    return replace ? v4_gpu_expert_attach_cached_mode(cache, view, 1, 0, 0) : -1;
 }
 
 extern int dsv4_cuda_stream_drain(int device);
@@ -14912,6 +15191,7 @@ extern int dsv4_cuda_upload_fence(int device, int drain);
 typedef struct {
     ColiExpertView *view;
     V4GpuExpertMirrorCache *cache;
+    uint64_t frequency;
 } V4UploadJob;
 #define V4_UPLOAD_QUEUE 32
 #define V4_UPLOAD_DEVICES 8
@@ -14953,7 +15233,7 @@ static void *v4_uploader_main(void *unused) {
         int sync = g_v4_up.sync;
         pthread_mutex_unlock(&g_v4_up.mutex);
         double started = v4_upload_clock();
-        int attached = v4_gpu_expert_attach_tiered(job.cache, job.view, sync) == 0;
+        int attached = v4_gpu_expert_attach_tiered(job.cache, job.view, sync, job.frequency) == 0;
         double spent = v4_upload_clock() - started;
         pthread_mutex_lock(&g_v4_up.mutex);
         g_v4_up.seconds += spent;
@@ -15000,7 +15280,9 @@ int coli_v4_gpu_expert_attach_queued(ColiExpertStore *store, ColiExpertView *vie
         const char *fence = getenv("V4_UPLOAD_FENCE");
         g_v4_up.sync = !g_v4_up.backend ? 1 : fence && *fence && atoi(fence) == 0 ? 2 : 3;
     }
-    g_v4_up.queue[g_v4_up.tail % V4_UPLOAD_QUEUE] = (V4UploadJob){view, cache};
+    uint64_t frequency = v4_gpu_hot_cache_wanted()
+        ? coli_v4_expert_store_frequency(store, view->key) : 0;
+    g_v4_up.queue[g_v4_up.tail % V4_UPLOAD_QUEUE] = (V4UploadJob){view, cache, frequency};
     g_v4_up.tail++;
     g_v4_up.busy++;
     g_v4_up.jobs++;
