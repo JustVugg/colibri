@@ -1188,6 +1188,7 @@ static void q38c_kv_down(Q38Chain *ch, Model *m, int i, int n, int pb) {
         }
         memcpy(m->IK[i] + (size_t)(pb + s) * ID, kv + 2 * (size_t)ch->rows * kvo + (size_t)s * ID, ID * sizeof(float));
     }
+    q38_qsa_pk_drop_from(m->qsa_pk, c->layers, pb, c->idx_ratio);
 }
 
 /* ---- the routed experts in the frame (vk_dmoe.h) ---------------------------------------
