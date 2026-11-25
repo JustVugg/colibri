@@ -101,7 +101,6 @@ static VkcFit g_mc_fit2;
 static int g_mc_fit2_on;
 static MimoChain *mc_of(Model *m, int d) { return (MimoChain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *mc_name(const MimoChain *ch) { return ch && ch->d ? "mimo dev2" : "mimo"; }
-static int mc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 
 /* the geometry of layer li's attention */

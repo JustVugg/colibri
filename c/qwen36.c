@@ -1308,6 +1308,8 @@ typedef struct {
     kv_prefix kvp;
     float *attn_sc;            /* [attn_sc_thr * kv_cap] score rows, one per thread */
     int attn_sc_thr;
+    float *attn_sc_grp;        /* reusable grouped-GQA score scratch [threads * gq * len] */
+    size_t attn_sc_grp_cap;
     double dense_load_s;
     uint32_t *freq;
     int freq_token_count, hot_pinned, hot_n, warmup_tokens, token_count;
@@ -1596,7 +1598,7 @@ static void tm_report(void){
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
 }
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 #include "kv16.h"
@@ -6296,6 +6298,216 @@ static inline void mrope_at(const Model *m, int p, int pos3[3]) {
     } else pos3[0] = pos3[1] = pos3[2] = p + m->rope_delta;
 }
 
+/* Grouped GQA attention core: share each K/V row read and float16 conversion
+ * across a group of gq query heads that map to the same KV head. Every head
+ * runs the exact same lane dot-products, softmax, and FMA axpy order as the
+ * per-head loop, so every output bit is unchanged. */
+static inline void attention_task(const Model *m, const Layer *l, int layer,
+                                  const float *query, const float *k, const float *vv,
+                                  int S, int pos_base, int win, int ring,
+                                  int gq, int nsub, int kv16, int sc_stride,
+                                  float *sc, float *ctx, int it) {
+    const Cfg *c = &m->c;
+    const int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, kvd = c->k_head_dim;
+    const int q_per_kv = H / KV;
+    const float scale = 1.f / sqrtf((float)hd);
+    const Q36Row *mr = m->mux_rows;
+    const int s = (S - 1) - it / (KV * nsub);
+    const int r = it % (KV * nsub);
+    const int kvh = r / nsub;
+    const int h0 = kvh * q_per_kv + (r % nsub) * gq;
+    const int qpos = mr ? mr[s].pos : pos_base + s;
+    const void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+    /* a sliding-window layer (Flint) sees the window's rows, its own included */
+    const int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+    const int len = qpos + 1 - t0;
+    /* from tb on, the step's own rows (a ring's, from the scratch): a multiplexed
+     * row's is itself, the others' from pos_base */
+    const int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
+    const int tc = tb < qpos + 1 ? tb : qpos + 1;
+    const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
+    const float *qbase = query + ((int64_t)s*H + h0)*hd;
+    float *cbase = ctx + ((int64_t)s*H + h0)*hd;
+    const int64_t ss = sc_stride;
+
+    /* 1. QK scores: cache rows [t0, tc) then scratch rows [tc, qpos] */
+    if (kv16) {
+        if (gq == 1) {
+            for (int t = t0; t < tc; t++)
+                sc[t - t0] = kv16_dot_lanes(qbase, (const uint16_t *)Kl + q36_kv_at(m, layer, kvh, t), kvd) * scale;
+        } else {
+            for (int t = t0; t < tc; t++) {
+                const int j = t - t0;
+                const uint16_t *krow16 = (const uint16_t *)Kl + q36_kv_at(m, layer, kvh, t);
+                int g = 0;
+                for (; g + 1 < gq; g += 2) {
+                    float d2[2];
+                    kv16_dot_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow16, kvd);
+                    sc[(int64_t)g*ss + j]       = d2[0] * scale;
+                    sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+                }
+                if (g < gq) sc[(int64_t)g*ss + j] = kv16_dot_lanes(qbase + (int64_t)g*hd, krow16, kvd) * scale;
+            }
+        }
+    } else {
+        for (int t = t0; t < tc; t++) {
+            const int j = t - t0;
+            const float *krow = (const float *)Kl + q36_kv_at(m, layer, kvh, t);
+            int g = 0;
+            for (; g + 1 < gq; g += 2) {
+                float d2[2];
+                dot_f32_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow, kvd);
+                sc[(int64_t)g*ss + j]       = d2[0] * scale;
+                sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+            }
+            if (g < gq) sc[(int64_t)g*ss + j] = dot_f32_lanes(qbase + (int64_t)g*hd, krow, kvd) * scale;
+        }
+    }
+    for (int t = tc; t <= qpos; t++) {
+        const int j = t - t0;
+        const float *krow = Kb + (int64_t)(t - sp0)*KV*kvd;
+        int g = 0;
+        for (; g + 1 < gq; g += 2) {
+            float d2[2];
+            dot_f32_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow, kvd);
+            sc[(int64_t)g*ss + j]       = d2[0] * scale;
+            sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+        }
+        if (g < gq) sc[(int64_t)g*ss + j] = dot_f32_lanes(qbase + (int64_t)g*hd, krow, kvd) * scale;
+    }
+
+    /* 2. Softmax (+ optional Flint sinks) and zero output accumulators */
+    for (int g = 0; g < gq; g++) {
+        float *scg = sc + (int64_t)g*ss;
+        if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
+            float mx = l->sinks[h0 + g];
+            for (int j = 0; j < len; j++) if (scg[j] > mx) mx = scg[j];
+            float sum = expf(l->sinks[h0 + g] - mx);
+            for (int j = 0; j < len; j++) { scg[j] = expf(scg[j] - mx); sum += scg[j]; }
+            float inv = 1.f / sum;
+            for (int j = 0; j < len; j++) scg[j] *= inv;
+        } else softmax_row(scg, len);
+        float *cx = cbase + (int64_t)g*hd;
+        for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+    }
+
+    /* 3. PV accumulation: cache rows [t0, tc) then scratch rows [tc, qpos] */
+    if (kv16) {
+        if (gq == 1) {
+            for (int t = t0; t < tc; t++)
+                kv16_axpy(cbase, sc[t - t0], (const uint16_t *)Vl + q36_kv_at(m, layer, kvh, t), kvd);
+        } else {
+            for (int t = t0; t < tc; t++) {
+                const int j = t - t0;
+                const uint16_t *vrow16 = (const uint16_t *)Vl + q36_kv_at(m, layer, kvh, t);
+                int g = 0;
+                for (; g + 3 < gq; g += 4)
+                    kv16_axpy_x4(cbase + (int64_t)g*hd, cbase + (int64_t)(g + 1)*hd,
+                                 cbase + (int64_t)(g + 2)*hd, cbase + (int64_t)(g + 3)*hd,
+                                 sc[(int64_t)g*ss + j], sc[(int64_t)(g + 1)*ss + j],
+                                 sc[(int64_t)(g + 2)*ss + j], sc[(int64_t)(g + 3)*ss + j], vrow16, kvd);
+                for (; g + 1 < gq; g += 2)
+                    kv16_axpy_x2(cbase + (int64_t)g*hd, cbase + (int64_t)(g + 1)*hd,
+                                 sc[(int64_t)g*ss + j], sc[(int64_t)(g + 1)*ss + j], vrow16, kvd);
+                if (g < gq) kv16_axpy(cbase + (int64_t)g*hd, sc[(int64_t)g*ss + j], vrow16, kvd);
+            }
+        }
+    } else {
+        for (int t = t0; t < tc; t++) {
+            const int j = t - t0;
+            const float *vrow = (const float *)Vl + q36_kv_at(m, layer, kvh, t);
+            for (int g = 0; g < gq; g++) {
+                float a = sc[(int64_t)g*ss + j];
+                float *cx = cbase + (int64_t)g*hd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+            }
+        }
+    }
+    for (int t = tc; t <= qpos; t++) {
+        const int j = t - t0;
+        const float *vrow = Vb + (int64_t)(t - sp0)*KV*kvd;
+        for (int g = 0; g < gq; g++) {
+            float a = sc[(int64_t)g*ss + j];
+            float *cx = cbase + (int64_t)g*hd;
+            for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+        }
+    }
+}
+
+static void attention_scores_ctx(Model *m, Layer *l, int layer,
+                                 const float *query, const float *k, const float *vv,
+                                 int S, int pos_base, int win, int ring, float *ctx) {
+    Cfg *c = &m->c;
+    const int H = c->q_heads, KV = c->kv_heads;
+    const int q_per_kv = H / KV;
+    const Q36Row *mr = m->mux_rows;
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+    if (threads < 1) threads = 1;
+#endif
+    int gq = q_per_kv;
+    {
+        int64_t want = S == 1 ? (int64_t)threads : (int64_t)4 * threads;
+        while (gq > 1 && (int64_t)S * KV * (q_per_kv / gq) < want) {
+            int d = gq - 1;
+            while (d > 1 && q_per_kv % d) d--;
+            gq = d;
+        }
+        /* For single-token decode, grouping fewer than 4 heads does not beat
+         * the single-head static loop's contiguous score stream. */
+        if (S == 1 && gq < 4) gq = 1;
+    }
+    const int nsub = q_per_kv / gq;
+    const int kv16 = q36_kv16();
+    int max_len = 0;
+    for (int s = 0; s < S; s++) {
+        int qpos = mr ? mr[s].pos : pos_base + s;
+        int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+        int len = qpos + 1 - t0;
+        if (len > max_len) max_len = len;
+    }
+    /* Pad row stride away from 4 KB multiples to prevent L1 set-aliasing across heads. */
+    int sc_stride = (max_len + 15) & ~15;
+    if (sc_stride < 16) sc_stride = 16;
+    if ((sc_stride & 1023) == 0) sc_stride += 16;
+    size_t per_thr = (size_t)gq * (size_t)sc_stride;
+    if (gq > 1) {
+        size_t need = (size_t)threads * per_thr;
+        if (need > m->attn_sc_grp_cap) {
+            free(m->attn_sc_grp);
+            m->attn_sc_grp = falloc((int64_t)need);
+            m->attn_sc_grp_cap = need;
+        }
+    }
+    const int nitems = S * KV * nsub;
+    if (S == 1) {
+        #pragma omp parallel for schedule(static)
+        for (int it = 0; it < nitems; it++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *sc = gq == 1 ? m->attn_sc + (int64_t)tid * m->kv_cap
+                                : m->attn_sc_grp + (size_t)tid * per_thr;
+            attention_task(m, l, layer, query, k, vv, S, pos_base, win, ring,
+                           gq, nsub, kv16, sc_stride, sc, ctx, it);
+        }
+    } else {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int it = 0; it < nitems; it++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *sc = gq == 1 ? m->attn_sc + (int64_t)tid * m->kv_cap
+                                : m->attn_sc_grp + (size_t)tid * per_thr;
+            attention_task(m, l, layer, query, k, vv, S, pos_base, win, ring,
+                           gq, nsub, kv16, sc_stride, sc, ctx, it);
+        }
+    }
+}
+
 /* Gated Attention (GQA) matching HF Qwen3_5MoeAttention:
  *  - q_proj outputs query(head_dim) ++ attn_output_gate(head_dim); k/v are head_dim.
  *  - per-head q/k RMSNorm (weight [head_dim], 1.0+weight).
@@ -6309,7 +6521,6 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int qdim = c->q_head_dim;                  /* per-head q total (query+gate) */
     int q_out = H * qdim;                      /* q_proj output dim */
     int kv_out = KV * kvd;                     /* k/v_proj output dim */
-    int q_per_kv = H / KV;
     int rotary = c->rotary_dim;
     /* HF always chunks q_proj output into query(head_dim) ++ gate(head_dim),
      * regardless of the attn_output_gate config flag -- so split whenever the
@@ -6366,7 +6577,6 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* the step's K and V as the cache keeps them (float16, q36_kv16), before anything reads them:
      * a row reads the same numbers from here as from the cache */
     if (q36_kv16()) { kv16_round(k, (int64_t)S*KV*kvd); kv16_round(vv, (int64_t)S*KV*kvd); }
-    float scale = 1.f / sqrtf((float)hd);
     const int win = c->win_layer && c->win_layer[layer] ? c->window : 0;
     /* A sliding layer's ring (q36_kv_rows): the step's own rows are read from k/vv, where
      * the cache would have them, and go into the ring after the scores; written first, the
@@ -6394,47 +6604,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     float *ctx = falloc((int64_t)S*H*hd);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int hh = 0; hh < H; hh++) {
-        for (int s = 0; s < S; s++) {
-            int kvh = hh / q_per_kv;
-            int qpos = mr ? mr[s].pos : pos_base + s;
-            const void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
-            const float *qv = query + ((int64_t)s*H + hh)*hd;
-            int tid = 0;
-#ifdef _OPENMP
-            tid = omp_get_thread_num();
-#endif
-            float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
-            /* a sliding-window layer (Flint) sees the window's rows, its own included */
-            int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
-            /* from tb on, the step's own rows (a ring's, from the scratch): a multiplexed
-             * row's is itself, the others' from pos_base */
-            int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
-            const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
-            for (int t = t0; t <= qpos; t++) {
-                float acc = t < tb ? q36_kv_dot(qv, Kl, q36_kv_at(m, layer, kvh, t), kvd)
-                                   : dot_f32_lanes(qv, Kb + (int64_t)(t - sp0)*KV*kvd, kvd);
-                sc[t] = acc * scale;
-            }
-            if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
-                float mx = l->sinks[hh];
-                for (int t = t0; t <= qpos; t++) if (sc[t] > mx) mx = sc[t];
-                float sum = expf(l->sinks[hh] - mx);
-                for (int t = t0; t <= qpos; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
-                float inv = 1.f / sum;
-                for (int t = t0; t <= qpos; t++) sc[t] *= inv;
-            } else softmax_row(sc + t0, qpos + 1 - t0);
-            float *cx = ctx + ((int64_t)s*H + hh)*hd;
-            for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
-            for (int t = t0; t <= qpos; t++) {
-                float a = sc[t];
-                if (t < tb) { q36_kv_axpy(cx, a, Vl, q36_kv_at(m, layer, kvh, t), kvd); continue; }
-                const float *vrow = Vb + (int64_t)(t - sp0)*KV*kvd;
-                for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
-            }
-        }
-    }
+    attention_scores_ctx(m, l, layer, query, k, vv, S, pos_base, win, ring, ctx);
     if (ring)   /* the step's rows into the ring: its last `ring` (an earlier one would be overwritten here) */
         for (int s = !mr && S > ring ? S - ring : 0; s < S; s++) {
             int t = mr ? mr[s].pos : pos_base + s;
@@ -10064,11 +10234,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
 }
 
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 1, 0, INT_MIN);
 }
 
 #ifndef QWEN36_NO_MAIN
@@ -12746,6 +12912,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
         free(cache->slot_by_expert); free(cache->slots);
     }
     free(model->attn_sc);
+    free(model->attn_sc_grp); model->attn_sc_grp = NULL; model->attn_sc_grp_cap = 0;
     free(model->seen); free(model->is_queued); free(model->is_pinned);
     free(model->momentum_logits); free(model->freq);
     free(model->DN_conv); free(model->DN_rec); free(model->dn_dev_fresh); free(model->dn_host_stale);

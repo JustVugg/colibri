@@ -2640,6 +2640,15 @@ tests/test_gq_rows_exact$(EXE): tests/test_gq_rows_exact.c
 # Q2_K's fused row kernel against the unpack + gq_dot_i8 path it replaced, to the bit
 tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Grouped GQA attention in qwen36.c against the per-head loop, to the bit; `bench` times both.
+tests/test_qwen36_attn_grouped$(EXE): tests/test_qwen36_attn_grouped.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+# Fused F32/F16/BF16 paths in gq_matmul_f32 and vectorized gq_dequant_row, to the bit
+tests/test_gq_f32_fused$(EXE): tests/test_gq_f32_fused.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Single-region gq_matmul2_act (R16, TILE16_BIAS, F8) against two gq_matmul_act calls, to the bit
+tests/test_gq_matmul2$(EXE): tests/test_gq_matmul2.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The grid types' and Q2_K's row kernels (AVX-512's on a VNNI build, AVX2's otherwise) against
 # the unpack + gq_dot_i8 path, to the bit, one to eight activation rows
 tests/test_gq_grid512$(EXE): tests/test_gq_grid512.c
@@ -3958,7 +3967,7 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 	fi
 	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
 		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py \
-		image_engine.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
+		image_engine.py audio_dmel.py compaction.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
 		setup_download.py mcp_server.py power.py model_fit.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py tools/iq3xxs_grid.json $(DESTDIR)$(LIBEXECDIR)/tools/
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/ui
