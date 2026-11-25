@@ -573,6 +573,7 @@ TEST_RULES  := $(patsubst tests/%,%,$(filter tests/test_%,$(RULE_NAMES)))
 # (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check. test_qwen38_dn_gpu does the same from
 # qwen38-dn-gpu-check.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
+	test_v4_np_route test_v4_np_queue \
 	test_segment_adapters_registration test_segment_adapters_real test_olmoe_segment_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
@@ -606,6 +607,7 @@ TEST_BINS += tests/test_v4_gpu_devices$(EXE)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE) \
+	tests/test_v4_np_route$(EXE) tests/test_v4_np_queue$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
 	tests/test_edge_adapters_registration$(EXE)
 endif
@@ -3423,6 +3425,17 @@ tests/test_v4_serve_framing$(EXE): tests/test_v4_serve_framing.c sse41_kernels.h
 		| tests/test_deepseek_v4$(EXE)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
 
+tests/test_v4_np_route$(EXE): tests/test_v4_np_route.c v4_np_route.h deepseek_v4.c \
+		deepseek_v4_internal.h Makefile.deepseek-v4 Makefile.deepseek-v4.units \
+		| tests/test_deepseek_v4$(EXE)
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
+
+tests/test_v4_np_queue$(EXE): tests/test_v4_np_queue.c deepseek_v4.c \
+		deepseek_v4.h deepseek_v4_internal.h v4_np_route.h compat.h \
+		Makefile.deepseek-v4 Makefile.deepseek-v4.units \
+		| tests/test_deepseek_v4$(EXE)
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
+
 endif
 
 tests/test_route_trace$(EXE): tests/test_route_trace.c
@@ -4040,7 +4053,7 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests
 # The same covers a .d deleted by hand.
 AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
-	test_v4_serve_framing
+	test_v4_serve_framing test_v4_np_route test_v4_np_queue
 AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
 	bench_indexer_allocations
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
