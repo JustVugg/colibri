@@ -54,9 +54,13 @@ BASE_ENV = {"SEED": os.environ.get("SEED", "1"), "OMP_NUM_THREADS": "2", "COLI_N
             "NOSTREAM": "1", "USAGE_SAVE": "0",
             # plain decoding is the reference, and both draft sources are on by default since
             # 1.13.0: every run starts from them off, and a case turns on what it checks
-            "Q38_MTP": "0", "COLI_LOOKUP": "0"}
+            "Q38_MTP": "0", "COLI_LOOKUP": "0",
+            # byte-identity with plain decoding holds for argmax drafts: a sampled turn whose drafts
+            # are drawn from the head (spec_exact.h) follows the same distribution, not the same
+            # draws, and tests/test_spec_exact.c + qwen38-spec-soft-check gate that rule
+            "COLI_SPEC_SOFT": "0"}
 SPEC_KEYS = ("Q38_MTP", "Q38_MTP_DRAFTS", "Q38_MTP_FORCE", "Q38_MTP_DUMP", "COLI_LOOKUP", "COLI_LOOKUP_DRAFTS",
-             "COLI_LOOKUP_FORCE", "COLI_SPEC_GATE", "DUMP", "SERVE", "N_NEW", "TOK")
+             "COLI_LOOKUP_FORCE", "COLI_SPEC_GATE", "COLI_SPEC_SOFT", "DUMP", "SERVE", "N_NEW", "TOK")
 MAX_ROWS = 6
 
 

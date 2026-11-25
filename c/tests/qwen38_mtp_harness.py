@@ -47,9 +47,14 @@ BASE_ENV = {"SEED": os.environ.get("SEED", "1"), "OMP_NUM_THREADS": "2", "COLI_N
             "Q38_TRUNK_GPU": "0", "NOSTREAM": "1", "USAGE_SAVE": "0", "Q38_MTP_DRAFTS": "1",
             # the comparisons are against plain decoding, and the MTP head and prompt lookup
             # are on by default since 1.13.0: a run is plain unless it sets Q38_MTP=1 itself
-            "Q38_MTP": "0", "COLI_LOOKUP": "0"}
+            "Q38_MTP": "0", "COLI_LOOKUP": "0",
+            # byte-identity with plain decoding holds for argmax drafts: a sampled turn whose drafts
+            # are drawn from the head (spec_exact.h) follows the same distribution, not the same
+            # draws, and tests/test_spec_exact.c + qwen38-spec-soft-check gate that rule
+            "COLI_SPEC_SOFT": "0"}
 MTP_KEYS = ("Q38_MTP", "Q38_MTP_WIRING", "Q38_MTP_FORCE", "Q38_MTP_DUMP", "DUMP",
-            "Q38_PREFILL_BATCH", "Q38_TRUNK_MIN_KB", "Q38_EXPERT_INT4", "Q38_MTP_DRAFTS", "COLI_LOOKUP")
+            "Q38_PREFILL_BATCH", "Q38_TRUNK_MIN_KB", "Q38_EXPERT_INT4", "Q38_MTP_DRAFTS", "COLI_LOOKUP",
+            "COLI_SPEC_SOFT")
 
 
 def check(ok, what):

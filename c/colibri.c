@@ -1675,6 +1675,7 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
                           * non vengono stampate. Solo misura: nessun effetto sull'output. */
 
 #include "sample.h"
+#include "spec_exact.h"                    /* drawn MTP drafts, kept by min(1, p/q) */
 /* KV-cache quantization tier flags — defined here (before kv_persist.h) so the .coli_kv
  * disk format can see them; the full rationale comments live at their original site below. */
 static int g_kv8=0;                             /* KV8=1: fp8 e4m3 latent KV + per-row scale */
@@ -9065,7 +9066,11 @@ static int ngram_draft(const int *ids, int len, int G, int *draft){
 static int mtp_argmax(const float *lo, int V){
     int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
 }
-static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft, float *pdraft){
+/* qs != NULL: each draft's proposal distribution q goes to qs[g] (softmax of the head's
+ * logits at the request's temperature and nucleus, spec_exact.h); drawn != 0 draws the
+ * draft from it instead of taking the argmax.  qs is filled either way, so the gate can
+ * weigh both rules on the rows the verify reads. */
+static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft, float *pdraft, SpecQ *qs, int drawn){
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
     int p=kv-1; if(p<0||G<1) return 0;
     if(g_mtp_gap){ m->kv_start[li]=p; g_mtp_gap=0; }   /* rows before p hold a gap */
@@ -9095,12 +9100,16 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft, float *p
         rmsnorm(row, hx, m->mtp_norm, D, c->eps);
         lm_logits(m,logit, row,1);
         int t2=mtp_argmax(logit, c->vocab);
+        if(qs){ specq_from_logits(&qs[g], logit, c->vocab, g_temp, g_nuc, SPEC_Q_MAX);
+                if(drawn) t2=specq_draw(&qs[g], rndu()); }
         if(dbg) fprintf(stderr,"[mtp2] pos=%d in_tok=%d ||eh||=%.1f ||post||=%.1f pre_blk=%d post_blk=%d\n",
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
         if(pdraft){   /* the draft's probability under the head: scores 20 below the best add under 2e-9 */
-            float mx=logit[t2]; double z=0;
+            float mx=logit[t2];
+            for(int i=0;i<c->vocab;i++) if(logit[i]>mx) mx=logit[i];
+            double z=0;
             for(int i=0;i<c->vocab;i++){ float d=logit[i]-mx; if(d>-20.f) z+=exp((double)d); }
-            pdraft[n]=z>0?(float)(1.0/z):0.f;
+            pdraft[n]=z>0?(float)(exp((double)(logit[t2]-mx))/z):0.f;
         }
         draft[n++]=t2; tok=t2; memcpy(h, hx, D*sizeof(float));
     }
@@ -9297,11 +9306,19 @@ static volatile sig_atomic_t g_mux_stop=0, g_mux_cancel=0;
  * Accepted DRAFT tokens get their verification row, so the per-token numeric
  * channel has no gap on the speculative path (they bypass every pick_tok
  * call site in the mux loop). Callers that don't need it ignore it. */
+/* Which rule the MTP drafts are settled with at temperature > 0 (spec_exact.h): the point
+ * mass of the argmax, or drafts drawn from the head's distribution and kept by min(1, p/q).
+ * One gate for the process: the engine serves one model. COLI_SPEC_SOFT=0 is the old
+ * behaviour exactly (same RNG draws); unset means auto. */
+static SpecSoftGate g_spec_soft; static int g_spec_soft_ready=0;
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,const float*,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
+    int carry_tok=-1;                    /* drawn draft rejected: the residual's token is the next one */
+    SpecQ qs[64]; int drawn_round=0;     /* the MTP drafts' q, and whether this round drew from it */
+    if(!g_spec_soft_ready){ spec_soft_gate_init(&g_spec_soft,2); g_spec_soft_ready=1; }
     /* #163: draft del modello attivi -> pin della famiglia di kernel per draft+verifica.
      * EN: model drafts live -> pin the kernel family for draft+verify forwards. */
     g_spec_live = (g_draft>0);
@@ -9321,7 +9338,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
     while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
         /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
-        int next=pick_tok(logit,V,carry_ban); carry_ban=-1;
+        int next=carry_tok>=0?carry_tok:pick_tok(logit,V,carry_ban); carry_ban=-1; carry_tok=-1;
         if((eos>=0 && next==eos) || is_stop(next)){ free(logit); logit=NULL; break; }
         emit(next,logit,ud); free(logit); logit=NULL; all[kv]=next; emitted++; m->n_emit++;
         gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
@@ -9332,6 +9349,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
          * incrementing kv would serialize an uninitialized KV row. */
         if(emitted>=n_new && !kv_out) break;
         int g = 0, gsrc = 0;                            /* sorgente: 1=grammatica 2=MTP/n-gram */
+        drawn_round = 0;
         if(g_grd.on){                                   /* metodo F: prima la grammatica — dove
                                                          * forza, l'acceptance e' ~1 (#48) */
             g=grammar_draft(&g_grd,draft,g_grd.max);
@@ -9383,7 +9401,8 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                  * verify's second row brings its own experts, and drafting can cost more than it returns */
                 int want=spec_gate_pick(&g_lookup_gate,SPEC_SRC_MTP,g_draft,NULL);
                 if(want>0){ double td0=now_s(); float pd[64];
-                            g=mtp_draft(m,next,kv,want,draft,g_mtp_pstep?pd:NULL); tdraft=now_s()-td0;
+                            drawn_round=spec_soft_gate_drawn(&g_spec_soft,g_temp);
+                            g=mtp_draft(m,next,kv,want,draft,g_mtp_pstep?pd:NULL,g_temp>0?qs:NULL,drawn_round); tdraft=now_s()-td0;
                             /* the depth these drafts are worth, from their probabilities (DeepSeek's
                              * confidence-scheduled verification): a doubtful draft goes unverified and its
                              * verify row's experts unread. Its head row at kv-1 holds the right pair. */
@@ -9392,6 +9411,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                                 memcpy(g_mtp_pd,pd,sizeof pd);
                                 if(!g){ g_mtp_pdeclined++; tdraft=0; }   /* T(1) is a plain step's */
                             }
+                            if(!g) drawn_round=0;
                             m->mtp_prop+=g; if(g)gsrc=2; }
             }
             else if(g_lookup){
@@ -9420,8 +9440,14 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             int accept;
             if(g_temp<=0) accept = (argmax_v(lo+(int64_t)k*V,V)==draft[k]);
             else { dist_build(lo+(int64_t)k*V,V);          /* rejection sampling: p(draft) */
-                   accept = (rndu() < g_pbuf[draft[k]]); }
-            if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
+                   if(gsrc==2 && m->has_mtp) spec_soft_gate_observe(&g_spec_soft,g_pbuf,V,&qs[k]);
+                   if(drawn_round){                        /* drawn draft: min(1, p/q), else the residual */
+                       int kept; double uk=rndu(), ur=rndu();
+                       int tok=spec_exact_settle(g_pbuf,V,&qs[k],draft[k],uk,ur,&kept);
+                       g_spec_soft.drawn_drafts++; accept=kept;
+                       if(kept) g_spec_soft.drawn_kept++; else carry_tok=tok;
+                   } else accept = (rndu() < g_pbuf[draft[k]]); }
+            if(!accept){ if(g_temp>0 && !drawn_round) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
             emit(draft[k],lo+(int64_t)k*V,ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
             gr_feed(&g_grd,draft[k]); k++;
@@ -10886,6 +10912,10 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
+    if(g_spec_soft.rows) printf("MTP sampled rows: expected keep %.0f%% drawn vs %.0f%% argmax over %llu rows | "
+        "drawn drafts kept %llu/%llu (COLI_SPEC_SOFT)\n",
+        100.0*g_spec_soft.keep_drawn, 100.0*g_spec_soft.keep_point, (unsigned long long)g_spec_soft.rows,
+        (unsigned long long)g_spec_soft.drawn_kept, (unsigned long long)g_spec_soft.drawn_drafts);
     if(g_corp_prop) printf("corpus drafts: %.0f%% acceptance (%llu/%llu proposed from %ld frozen ids)\n",
         100.0*g_corp_acc/g_corp_prop, (unsigned long long)g_corp_acc,
         (unsigned long long)g_corp_prop, g_corp_n);

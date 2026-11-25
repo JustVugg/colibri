@@ -29,6 +29,7 @@
 #ifndef DFLASH_CUDA_H
 #define DFLASH_CUDA_H
 #include "kv16.h"   /* float16 bits (a Q8_0 block's scale) */
+#include "dflash_select.h"   /* the path selector on the host; drawn paths for sampled requests */
 
 #define DF_MAX_L 16
 #define DF_MAX_T 8
@@ -357,8 +358,11 @@ static int df_ready(const DfDrafter *d, int pos) { return d->on && pos >= 1 && d
 static inline float df_bf16(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
 
 /* The block after tok (about to be fed at pos, its embedding emb): up to kmax drafts into out, their
- * probabilities among the position's candidates into prob. One frame, waited for. 0: none. */
-static int df_draft(DfDrafter *d, const float *emb, int tok, int pos, int kmax, int *out, float *prob) {
+ * probabilities among the position's candidates into prob. One frame, waited for. 0: none.
+ * qs != NULL (a sampled request): each draft's proposal distribution (dflash_select.h; a point
+ * mass on the drafter's pick without the selector), drawn != 0 the path drawn from them. */
+static int df_draft(DfDrafter *d, const float *emb, int tok, int pos, int kmax, int *out, float *prob,
+                    SpecQ *qs, int drawn, float temp, double (*rnd)(void)) {
     if (!df_ready(d, pos) || kmax < 1) return 0;
     double t0 = now_s();
     const int B = d->bs, D = d->D, hd = d->hd, H = d->H, KV = d->KV, qo = H * hd, I = d->I, V = d->V, K = d->topk, G = d->G;
@@ -410,30 +414,10 @@ static int df_draft(DfDrafter *d, const float *emb, int tok, int pos, int kmax, 
     int k = kmax < R ? kmax : R;
     if (d->select) {
         const float *tp = (const float *)cc_ptr(d->topd), *hg = (const float *)cc_ptr(d->hgd);
-        int prev = tok;
-        for (int t = 0; t < k; t++) {
-            const float *v = tp + (size_t)t * 2 * K, *gt = hg + (size_t)t * d->rank;
-            const uint16_t *a = d->A + (size_t)prev * d->rank;
-            float ag[DF_MAX_RANK];
-            const int rk = d->rank;
-            for (int j = 0; j < rk; j++) ag[j] = df_bf16(a[j]) * gt[j];
-            int best = 0; float bs = -INFINITY, z = 0.f;
-            for (int c = 0; c < K; c++) {
-                int id; memcpy(&id, v + K + c, 4);
-                if (id < 0 || id >= V) continue;
-                const uint16_t *b = d->B + (size_t)id * d->rank;
-                float s = v[c];
-                for (int j = 0; j < rk; j++) s += ag[j] * df_bf16(b[j]);
-                if (s > bs) { bs = s; best = c; }
-            }
-            for (int c = 0; c < K; c++) z += expf(v[c] - v[0]);
-            int id; memcpy(&id, v + K + best, 4);
-            out[t] = id; prob[t] = z > 0.f ? expf(v[best] - v[0]) / z : 0.f;
-            prev = id;
-        }
+        df_select_path(tp, hg, d->A, d->B, d->rank, K, V, tok, k, out, prob, qs, drawn, temp, rnd);
     } else {
         const char *pk = (const char *)cc_ptr(d->pick);
-        for (int t = 0; t < k; t++) { int id; float p; memcpy(&id, pk + (size_t)t * 8, 4); memcpy(&p, pk + (size_t)t * 8 + 4, 4); out[t] = id; prob[t] = p; }
+        for (int t = 0; t < k; t++) { int id; float p; memcpy(&id, pk + (size_t)t * 8, 4); memcpy(&p, pk + (size_t)t * 8 + 4, 4); out[t] = id; prob[t] = p; if (qs) specq_point(&qs[t], id); }
     }
     d->blocks++; d->ms += (now_s() - t0) * 1e3;
     return k;
