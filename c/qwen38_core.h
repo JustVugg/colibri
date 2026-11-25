@@ -278,7 +278,7 @@ typedef struct {
     float *PLE_conv_state;
     int ple_history_len;
     int range_begin, range_end;
-    int native_fp8, native_bf16, expert_prefetch, expert_parallel_reads;
+    int native_fp8, native_bf16, expert_prefetch, expert_parallel_reads, expert_direct;
     Q38ExpertBatchFallback expert_batch_fallback;
     int prefill_batch;
     uint64_t resident_weight_bytes;
@@ -1741,7 +1741,11 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     (void)bits; memset(m,0,sizeof(*m)); double t0=now_s();
     m->native_fp8=q38_env_bool("Q38_NATIVE_FP8",1);
     m->native_bf16=q38_env_bool("Q38_NATIVE_BF16",1);
-    m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
+    /* Q38_EXPERT_DIRECT (default 0, opt-in): expert misses bypass the OS file cache
+     * via O_DIRECT / FILE_FLAG_NO_BUFFERING into a fixed 32-buffer aligned pool; when
+     * enabled, prefetch advice defaults off so misses do not populate the file cache. */
+    m->expert_direct=q38_env_bool("Q38_EXPERT_DIRECT",0);
+    m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",!m->expert_direct);
     m->expert_parallel_reads=q38_env_bool("Q38_EXPERT_PARALLEL_READS",1);
     m->prefill_batch=q38_env_bool("Q38_PREFILL_BATCH",1);
     q38_load_cfg(&m->c,snap); q38_validate_cfg(&m->c);
@@ -1989,6 +1993,46 @@ static int q38_native_fp8_expert_tensors(Model *m,int layer,int expert,
     return 1;
 }
 
+/* An expert miss's range, read past the OS file cache (Q38_EXPERT_DIRECT): the enclosing
+ * whole blocks in one O_DIRECT / FILE_FLAG_NO_BUFFERING read into an aligned pool
+ * buffer, then one copy into the slot (the slot's three matrices sit back to back, so a
+ * read cannot land in place: st_read_range_rep needs slack in front of it). A range whose
+ * blocks run past the file's end, or a device that refuses the read, takes the buffered
+ * path with its bounds checks. g_q38_direct_reads counts the ranges served directly.
+ * The buffers are a fixed pool, not per thread: libgomp (MinGW) starts new threads when
+ * a team's size changes, so per-thread buffers leaked ~3 MB a parallel region. With
+ * every buffer busy, the read falls back to buffered I/O. */
+#define Q38_DIRECT_BUFS 32
+static unsigned long long g_q38_direct_reads;
+static struct { unsigned char *p; int64_t n; int busy; } g_q38_dbuf[Q38_DIRECT_BUFS];
+static pthread_mutex_t g_q38_dbuf_mx=PTHREAD_MUTEX_INITIALIZER;
+/* 0 when n bytes at off of dfd (an unbuffered fd of a file of fsize bytes) landed in out */
+static int q38_read_bounced(int dfd,int64_t fsize,int64_t off,int64_t n,void *out,int64_t cap) {
+    int b=-1;
+    if(dfd>=0&&n>0&&n<=cap&&off>=0&&off<=fsize-n){
+        int64_t pad=off%ST_DIRECT_ALIGN,len=(pad+n+ST_DIRECT_ALIGN-1)/ST_DIRECT_ALIGN*ST_DIRECT_ALIGN;
+        pthread_mutex_lock(&g_q38_dbuf_mx);
+        for(int i=0;i<Q38_DIRECT_BUFS&&b<0;i++)
+            if(!__atomic_load_n(&g_q38_dbuf[i].busy,__ATOMIC_ACQUIRE)){g_q38_dbuf[i].busy=1;b=i;}
+        pthread_mutex_unlock(&g_q38_dbuf_mx);
+        if(b>=0){
+            unsigned char **p=&g_q38_dbuf[b].p; int64_t *have=&g_q38_dbuf[b].n;   /* kept for the next miss */
+            if(len+ST_DIRECT_ALIGN>*have){free(*p);*have=len+ST_DIRECT_ALIGN;*p=(unsigned char*)malloc((size_t)*have);if(!*p)*have=0;}
+            unsigned char *w=*p?*p+(-(uintptr_t)*p&(ST_DIRECT_ALIGN-1)):NULL;
+            int ok=w&&off-pad+len<=fsize&&st_pread_aligned_try(dfd,w,len,off-pad)==0;
+            if(ok){memcpy(out,w+pad,(size_t)n);__atomic_fetch_add(&g_q38_direct_reads,1,__ATOMIC_RELAXED);}
+            __atomic_store_n(&g_q38_dbuf[b].busy,0,__ATOMIC_RELEASE);
+            if(ok)return 0;
+        }
+    }
+    return -1;
+}
+static void q38_read_expert_range(Model *m,int fd,int64_t off,int64_t n,void *out,int64_t cap,const char *tag) {
+    int fi=m->expert_direct?st_fidx(&m->S,fd):-1;
+    if(fi>=0&&!q38_read_bounced(m->S.dfds[fi],m->S.sizes[fi],off,n,out,cap))return;
+    st_read_range_raw_cap(&m->S,fd,off,n,out,cap,1,tag);
+}
+
 static void q38_load_native_fp8_ranges(Model *m,int layer,int expert,Slot *slot,
                                        st_tensor *weight[3]) {
     Cfg *c=&m->c;
@@ -2012,10 +2056,10 @@ static void q38_load_native_fp8_ranges(Model *m,int layer,int expert,Slot *slot,
     q38_bind_fp8_slot(slot,scales,(int)cache->scale_count,c->hidden,c->inter);
     int64_t pair_bytes=weight[0]->nbytes+weight[1]->nbytes;
     unsigned char *raw=(unsigned char*)slot->fp8_slab;
-    st_read_range_raw_cap(&m->S,weight[0]->fd,weight[0]->off,pair_bytes,
-                          raw,pair_bytes,1,"pread Qwen3.8 gate/up expert");
-    st_read_range_raw_cap(&m->S,weight[2]->fd,weight[2]->off,weight[2]->nbytes,
-                          raw+pair_bytes,slot->fp8_slab_bytes-pair_bytes,1,
+    q38_read_expert_range(m,weight[0]->fd,weight[0]->off,pair_bytes,
+                          raw,pair_bytes,"pread Qwen3.8 gate/up expert");
+    q38_read_expert_range(m,weight[2]->fd,weight[2]->off,weight[2]->nbytes,
+                          raw+pair_bytes,slot->fp8_slab_bytes-pair_bytes,
                           "pread Qwen3.8 down expert");
 }
 
