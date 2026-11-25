@@ -138,6 +138,25 @@ static int attn_device_on(void){static int on=-1;if(on<0){const char*e=getenv("V
 __constant__ float e8_table[256];
 __global__ void set_decode_state(int*state,int token,int position){if(!threadIdx.x){state[0]=token;state[1]=position;}}
 __device__ float e8(uint8_t b){return e8_table[b];}
+/* e8()'s values from the exponent bits: no serialized __constant__ reads when a warp's lanes need different scales */
+__device__ __forceinline__ float v4f_e8f(unsigned b){ return b? __uint_as_float(b<<23) : __uint_as_float(0x00400000u); }
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+template<class T> __device__ __forceinline__ T dsv4_ldcs(const T* p){return *p;}
+template<class T> __device__ __forceinline__ T dsv4_ldcg(const T* p){return *p;}
+#else
+template<class T> __device__ __forceinline__ T dsv4_ldcs(const T* p){return __ldcs(p);}
+template<class T> __device__ __forceinline__ T dsv4_ldcg(const T* p){return __ldcg(p);}
+#endif
+/* Exact warp-level reduction tree matching the 256-thread shared-memory tree (128, 64, ..., 1):
+ * lane l holds partials j = 8l..8l+7; steps 128..8 shuffle across lanes, 4..1 fold in-lane. */
+__device__ __forceinline__ float v4f_tree(float p[8]){
+    #pragma unroll
+    for(int k=16;k;k>>=1){
+        #pragma unroll
+        for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__shfl_down_sync(0xffffffffu,p[r],k));}
+    p[0]=__fadd_rn(p[0],p[4]);p[1]=__fadd_rn(p[1],p[5]);p[2]=__fadd_rn(p[2],p[6]);p[3]=__fadd_rn(p[3],p[7]);
+    p[0]=__fadd_rn(p[0],p[2]);p[1]=__fadd_rn(p[1],p[3]);
+    return __fadd_rn(p[0],p[1]);}
 __device__ __forceinline__ float e4m3_exact(unsigned b){
     unsigned sg=b>>7,e=(b>>3)&15u,m=b&7u;float v;
     if(e==0)v=(float)m*0.001953125f;
@@ -325,13 +344,62 @@ static void launch_bf16_one(const __nv_bfloat16*w,const float*x,float*y,int O,in
     }else mm_bf16_batch<<<dim3(O,1),256,0,st>>>(w,x,y,O,I,1);
 }
 template<int R> __global__ void mv_fp4_grouped(const MvDesc *desc,int count,int O,int I){
-    int matrix=blockIdx.y,base=blockIdx.x*R;if(matrix>=count)return;MvDesc d=desc[matrix];float sum[R]={};
-    for(int i=threadIdx.x;i<I;i+=blockDim.x){
+    int matrix=blockIdx.y,base=blockIdx.x*R;if(matrix>=count)return;MvDesc d=desc[matrix];
+    /* one buffer, as big as xs[4096] + s[R][256]: x for the warp path; else the block's
+     * staged rows (nibbles, then scales), then the reduction tree */
+    __shared__ __align__(16) uint8_t sm[16384+R*1024];
+    __shared__ float lut[16];
+    if(threadIdx.x<16){const float t[16]={0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6};lut[threadIdx.x]=t[threadIdx.x];}
+    if((I&255)==0&&I<=4096&&!((size_t)d.x&15)&&!((size_t)d.w&3)){
+        float*xs=(float*)sm;
+        for(int i=threadIdx.x*4;i<I;i+=256*4)*(float4*)(xs+i)=dsv4_ldcg((const float4*)(d.x+i));
+        __syncthreads();
+        int wid=threadIdx.x>>5,lane=threadIdx.x&31,o=base+wid;
+        if(wid>=R||o>=O)return;
+        const uint8_t* wrow=d.w+((long long)o*I>>1);
+        const uint8_t* srow=d.scale+(long long)o*(I/32);
+        float p[8]={0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+        #pragma unroll 4
+        for(int m=0;m<I;m+=256){
+            int i=m+8*lane;
+            unsigned u=dsv4_ldcs((const unsigned*)(wrow+(i>>1)));
+            float sc=v4f_e8f(__ldg(srow+(i>>5)));
+            const float4* xp=(const float4*)(xs+i);
+            float4 xa=xp[0],xb=xp[1];
+            const float xv[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
+            #pragma unroll
+            for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__fmul_rn(__fmul_rn(xv[r],lut[(u>>(4*r))&15]),sc));
+        }
+        float acc=v4f_tree(p);
+        if(!lane)d.y[o]=acc;
+        return;
+    }
+    /* I > 4096 (e.g. H=5120, 7168): stage the block's rows with 16-byte loads; same terms in
+     * the same order as the per-element loop below (lut holds f4's values), so bit-identical */
+    const int rows=O-base<R?O-base:R;
+    const bool staged=(I&31)==0&&R*(I/2)+R*(I/32)<=(int)sizeof sm&&!((size_t)d.w&15);
+    const uint8_t*ws=sm,*ss=sm+R*(I/2);
+    if(staged){
+        const uint4*wsrc=(const uint4*)(d.w+((long long)base*I>>1));
+        for(int i=threadIdx.x;i<rows*(I/2)/16;i+=blockDim.x)((uint4*)sm)[i]=dsv4_ldcs(wsrc+i);
+        const uint8_t*ssrc=d.scale+(long long)base*(I/32);
+        for(int i=threadIdx.x;i<rows*(I/32);i+=blockDim.x)sm[R*(I/2)+i]=__ldg(ssrc+i);
+    }
+    __syncthreads();
+    float sum[R]={};
+    if(staged)for(int i=threadIdx.x;i<I;i+=blockDim.x){
+        float xv=d.x[i];
+        #pragma unroll
+        for(int r=0;r<R;r++){int o=base+r;if(o<O){uint8_t p=ws[(r*I+i)>>1],q=(i&1)?p>>4:p&15;
+            sum[r]+=xv*lut[q]*v4f_e8f(ss[r*(I/32)+i/32]);}}
+    }
+    else for(int i=threadIdx.x;i<I;i+=blockDim.x){
         #pragma unroll
         for(int r=0;r<R;r++){int o=base+r;if(o<O){uint8_t p=d.w[((long long)o*I+i)>>1],q=(i&1)?p>>4:p&15;
             sum[r]+=d.x[i]*f4(q)*e8(d.scale[(long long)o*(I/32)+i/32]);}}
     }
-    __shared__ float s[R][256];
+    __syncthreads(); /* the tree reuses sm */
+    float (*s)[256]=(float(*)[256])sm;
     #pragma unroll
     for(int r=0;r<R;r++)s[r][threadIdx.x]=sum[r];__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n){
@@ -4633,7 +4701,6 @@ __device__ __forceinline__ void v4f_bar_sync(V4FBar* b,unsigned n){
 __device__ __forceinline__ float v4f_bfr(float v){ return __bfloat162float(__float2bfloat16(v)); }
 __device__ __forceinline__ float v4f_act_fn(float g,float u,float w,float limit){ float gg=fminf(v4f_bfr(g),limit); float uu=fmaxf(-limit,fminf(v4f_bfr(u),limit));
     return v4f_bfr(w*(gg/(1.f+expf(-gg)))*uu); }
-__device__ __forceinline__ float v4f_e8f(unsigned b){ return b? __uint_as_float(b<<23) : __uint_as_float(0x00400000u); }
 /* A warp's row dot in the order of the launch sequence's 256-thread matvecs
  * (mv_fp4_grouped for the routed experts, mv<8> for the shared one): partial j sums
  * i = j, j+256, ... in order, then the shared-memory tree s[j] += s[j+n] for
@@ -4641,14 +4708,6 @@ __device__ __forceinline__ float v4f_e8f(unsigned b){ return b? __uint_as_float(
  * the eight contiguous weights m + 8l .. m + 8l + 7 with one vector load. The tree's
  * steps 128..8 pair the same register of lanes l and l + n/8 (shuffles), 4, 2, 1 pair
  * registers inside lane 0. Every output gets the same operands in the same order. */
-__device__ __forceinline__ float v4f_tree(float p[8]){
-    #pragma unroll
-    for(int k=16;k;k>>=1){
-        #pragma unroll
-        for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__shfl_down_sync(0xffffffffu,p[r],k));}
-    p[0]=__fadd_rn(p[0],p[4]);p[1]=__fadd_rn(p[1],p[5]);p[2]=__fadd_rn(p[2],p[6]);p[3]=__fadd_rn(p[3],p[7]);
-    p[0]=__fadd_rn(p[0],p[2]);p[1]=__fadd_rn(p[1],p[3]);
-    return __fadd_rn(p[0],p[1]);}
 /* The decodes give the same values as e4m3() and e8_table: the hardware e4m3
  * conversion is exact, and the scale is 2^(b-127) (2^-127 for b = 0) from its bits. */
 __device__ __forceinline__ float v4f_e4m3(unsigned b){
