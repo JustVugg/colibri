@@ -109,15 +109,33 @@ int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (vo
 /* a GGUF's block formats: fake_block_elems for every fmt >= 100 (0: the backend takes none) */
 static int fake_block_elems;
 int coli_cuda_block_elems(int fmt) { return fmt >= 100 ? fake_block_elems : 0; }
-/* device memory (the tier's arena): host memory here; fake_alloc_fail refuses it */
-static int fake_alloc_fail;
-void *coli_cuda_pipe_alloc(int device, size_t bytes) { (void)device; return fake_alloc_fail ? NULL : calloc(1, bytes ? bytes : 1); }
-void coli_cuda_pipe_free(int device, void *p) { (void)device; free(p); }
+/* device memory (the tier's arena): host memory here; fake_alloc_fail refuses it;
+ * fake_pipe_max != 0 refuses larger allocs (fragmented card) */
+static int fake_alloc_fail, fake_pipe_allocs, fake_pipe_frees;
+static size_t fake_pipe_bytes, fake_pipe_max;
+void *coli_cuda_pipe_alloc(int device, size_t bytes) {
+    (void)device;
+    if (fake_alloc_fail || (fake_pipe_max && bytes > fake_pipe_max)) return NULL;
+    void *p = calloc(1, bytes ? bytes : 1);
+    if (p) { fake_pipe_allocs++; fake_pipe_bytes += bytes; }
+    return p;
+}
+void coli_cuda_pipe_free(int device, void *p) { (void)device; if (p) fake_pipe_frees++; free(p); }
 /* an arena's slot: the fake keeps the host bytes as an upload would */
 static int fake_upload_at;
 int coli_cuda_tensor_upload_at(ColiCudaTensor **t, void *dev, size_t cap, const void *w, int fmt, int I, int O, int device) {
     (void)dev; (void)cap; fake_upload_at++;
     return upload_common(t, w, NULL, fmt, I, O, device, 0);
+}
+/* QT_ARENA scaled-tensor view: upload_view records its slot; NULL tensor = probe */
+static int fake_upload_view_n, fake_upload_view_absent;
+int coli_cuda_tensor_upload_view(ColiCudaTensor **t, const void *w, const float *s, int fmt, int I, int O,
+                                 int device, int gs, void *dw, size_t dwb, void *ds, size_t dsb) {
+    if (!t) return !fake_upload_view_absent;
+    if (fake_upload_view_absent || !dw || !dwb || (fmt && fmt != 6 && (!ds || !dsb))) return 0;
+    if (!upload_common(t, w, s, fmt, I, O, device, gs)) return 0;
+    fake_upload_view_n++;
+    return 1;
 }
 /* a block-format matrix a range of rows at a time: the first range makes the tensor (one upload),
  * the rest go to it; nothing is kept (the fake computes no block format). _absent: an older

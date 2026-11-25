@@ -109,6 +109,7 @@ typedef void           (*fn_host_unregister)(void *p);
 typedef int            (*fn_planar_rows)(int device, int D, int I);
 typedef int            (*fn_block_elems)(int fmt);
 typedef int            (*fn_tensor_upload_at)(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device);
+typedef int            (*fn_tensor_upload_view)(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs, void *dev_w, size_t dev_w_bytes, void *dev_s, size_t dev_s_bytes);
 typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
 typedef const CuTierOps *(*fn_tier_ops)(void);
 typedef const ColiInkCudaOps *(*fn_ink_ops)(void);
@@ -204,6 +205,7 @@ static struct {
     fn_host_register host_register; fn_host_unregister host_unregister; fn_planar_rows planar_rows;   /* optional: the tier's RAM staged for a prompt chunk */
     fn_block_elems block_elems;   /* optional: a GGUF's block formats on the device */
     fn_tensor_upload_at tensor_upload_at;   /* optional: a block-format tensor in an arena's slot */
+    fn_tensor_upload_view tensor_upload_view;   /* optional: the tier's arena slots (QT_ARENA) */
     fn_chain_ops chain_ops;                 /* optional: the dense chain (cuda_chain.h); NULL = none */
     fn_tier_ops tier_ops;                   /* optional: the routed-expert tier (cu_tier_ops.h); NULL = none */
     fn_ink_ops ink_ops;                     /* optional: inkling's bf16 matrices (backend_cuda_ink.h); NULL = none */
@@ -1471,6 +1473,7 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(planar_rows, fn_planar_rows)
     RESOLVE_OPT(block_elems, fn_block_elems)
     RESOLVE_OPT(tensor_upload_at, fn_tensor_upload_at)
+    RESOLVE_OPT(tensor_upload_view, fn_tensor_upload_view)
     RESOLVE_OPT(chain_ops, fn_chain_ops)
     RESOLVE_OPT(tier_ops, fn_tier_ops)
     RESOLVE_OPT(ink_ops, fn_ink_ops)
@@ -1719,6 +1722,11 @@ int coli_cuda_planar_rows(int device, int D, int I){
 }
 int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device){
     return g_cuda.available && g_cuda.tensor_upload_at ? g_cuda.tensor_upload_at(tensor, dev, cap, weights, fmt, I, O, device) : 0;
+}
+int coli_cuda_tensor_upload_view(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O,
+                                 int device, int gs, void *dev_w, size_t dev_w_bytes, void *dev_s, size_t dev_s_bytes){
+    if(!g_cuda.available || !g_cuda.tensor_upload_view) return 0;   /* older DLL: the probe says no, the tier keeps cudaMalloc */
+    return g_cuda.tensor_upload_view(tensor, weights, scales, fmt, I, O, device, gs, dev_w, dev_w_bytes, dev_s, dev_s_bytes);
 }
 int coli_cuda_block_elems(int fmt){
     if(!coli_cuda_load()) return 0;   /* asked before any device: the engine decides where a GGUF runs */

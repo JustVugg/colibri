@@ -3511,6 +3511,10 @@ tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c
 tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# QT_ARENA=1 exact-size slab slots for FP8/int4 experts + copy-mode coldest cache.
+tests/test_qwen36_tier_arena$(EXE): tests/test_qwen36_tier_arena.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 # Same fake backend, qwen36 below full residency (#2090): cap < n_experts in copy
 # mode, the engine's planar int4 staged as the container's pairs, hits keeping
 # residents warm, the trunk-only cases, and cap == n_experts as before.
