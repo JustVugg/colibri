@@ -968,6 +968,11 @@ class Source:
         return {"config_sha256": hashlib.sha256(self.config_bytes).hexdigest(),
                 "shards": {os.path.basename(p): os.path.getsize(p) for p in shards}}
 
+    def close(self):
+        for fd in self._fds.values():
+            os.close(fd)
+        self._fds.clear()
+
     def _read(self, path, offset, nbytes):
         fd = self._fds.get(path)
         if fd is None:
@@ -1456,6 +1461,9 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         if pool:
             pool.close()
             pool.join()
+        elif _SOURCE is not None:
+            _SOURCE.close()  # Windows cannot delete or replace a shard held open
+        src.close()
     state = "complete" if index["complete"] else f"{len(index['done'])}/{g.layers} layers"
     print(f"{out_dir}: {state}" + (f", worst expert matrix rel L2 {worst:.4f}" if todo else ""))
     return out_dir

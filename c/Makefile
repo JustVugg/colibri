@@ -1217,6 +1217,9 @@ deepgemm-fetch $(DEEPGEMM_STAMP):
 # cublasLt64_12.dll alone is hundreds of MB. NO_TC=1, the name
 # Makefile.deepseek-v4 and the loader's advice use, means the same here.
 ifeq ($(NO_TC),1)
+ifeq ($(DSV4_TC),1)
+$(error NO_TC=1 means DSV4_TC=0, but DSV4_TC=1 is set (command line or environment): drop one)
+endif
 DSV4_TC ?= 0
 endif
 DSV4_TC ?= 1
