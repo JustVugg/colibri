@@ -10495,6 +10495,7 @@ fail:
 #include <time.h>
 
 #include "deepseek_v4_internal.h"
+#include "v4_tier_prewarm.h"
 
 typedef struct V4HotPolicy {
     ColiExpertStore *store;
@@ -11769,25 +11770,45 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
     int *order = every ? NULL : malloc((size_t)experts * sizeof(*order));
     if (!keys || (!every && !order)) { free(keys); free(order); return -1; }
     size_t count = 0;
+    uint8_t *device_bits = NULL;
+#ifdef COLI_V4_GPU_TIER
+    const char *tier_warm = getenv("COLI_V4_TIER_PREWARM");
+    if (store->gpu && tier_warm && atoi(tier_warm) != 0) {
+        size_t cells = (size_t)layers * (size_t)experts;
+        device_bits = calloc((cells + 7) / 8, 1);
+        if (device_bits)
+            coli_v4_gpu_mirror_bitmap(store, device_bits, layers, experts);
+    }
+#endif
     for (int layer = 0; layer < layers; layer++) {
         if (every) {
-            for (int expert = 0; expert < experts; expert++)
+            for (int expert = 0; expert < experts; expert++) {
+                size_t cell = (size_t)layer * (size_t)experts + (size_t)expert;
+                if (device_bits && (device_bits[cell >> 3] & (1u << (cell & 7))))
+                    continue;
                 keys[count++] = (ColiExpertKey){layer, expert};
+            }
             continue;
         }
         /* the per_layer most selected, ties to the lower id; never selected ones stay out */
         const uint64_t *use = policy->usage + (size_t)layer * experts;
         for (int expert = 0; expert < experts; expert++) order[expert] = expert;
-        for (int rank = 0; rank < per_layer; rank++) {
+        int taken = 0;
+        for (int rank = 0; rank < experts && taken < per_layer; rank++) {
             int best = rank;
             for (int j = rank + 1; j < experts; j++)
                 if (use[order[j]] > use[order[best]]) best = j;
             int chosen = order[best]; order[best] = order[rank]; order[rank] = chosen;
             if (!use[chosen]) break;
+            size_t cell = (size_t)layer * (size_t)experts + (size_t)chosen;
+            if (device_bits && (device_bits[cell >> 3] & (1u << (cell & 7))))
+                continue;
             keys[count++] = (ColiExpertKey){layer, chosen};
+            taken++;
         }
     }
     free(order);
+    free(device_bits);
     if (!count) { free(keys); return 0; }
     double total_gib = (double)count * state->record_bytes / 1073741824.0;
     fprintf(stderr, "[v4] expert cache: reading %s (%zu experts, %.1f GiB) before "
@@ -11853,6 +11874,118 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
         fprintf(stderr, "[v4] expert cache: %d experts could not be read now; each "
                 "loads when it is first used\n", failed);
     return failed;
+}
+
+#ifdef COLI_V4_GPU_TIER
+/* Unindex an expert's temporary RAM copy once mirrored in VRAM, moving its
+ * slot to the cold end of the LRU so RAM fills with the next ranked experts
+ * rather than duplicating VRAM residents. Keeps the slab allocated so
+ * allocated_per_layer and resident_bytes stay consistent. */
+static int v4_drop_ram_copy(ColiExpertStore *store, V4HotPolicy *policy,
+                            ColiExpertKey key) {
+    V4ExpertStoreState *state = store->state;
+    int dropped = 0;
+    pthread_mutex_lock(&state->mutex);
+    V4ExpertSlot *slot = indexed_expert_slot(state, key);
+    if (slot && !slot->references && slot->slab) {
+        unindex_expert_slot(state, slot);
+        slot->owner_layer = slot->expert = slot->loading_expert = -1;
+        policy->packed[hot_slot_index(state, slot)] = 0;
+        cold_lru_slot(state, slot);
+        dropped = 1;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return dropped;
+}
+#endif
+
+/* Called after dense CUDA uploads, before READY (COLI_V4_TIER_PREWARM=1).
+ * Fills VRAM mirrors globally by usage frequency (grow-only, respecting the
+ * VRAM reserve), drops the temporary RAM copies once mirrored, then fills RAM
+ * with the remaining ranked experts. Clean no-op when disabled or without
+ * usage history. */
+int coli_v4_expert_store_prewarm_tiers(ColiExpertStore *store) {
+    V4HotPolicy *policy = store && store->state ? hot_find(store) : NULL;
+    const char *setting = getenv("COLI_V4_TIER_PREWARM");
+    const char *warm = getenv("COLI_V4_PREWARM");
+    if (!policy || !setting || !atoi(setting) || (warm && !atoi(warm)))
+        return 0;
+    V4ExpertStoreState *state = store->state;
+    int uploaded = 0;
+    uint64_t lowest = 0, highest = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (store->gpu && policy->history_total) {
+        size_t total = (size_t)state->layers * (size_t)state->experts_per_layer;
+        ColiV4TierRank *ranked = malloc(total * sizeof(*ranked));
+        if (!ranked) return -1;
+        size_t count = coli_v4_tier_prewarm_select(
+            policy->usage, state->layers, state->experts_per_layer,
+            ranked, total);
+        if (count > 0) {
+            pthread_mutex_lock(&state->mutex);
+            ColiExpertStoreStats before = state->stats;
+            double disk_before = state->disk_sec;
+            pthread_mutex_unlock(&state->mutex);
+
+            const char *ahead_env = getenv("COLI_V4_TIER_PREWARM_AHEAD");
+            int ahead = coli_v4_tier_prewarm_ahead_clamp(
+                ahead_env ? atoi(ahead_env) : 1, state->slots_per_layer);
+            ColiExpertView views[COLI_V4_TIER_PREWARM_AHEAD_MAX];
+            int held[COLI_V4_TIER_PREWARM_AHEAD_MAX];
+            int stop = 0;
+
+            policy->warming = 1;
+            for (size_t at = 0; at < count && !stop; at += (size_t)ahead) {
+                int w = count - at < (size_t)ahead
+                    ? (int)(count - at) : ahead;
+                #pragma omp parallel for schedule(dynamic, 1) if (w > 1) num_threads(w)
+                for (int j = 0; j < w; j++) {
+                    ColiExpertKey key = {ranked[at + (size_t)j].layer,
+                                         ranked[at + (size_t)j].expert};
+                    held[j] = !lookup_hot(store, key, &views[j]);
+                }
+                for (int j = 0; j < w; j++) {
+                    size_t i = at + (size_t)j;
+                    ColiExpertKey key = {ranked[i].layer, ranked[i].expert};
+                    int moved = 0;
+                    if (!stop) {
+                        if (!held[j] &&
+                            (w == 1 || !(held[j] = !lookup_hot(store, key, &views[j])))) {
+                            stop = 1;
+                            continue;
+                        }
+                        if (coli_v4_gpu_expert_warm(store, &views[j])) {
+                            /* Capacity or VRAM reserve reached; keep in RAM. */
+                            stop = 1;
+                        } else {
+                            if (!uploaded) highest = ranked[i].frequency;
+                            lowest = ranked[i].frequency;
+                            uploaded++;
+                            moved = 1;
+                        }
+                    }
+                    if (!held[j]) continue;
+                    release(store, &views[j]);
+                    if (moved) v4_drop_ram_copy(store, policy, key);
+                }
+            }
+            policy->warming = 0;
+
+            pthread_mutex_lock(&state->mutex);
+            uint64_t resident = state->stats.resident_bytes;
+            state->stats = before;
+            state->stats.resident_bytes = resident;
+            state->disk_sec = disk_before;
+            pthread_mutex_unlock(&state->mutex);
+        }
+        free(ranked);
+    }
+#endif
+    fprintf(stderr,
+            "v4_tier_prewarm vram_experts=%d frequency_high=%llu "
+            "frequency_low=%llu order=VRAM-RAM-disk ram_excludes_vram=on\n",
+            uploaded, (unsigned long long)highest, (unsigned long long)lowest);
+    return coli_v4_expert_store_prewarm(store);
 }
 
 #ifndef COLI_V4_ROWS16_STORE_OPEN
@@ -11938,9 +12071,12 @@ int COLI_V4_ROWS16_STORE_OPEN(
             "mode=resident-ram rows16=hot-pins\n", pin_count,
             (unsigned long long)policy->repin_interval);
     /* COLI_V4_PREWARM=1 fills the cache here, in any run; unset, a serve fills it
-     * before READY (v4_serve_main) and a one-shot run leaves it to the misses. */
+     * before READY (v4_serve_main) and a one-shot run leaves it to the misses.
+     * With COLI_V4_TIER_PREWARM=1, v4_serve_main fills VRAM first, then RAM. */
     const char *prewarm = getenv("COLI_V4_PREWARM");
-    if (prewarm && atoi(prewarm) != 0 && !options->skip_mirror_setup)
+    const char *tier_prewarm = getenv("COLI_V4_TIER_PREWARM");
+    if (!(tier_prewarm && atoi(tier_prewarm) != 0) &&
+        prewarm && atoi(prewarm) != 0 && !options->skip_mirror_setup)
         coli_v4_expert_store_prewarm(*output);
     return 0;
 }
@@ -14792,6 +14928,47 @@ int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
     if (!store || !view) return -1;
     return v4_gpu_expert_attach_tiered(
         v4_gpu_expert_cache(store, view->key.layer), view, 1);
+}
+
+int coli_v4_gpu_expert_warm(ColiExpertStore *store, ColiExpertView *view) {
+    if (!store || !view || !store->gpu) return -1;
+    V4GpuExpertMirrorCache *primary = v4_gpu_expert_cache(store, view->key.layer);
+    if (!primary || primary->experts_per_layer) return -1;
+    if (v4_mirror_peek_cache(primary, view) == 0) return 0;
+    if (v4_gpu_expert_attach_cached_mode(primary, view, 1, 1) == 0) return 0;
+    V4GpuExpertMirrorCache *peer = v4_peer_pool();
+    if (peer) {
+        if (v4_mirror_peek_cache(peer, view) == 0) return 0;
+        if (v4_gpu_expert_attach_cached_mode(peer, view, 1, 1) == 0) return 0;
+    }
+    return -1;
+}
+
+int coli_v4_gpu_mirror_bitmap(ColiExpertStore *store, uint8_t *bits, int rows,
+                              int cols) {
+    if (!store || !store->gpu) return 0;
+    int count = 0;
+    V4GpuExpertMirrorCache *peer = v4_peer_pool();
+    for (int pass = 0; pass < 2; pass++) {
+        for (V4GpuExpertMirrorCache *cache = pass ? peer : store->gpu;
+             cache; cache = pass ? NULL : cache->next) {
+            pthread_mutex_lock(&cache->mutex);
+            for (int i = 0; i < cache->count; i++) {
+                const V4GpuExpertMirror *m = &cache->entries[i];
+                if (!m->gate || !m->up || !m->down) continue;
+                if (bits) {
+                    if (m->layer < 0 || m->layer >= rows ||
+                        m->expert < 0 || m->expert >= cols)
+                        continue;
+                    size_t cell = (size_t)m->layer * (size_t)cols + (size_t)m->expert;
+                    bits[cell >> 3] |= (uint8_t)(1u << (cell & 7));
+                }
+                count++;
+            }
+            pthread_mutex_unlock(&cache->mutex);
+        }
+    }
+    return count;
 }
 
 /* Async twin: the upload is ENQUEUED on the device stream and may still be
@@ -21266,9 +21443,15 @@ static int v4_serve_main(void) {
     /* Every expert the RAM plan holds is read before READY (#2109), so the first
      * request runs at the warm speed instead of filling the cache miss by miss.
      * COLI_V4_PREWARM=0 skips it (=1 already filled it when the store opened). */
-    const char *prewarm = getenv("COLI_V4_PREWARM");
-    if (!prewarm || atoi(prewarm) != 0)
-        coli_v4_expert_store_prewarm(engine->experts);
+    const char *tier_prewarm = getenv("COLI_V4_TIER_PREWARM");
+    if (tier_prewarm && atoi(tier_prewarm) != 0) {
+        if (coli_v4_expert_store_prewarm_tiers(engine->experts))
+            fprintf(stderr, "v4_tier_prewarm warning=partial; continuing with demand loading\n");
+    } else {
+        const char *prewarm = getenv("COLI_V4_PREWARM");
+        if (!prewarm || atoi(prewarm) != 0)
+            coli_v4_expert_store_prewarm(engine->experts);
+    }
     coli_serve_stdio_init();
     coli_serve_write_ready(stdout, v4_serve_rss_gb());
     v4_hwinfo_emit();

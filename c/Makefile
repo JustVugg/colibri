@@ -3682,6 +3682,10 @@ tests/test_v4_bank_pair$(EXE): tests/test_v4_bank_pair.c
 tests/test_v4_topk$(EXE): tests/test_v4_topk.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# DeepSeek V4 VRAM tier prewarm ranking & cap/fallback tests. Pure CPU.
+tests/test_v4_tier_prewarm$(EXE): tests/test_v4_tier_prewarm.c v4_tier_prewarm.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_ram_clamp$(EXE): tests/test_ram_clamp.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
