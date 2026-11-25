@@ -95,6 +95,9 @@ int coli_st_streaming_direct_available_rep(const ColiSafetensorsIndex *index,
 int coli_st_expert_route(int layer, int eid);
 int coli_st_mirror_active(void);
 int coli_st_mirror_nrep(void);
+int coli_st_mirror_share(int rep);
+size_t coli_v4_stripe_head_bytes(size_t direct_length, int share_rep,
+                                 int share_other);
 
 /* Rep-aware reads: route to the replica fd (falling back to the primary when
  * the shard is absent there or on read error) and account bytes per drive. */
@@ -1462,6 +1465,10 @@ uint64_t coli_v4_test_direct_fallbacks(void);
 /* Point missing O_DIRECT twins at a dup of the buffered fd so tests can
  * exercise the direct-window path on filesystems that refuse O_DIRECT. */
 int coli_v4_test_force_streaming_direct(ColiExpertStore *store);
+int coli_v4_test_read_direct_window(ColiSafetensorsIndex *index, int shard,
+                                    int rep, unsigned char *slab,
+                                    uint64_t offset, size_t length,
+                                    size_t destination_offset, size_t *shift);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);
