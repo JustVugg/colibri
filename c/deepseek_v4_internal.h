@@ -1280,6 +1280,27 @@ int coli_v4_upload_thread_on(void);
 int coli_v4_gpu_expert_attach_queued(ColiExpertStore *store, ColiExpertView *view);
 void coli_v4_gpu_expert_upload_join(void);
 void coli_v4_gpu_expert_upload_settle(void);
+/* V4_UPLOAD_PIECES: a checkpoint's expert record as a two-run mirror takes
+ * it. S and Wb are the scale run's and the weight run's bytes; soff and woff
+ * where gate, up and down start in each; dims gate's (and up's) rows and
+ * columns, then down's. Offsets handed to pieces_land count from the record's
+ * first byte: the scale run, then the weight run. */
+typedef struct {
+    long long S, Wb, soff[3], woff[3];
+    int dims[4];
+} V4PieceLayout;
+/* The decode step opens the window around its lane reads; only a read that
+ * starts inside it reserves a mirror. pieces_begin returns NULL when the read
+ * goes the usual way; otherwise every piece is reported with pieces_land as it
+ * lands, in any order, and pieces_end closes the job (read_ok 0, or anything
+ * short of the whole record landed, leaves the mirror empty). */
+void coli_v4_gpu_pieces_window(int on);
+void *coli_v4_gpu_pieces_begin(ColiExpertStore *store, ColiExpertKey key,
+                               const V4PieceLayout *layout, const void *slab,
+                               size_t slab_bytes);
+void coli_v4_gpu_pieces_land(void *job, unsigned long long record_offset, size_t length,
+                             const unsigned char *bytes);
+void coli_v4_gpu_pieces_end(void *job, int read_ok);
 extern double g_v4_hyb_fill_bw, g_v4_hyb_host_bw;
 extern unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
 extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
@@ -1444,6 +1465,11 @@ extern int coli_v4_test_fail_expert_store_open;
 extern int coli_v4_test_skip_expert_store_open;
 extern int coli_v4_test_closed_owned_index;
 extern void (*coli_v4_test_expert_read_hook)(ColiExpertKey key);
+/* Set, every direct read of a checkpoint's expert reports its pieces here
+ * (V4_UPLOAD_PIECES of them) instead of to the GPU tier: offsets count from
+ * the record's first byte, the scale run then the weight run. */
+extern void (*coli_v4_test_piece_hook)(void *context, unsigned long long record_offset,
+                                       size_t length, const unsigned char *bytes);
 extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
 extern uint64_t coli_v4_test_fp4_batch_calls;
 extern uint64_t coli_v4_test_expert_victim_probes;

@@ -6618,6 +6618,14 @@ static int moe_token_pipeline(float *output,
      * must provide (all of them unless VRAM-first finds mirrors); leased[i]
      * marks views holding a store lease, the only ones released at the end. */
     int alloc_n = selected ? selected : 1;
+#ifdef COLI_V4_GPU_TIER
+    /* V4_UPLOAD_PIECES: the reads this step starts may copy to a mirror as
+     * they land; closed once the lanes are done, then fenced and settled as
+     * the uploader's copies are */
+    int pieces_open = !result && store->gpu && coli_v4_upload_thread_on() &&
+                      !coli_v4_hybrid_enabled();
+    if (pieces_open) coli_v4_gpu_pieces_window(1);
+#endif
     ColiExpertView *views = malloc((size_t)alloc_n * sizeof(*views));
     unsigned char *leased = calloc((size_t)alloc_n, 1);
     int *fetch = malloc((size_t)alloc_n * sizeof(*fetch));
@@ -6801,15 +6809,15 @@ static int moe_token_pipeline(float *output,
     }
     v4_lanes_finish(store, jobs, loaders, loader_active);
 #ifdef COLI_V4_GPU_TIER
-    if (uploads_queued) {
+    if (pieces_open) coli_v4_gpu_pieces_window(0);
+    if (uploads_queued || pieces_open) {
         /* on every exit of the loop, a failed read included: the views and
          * their leases are the uploader's until it has reported them */
         double join0 = v4_wait_clock();
         coli_v4_gpu_expert_upload_join();
-        if (dec) {
-            g_v4_dec_attach_s += v4_wait_clock() - join0;
+        if (dec) g_v4_dec_attach_s += v4_wait_clock() - join0;
+        if (dec && uploads_queued)
             g_v4_dec_uploads += coli_v4_gpu_expert_uploads() - uploads_before;
-        }
         for (int i = 0; i < selected; i++)
             if (!views[i].gate.gpu || !views[i].up.gpu || !views[i].down.gpu)
                 gpu_compute = 0;
@@ -7130,7 +7138,7 @@ static int moe_token_pipeline(float *output,
     if (hybrid_pending_drain) coli_v4_gpu_expert_drain(store);
     /* The uploader's copies read from the leased slabs: wait for the ones
      * still in flight before the leases go. */
-    if (uploads_queued) coli_v4_gpu_expert_upload_settle();
+    if (uploads_queued || pieces_open) coli_v4_gpu_expert_upload_settle();
     /* A view still without a lease was computed from VRAM (VRAM-first): its
      * routing never reached the store, which counts it here, once per
      * token-layer (fetch[] is free again: it carries the expert ids). */
@@ -10667,14 +10675,120 @@ static int v4_slab_shift_on(void) {
     return !(setting && *setting == '0');
 }
 
+/* V4_UPLOAD_PIECES=N (unset or 0 = off; 16 at most): a direct read that
+ * someone wants reported lands in N pieces, each handed over as it is in (1:
+ * the whole window, once it is in),
+ * so its bytes can go to the card while the rest of the record is still being
+ * read (coli_v4_gpu_pieces_land). Only where the record stays where the
+ * window put it (V4_SLAB_SHIFT): bytes that are moved afterwards cannot be
+ * copied from under the read. record_base is the record offset of the range a
+ * window carries (0 for a whole record, the scale run's length for the
+ * weights' window). */
+typedef struct {
+    void (*land)(void *context, unsigned long long record_offset, size_t length,
+                 const unsigned char *bytes);
+    void *context;
+    uint64_t record_base;
+} V4ReadHook;
+#ifdef COLI_V4_TEST_HOOKS
+void (*coli_v4_test_piece_hook)(void *context, unsigned long long record_offset,
+                                size_t length, const unsigned char *bytes);
+#endif
+static int v4_upload_pieces(void) {
+    const char *setting = getenv("V4_UPLOAD_PIECES");
+    int pieces = setting && *setting ? atoi(setting) : 0;
+    return pieces < 0 ? 0 : pieces > 16 ? 16 : pieces;
+}
+/* [from, to) of the window at slab is in; the caller's range is
+ * [pad, pad + length) of that window */
+static void v4_window_landed(const V4ReadHook *hook, const unsigned char *slab, size_t pad,
+                             size_t length, size_t from, size_t to) {
+    size_t low = from > pad ? from : pad;
+    size_t end = pad + length;
+    size_t high = to < end ? to : end;
+    if (low < high)
+        hook->land(hook->context, hook->record_base + (low - pad), high - low, slab + low);
+}
+/* The window in pieces of whole pages. On Windows every piece's read is in
+ * flight at once (the direct handles are opened FILE_FLAG_OVERLAPPED) and they
+ * are waited for in order, so a piece is reported once every byte before it
+ * is in; elsewhere one piece after the other. -1 on any failure: the reads
+ * still out are cancelled and waited for, and the caller falls back. */
+static int v4_pread_pieces(int fd, unsigned char *slab, size_t window, uint64_t base,
+                           int pieces, const V4ReadHook *hook, size_t pad, size_t length) {
+    size_t piece = ((window + (size_t)pieces - 1) / (size_t)pieces + 4095u) & ~(size_t)4095u;
+    if (!piece) return -1;
+#ifdef _WIN32
+    enum { V4_PIECE_READS = 16 };
+    intptr_t os_handle = _get_osfhandle(fd);
+    if (os_handle == -1 || os_handle == -2) return -1;
+    HANDLE handle = (HANDLE)os_handle;
+    HANDLE event[V4_PIECE_READS];
+    OVERLAPPED overlapped[V4_PIECE_READS];
+    size_t at[V4_PIECE_READS], size[V4_PIECE_READS];
+    int issued = 0, done = 0, result = -1;
+    for (size_t position = 0; position < window && issued < V4_PIECE_READS;) {
+        size_t count = window - position < piece ? window - position : piece;
+        if (count > 0x7FFFFFFFu) goto cancel;
+        event[issued] = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!event[issued]) goto cancel;
+        memset(&overlapped[issued], 0, sizeof(overlapped[issued]));
+        uint64_t file_offset = base + position;
+        overlapped[issued].Offset = (DWORD)(file_offset & 0xFFFFFFFFu);
+        overlapped[issued].OffsetHigh = (DWORD)(file_offset >> 32);
+        overlapped[issued].hEvent = event[issued];
+        at[issued] = position; size[issued] = count;
+        DWORD got = 0;
+        BOOL started = ReadFile(handle, slab + position, (DWORD)count, &got, &overlapped[issued]);
+        DWORD error = started ? 0 : GetLastError();
+        issued++;
+        if (!started && error != ERROR_IO_PENDING) {
+            issued--;   /* it never started: nothing to cancel or wait for */
+            CloseHandle(event[issued]);
+            goto cancel;
+        }
+        position += count;
+    }
+    {
+        size_t covered = issued ? at[issued - 1] + size[issued - 1] : 0;
+        if (covered != window) goto cancel;
+    }
+    for (int i = 0; i < issued; i++) {
+        DWORD got = 0;
+        if (!GetOverlappedResult(handle, &overlapped[i], &got, TRUE) || got != (DWORD)size[i])
+            goto cancel;
+        done = i + 1;
+        v4_window_landed(hook, slab, pad, length, at[i], at[i] + size[i]);
+    }
+    result = 0;
+cancel:
+    for (int i = done; i < issued; i++) {
+        DWORD got = 0;
+        if (result) CancelIoEx(handle, &overlapped[i]);
+        GetOverlappedResult(handle, &overlapped[i], &got, TRUE);
+    }
+    for (int i = 0; i < issued; i++) CloseHandle(event[i]);
+    return result;
+#else
+    for (size_t position = 0; position < window;) {
+        size_t count = window - position < piece ? window - position : piece;
+        if (v4_pread_full_try(fd, slab + position, count, base + position)) return -1;
+        v4_window_landed(hook, slab, pad, length, position, position + count);
+        position += count;
+    }
+    return 0;
+#endif
+}
+
 /* shift: NULL moves the range to slab + destination_offset, as a caller that
  * tiles several ranges into one slab needs. Otherwise the range stays where
  * the window put it, *shift bytes into the slab (destination_offset is then
- * 0), and nothing is moved. */
+ * 0), and nothing is moved. hook: with a shift, the window is read in
+ * V4_UPLOAD_PIECES pieces and each is reported as it lands. */
 static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
                                  int rep, unsigned char *slab, uint64_t offset,
                                  size_t length, size_t destination_offset,
-                                 size_t *shift) {
+                                 size_t *shift, const V4ReadHook *hook) {
     if (!state || !state->index || shard < 0 || shard >= state->index->nfd) return -1;
     /* DUAL-SSD: prefer the routed replica's O_DIRECT twin. */
     int dfd = rep ? state->index->mdfds[rep - 1][shard] : state->index->dfds[shard];
@@ -10693,10 +10807,19 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
     uint64_t available = file_bytes - base;
     if ((uint64_t)direct_length > available)
         direct_length = (size_t)(available & ~(alignment - 1));
-    if (direct_length && v4_pread_full_try(dfd, slab, direct_length, base)) return -1;
-    if (direct_length < wanted && v4_pread_full_try(
-            fd, slab + direct_length,
-            wanted - direct_length, base + direct_length)) return -1;
+    int pieces = hook && shift ? v4_upload_pieces() : 0;
+    if (direct_length && pieces > 1) {
+        if (v4_pread_pieces(dfd, slab, direct_length, base, pieces, hook, pad, length))
+            return -1;
+    } else if (direct_length) {
+        if (v4_pread_full_try(dfd, slab, direct_length, base)) return -1;
+        if (pieces == 1) v4_window_landed(hook, slab, pad, length, 0, direct_length);
+    }
+    if (direct_length < wanted) {
+        if (v4_pread_full_try(fd, slab + direct_length, wanted - direct_length,
+                              base + direct_length)) return -1;
+        if (pieces > 0) v4_window_landed(hook, slab, pad, length, direct_length, wanted);
+    }
     if (shift)
         *shift = pad;
     else
@@ -10717,7 +10840,7 @@ static int v4_read_direct_copy(const V4ExpertStoreState *state, int shard,
     unsigned char *bounce = NULL;
     if (posix_memalign((void **)&bounce, 4096, length + 8192u)) return -1;
     int result = v4_read_direct_window(state, shard, rep, bounce, offset,
-                                       length, 0, NULL);
+                                       length, 0, NULL, NULL);
     if (!result) memcpy(destination, bounce, length);
     compat_aligned_free(bounce);
     return result;
@@ -10732,7 +10855,7 @@ static int v4_try_direct_segment(V4ExpertStoreState *state, int shard, int rep,
     size_t length = (size_t)bytes;
     if (dest == 0)
         return v4_read_direct_window(state, shard, rep, slot->slab, offset,
-                                     length, 0, NULL);
+                                     length, 0, NULL, NULL);
     return v4_read_direct_copy(state, shard, rep, slot->slab + dest, offset,
                                length);
 }
@@ -10835,7 +10958,8 @@ static int v4_gguf_interleave(const V4ExpertRecord *record, unsigned char *slab)
 
 static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
-                                 V4ExpertSlot *slot, int rep) {
+                                 V4ExpertSlot *slot, int rep,
+                                 const V4ReadHook *hook) {
     /* whatever a previous record left: every path below that does not shift
      * puts the record at the slab's first byte */
     slot->data_shift = 0;
@@ -10896,12 +11020,19 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
     int same_shard = record->scale_shard == record->weight_shard;
     int keep = v4_slab_shift_on();
     size_t window_shift = 0;
+    /* the pieces are reported only where the record stays in place */
+    V4ReadHook whole = {0}, weights = {0};
+    if (hook && keep && v4_upload_pieces() > 0) {
+        whole = *hook; whole.record_base = 0;
+        weights = *hook; weights.record_base = record->scale_bytes;
+    }
     if (direct_available && same_shard &&
         record->scale_offset + record->scale_bytes == record->weight_offset &&
         !v4_read_direct_window(state, record->scale_shard, rep, slot->slab,
                                record->scale_offset,
                                (size_t)record->record_bytes, 0,
-                               keep ? &window_shift : NULL)) {
+                               keep ? &window_shift : NULL,
+                               whole.land ? &whole : NULL)) {
         slot->data_shift = slot->weight_shift = window_shift;
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
         __atomic_fetch_add(&v4_direct_flock_reads, UINT64_C(1),
@@ -10921,16 +11052,21 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
     int weight_direct = direct_available && !v4_read_direct_window(
         state, record->weight_shard, rep, slot->slab + weight_at,
         record->weight_offset, (size_t)record->weight_bytes,
-        keep ? 0 : (size_t)record->scale_bytes, keep ? &window_shift : NULL);
+        keep ? 0 : (size_t)record->scale_bytes, keep ? &window_shift : NULL,
+        weights.land ? &weights : NULL);
     if (weight_direct) {
         if (keep)
             slot->weight_shift = weight_at + window_shift - (size_t)record->scale_bytes;
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
         __atomic_fetch_add(&v4_direct_payload_bytes, record->weight_bytes,
                            __ATOMIC_RELAXED);
-        return coli_st_read_at_rep(state->index, record->scale_shard, rep,
-                                   record->scale_offset,
-                                   (size_t)record->scale_bytes, slot->slab);
+        int scales_read = coli_st_read_at_rep(state->index, record->scale_shard, rep,
+                                              record->scale_offset,
+                                              (size_t)record->scale_bytes, slot->slab);
+        /* the scale run, at the slab's first byte */
+        if (!scales_read && whole.land)
+            whole.land(whole.context, 0, (size_t)record->scale_bytes, slot->slab);
+        return scales_read;
     }
     if (direct_available)
         __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
@@ -10943,6 +11079,56 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
                                record->scale_offset,
                                (size_t)record->scale_bytes, slot->slab);
 }
+
+#ifdef COLI_V4_GPU_TIER
+/* The record as a two-run mirror takes it (V4_UPLOAD_PIECES): its scale run
+ * and its weight run each tiled by the three tensors, gate, up and down as
+ * the views name them. 0 for a GGUF or per-matrix record, or a layout a
+ * two-run mirror cannot hold. */
+static int v4_record_piece_layout(const V4ExpertRecord *record, V4PieceLayout *layout) {
+    static const int matrix[3] = {V4_W1, V4_W3, V4_W2};
+    if (record->gguf || record->per_matrix) return 0;
+    long long scale_sum = 0, weight_sum = 0, scale_size[3], weight_size[3];
+    for (int k = 0; k < 3; k++) {
+        const ColiSafetensorsTensor *weight = record->weight[matrix[k]];
+        const ColiSafetensorsTensor *scale = record->scale[matrix[k]];
+        if (!weight || !scale || weight->shape[0] <= 0 || weight->shape[1] <= 0) return 0;
+        if ((uint64_t)scale->off < record->scale_offset ||
+            (uint64_t)scale->off + (uint64_t)scale->nbytes > record->scale_offset + record->scale_bytes)
+            return 0;
+        if ((uint64_t)weight->off < record->weight_offset ||
+            (uint64_t)weight->off + (uint64_t)weight->nbytes > record->weight_offset + record->weight_bytes)
+            return 0;
+        if ((long long)weight->nbytes != (long long)weight->shape[0] * weight->shape[1] ||
+            (long long)scale->nbytes * 16 != (long long)weight->nbytes)
+            return 0;
+        layout->soff[k] = (long long)((uint64_t)scale->off - record->scale_offset);
+        layout->woff[k] = (long long)((uint64_t)weight->off - record->weight_offset);
+        if (layout->woff[k] & 15) return 0;
+        scale_size[k] = (long long)scale->nbytes;
+        weight_size[k] = (long long)weight->nbytes;
+        scale_sum += scale_size[k];
+        weight_sum += weight_size[k];
+        int rows = (int)weight->shape[0], columns = (int)weight->shape[1] * 2;
+        if (k == 0) { layout->dims[0] = rows; layout->dims[1] = columns; }
+        else if (k == 1) { if (rows != layout->dims[0] || columns != layout->dims[1]) return 0; }
+        else { layout->dims[2] = rows; layout->dims[3] = columns; }
+    }
+    if (scale_sum != (long long)record->scale_bytes || weight_sum != (long long)record->weight_bytes)
+        return 0;
+    for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) {
+            if (a == b) continue;
+            if (layout->soff[a] < layout->soff[b] + scale_size[b] &&
+                layout->soff[b] < layout->soff[a] + scale_size[a]) return 0;
+            if (layout->woff[a] < layout->woff[b] + weight_size[b] &&
+                layout->woff[b] < layout->woff[a] + weight_size[a]) return 0;
+        }
+    layout->S = (long long)record->scale_bytes;
+    layout->Wb = (long long)record->weight_bytes;
+    return 1;
+}
+#endif
 
 static void hot_fill_view(ColiTensorView *view,
                           const V4ExpertRecord *record,
@@ -11361,7 +11547,32 @@ retry_lookup:
     if (coli_v4_test_expert_read_hook)
         coli_v4_test_expert_read_hook(key);
 #endif
-    int read_result = v4_read_expert_record(state, record, slot, rep);
+    /* V4_UPLOAD_PIECES: a mirror reserved before the read takes each piece
+     * as it lands. The GPU unit decides (NULL: the read goes the usual way);
+     * the caller keeps its lease until the step has settled the copies. */
+    V4ReadHook piece_hook = {0};
+#ifdef COLI_V4_TEST_HOOKS
+    if (coli_v4_test_piece_hook) piece_hook.land = coli_v4_test_piece_hook;
+#endif
+#ifdef COLI_V4_GPU_TIER
+    void *piece_job = NULL;
+    V4PieceLayout piece_layout;
+    if (!piece_hook.land && store->gpu && slot->aligned_slab && v4_upload_pieces() > 0 &&
+        v4_slab_shift_on() && v4_record_piece_layout(record, &piece_layout)) {
+        piece_job = coli_v4_gpu_pieces_begin(
+            store, key, &piece_layout, slot->slab,
+            (size_t)state->record_bytes + COLI_V4_EXPERT_SLAB_SLACK);
+        if (piece_job) {
+            piece_hook.land = coli_v4_gpu_pieces_land;
+            piece_hook.context = piece_job;
+        }
+    }
+#endif
+    int read_result = v4_read_expert_record(state, record, slot, rep,
+                                            piece_hook.land ? &piece_hook : NULL);
+#ifdef COLI_V4_GPU_TIER
+    if (piece_job) coli_v4_gpu_pieces_end(piece_job, read_result == 0);
+#endif
     struct timespec disk_t1;
     clock_gettime(CLOCK_MONOTONIC, &disk_t1);
     /* Pack outside the mutex: the slot holds our reference so its slab is
@@ -11696,7 +11907,7 @@ int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
     slot.slab = buffer; slot.aligned_slab = 1;
     slot.owner_layer = key.layer; slot.expert = key.expert; slot.loading_expert = -1;
     if (v4_read_expert_record(state, record, &slot,
-                              coli_st_expert_route(key.layer, key.expert)))
+                              coli_st_expert_route(key.layer, key.expert), NULL))
         return -1;
     memset(view, 0, sizeof(*view));
     view->key = key;
@@ -13988,6 +14199,7 @@ struct V4GpuExpertMirrorCache {
      * mirror); V4_MIRROR_BLOCK_VERIFY: fills read back, and those that
      * differed */
     unsigned long long block_made, block_refills, block_scattered;
+    int recycling;   /* the last miss recycled a mirror (the cache cannot grow): the piece uploads reserve only then */
     unsigned long long block_verified, block_mismatches;
 };
 /* A layer attaches its 6 routed experts before computing them, and a slot is
@@ -14565,6 +14777,12 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
             for (int i = 1; i < cache->count; i++)
                 if (cache->entries[i].clock < cache->entries[found].clock)
                     found = i;
+            cache->recycling = 1;
+            if (cache->entries[found].clock == UINT64_MAX) {
+                /* every mirror is reserved for a read in flight (V4_UPLOAD_PIECES) */
+                pthread_mutex_unlock(&cache->mutex);
+                return -1;
+            }
             /* RECYCLE IN PLACE: every routed expert has the same shape, so
              * refill the victim's device buffers (pinned DMA) instead of
              * cudaFree + cudaMalloc + pageable copy x3 — at long context
@@ -14619,6 +14837,7 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
         } else {
             found = cache->count++;
             appended = 1;
+            cache->recycling = 0;
         }
         cache->entries[found].layer = view->key.layer;
         cache->entries[found].expert = view->key.expert;
@@ -14925,6 +15144,7 @@ static struct {
     int busy;           /* handed over and not yet reported */
     int sync;           /* of the views in flight: chosen when the first one is handed over */
     int backend;        /* -1 not asked yet, 1 the backend has the fence, 0 it has not */
+    int fence;          /* enqueued copies since the last settle: the uploader's (sync 3) or a lane's pieces */
     int devices[V4_UPLOAD_DEVICES], device_count;   /* cards whose second stream may hold copies */
     unsigned long long jobs, attached, fences, fence_drains;
     double seconds;     /* in the attach, on the thread */
@@ -15000,6 +15220,7 @@ int coli_v4_gpu_expert_attach_queued(ColiExpertStore *store, ColiExpertView *vie
         const char *fence = getenv("V4_UPLOAD_FENCE");
         g_v4_up.sync = !g_v4_up.backend ? 1 : fence && *fence && atoi(fence) == 0 ? 2 : 3;
     }
+    if (g_v4_up.sync == 3) g_v4_up.fence = 1;
     g_v4_up.queue[g_v4_up.tail % V4_UPLOAD_QUEUE] = (V4UploadJob){view, cache};
     g_v4_up.tail++;
     g_v4_up.busy++;
@@ -15013,9 +15234,9 @@ void coli_v4_gpu_expert_upload_join(void) {
     pthread_mutex_lock(&g_v4_up.mutex);
     while (g_v4_up.busy > 0)
         pthread_cond_wait(&g_v4_up.done, &g_v4_up.mutex);
-    int sync = g_v4_up.sync, count = g_v4_up.device_count;
+    int fence = g_v4_up.fence, count = g_v4_up.device_count;
     pthread_mutex_unlock(&g_v4_up.mutex);
-    if (sync != 3) return;   /* the uploader drained its copies itself */
+    if (!fence) return;   /* the uploader drained its copies itself, and no piece was copied */
     for (int i = 0; i < count; i++) {
         if (dsv4_cuda_upload_fence(g_v4_up.devices[i], 0)) {
             g_v4_up.fences++;
@@ -15031,17 +15252,20 @@ void coli_v4_gpu_expert_upload_settle(void) {
     pthread_mutex_lock(&g_v4_up.mutex);
     while (g_v4_up.busy > 0)
         pthread_cond_wait(&g_v4_up.done, &g_v4_up.mutex);
-    int sync = g_v4_up.sync, count = g_v4_up.device_count;
+    int fence = g_v4_up.fence, count = g_v4_up.device_count;
     g_v4_up.device_count = 0;
+    g_v4_up.fence = 0;
     pthread_mutex_unlock(&g_v4_up.mutex);
     /* After an expert group that synchronized its stream behind the fence this
      * waits on finished work; after a step that computed on the CPU instead it
      * is what keeps the slabs in place under the copies. */
-    if (sync == 3)
+    if (fence)
         for (int i = 0; i < count; i++)
             dsv4_cuda_upload_fence(g_v4_up.devices[i], 1);
 }
 
+static unsigned long long g_v4_pieces_reserved, g_v4_pieces_mirrored, g_v4_pieces_abandoned,
+                          g_v4_pieces_copies, g_v4_pieces_verified, g_v4_pieces_mismatches;
 static void v4_upload_report(void) {
     static unsigned long long reported;
     if (g_v4_up.jobs == reported) return;
@@ -15053,6 +15277,180 @@ static void v4_upload_report(void) {
             g_v4_up.sync == 3 ? "second-stream, fenced"
             : g_v4_up.sync == 2 ? "second-stream, drained" : "compute-stream, drained",
             g_v4_up.fences, g_v4_up.fence_drains);
+    if (g_v4_pieces_reserved)
+        fprintf(stderr, "v4_gpu pieces: reserved=%llu mirrored=%llu abandoned=%llu copies=%llu "
+                        "verified=%llu mismatches=%llu\n",
+                g_v4_pieces_reserved, g_v4_pieces_mirrored, g_v4_pieces_abandoned,
+                g_v4_pieces_copies, g_v4_pieces_verified, g_v4_pieces_mismatches);
+}
+
+/* ---- the piece uploads (V4_UPLOAD_PIECES=N; off by default) --------------
+ * With the uploader thread a mirror's copies start when its expert's read is
+ * complete: the link is idle under the read and busy after it. Here a decode
+ * lane reserves the mirror BEFORE its read, the store reads the record in N
+ * pieces and reports each as it lands, and the piece is copied to its place
+ * in the mirror at once, enqueued on the device's second stream. The link
+ * works under the read. When the last piece is in, the tensors are given
+ * their places in the runs and the entry becomes its expert's: the step then
+ * finds it mirrored and nothing is left to upload. The join's event orders
+ * the expert group after the pieces, as after the uploader's copies, and the
+ * settle waits for them.
+ *
+ * What it needs, each checked before a mirror is reserved: the uploader
+ * thread with its copies fenced (V4_UPLOAD_THREAD=1, V4_UPLOAD_FENCE not 0,
+ * a backend with dsv4_cuda_upload_fence), two-run mirrors (V4_MIRROR_BLOCK=1),
+ * the record where its read lands (V4_SLAB_SHIFT), a slab the backend can
+ * page-lock before the read, and a cache that recycles: the victim is its
+ * least recently used mirror, which must be a two-run one. While the cache
+ * still grows, and for any expert these do not hold for, the read goes the
+ * usual way and the uploader attaches it.
+ *
+ * A reserved entry belongs to no expert (layer and expert -1) and carries the
+ * clock UINT64_MAX until its job ends, so no lookup hits it and no recycle
+ * picks it. A job that ends short of the whole record leaves the entry empty
+ * with clock 0, the next one recycled; its expert takes the usual path. */
+typedef struct {
+    V4GpuExpertMirrorCache *cache;
+    Dsv4CudaTensor *gate, *up, *down;
+    V4PieceLayout layout;
+    ColiExpertKey key;
+    long long landed;
+    int ok, copies;
+    const unsigned char *scales, *weights;   /* the runs' host bytes, for V4_MIRROR_BLOCK_VERIFY */
+} V4PieceJob;
+static int g_v4_pieces_window;
+
+void coli_v4_gpu_pieces_window(int on) {
+    __atomic_store_n(&g_v4_pieces_window, on, __ATOMIC_RELEASE);
+}
+
+void *coli_v4_gpu_pieces_begin(ColiExpertStore *store, ColiExpertKey key,
+                               const V4PieceLayout *layout, const void *slab,
+                               size_t slab_bytes) {
+    if (!store || !store->gpu || !layout || !slab || !slab_bytes) return NULL;
+    if (!__atomic_load_n(&g_v4_pieces_window, __ATOMIC_ACQUIRE)) return NULL;
+    if (!coli_v4_upload_thread_on() || !v4_mirror_block_on() || dsv4_cuda_lost()) return NULL;
+    if (layout->S <= 0 || layout->Wb <= 0) return NULL;
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, key.layer);
+    if (!cache || cache->experts_per_layer || cache->capacity < V4_MIRROR_RECYCLE_MIN)
+        return NULL;
+    /* a backend that refuses every piece: stop reserving after the first few */
+    if (__atomic_load_n(&g_v4_pieces_abandoned, __ATOMIC_RELAXED) >= 8 &&
+        !__atomic_load_n(&g_v4_pieces_mirrored, __ATOMIC_RELAXED))
+        return NULL;
+    pthread_mutex_lock(&g_v4_up.mutex);
+    if (g_v4_up.backend < 0)
+        g_v4_up.backend = dsv4_cuda_upload_fence(cache->device, 1) ? 1 : 0;
+    const char *fence = getenv("V4_UPLOAD_FENCE");
+    int fenced = g_v4_up.backend == 1 && !(fence && *fence && atoi(fence) == 0);
+    pthread_mutex_unlock(&g_v4_up.mutex);
+    if (!fenced) return NULL;
+    /* now, with no read in flight on the slab */
+    if (!dsv4_cuda_host_pin(slab, (long long)slab_bytes)) return NULL;
+    V4PieceJob *job = calloc(1, sizeof(*job));
+    if (!job) return NULL;
+    pthread_mutex_lock(&cache->mutex);
+    int found = -1;
+    if (cache->recycling && cache->count >= V4_MIRROR_RECYCLE_MIN) {
+        found = 0;
+        for (int i = 1; i < cache->count; i++)
+            if (cache->entries[i].clock < cache->entries[found].clock) found = i;
+        V4GpuExpertMirror *entry = &cache->entries[found];
+        if (entry->clock == UINT64_MAX || !entry->block || !entry->gate || !entry->up ||
+            !entry->down) {
+            found = -1;
+        } else {
+            entry->layer = entry->expert = -1;
+            entry->clock = UINT64_MAX;
+            job->gate = entry->gate; job->up = entry->up; job->down = entry->down;
+        }
+    }
+    pthread_mutex_unlock(&cache->mutex);
+    int noted = 0;
+    if (found >= 0) {
+        /* the join fences this card and the settle waits for it */
+        pthread_mutex_lock(&g_v4_up.mutex);
+        noted = v4_upload_note_device(cache->device);
+        if (noted) g_v4_up.fence = 1;
+        pthread_mutex_unlock(&g_v4_up.mutex);
+    }
+    job->cache = cache;
+    job->layout = *layout;
+    job->key = key;
+    job->ok = 1;
+    if (!noted) {
+        if (found >= 0) coli_v4_gpu_pieces_end(job, 0);   /* gives the entry back, empty */
+        else free(job);
+        return NULL;
+    }
+    __atomic_fetch_add(&g_v4_pieces_reserved, 1ULL, __ATOMIC_RELAXED);
+    return job;
+}
+
+void coli_v4_gpu_pieces_land(void *context, unsigned long long record_offset, size_t length,
+                             const unsigned char *bytes) {
+    V4PieceJob *job = context;
+    if (!job || !job->ok || !length || !bytes) return;
+    long long first = (long long)record_offset, end = first + (long long)length;
+    long long scales = job->layout.S, total = scales + job->layout.Wb;
+    if (first < 0 || end > total) { job->ok = 0; return; }
+    if (first == 0) job->scales = bytes;
+    if (first <= scales && end > scales) job->weights = bytes + (scales - first);
+    if (first < scales) {
+        long long count = (end < scales ? end : scales) - first;
+        if (!dsv4_cuda_mirror_copy(job->gate, 0, first, bytes, count)) { job->ok = 0; return; }
+        job->copies++;
+    }
+    if (end > scales) {
+        long long from = first > scales ? first : scales;
+        if (!dsv4_cuda_mirror_copy(job->gate, 1, from - scales, bytes + (from - first),
+                                   end - from)) { job->ok = 0; return; }
+        job->copies++;
+    }
+    job->landed += (long long)length;
+}
+
+void coli_v4_gpu_pieces_end(void *context, int read_ok) {
+    V4PieceJob *job = context;
+    if (!job) return;
+    V4GpuExpertMirrorCache *cache = job->cache;
+    const V4PieceLayout *layout = &job->layout;
+    int complete = read_ok && job->ok && job->landed == layout->S + layout->Wb &&
+                   dsv4_cuda_mirror_point(job->gate, job->up, job->down, layout->S,
+                                          layout->soff, layout->Wb, layout->woff);
+    if (complete && v4_mirror_block_verify_on() && job->scales && job->weights) {
+        /* the check waits for the second stream, then reads both runs back */
+        long long scale_bad = dsv4_cuda_mirror_check(job->gate, 0, job->scales, layout->S);
+        long long weight_bad = dsv4_cuda_mirror_check(job->gate, 1, job->weights, layout->Wb);
+        __atomic_fetch_add(&g_v4_pieces_verified, 1ULL, __ATOMIC_RELAXED);
+        if (scale_bad != -1 || weight_bad != -1) {
+            __atomic_fetch_add(&g_v4_pieces_mismatches, 1ULL, __ATOMIC_RELAXED);
+            fprintf(stderr, "piecesverify device=%d layer=%d expert=%d scales=%lld weights=%lld "
+                            "(first differing offset; -1 equal, -2 error)\n",
+                    cache->device, job->key.layer, job->key.expert, scale_bad, weight_bad);
+        }
+    }
+    pthread_mutex_lock(&cache->mutex);
+    for (int i = 0; i < cache->count; i++) {   /* by handle: entries move when one is dropped */
+        V4GpuExpertMirror *entry = &cache->entries[i];
+        if (entry->gate != job->gate) continue;
+        if (complete) {
+            entry->layer = job->key.layer;
+            entry->expert = job->key.expert;
+            entry->clock = v4_mirror_tick();
+            cache->block_refills++;
+        } else {
+            entry->layer = entry->expert = -1;
+            entry->clock = 0;   /* empty: the next one recycled */
+        }
+        break;
+    }
+    pthread_mutex_unlock(&cache->mutex);
+    if (complete) __atomic_fetch_add(&g_v4_mirror_uploads, 1ULL, __ATOMIC_RELAXED);
+    __atomic_fetch_add(complete ? &g_v4_pieces_mirrored : &g_v4_pieces_abandoned, 1ULL,
+                       __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_v4_pieces_copies, (unsigned long long)job->copies, __ATOMIC_RELAXED);
+    free(job);
 }
 
 /* Lookup-only twin of attach: report whether {layer, expert} is already
@@ -15534,6 +15932,7 @@ static int v4_gpu_mirrors_make_room(ColiExpertStore *store, int device) {
             }
         }
         /* the growth guard probes the card again before the next mirror */
+        cache->recycling = 0;
         cache->last_free_mb = -1;
         cache->grown_bytes = 0;
         cache->upload_failed = 0;

@@ -96,6 +96,31 @@ int dsv4_cuda_upload_fence(int device, int drain) {
     fences[device]++;
     return 1;
 }
+/* V4_UPLOAD_PIECES: the pieces copied, per run; the re-point; the slab pinned */
+static int piece_copies, piece_copy_ok = 1, piece_points, piece_point_ok = 1;
+static int host_pins, host_pin_ok = 1;
+static long long piece_run_bytes[2], piece_scale_offset[3], piece_weight_offset[3];
+int dsv4_cuda_mirror_copy(Dsv4CudaTensor *gate, int run, long long off, const uint8_t *src,
+                          long long len) {
+    assert(gate && src && off >= 0 && len > 0 && (run == 0 || run == 1));
+    if (!piece_copy_ok) return 0;
+    piece_copies++;
+    piece_run_bytes[run] += len;
+    return 1;
+}
+int dsv4_cuda_mirror_point(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                           long long S, const long long *soff, long long Wb,
+                           const long long *woff) {
+    assert(gate && up && down && S > 0 && Wb > 0 && soff && woff);
+    if (!piece_point_ok) return 0;
+    for (int k = 0; k < 3; k++) { piece_scale_offset[k] = soff[k]; piece_weight_offset[k] = woff[k]; }
+    piece_points++;
+    return 1;
+}
+int dsv4_cuda_host_pin(const void *p, long long len) {
+    host_pins++;
+    return host_pin_ok && p && len > 0;
+}
 /* V4_MIRROR_BLOCK: one allocation call makes the three tensors, one refill
  * call takes the record's two runs */
 static int mirror_allocs, mirror_refills, mirror_alloc_ok = 1, mirror_refill_ok = 1;
@@ -878,6 +903,168 @@ static void test_upload_thread_block(void) {
     assert(live_tensors == tensors);
 }
 
+/* V4_UPLOAD_PIECES: a mirror reserved before the read, the pieces copied as
+ * they land, the entry given to its expert when the last one is in. The cache
+ * is device 2's, 8 two-run mirrors of layer 3, full and recycling. */
+static int reserved_entries(const V4GpuExpertMirrorCache *cache) {
+    int reserved = 0;
+    for (int i = 0; i < cache->count; i++)
+        reserved += cache->entries[i].clock == UINT64_MAX;
+    return reserved;
+}
+static void test_upload_pieces(void) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(2, 8);
+    cache->first_layer = 0; cache->end_layer = 4;
+    ColiExpertStore store = {0};
+    store.gpu = cache;
+    int tensors = live_tensors;
+    /* the record of block_view: 5 scale bytes (up, gate, down), 80 weight bytes */
+    const V4PieceLayout layout = {5, 80, {2, 0, 4}, {32, 0, 64}, {2, 32, 1, 32}};
+    static uint8_t slab[4096];
+    setenv("V4_MIRROR_BLOCK", "1", 1);
+    setenv("V4_UPLOAD_THREAD", "1", 1);
+    unsetenv("V4_UPLOAD_FENCE");
+    unsetenv("V4_MIRROR_BLOCK_VERIFY");
+    ColiExpertView view;
+    for (int expert = 0; expert < 8; expert++) {
+        view = block_view(expert, 0);
+        assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    }
+    assert(cache->count == 8 && !cache->recycling);
+    ColiExpertKey key = {3, 40};
+    /* outside the step's window, and while the cache still grows: the usual read */
+    assert(!coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab)));
+    coli_v4_gpu_pieces_window(1);
+    assert(!coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab)));
+    view = block_view(8, 0);   /* the ninth recycles: the cache cannot grow */
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0 && cache->recycling);
+    /* each thing it needs, one at a time */
+    unsetenv("V4_UPLOAD_THREAD");
+    assert(!coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab)));
+    setenv("V4_UPLOAD_THREAD", "1", 1);
+    unsetenv("V4_MIRROR_BLOCK");
+    assert(!coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab)));
+    setenv("V4_MIRROR_BLOCK", "1", 1);
+    setenv("V4_UPLOAD_FENCE", "0", 1);
+    assert(!coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab)));
+    unsetenv("V4_UPLOAD_FENCE");
+    host_pin_ok = 0;
+    assert(!coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab)));
+    host_pin_ok = 1;
+    assert(!reserved_entries(cache));
+
+    /* a whole record in two pieces, the first across the two runs */
+    memset(fences, 0, sizeof(fences));
+    memset(fence_drains, 0, sizeof(fence_drains));
+    piece_copies = piece_points = 0;
+    piece_run_bytes[0] = piece_run_bytes[1] = 0;
+    unsigned long long uploads = coli_v4_gpu_expert_uploads();
+    unsigned long long refills = cache->block_refills;
+    int pins = host_pins;
+    void *job = coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab));
+    assert(job && host_pins == pins + 1 && reserved_entries(cache) == 1);
+    ColiExpertView probe = {0};
+    probe.key = key;
+    assert(coli_v4_gpu_expert_peek(&store, &probe) != 0);   /* not a hit while it is read */
+    /* an attach that recycles meanwhile takes another mirror */
+    view = block_view(9, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0 && reserved_entries(cache) == 1);
+    coli_v4_gpu_pieces_land(job, 0, 20, block_record);
+    coli_v4_gpu_pieces_land(job, 20, 65, block_record + 31);
+    assert(piece_copies == 3 && piece_run_bytes[0] == 5 && piece_run_bytes[1] == 80);
+    coli_v4_gpu_pieces_end(job, 1);
+    assert(piece_points == 1 && !reserved_entries(cache));
+    assert(piece_scale_offset[0] == 2 && piece_weight_offset[0] == 32 && piece_weight_offset[2] == 64);
+    assert(coli_v4_gpu_expert_peek(&store, &probe) == 0 && probe.gate.gpu && probe.down.gpu);
+    /* two uploads since: the attach that recycled meanwhile, and this mirror */
+    assert(coli_v4_gpu_expert_uploads() == uploads + 2 && cache->block_refills == refills + 2);
+    /* the step's join orders the card's compute stream after the pieces, its settle waits for them */
+    coli_v4_gpu_expert_upload_join();
+    assert(fences[2] == 1);
+    int drains = fence_drains[2];
+    coli_v4_gpu_expert_upload_settle();
+    assert(fence_drains[2] == drains + 1);
+    coli_v4_gpu_expert_upload_join();   /* nothing owed any more */
+    assert(fences[2] == 1);
+
+    /* short of the whole record: the entry is left empty, the next one recycled */
+    key.expert = 41;
+    probe.key = key;
+    job = coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab));
+    assert(job);
+    coli_v4_gpu_pieces_land(job, 0, 20, block_record);
+    coli_v4_gpu_pieces_end(job, 1);
+    assert(piece_points == 1 && !reserved_entries(cache));
+    assert(coli_v4_gpu_expert_peek(&store, &probe) != 0);
+    int empty = -1;
+    for (int i = 0; i < cache->count; i++)
+        if (cache->entries[i].layer == -1 && cache->entries[i].clock == 0) empty = i;
+    assert(empty >= 0);
+    /* a read that failed, a piece the backend refuses, a re-point it refuses */
+    job = coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab));
+    assert(job && cache->entries[empty].clock == UINT64_MAX);   /* the empty one was taken first */
+    coli_v4_gpu_pieces_land(job, 0, 85, block_record);
+    coli_v4_gpu_pieces_end(job, 0);
+    assert(coli_v4_gpu_expert_peek(&store, &probe) != 0);
+    piece_copy_ok = 0;
+    job = coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab));
+    coli_v4_gpu_pieces_land(job, 0, 85, block_record);
+    coli_v4_gpu_pieces_end(job, 1);
+    piece_copy_ok = 1;
+    assert(coli_v4_gpu_expert_peek(&store, &probe) != 0);
+    piece_point_ok = 0;
+    job = coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab));
+    coli_v4_gpu_pieces_land(job, 0, 85, block_record);
+    coli_v4_gpu_pieces_end(job, 1);
+    piece_point_ok = 1;
+    assert(coli_v4_gpu_expert_peek(&store, &probe) != 0 && !reserved_entries(cache));
+
+    /* every mirror reserved: an attach has no victim and leaves the expert to the CPU */
+    void *jobs[8];
+    for (int i = 0; i < 8; i++) {
+        jobs[i] = coli_v4_gpu_pieces_begin(&store, (ColiExpertKey){3, 50 + i}, &layout, slab,
+                                           sizeof(slab));
+        assert(jobs[i]);
+    }
+    assert(reserved_entries(cache) == 8);
+    assert(!coli_v4_gpu_pieces_begin(&store, key, &layout, slab, sizeof(slab)));
+    view = block_view(70, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == -1);
+    for (int i = 0; i < 8; i++) {
+        coli_v4_gpu_pieces_land(jobs[i], 0, 85, block_record);
+        coli_v4_gpu_pieces_end(jobs[i], 1);
+    }
+    assert(!reserved_entries(cache));
+    for (int i = 0; i < 8; i++) {
+        probe.key = (ColiExpertKey){3, 50 + i};
+        assert(coli_v4_gpu_expert_peek(&store, &probe) == 0);
+    }
+    coli_v4_gpu_expert_upload_join();
+    coli_v4_gpu_expert_upload_settle();
+
+    /* V4_MIRROR_BLOCK_VERIFY: the mirror read back when its last piece is in */
+    setenv("V4_MIRROR_BLOCK_VERIFY", "1", 1);
+    unsigned long long verified = g_v4_pieces_verified, mismatches = g_v4_pieces_mismatches;
+    job = coli_v4_gpu_pieces_begin(&store, (ColiExpertKey){3, 80}, &layout, slab, sizeof(slab));
+    coli_v4_gpu_pieces_land(job, 0, 85, block_record);
+    coli_v4_gpu_pieces_end(job, 1);
+    assert(g_v4_pieces_verified == verified + 1 && g_v4_pieces_mismatches == mismatches);
+    mirror_check_weights = 3;
+    job = coli_v4_gpu_pieces_begin(&store, (ColiExpertKey){3, 81}, &layout, slab, sizeof(slab));
+    coli_v4_gpu_pieces_land(job, 0, 85, block_record);
+    coli_v4_gpu_pieces_end(job, 1);
+    assert(g_v4_pieces_verified == verified + 2 && g_v4_pieces_mismatches == mismatches + 1);
+    mirror_check_weights = -1;
+    unsetenv("V4_MIRROR_BLOCK_VERIFY");
+    coli_v4_gpu_expert_upload_settle();
+
+    coli_v4_gpu_pieces_window(0);
+    unsetenv("V4_UPLOAD_THREAD");
+    unsetenv("V4_MIRROR_BLOCK");
+    v4_gpu_expert_mirrors_free(cache);
+    assert(live_tensors == tensors);
+}
+
 /* V4_BANK_MAKE_ROOM: the reserve is the headroom, and a bank about to be
  * created releases the oldest mirrors on its device until it fits. */
 static V4GpuExpertMirrorCache *room_cache(int device, int mirrors, uint64_t first_clock) {
@@ -1071,6 +1258,7 @@ int main(void) {
     test_upload_thread();
     test_upload_thread_block();
     test_hot_admission();
+    test_upload_pieces();
     test_resident_route();
     test_bank_make_room();
     test_wo_decode();

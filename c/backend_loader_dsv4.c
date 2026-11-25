@@ -213,6 +213,10 @@ typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
 typedef int             (*fn_stream_drain)(int device);
+typedef int             (*fn_mirror_copy)(Dsv4CudaTensor *gate, int run, long long off, const uint8_t *src, long long len);
+typedef int             (*fn_mirror_point)(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                                           long long S, const long long *soff, long long Wb, const long long *woff);
+typedef int             (*fn_host_pin)(const void *p, long long len);
 typedef int             (*fn_mirror_alloc)(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
                                            int Og, int Ig, int Od, int Id, int device);
 typedef int             (*fn_mirror_refill)(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
@@ -391,6 +395,9 @@ static struct {
     fn_mem_free_mb mem_free_mb;
     fn_device_unified device_unified;     /* optional: older DLLs answer 0 (discrete) */
     fn_stream_drain stream_drain;                /* optional (older DLLs) */
+    fn_mirror_copy mirror_copy;                  /* optional: the piece uploads (V4_UPLOAD_PIECES) */
+    fn_mirror_point mirror_point;
+    fn_host_pin host_pin;
     fn_mirror_alloc mirror_alloc;                /* optional: block mirrors (V4_MIRROR_BLOCK) */
     fn_mirror_refill mirror_refill;
     fn_mirror_check mirror_check;
@@ -663,6 +670,9 @@ static int dsv4_cuda_resolve(const char *dllname){
     /* optional: an older DLL without the export keeps the whole tier alive;
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
+    g_dsv4.mirror_copy = (fn_mirror_copy)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_copy");
+    g_dsv4.mirror_point = (fn_mirror_point)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_point");
+    g_dsv4.host_pin = (fn_host_pin)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_pin");
     g_dsv4.mirror_alloc = (fn_mirror_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_alloc");
     g_dsv4.mirror_refill = (fn_mirror_refill)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_refill");
     g_dsv4.mirror_check = (fn_mirror_check)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_check");
@@ -1162,6 +1172,22 @@ int dsv4_cuda_stream_drain(int device){
 int dsv4_cuda_upload_fence(int device, int drain){
     if(!g_dsv4.available || !g_dsv4.upload_fence) return 0;
     return g_dsv4.upload_fence(device, drain);
+}
+
+/* V4_UPLOAD_PIECES. A DLL without these answers 0: host_pin is asked before a
+ * mirror is reserved, so the engine never starts a piece upload it cannot do. */
+int dsv4_cuda_mirror_copy(Dsv4CudaTensor *gate, int run, long long off, const uint8_t *src, long long len){
+    if(!g_dsv4.available || !g_dsv4.mirror_copy) return 0;
+    return g_dsv4.mirror_copy(gate, run, off, src, len);
+}
+int dsv4_cuda_mirror_point(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                           long long S, const long long *soff, long long Wb, const long long *woff){
+    if(!g_dsv4.available || !g_dsv4.mirror_point) return 0;
+    return g_dsv4.mirror_point(gate, up, down, S, soff, Wb, woff);
+}
+int dsv4_cuda_host_pin(const void *p, long long len){
+    if(!g_dsv4.available || !g_dsv4.host_pin || !g_dsv4.mirror_copy || !g_dsv4.mirror_point) return 0;
+    return g_dsv4.host_pin(p, len);
 }
 
 int dsv4_cuda_kv_ring_append(int device, int layer, const float *rows, int start_pos,

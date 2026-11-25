@@ -17,6 +17,7 @@
 #include <cstring>
 #include <climits>
 #include <algorithm>
+#include <mutex>
 #include <cfloat>
 #include <vector>
 #ifndef _WIN32
@@ -3857,7 +3858,7 @@ extern "C" long long dsv4_cuda_mirror_check(Dsv4CudaTensor*g,int run,const uint8
     if(!g||!g->block||!g->block2||!src||len<=0||(run!=0&&run!=1))return -2;
     if(len>(run?g->blockcap:g->block2cap))return -2;
     Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror check device"))return -2;
-    if(!ok(cudaStreamSynchronize(c->stream),"mirror check drain"))return -2;
+    if(!ok(cudaStreamSynchronize(c->stream),"mirror check drain")||!ok(cudaStreamSynchronize(c->aux),"mirror check upload drain"))return -2;
     uint8_t*h=(uint8_t*)malloc((size_t)len);if(!h)return -2;
     if(!ok(cudaMemcpy(h,run?g->block:g->block2,(size_t)len,cudaMemcpyDeviceToHost),"mirror check download")){free(h);return -2;}
     long long bad=-1;for(long long i=0;i<len;i++)if(h[(size_t)i]!=src[i]){bad=i;break;}
@@ -5036,6 +5037,7 @@ struct PinRegion{uintptr_t base;size_t size;};
 static std::vector<PinRegion> g_pin_regions,g_pin_failed;
 static size_t g_pin_bytes;
 static int g_pin_enabled=-1;
+static std::mutex g_pin_mutex;   /* the uploader thread and the decode lanes (V4_UPLOAD_PIECES) come here together */
 /* DSV4_CUDA_PIN_CAP_GB (20): total page-locked expert-slab bytes, in GiB. The
  * RAM expert cache can exceed 20 GB (--ram 40 -> ~32 GB of slabs); slabs past
  * the cap upload through pageable staging at roughly half the PCIe rate.
@@ -5056,6 +5058,7 @@ static bool host_pin_straddled(const void*p,size_t len){
 static bool host_pinned(const void*p,size_t len){
     if(g_pin_enabled<0){const char*e=getenv("DSV4_CUDA_PIN_HOST");g_pin_enabled=!(e&&*e=='0');}
     if(!g_pin_enabled||!p||!len)return false;
+    std::lock_guard<std::mutex> pin_lock(g_pin_mutex);
     uintptr_t a=(uintptr_t)p;
     for(auto&r:g_pin_regions)if(a>=r.base&&a+len<=r.base+r.size)return true;
     if(!host_pin_straddled(p,len))for(auto&r:g_pin_failed)if(a>=r.base&&a+len<=r.base+r.size)return false;
@@ -5123,7 +5126,34 @@ extern "C" int dsv4_cuda_stream_drain(int device){
  * its status so the driver submits the copy now and the transfer runs under
  * the reads that follow, not when the next call on this device happens to
  * flush it (WDDM batches a thread's submissions). */
-static void upload_submit(Dev*c){cudaError_t e=cudaStreamQuery(c->aux);if(e!=cudaSuccess&&e!=cudaErrorNotReady)ok(e,"upload submit");}
+static void upload_submit(Dev*c){
+    static int on=-1;if(on<0){const char*e=getenv("DSV4_UPLOAD_SUBMIT");on=!(e&&*e=='0');}   /* 0: leave the submission to the driver */
+    if(!on)return;
+    cudaError_t e=cudaStreamQuery(c->aux);if(e!=cudaSuccess&&e!=cudaErrorNotReady)ok(e,"upload submit");}
+/* V4_UPLOAD_PIECES: a decode lane's read lands in pieces, and each piece of
+ * the record goes to its place in a two-run mirror as it lands, enqueued on
+ * the second stream and never waited for here: the link works under the read.
+ * run 0 = the scale run, 1 = the weight run; off = the piece's offset in it.
+ * dsv4_cuda_upload_fence orders the compute stream after these copies as it
+ * does for the uploader's. mirror_point gives the three tensors their places
+ * in the runs once every piece is in (host side only). host_pin page-locks a
+ * slab before its read starts: registering a region the drive is still
+ * writing into left stale bytes behind (WDDM moves the pages). */
+extern "C" int dsv4_cuda_mirror_copy(Dsv4CudaTensor*g,int run,long long off,const uint8_t*src,long long len){
+    if(!g||!g->block||!g->block2||!src||off<0||len<=0||(run!=0&&run!=1))return 0;
+    if(off+len>(run?g->blockcap:g->block2cap))return 0;
+    Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror piece device"))return 0;
+    host_pinned(src,(size_t)len);
+    if(!ok(cudaMemcpyAsync((uint8_t*)(run?g->block:g->block2)+off,src,(size_t)len,cudaMemcpyHostToDevice,c->aux),"mirror piece upload"))return 0;
+    upload_submit(c);return 1;}
+extern "C" int dsv4_cuda_mirror_point(Dsv4CudaTensor*g,Dsv4CudaTensor*u,Dsv4CudaTensor*d,long long S,const long long*soff,long long Wb,const long long*woff){
+    if(!g||!g->block||!g->block2||!u||!d||!soff||!woff||S<=0||Wb<=0||S>g->block2cap||Wb>g->blockcap)return 0;
+    Dsv4CudaTensor*t[3]={g,u,d};
+    for(int k=0;k<3;k++){long long sb=(long long)t[k]->O*t[k]->I/32,wb=(long long)t[k]->O*t[k]->I/2;
+        if(soff[k]<0||soff[k]+sb>S||woff[k]<0||woff[k]+wb>Wb||(woff[k]&15))return 0;}
+    for(int k=0;k<3;k++){t[k]->scale=(uint8_t*)g->block2+soff[k];t[k]->w=(uint8_t*)g->block+woff[k];}
+    return 1;}
+extern "C" int dsv4_cuda_host_pin(const void*p,long long len){return p&&len>0&&host_pinned(p,(size_t)len)?1:0;}
 extern "C" int dsv4_cuda_upload_fence(int device,int drain){
     Dev*c=ctx(device);if(!c||!ok(cudaSetDevice(device),"select upload fence device"))return 0;
     if(drain)return ok(cudaStreamSynchronize(c->aux),"upload drain")?1:0;
