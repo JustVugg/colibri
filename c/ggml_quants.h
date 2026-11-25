@@ -761,7 +761,17 @@ static int gq_matmul_f32(float *y, const float *x, const uint8_t *W, int t, int 
         }
         return 0;
     }
-    if (S == 1 && (t == GQ_F16 || t == GQ_BF16)) {
+    /* The fused 16-bit kernels keep gq_dot_f32's AVX2 FMA chains, so they give its bits only where it
+     * takes that path (and F16 needs F16C for the conversion); elsewhere the decoded row below is the
+     * reference itself. On macOS arm64 the scalar F16 kernel was not bit-identical (I=255). */
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    const int fused16 = S == 1 && (t == GQ_F16 || t == GQ_BF16);
+#elif defined(__AVX2__) && defined(__FMA__)
+    const int fused16 = S == 1 && t == GQ_BF16;
+#else
+    const int fused16 = 0;
+#endif
+    if (fused16) {
         if (t == GQ_F16) {
             #pragma omp parallel for schedule(static)
             for (int o = 0; o < O; o++) y[o] = gq_dot_f16_f32(W + (int64_t)o * rb, x, I);

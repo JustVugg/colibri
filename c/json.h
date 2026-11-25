@@ -271,7 +271,7 @@ static inline int *json_read_int_array(jval *o, const char *key, int *n_out,
         jval *v = a->kids[i];
         if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < (double)min_val ||
             v->num > (double)INT_MAX || floor(v->num) != v->num) {
-            fprintf(stderr, "ref.json: %s[%d] is not a valid integer\n", key, i);
+            fprintf(stderr, "ref.json: %s[%d] is not an integer\n", key, i);   /* olmoe's line (test_olmoe_ref_input) */
             exit(1);
         }
         r[i] = (int)v->num;
