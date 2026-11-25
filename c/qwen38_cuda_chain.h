@@ -82,6 +82,7 @@ typedef struct {
     int dn_where, host_zero, snap_valid;
     CcBuf *hyper, *hn, *low, *mix, *mixed, *inj_a, *inj_m, *blk, *q, *k, *v, *ip, *ctx, *qsc, *sel;
     CcBuf *hyper_all;                          /* every row's streams through a prompt run layer by layer (q38cc_forward_lm) */
+    CcBuf *lm_st;                              /* Q38_PREFILL_LAYER_MAJOR: a segment's rows parked across a host-MoE layer */
     /* the streams the hyper-connections read and write (q38cc_gr_read, q38cc_gr_apply, q38cc_ple):
      * hyper, or (hyp) a prompt chunk's rows of hyper_all from row hoff, in place */
     CcBuf *hyp; int hoff;
@@ -400,6 +401,8 @@ static size_t q38cc_row_floats(const Cfg *c, size_t cap) {
            2 * (size_t)c->dn_conv_dim + 2 * V + 2 * (size_t)c->dn_vheads + 2 * E + 3 * SI + 2 * Ep /* emb, embd */ +
            (size_t)(c->rotary_dim > 0 ? c->rotary_dim : 2);
 }
+static size_t q38cc_host_lm_row(const Cfg *c) { return (size_t)c->hc_width + c->hidden + 1 + c->hc_count; }
+static int q38cc_host_lm_seg(int rows) { int n = q38_lm_rows() / rows * rows; return n >= 2 * rows ? n : 0; }
 static size_t q38cc_reserve_bytes(Model *m) {
     Cfg *c = &m->c; int L = c->layers, n_attn = 0, head = q38cc_mtp_planned(m);
     for (int i = 0; i < L; i++) n_attn += c->is_attn[i] != 0;
@@ -423,6 +426,7 @@ static size_t q38cc_reserve_bytes(Model *m) {
              ((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim + (size_t)c->dn_conv_dim * (c->dn_convk - 1)) * F;
         if (E > 0) b += (cc_moe_hid_floats((int)R, (int)K, (int)H, c->inter, (int)E) + R * H + 2 * (size_t)L * R * K) * F;
         if (q38cc_layer_major()) b += (size_t)(q38cc_lm_rows() > (int)R ? q38cc_lm_rows() : (int)R) * W * F;
+        if (q38cc_host_lm_seg((int)R) > 0) b += (size_t)q38cc_host_lm_seg((int)R) * q38cc_host_lm_row(c) * F;
         if (q38cc_layer_major() && E > 0) {   /* a group of chunks' rows (q38cc_moe_group_rows): as many as dm_hid holds with 512 of down's outputs */
             size_t hc = c->hidden < 512 ? (size_t)c->hidden : 512, G = R * ((size_t)c->inter + H) / ((size_t)c->inter + hc);
             if (G > (size_t)q38cc_lm_rows()) G = (size_t)q38cc_lm_rows();
@@ -470,6 +474,7 @@ static void q38cc_free_own(Q38CChain *ch, Model *m) {
         if (ch->ring_snap[sl]) for (int i = 0; i < L; i++) { cc_free(ch->ring_snap[sl][i]); ch->ring_snap[sl][i] = NULL; }
     }
     cc_free(ch->ple_ring); ch->ple_ring = NULL;
+    cc_free(ch->lm_st); ch->lm_st = NULL;
     cc_free(ch->prm); ch->prm = NULL;
 }
 
@@ -3560,6 +3565,101 @@ static void q38cc_pd_end(Q38CChain *ch, int S, int pd, double sec) {
         fprintf(stderr, "[chain] qwen38: a decode step's pooled experts %s: %.2f ms a step%s%.0d with the CPU's, %.2f over the bus\n",
                 ch->pd_bus ? "read by the device over the bus" : "on the CPU", cpu * 1e3, r ? " of " : "", r, bus * 1e3);
 }
+/* Q38_PREFILL_LAYER_MAJOR=1 (default off; q38_lm_rows): host-MoE prompt forward of more
+ * than one piece, layers outside and pieces inside, in segments of `seg` rows. Each layer
+ * runs every piece of the segment up to its MoE input (frame A1) and shared expert (frame
+ * A2, parking streams, shared output/gate and injection in ch->lm_st), then one q38_moe_ex
+ * call computes the routed experts of ALL the segment's rows so each missed expert is read
+ * once per segment instead of once per piece. 0 = a frame failed (caller's lost path),
+ * 2 = stopped by coli_prompt_break(). */
+static unsigned long long g_q38_lm_pieces;   /* piece-layers run layer-major (tests read it) */
+static int q38cc_forward_host_lm(Q38CChain *ch, Model *m, const int *ids, int S, int pos_base, int nlogits,
+                                 float *hyper_h, int want_streams, float *mixed_h, int rows, int seg, float *wk) {
+    Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, L = c->layers, E = c->experts, V = c->vocab;
+    int half = c->rotary_dim / 2;
+    int Ep = c->ngram_heads * c->ngram_head_dim, ple = c->ple_layer >= 0 && c->ple_layer < L;
+    if (Ep < 1) Ep = 1;
+    float *xa = wk, *la = xa + (size_t)seg * H, *ra = la + (size_t)seg * E, *ea = ra + (size_t)seg * H, *csa = ea + (size_t)seg * Ep;
+    size_t od = (size_t)seg * W, og = od + (size_t)seg * H, oi = og + (size_t)seg;   /* lm_st: streams | shared | gate | injection */
+    for (int s = 0; s < S && half; s++) for (int j = 0; j < half; j++) {
+        float ang = (float)(pos_base + s) / powf(c->theta, (float)(2 * j) / c->rotary_dim);
+        csa[((size_t)s * half + j) * 2] = cosf(ang); csa[((size_t)s * half + j) * 2 + 1] = sinf(ang);
+    }
+    for (int g0 = 0; g0 < S; g0 += seg) {
+        int Sn = S - g0 < seg ? S - g0 : seg;
+        if (ple) q38cc_ple_rows(m, ids, g0, Sn, ea);
+        for (int i = 0; i <= L; i++) {   /* i == L: the last layer's sum and the read-out */
+            if (i < L && coli_prompt_break()) { cc_finish(); return 2; }
+            Layer *l = &m->L[i < L ? i : 0];
+            for (int c0 = g0; c0 < g0 + Sn; c0 += rows) {
+                int n = g0 + Sn - c0 < rows ? g0 + Sn - c0 : rows, pb = pos_base + c0;
+                size_t r0 = (size_t)(c0 - g0);
+                if (half && i < L) memcpy(cc_ptr(ch->cs), csa + (size_t)c0 * half * 2, (size_t)n * half * 2 * sizeof(float));
+                if (i) memcpy(cc_ptr(ch->routed), ra + r0 * H, (size_t)n * H * sizeof(float));
+                int ok = q38cc_frame_begin(ch);
+                if (!i) ok = ok && q38cc_hyper_in(ch, hyper_h + (size_t)c0 * W, n, W) &&
+                             (c0 > g0 || q38cc_push_state(ch, m, pb));
+                else ok = ok && cc_copy(ch->hyper, 0, ch->lm_st, r0 * W, (size_t)n * W) &&
+                          cc_copy(ch->ds, 0, ch->lm_st, od + r0 * H, (size_t)n * H) &&
+                          cc_copy(ch->sgd, 0, ch->lm_st, og + r0, (size_t)n) &&
+                          cc_copy(ch->inj_m, 0, ch->lm_st, oi + r0 * C, (size_t)n * C);
+                if (i == L) {
+                    if (ok) ok = q38cc_moe_apply(ch, m, n, ch->routed);
+                    if (ok && want_streams) ok = cc_copy(ch->hypd, 0, ch->hyper, 0, (size_t)n * W);
+                    int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
+                    int need_final = mixed_h || (lo0 < n && c0 + n > S - nlogits);
+                    if (ok && need_final) ok = q38cc_gr_read(ch, m, &m->final_gr, ch->o_fn, n, NULL);
+                    if (ok && mixed_h) ok = cc_copy(ch->find, 0, ch->mixed, 0, (size_t)n * H);
+                    if (ok && need_final && lo_n > 0 && c0 + n > S - nlogits) {
+                        int dst = c0 + lo0 - (S - nlogits);
+                        ok = cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)lo0 * H, ch->outd, (size_t)dst * V, lo_n);
+                    }
+                    double t0 = now_s();
+                    ok = ok && cc_submit(1);
+                    m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
+                    if (!ok) return 0;
+                    if (want_streams) memcpy(hyper_h + (size_t)c0 * W, cc_ptr(ch->hypd), (size_t)n * W * 4);
+                    if (mixed_h) memcpy(mixed_h + (size_t)c0 * H, cc_ptr(ch->find), (size_t)n * H * 4);
+                    continue;
+                }
+                if (i) ok = ok && q38cc_moe_apply(ch, m, n, ch->routed);
+                if (ok && i == c->ple_layer) {
+                    float *he = ch->host_emb;
+                    ch->host_emb = ea + r0 * Ep; ok = q38cc_ple(ch, m, n, c0, 0); ch->host_emb = he;
+                }
+                ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
+                ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, 0));
+                ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n);
+                ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
+                ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) &&
+                     cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H);
+                double t0 = now_s();
+                ok = ok && cc_submit(1);   /* A1 */
+                m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
+                if (!ok) return 0;
+                q38cc_kv_down(ch, m, i, n, pb);
+                memcpy(xa + r0 * H, cc_ptr(ch->mixd), (size_t)n * H * sizeof(float));
+                memcpy(la + r0 * E, cc_ptr(ch->lgd), (size_t)n * E * sizeof(float));
+                /* A2: the shared expert, then the piece parks; the next piece's A1 follows on the stream */
+                if (!(q38cc_frame_begin(ch) && q38cc_shared(ch, m, l, i, n) &&
+                      cc_copy(ch->lm_st, r0 * W, ch->hyper, 0, (size_t)n * W) &&
+                      cc_copy(ch->lm_st, od + r0 * H, ch->ds, 0, (size_t)n * H) &&
+                      cc_copy(ch->lm_st, og + r0, ch->sgd, 0, (size_t)n) &&
+                      cc_copy(ch->lm_st, oi + r0 * C, ch->inj_m, 0, (size_t)n * C) &&
+                      cc_submit(0))) return 0;
+                g_q38_lm_pieces++;
+            }
+            if (i == L) break;
+            double t1 = now_s();
+            q38_moe_ex(m, l, i, xa, Sn, ra, la, 1);
+            ch->host_ms += (now_s() - t1) * 1e3;
+        }
+        for (int i = 0; i < L; i++) if (c->is_attn[i]) ch->kv_valid[i] = pos_base + g0 + Sn;
+        ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
+    }
+    return 1;
+}
+
 /* Every layer for S rows. hyper_h: the rows' streams in, the final ones out when
  * want_streams; mixed_h (or NULL): every row's final mixed row, for the prefill
  * read-out; logit: the last nlogits rows' logits (a greedy caller's picks instead, in
@@ -3610,6 +3710,26 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         if (r < 0) goto lost;
         if (r == 2) { q38cc_dm_end(ch); return 0; }   /* stopped: not taken */
         if (r > 0) { q38cc_dm_end(ch); ch->snap_valid = 0; ch->forwards++; return 1; }
+    }
+    {
+        int seg = S > rows && !m->snap_rows && !ch->dm_on && !greedy ? q38cc_host_lm_seg(rows) : 0;
+        if (seg && !cc_reserve(&ch->lm_st, (size_t)seg * q38cc_host_lm_row(c) * 4, CC_DEV)) seg = 0;
+        if (seg) {
+            int Ep = c->ngram_heads * c->ngram_head_dim;
+            if (Ep < 1) Ep = 1;
+            size_t wf = (size_t)seg * (2 * (size_t)H + (size_t)E + (size_t)Ep) + (size_t)S * (size_t)half * 2;
+            float *wk = (float *)malloc(wf * sizeof(float));
+            if (wk) {
+                int r = q38cc_forward_host_lm(ch, m, ids, S, pos_base, nlogits, hyper_h, want_streams, mixed_h, rows, seg, wk);
+                free(wk);
+                if (r == 0) goto lost;
+                if (r == 2) return 0;
+                memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
+                ch->snap_valid = 0; ch->forwards++;
+                q38cc_pd_end(ch, S, pd, now_s() - pd_t0);
+                return 1;
+            }
+        }
     }
     for (int c0 = 0; c0 < S; c0 += rows) {
         if (coli_prompt_break()) { q38cc_pd_end(ch, S, pd, 0); q38cc_dm_end(ch); return 0; }   /* a served prompt's stop, between two chunks */
@@ -3942,6 +4062,9 @@ static void q38cc_report(Model *m) {
     if (ch->lm_forwards)
         fprintf(stderr, "[chain] qwen38: %llu prompts layer by layer, each layer's host pool experts staged once "
                         "(COLI_CUDA_CHAIN_LAYERWISE=0: chunk by chunk)\n", ch->lm_forwards);
+    if (g_q38_lm_pieces)
+        fprintf(stderr, "[chain] qwen38: Q38_PREFILL_LAYER_MAJOR: %llu piece-layers ran layer-major\n",
+                g_q38_lm_pieces);
     if (ch->dm_early)
         fprintf(stderr, "[chain] qwen38: %llu prompt layer steps' copies started beside the layer before's experts (%.2f GB of them; "
                         "COLI_CUDA_CHAIN_STAGE_RING=0: after them)\n", ch->dm_early, ch->dm_early_bytes / 1073741824.0);

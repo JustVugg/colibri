@@ -299,6 +299,17 @@ void qt_chain_own(void);
 void qt_heat_order(uint32_t *const *counts, int nl, int ne);
 int  qt_note_wanted(int layer, int eid);
 void qt_note_heat(int layer, int eid);
+
+/* QT_PREFILL_GROUP (qwen38): a prompt group's hits in one call (see qwen36_tier.c): the
+ * hits of n rows computed grouped by expert with the synchronous coli_cuda_expert_group
+ * (at most cap rows a call; xs, ys: cap rows of D floats of scratch). skip[n*K] (or NULL):
+ * assignments the CPU already computed. Returns the hits computed (hit[a] = 1, out + a*D),
+ * or -1 = declined (the caller issues row by row). qt_rows_add adds one row's device ranks
+ * in qt_take's order (device-major, rank order). */
+int  qt_rows_grouped(int layer, const int *eids, int n, int K, const float *x, float *out,
+                     unsigned char *hit, float *xs, float *ys, int cap, const unsigned char *skip);
+void qt_rows_add(int layer, const int *eids, int K, const unsigned char *hit, const float *rows,
+                 const float *val, float *out);
 int  qt_chain_devices(void);
 int  qt_chain_history(void);
 /* The chain's promotions (qwen36_tier.c's comment): after a decode-sized step, up to max of its
@@ -432,6 +443,8 @@ static inline int  qt_replan(int l,const uint32_t*a,int b){(void)l;(void)a;(void
 static inline int  qt_evicted_take(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_stats_mark(void){}
 static inline int  qt_counters(QtCounters *out){QtCounters z={0,0,0,0,0};*out=z;return 0;}
+static inline int  qt_rows_grouped(int l,const int*e,int n,int K,const float*x,float*o,unsigned char*h,float*a,float*b,int c,const unsigned char*s){(void)l;(void)e;(void)x;(void)o;(void)a;(void)b;(void)c;(void)s;for(int i=0;i<n*K;i++)h[i]=0;return -1;}
+static inline void qt_rows_add(int l,const int*e,int K,const unsigned char*h,const float*r,const float*v,float*o){(void)l;(void)e;(void)K;(void)h;(void)r;(void)v;(void)o;}
 static inline void qt_stats(void){}
 
 #endif /* COLI_CUDA */

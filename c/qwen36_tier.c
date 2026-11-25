@@ -804,6 +804,10 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
 static int G_fp8_stream;
 static const float *G_fp8_lut;
 static int G_upload_sync;             /* QT_UPLOAD_SYNC=1: qt_issue waits for in-flight uploads first (tests) */
+/* QT_FREEZE=1 (A/B and test knob, default off): after the warm start the tier moves no expert --
+ * no note promotes or swaps, the tick plans no swap and drains no replan -- so two runs that
+ * differ only in how they group rows see the same residents and give the same bits. */
+static int G_freeze;
 
 int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e4m3_lut){
     if(G.on) return 0;
@@ -913,6 +917,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         fprintf(stderr,"[qtier] RAM holds %d of %d experts a layer: the tier copies each expert it takes as it passes\n",cap,ne);
     memset(&G,0,sizeof G);
     { const char *e=getenv("QT_UPLOAD_SYNC"); G_upload_sync=e&&*e&&*e!='0'; }
+    { const char *e=getenv("QT_FREEZE"); G_freeze=e&&*e&&*e!='0'; }
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
     /* Placement state is re-derived per init: the device fold-in below reads
      * COLI_PLACE before the automatic placement has decided anything, and a
@@ -2060,7 +2065,7 @@ static void stream_promote_locked(int layer,int eid){
 void qt_note(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4 || G_trunk_only || G_chain_own) return;
+    if(!G.on || !g4 || G_trunk_only || G_chain_own || G_freeze) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
     if(G_stream){
@@ -2093,7 +2098,7 @@ void qt_heat_order(uint32_t *const *counts, int nl, int ne){
  * and room on its device or a resident colder than it, as of the last tick), so an engine
  * converts the bytes only then; qt_note_heat counts a pass of one it does not hand over. */
 int qt_note_wanted(int layer,int eid){
-    if(!G.on || G_trunk_only || G_chain_own || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+    if(!G.on || G_trunk_only || G_chain_own || G_freeze || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
     if(!G_stream) return 1;
     QSlot *s=qs(layer,eid);
     if(s->resident || s->queued) return 0;
@@ -2371,7 +2376,7 @@ int qt_counters(QtCounters *out){
 }
 
 static void qt_lfru_tick_locked(void){
-    if(G_chain_own) return;   /* the chain's to move */
+    if(G_chain_own || G_freeze) return;   /* the chain's to move, or QT_FREEZE: no swap planned or drained */
     size_t n=(size_t)G.nl*G.ne;
     G.tick++;
     if(G_stream){   /* copy mode: qt_note_wanted's bar */
@@ -2497,6 +2502,92 @@ int qt_take_scaled(uint32_t mask,const float *val,int K,float *out,const float *
     return ok;
 }
 
+/* QT_PREFILL_GROUP (qwen38, a prompt's rows): the hits of n rows in one call instead of
+ * n one-row qt_issue/qt_take round trips. Under the lock it does what n one-row issues
+ * do, row by row: the tick at layer 0, a hit's heat and count, a miss's count. Then each
+ * device computes its hit assignments (row*K + rank) grouped by expert with the
+ * synchronous coli_cuda_expert_group, at most `cap` rows and 64 experts a call (xs, ys:
+ * cap rows of D floats of scratch). hit[a] = 1 and out + a*D = that expert's output for
+ * the assignments a device computed; the others are the caller's (not resident, skipped,
+ * or a device call that failed, as a refused issue's ranks are). MXFP4 only (fmt 7): its
+ * sync group runs the issue path's kernels, and a row's result does not depend on what
+ * shares its entry or its call. Returns the hits, or -1 = declined, nothing counted. */
+static uint64_t G_pg_calls, G_pg_rows, G_pg_refused;
+int qt_rows_grouped(int layer,const int *eids,int n,int K,const float *x,float *out,
+                    unsigned char *hit,float *xs,float *ys,int cap,const unsigned char *skip){
+    int N=n*K, nh=0;
+    memset(hit,0,(size_t)N);
+    if(!G.on||G.wfmt!=7||K<1||K>QT_MAX_ROWS||n<1||cap<1||G_chain_own) return -1;
+    int *off=calloc((size_t)G.ne+2,sizeof(int)), *ord=malloc((size_t)N*sizeof(int)), *as=malloc((size_t)cap*sizeof(int));
+    ColiCudaTensor **t=malloc((size_t)G.ne*3*sizeof *t);
+    if(!off||!ord||!as||!t){ free(off); free(ord); free(as); free(t); return -1; }
+    pthread_mutex_lock(&G.mx);
+    if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
+    if(G.th_stop){ pthread_mutex_unlock(&G.mx); free(off); free(ord); free(as); free(t); return -1; }
+    G.issue_open=1;   /* before the first tick: a swap it plans may not touch a tensor picked below */
+    for(int r=0;r<n;r++){
+        if(layer==0) qt_lfru_tick_locked();
+        for(int k=0;k<K;k++){
+            int a=r*K+k, e=eids[a];
+            QSlot *s=qs(layer,e);
+            if((skip && skip[a]) || !s->resident){ G.miss++; continue; }   /* skip: the CPU's already */
+            if(s->heat<0xFFFFFFFFu) s->heat++;
+            G.hits[home2(layer,e)]++; hit[a]=1; off[e+2]++; nh++;
+        }
+    }
+    for(int e=0;e<G.ne;e++){
+        QSlot *s=qs(layer,e);
+        t[3*e]=s->tg; t[3*e+1]=s->tu; t[3*e+2]=s->td;
+        off[e+2]+=off[e+1];   /* off[e+1] = e's start, a cursor for the fill below */
+    }
+    pthread_mutex_unlock(&G.mx);
+    for(int a=0;a<N;a++) if(hit[a]) ord[off[eids[a]+1]++]=a;   /* now off[e+1] = e's end, off[e] its start */
+    for(int di=0;di<G.ndev && nh;di++){
+        ColiCudaTensor *tg[64],*tu[64],*td[64]; int rows[64], c=0, tot=0;
+        for(int e=0;e<=G.ne;e++){   /* e == G.ne: the device's last call */
+            int at=0, end=0;
+            if(e<G.ne && home2(layer,e)==di){ at=off[e]; end=off[e+1]; }
+            while(at<end || (e==G.ne && c)){
+                if(at<end){   /* this expert's rows, as many as the call still takes */
+                    int take=end-at<cap-tot?end-at:cap-tot;
+                    tg[c]=t[3*e]; tu[c]=t[3*e+1]; td[c]=t[3*e+2]; rows[c++]=take;
+                    for(int i=0;i<take;i++,at++,tot++){
+                        as[tot]=ord[at];
+                        memcpy(xs+(size_t)tot*G.D, x+(size_t)(ord[at]/K)*G.D, (size_t)G.D*sizeof(float));
+                    }
+                }
+                if(c<64 && tot<cap && e<G.ne) break;   /* room left: the next expert joins */
+                if(coli_cuda_expert_group(tg,tu,td,rows,c,ys,xs)){
+                    for(int j=0;j<tot;j++) memcpy(out+(size_t)as[j]*G.D, ys+(size_t)j*G.D, (size_t)G.D*sizeof(float));
+                    G_pg_calls++; G_pg_rows+=(uint64_t)tot;
+                } else {
+                    if(!G_pg_refused) fprintf(stderr,"[qtier] dev %d: QT_PREFILL_GROUP: a group of %d rows was refused, its rows run on the CPU\n",G.dev[di],tot);
+                    for(int j=0;j<tot;j++) hit[as[j]]=0;
+                    G_pg_refused+=(uint64_t)tot; nh-=tot;
+                }
+                c=tot=0;
+            }
+        }
+    }
+    free(off); free(ord); free(as); free(t);
+    pthread_mutex_lock(&G.mx);
+    G.issue_open=0;
+    pthread_cond_broadcast(&G.cv_take);
+    pthread_mutex_unlock(&G.mx);
+    return nh;
+}
+/* One row of a qt_rows_grouped group: its device ranks added as qt_take adds a
+ * one-row issue's (device-major, rank order, the same expression). eids, hit, val: the
+ * row's K; rows: its K output rows of D. */
+void qt_rows_add(int layer,const int *eids,int K,const unsigned char *hit,const float *rows,const float *val,float *out){
+    for(int di=0;di<G.ndev;di++) for(int k=0;k<K;k++){
+        if(!hit[k] || home2(layer,eids[k])!=di) continue;
+        float w=val[k];
+        const float *row=rows+(size_t)k*G.D;
+        for(int d=0;d<G.D;d++) out[d]+=w*row[d];
+    }
+}
+
 void qt_stats(void){
     if(!G.on) return;
     uint64_t hits=0; size_t res=0;
@@ -2521,6 +2612,9 @@ void qt_stats(void){
         fprintf(stderr,"[qtier] decode VRAM hit rate: %.1f %% (%llu hits, %llu misses after the prefill)\n",
                 dh+dm? 100.0*dh/(dh+dm) : 0.0, (unsigned long long)dh, (unsigned long long)dm);
     }
+    if(G_pg_calls||G_pg_refused)
+        fprintf(stderr,"[qtier] QT_PREFILL_GROUP: %llu prompt hit rows in %llu device calls, %llu rows refused (CPU)\n",
+                (unsigned long long)G_pg_rows,(unsigned long long)G_pg_calls,(unsigned long long)G_pg_refused);
     if(G.rp_planned)
         fprintf(stderr,"[qtier] replan: %llu swaps planned, %llu done, %d still pending\n",
                 (unsigned long long)G.rp_planned, (unsigned long long)G.rp_done, G.rp_n-G.rp_i);

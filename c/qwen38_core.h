@@ -2861,15 +2861,21 @@ static int q38_expert_batch_fallback(Model *m,Q38ExpertBatchFallback reason,
     return 0;
 }
 
-static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
-                                Slot **selected) {
+/* The batch in three steps, so a caller can read the next demand set while it computes
+ * this one (q38_group_cpu_rows): reserve (main thread: slots picked, `keep` -- slots
+ * still being computed -- never taken), load (the reads, any thread), publish (main
+ * thread). Returns 0 where q38_expert_get_batch falls back. */
+static int q38_expert_batch_reserve(Model *m,int layer,const int *experts,int count,
+                                    Slot **selected,Slot *const *keep,int keep_n,
+                                    Q38ExpertLoadJob **jobs_out,int *jobs_n) {
+    *jobs_out=NULL;*jobs_n=0;
     if(!experts||!selected||count<2)return 0;
     if(!m->expert_parallel_reads)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_DISABLED,layer,0,0);
     LCache *cache=&m->cache[layer];
-    if(count>cache->cap)
+    if(count+keep_n>cache->cap)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY,
-                                         layer,cache->cap,count);
+                                         layer,cache->cap,count+keep_n);
     int x4=q38_layer_int4(m,layer),gg=g_q38_gguf;
     const gguf_tensor *ggt[3]={0};
     if(gg)q38_gg_expert_tensors(m,layer,ggt);
@@ -2911,6 +2917,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
         int slot_index=cache->by_expert[experts[index]];
         if(slot_index>=0)protected_slots[slot_index]=1;
     }
+    for(int k=0;k<keep_n;k++)if(keep[k])protected_slots[keep[k]-cache->slots]=1;
     int job_count=0;
     for(int index=0;index<count;index++){
         int expert=experts[index],slot_index=cache->by_expert[expert];Slot *slot;
@@ -2939,28 +2946,100 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
         protected_slots[slot-cache->slots]=1;
     }
     free(protected_slots);
+    if(job_count)*jobs_out=jobs; else free(jobs);
+    *jobs_n=job_count;
+    return 1;
+}
+static int q38_read_team(void) {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+static void q38_expert_batch_load(Model *m,int layer,Q38ExpertLoadJob *jobs,int job_count,int workers) {
+    int x4=q38_layer_int4(m,layer),gg=g_q38_gguf;
+    const gguf_tensor *ggt[3]={0};
+    if(gg)q38_gg_expert_tensors(m,layer,ggt);
+#ifndef _OPENMP
+    (void)workers;
+#endif
+    #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
+    for(int job=0;job<job_count;job++){
+        if(gg)q38_gg_read_expert(m,ggt,jobs[job].expert,jobs[job].slot);
+        else if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
+        else q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
+                                        jobs[job].weight);
+    }
+}
+static void q38_expert_batch_publish(Model *m,int layer,Q38ExpertLoadJob *jobs,int job_count) {
+    LCache *cache=&m->cache[layer];int x4=q38_layer_int4(m,layer),gg=g_q38_gguf;
+    m->expert_weight_reads+=(uint64_t)job_count*(gg?3:x4?1:2);
+    if(!x4&&!gg)m->expert_pair_reads+=(uint64_t)job_count;
+    if(job_count>1)m->expert_parallel_batches++;
+    for(int job=0;job<job_count;job++){
+        Slot *slot=jobs[job].slot;slot->eid=jobs[job].expert;
+        cache->by_expert[jobs[job].expert]=(int)(slot-cache->slots);
+    }
+}
+static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
+                                Slot **selected) {
+    Q38ExpertLoadJob *jobs;int job_count;
+    if(!q38_expert_batch_reserve(m,layer,experts,count,selected,NULL,0,&jobs,&job_count))return 0;
     if(job_count){
         double started=now_s();
-        /* the default team, whatever the jobs: one as large as the jobs changed size from
-         * batch to batch, and libgomp ended and started threads at each change (#2592) */
-        #pragma omp parallel for schedule(static) if(job_count>1)
-        for(int job=0;job<job_count;job++){
-            if(gg)q38_gg_read_expert(m,ggt,jobs[job].expert,jobs[job].slot);
-            else if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
-            else q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
-                                            jobs[job].weight);
-        }
+        q38_expert_batch_load(m,layer,jobs,job_count,q38_read_team());
         q38_tm_add(m,Q38_TM_EXPERT_READ,started);
-        m->expert_weight_reads+=(uint64_t)job_count*(gg?3:x4?1:2);
-        if(!x4&&!gg)m->expert_pair_reads+=(uint64_t)job_count;
-        if(job_count>1)m->expert_parallel_batches++;
-        for(int job=0;job<job_count;job++){
-            Slot *slot=jobs[job].slot;slot->eid=jobs[job].expert;
-            cache->by_expert[jobs[job].expert]=(int)(slot-cache->slots);
-        }
+        q38_expert_batch_publish(m,layer,jobs,job_count);
     }
     free(jobs);
     return 1;
+}
+/* Persistent background loader thread for overlapping the next prefill read wave with compute
+ * (Q38_GROUP_OVERLAP). Keeps one OpenMP team on the loader thread instead of recreating threads. */
+typedef struct {
+    pthread_mutex_t mx;
+    pthread_cond_t cv;
+    pthread_t th;
+    int started,busy,layer,n,workers;
+    Model *m;
+    Q38ExpertLoadJob *jobs;
+    double secs;
+} Q38ExpertLoader;
+static Q38ExpertLoader g_q38_ld={.mx=PTHREAD_MUTEX_INITIALIZER,.cv=PTHREAD_COND_INITIALIZER};
+static unsigned long long g_q38_overlap_waves;   /* waves read while the previous one computed */
+static void *q38_loader_main(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_q38_ld.mx);
+    for(;;){
+        while(!g_q38_ld.busy)pthread_cond_wait(&g_q38_ld.cv,&g_q38_ld.mx);
+        pthread_mutex_unlock(&g_q38_ld.mx);
+        double started=now_s();
+        q38_expert_batch_load(g_q38_ld.m,g_q38_ld.layer,g_q38_ld.jobs,g_q38_ld.n,g_q38_ld.workers);
+        double secs=now_s()-started;
+        pthread_mutex_lock(&g_q38_ld.mx);
+        g_q38_ld.secs=secs;g_q38_ld.busy=0;pthread_cond_broadcast(&g_q38_ld.cv);
+    }
+    return NULL;
+}
+static int q38_loader_start(Model *m,int layer,Q38ExpertLoadJob *jobs,int n) {
+    pthread_mutex_lock(&g_q38_ld.mx);
+    if(!g_q38_ld.started){
+        g_q38_ld.workers=q38_read_team();
+        if(pthread_create(&g_q38_ld.th,NULL,q38_loader_main,NULL)){pthread_mutex_unlock(&g_q38_ld.mx);return 0;}
+        pthread_detach(g_q38_ld.th);g_q38_ld.started=1;
+    }
+    if(g_q38_ld.busy){pthread_mutex_unlock(&g_q38_ld.mx);return 0;}
+    g_q38_ld.m=m;g_q38_ld.layer=layer;g_q38_ld.jobs=jobs;g_q38_ld.n=n;g_q38_ld.busy=1;
+    pthread_cond_broadcast(&g_q38_ld.cv);
+    pthread_mutex_unlock(&g_q38_ld.mx);
+    return 1;
+}
+static void q38_loader_join(Model *m) {
+    pthread_mutex_lock(&g_q38_ld.mx);
+    while(g_q38_ld.busy)pthread_cond_wait(&g_q38_ld.cv,&g_q38_ld.mx);
+    m->timers.seconds[Q38_TM_EXPERT_READ]+=g_q38_ld.secs;
+    pthread_mutex_unlock(&g_q38_ld.mx);
 }
 
 static void q38_ple_row(Model *m,int64_t row,float *out) {
@@ -5059,6 +5138,186 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     return 1;
 }
 
+/* ---- Opt-in CUDA-tier prefill levers (all default off) ------------------------
+ * Q38_PREFILL_LAYER_MAJOR=1: CUDA chain host-MoE prompt forwards run layer-major
+ *   in segments of Q38_PREFILL_LAYER_MAJOR_ROWS (default 2048), so each missed
+ *   expert is read once per segment instead of once per chain piece.
+ * Q38_TIER_PREFILL_ROWWISE=1: prompt MoE layers use the CUDA tier (q38_moe_decode_ex)
+ *   so VRAM-resident experts serve prefill rows on the GPU.
+ * Q38_TIER_PREFILL_GROUP=1: group Q38_TIER_GROUP_ROWS (default max(256, lm_rows))
+ *   rows in q38_moe_decode_ex, loading and computing each CPU miss once per group
+ *   in half-cache overlapped waves (Q38_GROUP_OVERLAP=1).
+ * Q38_WAVE_OMP=1: compute a read wave of MXFP4 CPU experts in one OpenMP region
+ *   using quant.h's mx4_dot_row (bit-identical to matmul_mxfp4).
+ * QT_PREFILL_GROUP=1: compute each group's MXFP4 VRAM hits in synchronous grouped
+ *   device calls (qt_rows_grouped, up to QT_PREFILL_GROUP_ROWS=256 rows/call) with
+ *   a compact CPU output buffer. */
+static int q38_lm_rows(void) {
+    return q38_env_bool("Q38_PREFILL_LAYER_MAJOR",0)?q38_env_positive_int("Q38_PREFILL_LAYER_MAJOR_ROWS",2048,1<<16):0;
+}
+static int q38_prefill_group_rows(void) {
+    return q38_env_bool("QT_PREFILL_GROUP",0)?q38_env_positive_int("QT_PREFILL_GROUP_ROWS",256,4096):0;
+}
+static int q38_wave_omp_on(void) {
+    return q38_env_bool("Q38_WAVE_OMP",0);
+}
+static int q38_group_rows(void) {
+    int lm=q38_lm_rows();
+    int def=q38_prefill_group_rows()>0||q38_wave_omp_on()||lm>0;
+    return q38_env_bool("Q38_TIER_PREFILL_GROUP",def)?q38_env_positive_int("Q38_TIER_GROUP_ROWS",lm>256?lm:256,1<<16):0;
+}
+static int q38_tier_prefill_rowwise(void) {
+    int def=q38_group_rows()>0||q38_prefill_group_rows()>0||q38_wave_omp_on();
+    return q38_env_bool("Q38_TIER_PREFILL_ROWWISE",def);
+}
+typedef struct {
+    int *idx,*list,*ident,*count,*offs,*uniq;
+    float *gate,*out,*in,*eg,*eu;
+    unsigned char *have;
+    Slot **slots,**slots2;
+    int wave;   /* Q38_WAVE_OMP: eg/eu hold K rows per group row (q38_wave_rows) */
+    int pg;     /* QT_PREFILL_GROUP: rows a device call (0 = off); hit[n*K], dx/dy its scratch */
+    unsigned char *hit;
+    float *dx,*dy;
+    int keep;   /* Q38_GROUP_KEEP: out is g_q38_keep_out, not freed */
+    /* QT_PREFILL_GROUP's compact workspace: out holds only the CPU's outputs, in list order
+     * (cpos[a] = assignment a's row there), sized after routing; the hits of QT_PREFILL_GROUP_ROWS
+     * rows at a time land in hout (g_q38_pg_hout) and are added before the next rows' call */
+    int compact,*cpos;
+    float *hout;
+    int64_t outcap,egcap;
+} Q38RowGroup;
+static float *g_q38_keep_out;static int64_t g_q38_keep_n;
+static float *g_q38_pg_hout;static int64_t g_q38_pg_hout_n;
+static unsigned long long g_q38_wave_experts;   /* experts computed in wave regions (tests read it) */
+static void q38_prefill_expert_rows(Model *m,Slot *expert,const float *xc,int K,const int *assign,
+                                    const int *pos,int n,float *in,float *gate,float *up,float *routed_out);
+static int q38_wave_weight(const Q38Weight *w,int rows,int cols) {
+    return w->kind==Q38_WEIGHT_MXFP4&&w->data&&w->x2q&&w->rows==rows&&w->cols==cols&&!w->gpu&&!w->q8;
+}
+/* Q38_WAVE_OMP=1: a read wave's MXFP4 CPU experts in ONE OpenMP region (gate+up, silu,
+ * down: two barriers) instead of three regions and a serial silu per expert. Each output
+ * calls quant.h's mx4_dot_row, so every value is matmul_mxfp4's bit for bit. */
+static int q38_wave_rows(Model *m,Slot *const *ex,const int *eids,int ne,Q38RowGroup *g,const float *xc,int K) {
+    int H=m->c.hidden,I=m->c.inter;
+    for(int o=0;o<ne;o++)
+        if(!q38_wave_weight(&ex[o]->gate,I,H)||!q38_wave_weight(&ex[o]->up,I,H)||!q38_wave_weight(&ex[o]->down,H,I))return 0;
+    const int rb_h=(H+1)/2,ng_h=(H+31)/32,rb_i=(I+1)/2,ng_i=(I+31)/32;
+    double started=now_s();
+    enum{WMAX=32};
+    for(int o0=0;o0<ne;o0+=WMAX){
+        int nw=ne-o0<WMAX?ne-o0:WMAX,base[WMAX+1],lo[WMAX];const int *pos[WMAX];
+        base[0]=0;
+        for(int o=0;o<nw;o++){int e=eids[o0+o];pos[o]=g->list+g->offs[e];base[o+1]=base[o]+g->count[e];lo[o]=g->compact?g->offs[e]:-1;}
+        int64_t R=base[nw];float *eg=g->eg,*eu=g->eu,*out=g->out;
+        Slot *const *w=ex+o0;
+        #pragma omp parallel
+        {
+            #pragma omp for schedule(static)
+            for(int64_t u=0;u<R*I;u++){
+                int o=0;while(u>=(int64_t)base[o+1]*I)o++;
+                int c=base[o+1]-base[o];int64_t l=u-(int64_t)base[o]*I;int j=(int)(l/c),p=(int)(l%c);
+                const float *xs=xc+(int64_t)(pos[o][p]/K)*H;int64_t r=(int64_t)(base[o]+p)*I+j;
+                eg[r]=mx4_dot_row((const uint8_t*)w[o]->gate.data+(int64_t)j*rb_h,w[o]->gate.x2q+(int64_t)j*ng_h,xs,H);
+                eu[r]=mx4_dot_row((const uint8_t*)w[o]->up.data+(int64_t)j*rb_h,w[o]->up.x2q+(int64_t)j*ng_h,xs,H);
+            }
+            #pragma omp for schedule(static)
+            for(int64_t i=0;i<R*I;i++)eg[i]=q38_silu(eg[i])*eu[i];
+            #pragma omp for schedule(static)
+            for(int64_t u=0;u<R*H;u++){
+                int o=0;while(u>=(int64_t)base[o+1]*H)o++;
+                int c=base[o+1]-base[o];int64_t l=u-(int64_t)base[o]*H;int d=(int)(l/c),p=(int)(l%c);
+                out[(lo[o]>=0?(int64_t)lo[o]+p:(int64_t)pos[o][p])*H+d]=
+                    mx4_dot_row((const uint8_t*)w[o]->down.data+(int64_t)d*rb_i,w[o]->down.x2q+(int64_t)d*ng_i,
+                                eg+(int64_t)(base[o]+p)*I,I);
+            }
+        }
+    }
+    g_q38_wave_experts+=(unsigned long long)ne;
+    q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
+    return 1;
+}
+static void q38_group_cpu_rows(Model *m,Layer *l,int layer,const float *x,const float *logits_in,
+                               int s0,int n,float *logits,Q38RowGroup *g) {
+    Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,tiered=layer<c->layers;
+    memset(g->count,0,(size_t)E*sizeof(int));
+    memset(g->have,0,(size_t)n*K);
+    const int onepass=q38_route_par_on();
+    if(onepass&&logits_in&&n>=g_q38_route_par_min){
+        #pragma omp parallel
+        {
+            float *lg=falloc(E);
+            #pragma omp for schedule(static)
+            for(int r=0;r<n;r++){
+                memcpy(lg,logits_in+(int64_t)(s0+r)*E,(size_t)E*sizeof(float));
+                q38_route_probs(lg,E,K,layer,c->norm_topk,1,g->idx+(int64_t)r*K,g->gate+(int64_t)r*K);
+            }
+            free(lg);
+        }
+    } else for(int r=0;r<n;r++){
+        int s=s0+r;
+        if(logits_in)memcpy(logits,logits_in+(int64_t)s*E,(size_t)E*sizeof(float));
+        else q38_dense_matmul(m,logits,x+(int64_t)s*H,&l->router,1,H,E);
+        q38_route_probs(logits,E,K,layer,c->norm_topk,onepass,g->idx+(int64_t)r*K,g->gate+(int64_t)r*K);
+    }
+    /* the CPU's share: what the tier does not hold now (have = computed below; one the
+     * tier then declines anyway is computed by the per-row loop). */
+    for(int a=0;a<n*K;a++){
+        int e=g->idx[a],hit=tiered&&qt_is_resident(layer,e);
+        if(!hit){g->have[a]=1;g->count[e]++;}
+    }
+    int nu=0;g->offs[0]=0;
+    for(int e=0;e<E;e++){g->offs[e+1]=g->offs[e]+g->count[e];if(g->count[e])g->uniq[nu++]=e;}
+    int *fill=g->ident;
+    memcpy(fill,g->offs,(size_t)E*sizeof(int));
+    for(int a=0;a<n*K;a++)if(g->have[a])g->list[fill[g->idx[a]]++]=a;
+    for(int a=0;a<n*K;a++)g->ident[a]=a;
+    if(g->compact){   /* the CPU's outputs in list order: as many rows as it has assignments */
+        int64_t nc=g->offs[E],ne=g->wave&&nc>n?nc:n;   /* eg/eu: a wave region's rows (up to nc), else one expert's (up to n) */
+        for(int i=0;i<nc;i++)g->cpos[g->list[i]]=i;
+        if(nc*H>g->outcap){free(g->out);g->out=falloc(nc*H>0?nc*H:1);g->outcap=nc*H;}
+        if(ne*I>g->egcap){free(g->eg);free(g->eu);g->eg=falloc(ne*I);g->eu=falloc(ne*I);g->egcap=ne*I;}
+    }
+    int load_limit=m->cache[layer].cap<1?1:m->cache[layer].cap;
+    int overlap=load_limit>=4&&q38_env_bool("Q38_GROUP_OVERLAP",1);
+    if(overlap)load_limit/=2;
+    Slot **cur=g->slots,**nxt=g->slots2;
+    int cnt=nu<load_limit?nu:load_limit;
+    int batch=cnt>=2&&q38_expert_get_batch(m,layer,g->uniq,cnt,cur);
+    for(int u0=0;u0<nu;){
+        int u1=u0+cnt,cnt1=nu-u1<load_limit?nu-u1:load_limit,next=0,pending=0,jn=0;
+        Q38ExpertLoadJob *jobs=NULL;
+        if(overlap&&batch&&cnt1>=2&&q38_expert_batch_reserve(m,layer,g->uniq+u1,cnt1,nxt,cur,cnt,&jobs,&jn)){
+            next=1;
+            if(jn&&q38_loader_start(m,layer,jobs,jn)){pending=1;g_q38_overlap_waves++;}
+            /* a prefill wave is disk-bound: one reader per record keeps many reads in flight */
+            else if(jn){double started=now_s();q38_expert_batch_load(m,layer,jobs,jn,jn);q38_tm_add(m,Q38_TM_EXPERT_READ,started);
+                        q38_expert_batch_publish(m,layer,jobs,jn);}
+        }
+        if(g->wave&&batch&&q38_wave_rows(m,cur,g->uniq+u0,cnt,g,x+(int64_t)s0*H,K)){
+            if(tiered)for(int o=0;o<cnt;o++){
+                int e=g->uniq[u0+o];
+                if(g->count[e]>0){q38_tier_note(layer,e,cur[o]);for(int h=1;h<g->count[e];h++)qt_note_heat(layer,e);}
+            }
+        } else for(int o=0;o<cnt;o++){
+            int e=g->uniq[u0+o];
+            Slot *ex=batch?cur[o]:q38_expert_get(m,layer,e);
+            const int *pos=g->list+g->offs[e];
+            /* an expert a row routes twice (rt_router_pick's fallback on non-finite logits)
+             * has more assignments than the group has rows: slice by n to avoid buffer overflow */
+            for(int p=0;p<g->count[e];p+=n)
+                q38_prefill_expert_rows(m,ex,x+(int64_t)s0*H,K,g->compact?g->list:g->ident,
+                                        g->compact?g->ident+g->offs[e]+p:pos+p,g->count[e]-p<n?g->count[e]-p:n,
+                                        g->in,g->eg,g->eu,g->out);
+            if(tiered&&g->count[e]>0){q38_tier_note(layer,e,ex);for(int h=1;h<g->count[e];h++)qt_note_heat(layer,e);}
+        }
+        if(pending){q38_loader_join(m);q38_expert_batch_publish(m,layer,jobs,jn);}
+        free(jobs);
+        if(!next)next=cnt1>=2&&q38_expert_get_batch(m,layer,g->uniq+u1,cnt1,nxt);
+        Slot **t=cur;cur=nxt;nxt=t;batch=next;u0=u1;cnt=cnt1;
+    }
+}
+
 /* logits_in: the router's raw rows (S x E) when the caller has them, else NULL and the
  * router runs here; routed_only = 1: `out` gets the routed experts' rank-order sum
  * without the shared expert (the Vulkan dense chain runs the router and the shared
@@ -5071,13 +5330,51 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
     int vk=vkt_ready()&&layer<vkt_layers();   /* the Vulkan tier: outputs buffered per rank */
     float *ebuf=vk?falloc((int64_t)K*H):NULL;
-    for(int s=0;s<S;s++){
+    int G=S>1&&!vk?q38_group_rows():0;   /* rows grouped per expert load, 0 = per row */
+    if(G>S)G=S;
+    Q38RowGroup g;memset(&g,0,sizeof g);
+    if(G){
+        int64_t a=(int64_t)G*K;
+        g.wave=q38_wave_omp_on();
+        g.idx=(int*)malloc((size_t)a*sizeof(int));g.list=(int*)malloc((size_t)a*sizeof(int));
+        g.ident=(int*)malloc((size_t)(a>E?a:E)*sizeof(int));g.count=(int*)malloc((size_t)E*sizeof(int));
+        g.offs=(int*)malloc((size_t)(E+1)*sizeof(int));g.uniq=(int*)malloc((size_t)E*sizeof(int));
+        g.gate=falloc(a);g.in=falloc((int64_t)G*H);
+        g.pg=layer<c->layers&&qt_ready()?q38_prefill_group_rows():0;
+        g.compact=g.pg>0;   /* out, eg, eu sized by q38_group_cpu_rows once the CPU's share is known */
+        g.keep=!g.compact&&q38_env_bool("Q38_GROUP_KEEP",0);
+        if(g.keep&&g_q38_keep_n<a*H){free(g_q38_keep_out);g_q38_keep_out=falloc(a*H);g_q38_keep_n=a*H;}
+        if(!g.compact){g.out=g.keep?g_q38_keep_out:falloc(a*H);g.eg=falloc((g.wave?a:G)*I);g.eu=falloc((g.wave?a:G)*I);}
+        g.have=(unsigned char*)malloc((size_t)a);g.slots=(Slot**)malloc((size_t)E*sizeof(Slot*));g.slots2=(Slot**)malloc((size_t)E*sizeof(Slot*));
+        if(g.pg){
+            int64_t hn=(int64_t)g.pg*K*H;
+            if(g_q38_pg_hout_n<hn){free(g_q38_pg_hout);g_q38_pg_hout=falloc(hn);g_q38_pg_hout_n=hn;}
+            g.hout=g_q38_pg_hout;g.cpos=(int*)malloc((size_t)a*sizeof(int));
+            g.hit=(unsigned char*)malloc((size_t)a);g.dx=falloc((int64_t)g.pg*H);g.dy=falloc((int64_t)g.pg*H);
+        }
+        if(!g.idx||!g.list||!g.ident||!g.count||!g.offs||!g.uniq||!g.have||!g.slots||!g.slots2||(g.pg&&(!g.hit||!g.cpos))){
+            fprintf(stderr,"OOM Qwen3.8 grouped row workspace\n");exit(1);
+        }
+    }
+    for(int s0=0;s0<S;s0+=G?G:S){
+    int n=G?(S-s0<G?S-s0:G):S;
+    if(G)q38_group_cpu_rows(m,l,layer,x,logits_in,s0,n,logits,&g);
+    int pgr=g.pg;   /* QT_PREFILL_GROUP: the hits of g.pg rows at a time in g.hout */
+    for(int s=s0;s<s0+n;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
         if(g_q38_cov)q38_cov_add(layer,xs,1);
-        if(logits_in)memcpy(logits,logits_in+(int64_t)s*E,(size_t)E*sizeof(float));
-        else q38_dense_matmul(m,logits,xs,&l->router,1,H,E);
         int idx[Q38_MAX_TOPK];float route_gates[Q38_MAX_TOPK];
-        q38_route_probs(logits,E,K,layer,c->norm_topk,q38_route_par_on(),idx,route_gates);
+        int r=s-s0;   /* the row within its group */
+        if(pgr&&r%g.pg==0){   /* the next rows' hits, minus what the CPU computed (have) */
+            if(qt_rows_grouped(layer,g.idx+(int64_t)r*K,n-r<g.pg?n-r:g.pg,K,xs,g.hout,g.hit+(int64_t)r*K,g.dx,g.dy,g.pg,g.have+(int64_t)r*K)<0)
+                pgr=g.pg=0;   /* declined: row by row from here */
+        }
+        if(G){memcpy(idx,g.idx+(int64_t)r*K,(size_t)K*sizeof(int));memcpy(route_gates,g.gate+(int64_t)r*K,(size_t)K*sizeof(float));}
+        else{
+            if(logits_in)memcpy(logits,logits_in+(int64_t)s*E,(size_t)E*sizeof(float));
+            else q38_dense_matmul(m,logits,xs,&l->router,1,H,E);
+            q38_route_probs(logits,E,K,layer,c->norm_topk,q38_route_par_on(),idx,route_gates);
+        }
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
         if(g_q38_dump)q38_dump_add(layer,xs,idx,route_gates,K,H);
         /* Resident experts run on the GPU from here on (asynchronously); the
@@ -5087,10 +5384,20 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         uint8_t taken[Q38_MAX_TOPK]={0};
         int ndev=vk?vkt_issue(layer,xs,1,K,idx,taken):0;
         for(int z=0;z<K;z++)if(taken[z])q38_ehit_mark(m,layer,idx[z]);   /* routed this turn, wherever it ran */
-        uint32_t qmask=tiered?qt_issue(layer,idx,K,xs):0;
+        uint32_t qmask=0;
+        if(pgr)for(int z=0;z<K;z++)qmask|=(uint32_t)g.hit[r*K+z]<<z;
+        else qmask=tiered?qt_issue(layer,idx,K,xs):0;
         int cpu_idx[Q38_MAX_TOPK],cpu_rank[Q38_MAX_TOPK],cpu_n=0;
         for(int z=0;z<K;z++)if(!((qmask>>z)&1u)&&!taken[z]){cpu_idx[cpu_n]=idx[z];cpu_rank[cpu_n]=z;cpu_n++;}
-        q38_prefetch_experts(m,layer,cpu_idx,cpu_n);
+        /* grouped: the group's pass computed these already; only an expert it left to the
+         * tier and the tier then declined is loaded here (need_*) */
+        const float *pre[Q38_MAX_TOPK];int need_idx[Q38_MAX_TOPK],need_n=0;
+        for(int i=0;i<cpu_n;i++){
+            int a=r*K+cpu_rank[i];
+            pre[i]=G&&g.have[a]?g.out+(int64_t)(g.compact?g.cpos[a]:a)*H:NULL;
+            if(!pre[i])need_idx[need_n++]=cpu_idx[i];
+        }
+        q38_prefetch_experts(m,layer,need_idx,need_n);
         double phase_started=now_s();
         float gate=0.f;
         if(!routed_only){
@@ -5100,12 +5407,13 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
         }
         Slot *selected[Q38_MAX_TOPK];
-        int loaded_batch=q38_expert_get_batch(m,layer,cpu_idx,cpu_n,selected);
-        for(int i=0;i<cpu_n;i++){
+        int loaded_batch=q38_expert_get_batch(m,layer,need_idx,need_n,selected);
+        for(int i=0,j=0;i<cpu_n;i++){
             int z=cpu_rank[i];
-            Slot *ex=loaded_batch?selected[i]:q38_expert_get(m,layer,cpu_idx[i]);phase_started=now_s();
+            if(pre[i]){for(int d=0;d<H;d++)ys[d]+=route_gates[z]*pre[i][d];continue;}   /* vk is off when grouped */
+            Slot *ex=loaded_batch?selected[j]:q38_expert_get(m,layer,need_idx[j]);j++;phase_started=now_s();
             q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
-            for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];
+            for(int k=0;k<I;k++)eh[k]=q38_silu(eg[k])*eu[k];
             if(g_q38_act)q38_act_add(layer,cpu_idx[i],xs,eh,1);
             q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             if(vk){
@@ -5131,13 +5439,20 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         }
         /* GPU experts land after the CPU ones: same values, one more group in
          * the float sum (that is the only ordering difference to a CPU run). */
-        if(tiered&&!qt_take(qmask,route_gates,K,ys)){
+        if(pgr)qt_rows_add(layer,idx,K,g.hit+r*K,g.hout+(int64_t)(r%g.pg)*K*H,route_gates,ys);
+        else if(tiered&&!qt_take(qmask,route_gates,K,ys)){
             fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
             exit(1);
         }
         if(!routed_only)for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
+    }
     rt_trace_end();
+    if(G){
+        free(g.idx);free(g.list);free(g.ident);free(g.count);free(g.offs);free(g.uniq);
+        free(g.gate);if(!g.keep)free(g.out);free(g.in);free(g.eg);free(g.eu);
+        free(g.have);free(g.slots);free(g.slots2);free(g.cpos);free(g.hit);free(g.dx);free(g.dy);
+    }
     free(logits);free(sg);free(su);free(sh);free(shared);free(eg);free(eu);free(eh);free(eo);free(ebuf);
 }
 static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
@@ -5451,9 +5766,9 @@ static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *o
             S-=base;
         }
     }
-    /* An MTP verify on the CUDA tier routes row by row as decode does, so
-     * the tier's resident experts serve it (the batched path is CPU only). */
-    if(S<=1||!m->prefill_batch||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers))
+    /* An MTP verify (or opt-in Q38_TIER_PREFILL_ROWWISE) on the CUDA tier routes row by row
+     * as decode does, so the tier's resident experts serve it (the batched path is CPU only). */
+    if(S<=1||!m->prefill_batch||((g_q38_rowwise||q38_tier_prefill_rowwise())&&qt_ready()&&layer<m->c.layers))
         q38_moe_decode_ex(m,l,layer,x,S,out,logits_in,routed_only);
     else q38_moe_prefill(m,l,layer,x,S,out,logits_in,routed_only);
 }

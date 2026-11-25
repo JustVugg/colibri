@@ -172,6 +172,13 @@ int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const
     return 0;
 }
 const float *coli_cuda_expert_group_take(int device) { (void)device; return fake_group_hook ? fake_group_out : NULL; }
+static int (*fake_sync_group_hook)(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                                   const int *rows, int count, float *y, const float *x);
+int coli_cuda_expert_group(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                           const int *rows, int count, float *y, const float *x) {
+    if (fake_sync_group_hook) return fake_sync_group_hook(g, u, d, rows, count, y, x);
+    return 0;
+}
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d, double *kernel, double *d2h) {
     if (calls) *calls = 0; if (experts) *experts = 0; if (rows) *rows = 0;

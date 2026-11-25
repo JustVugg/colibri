@@ -91,6 +91,25 @@ static int mx_compute(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCu
     fake_group_out = mx_out; mx_groups++;
     return 1;
 }
+static int mx_sync_shared;
+static int mx_sync_compute(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                           const int *rows, int count, float *y, const float *x) {
+    const int D = g[0]->I, I = g[0]->O;
+    float eg[256], eu[256];
+    if (D > 256 || I > 256) return 0;
+    int off = 0;
+    for (int j = 0; j < count; j++) {
+        if (g[j]->fmt != 7 || !g[j]->owned || !u[j]->owned || !d[j]->owned) return 0;
+        if (rows[j] > 1) mx_sync_shared++;
+        for (int r = 0; r < rows[j]; r++, off++) {
+            matmul_mxfp4(eg, x + (size_t)off * D, (const uint8_t *)g[j]->w, (const uint8_t *)g[j]->sc, 1, D, I);
+            matmul_mxfp4(eu, x + (size_t)off * D, (const uint8_t *)u[j]->w, (const uint8_t *)u[j]->sc, 1, D, I);
+            for (int i = 0; i < I; i++) eg[i] = q38_silu(eg[i]) * eu[i];
+            matmul_mxfp4(y + (size_t)off * D, eg, (const uint8_t *)d[j]->w, (const uint8_t *)d[j]->sc, 1, I, D);
+        }
+    }
+    return 1;
+}
 
 /* The load's own steps, model_init then q38_tier_start, with the trunk placed on the
  * fake tier: a placed matrix keeps only its int8 rows from then on (its BF16 rows freed
@@ -306,6 +325,155 @@ int main(int argc, char **argv_in) {
         tk(rel >= 0 && rel <= 1e-6, "within 1e-6 of the CPU's (the device's rows join the sum after the CPU's)");
         dump_rel(dev2, dev1, &same);
         tk(same, "two runs with the same residency give the same bits");
+
+        /* Fourth pass: opt-in CUDA-tier prefill levers (Q38_TIER_PREFILL_ROWWISE,
+         * Q38_TIER_PREFILL_GROUP, Q38_WAVE_OMP, QT_PREFILL_GROUP, QT_FREEZE,
+         * Q38_PREFILL_LAYER_MAJOR). Write a 6-expert heat file so residency is known. */
+        {
+            char hf[2048], d_row[2048], d_grp[2048], d_wav[2048], d_pg[2048], d_pg3[2048], d_ref0[2048], d_ref1[2048];
+            char d_pc[2048], d_lm[2048];
+            snprintf(hf, sizeof hf, "%s/tier_heat.bin", snap);
+            snprintf(d_row, sizeof d_row, "%s/tier_row.f32", snap);
+            snprintf(d_grp, sizeof d_grp, "%s/tier_grp.f32", snap);
+            snprintf(d_wav, sizeof d_wav, "%s/tier_wav.f32", snap);
+            snprintf(d_pg, sizeof d_pg, "%s/tier_pg.f32", snap);
+            snprintf(d_pg3, sizeof d_pg3, "%s/tier_pg3.f32", snap);
+            snprintf(d_ref0, sizeof d_ref0, "%s/tier_ref0.f32", snap);
+            snprintf(d_ref1, sizeof d_ref1, "%s/tier_ref1.f32", snap);
+            snprintf(d_pc, sizeof d_pc, "%s/tier_pc.f32", snap);
+            snprintf(d_lm, sizeof d_lm, "%s/tier_lm.f32", snap);
+            uint32_t heat[3 + 16] = { 0x48454154u, 4, 4, 10, 0, 10, 0,  0, 10, 0, 10,  10, 0, 0, 0,  0, 10, 0, 0 };
+            FILE *hfp = fopen(hf, "wb");
+            if (hfp) { fwrite(heat, sizeof heat, 1, hfp); fclose(hfp); }
+
+            /* Cap 4 so half-cache waves (2 experts) exercise Q38_GROUP_OVERLAP as well. */
+            char *argvm4[] = { (char *)"qwen38", (char *)"4", (char *)"8", ref };
+            G_offer_n = 0;   /* clear the chain/trunk offers left by the pass above */
+            fake_own_mx4 = 1; fake_group_hook = mx_compute; fake_sync_group_hook = mx_sync_compute;
+            setenv("HEAT_FILE", hf, 1); setenv("QT_NO_WARMSTART", "0", 1);
+            setenv("QT_FREEZE", "1", 1);
+            snprintf(gb, sizeof gb, "%.15f", (double)(6 * mx_bytes + mx_bytes / 2) / 1073741824.0);
+            setenv("CUDA_EXPERT_GB", gb, 1);
+
+            printf(" Q38_TIER_PREFILL_ROWWISE / GROUP / WAVE_OMP on MXFP4 records\n");
+            setenv("Q38_TIER_PREFILL_ROWWISE", "1", 1); setenv("Q38_TIER_PREFILL_GROUP", "0", 1);
+            setenv("DUMP", d_row, 1);
+            int r0 = qwen38_main_unused(4, argvm4);
+            QtCounters q0; qt_counters(&q0);
+            qt_shutdown();
+
+            setenv("Q38_TIER_PREFILL_GROUP", "1", 1); setenv("Q38_WAVE_OMP", "0", 1);
+            setenv("DUMP", d_grp, 1);
+            int r1 = qwen38_main_unused(4, argvm4);
+            qt_shutdown();
+
+            unsigned long long w0 = g_q38_wave_experts;
+            setenv("Q38_WAVE_OMP", "1", 1);
+            setenv("DUMP", d_wav, 1);
+            int r2 = qwen38_main_unused(4, argvm4);
+            unsigned long long w1 = g_q38_wave_experts;
+            qt_shutdown();
+            unsetenv("Q38_WAVE_OMP");
+
+            int same_grp = 0, same_wav = 0;
+            dump_rel(d_grp, d_row, &same_grp);
+            dump_rel(d_wav, d_row, &same_wav);
+            tk(r0 == 0 && r1 == 0 && same_grp, "Q38_TIER_PREFILL_GROUP=1 matches per-row Q38_TIER_PREFILL_ROWWISE=1 to the bit");
+            tk(r2 == 0 && same_wav && w1 > w0, "Q38_WAVE_OMP=1 matches per-row logits to the bit and ran wave regions");
+
+            printf(" QT_PREFILL_GROUP=1 + QT_FREEZE=1 on MXFP4 records\n");
+            int sh0 = mx_sync_shared;
+            unsigned long long c0 = G_pg_calls, rw0 = G_pg_rows, rf0 = G_pg_refused;
+            setenv("QT_PREFILL_GROUP", "1", 1); setenv("DUMP", d_pg, 1);
+            int rp1 = qwen38_main_unused(4, argvm4);
+            QtCounters q1; qt_counters(&q1);
+            unsigned long long c1 = G_pg_calls - c0, rw1 = G_pg_rows - rw0, rf1 = G_pg_refused - rf0;
+            qt_shutdown();
+
+            c0 = G_pg_calls; rw0 = G_pg_rows;
+            setenv("QT_PREFILL_GROUP_ROWS", "3", 1); setenv("DUMP", d_pg3, 1);
+            int rp2 = qwen38_main_unused(4, argvm4);
+            QtCounters q2; qt_counters(&q2);
+            unsigned long long c2 = G_pg_calls - c0, rw2 = G_pg_rows - rw0;
+            qt_shutdown();
+            unsetenv("QT_PREFILL_GROUP_ROWS");
+
+            int same_pg = 0, same_pg3 = 0;
+            dump_rel(d_pg, d_row, &same_pg);
+            dump_rel(d_pg3, d_row, &same_pg3);
+            tk(rp1 == 0 && c1 > 0 && rf1 == 0 && rw1 > c1 && mx_sync_shared > sh0,
+               "QT_PREFILL_GROUP=1 ran grouped device calls with multiple rows per expert");
+            tk(rp2 == 0 && c2 > c1 && rw2 == rw1, "QT_PREFILL_GROUP_ROWS=3: same hit rows in more calls");
+            tk(q1.hits == q0.hits && q1.miss == q0.miss && q2.hits == q0.hits && q2.miss == q0.miss && q1.swaps == 0,
+               "QT_PREFILL_GROUP=1 matches per-row hit/miss counts; QT_FREEZE=1 prevents swaps");
+            tk(same_pg && same_pg3, "QT_PREFILL_GROUP=1 (default and 3 rows/call) matches per-row logits to the bit");
+
+            /* Every group refused: QT_PREFILL_GROUP=1 falls back to CPU and matches per-row refused to the bit. */
+            fake_group_hook = NULL; fake_sync_group_hook = NULL;
+            unsetenv("QT_PREFILL_GROUP"); setenv("Q38_TIER_PREFILL_GROUP", "0", 1);
+            setenv("DUMP", d_ref0, 1);
+            int rr0 = qwen38_main_unused(4, argvm4);
+            qt_shutdown();
+
+            c0 = G_pg_calls; rf0 = G_pg_refused;
+            setenv("Q38_TIER_PREFILL_GROUP", "1", 1); setenv("QT_PREFILL_GROUP", "1", 1);
+            setenv("DUMP", d_ref1, 1);
+            int rr1 = qwen38_main_unused(4, argvm4);
+            unsigned long long cr1 = G_pg_calls - c0, rfr1 = G_pg_refused - rf0;
+            qt_shutdown();
+            int same_ref = 0;
+            dump_rel(d_ref1, d_ref0, &same_ref);
+            tk(rr0 == 0 && rr1 == 0 && cr1 == 0 && rfr1 == rw1 && same_ref,
+               "QT_PREFILL_GROUP=1 with every group refused matches per-row refused logits to the bit");
+
+            /* QT_FREEZE=1 with room to promote: unfrozen uploads > 0, frozen uploads == 0 and swaps == 0. */
+            fake_group_hook = mx_compute; fake_sync_group_hook = mx_sync_compute;
+            snprintf(gb, sizeof gb, "%.15f", (double)(12 * mx_bytes + mx_bytes / 2) / 1073741824.0);
+            setenv("CUDA_EXPERT_GB", gb, 1);
+            setenv("COLI_CUDA_TIER_WARM", "0", 1);
+            unsetenv("QT_FREEZE"); unsetenv("QT_PREFILL_GROUP"); unsetenv("DUMP");
+            int ru0 = qwen38_main_unused(4, argvm4);
+            QtCounters qu0; qt_counters(&qu0);
+            qt_shutdown();
+            setenv("QT_FREEZE", "1", 1);
+            int ru1 = qwen38_main_unused(4, argvm4);
+            QtCounters qu1; qt_counters(&qu1);
+            qt_shutdown();
+            unsetenv("COLI_CUDA_TIER_WARM");
+            tk(ru0 == 0 && ru1 == 0 && qu0.uploads > 0 && qu1.uploads == 0 && qu1.swaps == 0,
+               "QT_FREEZE=1 prevents uploads and swaps after warm start");
+
+            printf(" Q38_PREFILL_LAYER_MAJOR=1 on the CUDA chain + MXFP4 tier\n");
+            setenv("COLI_CUDA_CHAIN", "1", 1); setenv("COLI_CUDA_CHAIN_ROWS", "2", 1);
+            setenv("Q38_TRUNK_GPU", "1", 1); setenv("Q38_TRUNK_MIN_KB", "0", 1);
+            setenv("COLI_PLACE", "auto", 1); setenv("CUDA_EXPERT_GB", "0.5", 1);
+            setenv("QT_FREEZE", "1", 1); setenv("QT_PREFILL_GROUP", "1", 1);
+            G_offer_n = 0; fake_dense_compute = 1;
+            setenv("Q38_PREFILL_LAYER_MAJOR", "0", 1); setenv("DUMP", d_pc, 1);
+            int rlm0 = qwen38_main_unused(4, argvm4);
+            qt_shutdown();
+            unsigned long long lm0 = g_q38_lm_pieces;
+            setenv("Q38_PREFILL_LAYER_MAJOR", "1", 1); setenv("Q38_PREFILL_LAYER_MAJOR_ROWS", "4", 1);
+            setenv("DUMP", d_lm, 1);
+            G_offer_n = 0;
+            int rlm1 = qwen38_main_unused(4, argvm4);
+            unsigned long long lm1 = g_q38_lm_pieces;
+            qt_shutdown();
+            int same_lm = 0;
+            dump_rel(d_lm, d_pc, &same_lm);
+            tk(rlm0 == 0 && rlm1 == 0 && lm1 > lm0 && same_lm,
+               "Q38_PREFILL_LAYER_MAJOR=1 (2-row pieces, 4-row segments) matches piece-by-piece logits to the bit");
+
+            setenv("COLI_CUDA_CHAIN", "0", 1); unsetenv("COLI_CUDA_CHAIN_ROWS");
+            setenv("Q38_TRUNK_GPU", "0", 1); setenv("COLI_PLACE", "off", 1);
+            unsetenv("Q38_PREFILL_LAYER_MAJOR"); unsetenv("Q38_PREFILL_LAYER_MAJOR_ROWS");
+            unsetenv("Q38_TIER_PREFILL_ROWWISE"); unsetenv("Q38_TIER_PREFILL_GROUP");
+            unsetenv("QT_PREFILL_GROUP"); unsetenv("QT_FREEZE");
+            setenv("HEAT_FILE", "", 1); setenv("QT_NO_WARMSTART", "1", 1);
+            fake_dense_compute = 0; fake_own_mx4 = 0; fake_group_hook = NULL; fake_sync_group_hook = NULL; fake_group_out = NULL;
+            remove(hf); remove(d_row); remove(d_grp); remove(d_wav); remove(d_pg); remove(d_pg3);
+            remove(d_ref0); remove(d_ref1); remove(d_pc); remove(d_lm);
+        }
         unsetenv("Q38_EXPERT_LOWBIT"); unsetenv("DUMP");
     } else if (argc > 1) {
         /* Third pass: the int4-g64 sidecar. The tier must stay off -- no
