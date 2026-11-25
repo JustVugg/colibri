@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "hypothesis": "In decode the Metal chain's GPU experts wait on SSD reads for about half of a step; running the next layer's router on the current MLP row and announcing its six likeliest uncached experts to the OS (F_RDADVISE on their GGUF ranges) once the next trunk is submitted lets the SSD read them while the GPU computes, so decode after the 61-token short.txt prompt gets faster with the same tokens.",
+  "commit": "cecdd7236216a284396b5ad5553a2e7f12b4871d",
+  "model": "Qwen3.8-Flash-Next heretic-2, llama.cpp IQ4_XS GGUF (routed experts IQ4_XS gate/up, IQ4_NL down, 2.54 MiB each; trunk mostly Q8_0), imported in link mode (colibri-dev)",
+  "command": "BUILD='cecdd723 METAL=1' METAL=1 WARMUP=1 BENCH_RAW=results/raw-m3 ARM_ENV='USAGE_SAVE=0 QWEN38_METAL_AHEAD=<0|1>' bench/q38_bench.sh bench/bin/qwen38-metal-m3 ~/models/qwen38-heretic2/colibri-dev metal-m3-<noahead|ahead> 3",
+  "prompt_hash": "1d86e7a6a60915badaf1a1321d9fd24d3fa99dc1da139372b26437f7912ed8f8",
+  "hardware": {
+    "cpu": "Apple M4 Pro, 8 performance + 4 efficiency cores (Mac16,8)",
+    "ram": "24 GB unified memory",
+    "storage": "internal Apple SSD, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.1.1.101), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "QWEN38_METAL_AHEAD"
+  ],
+  "baseline": {
+    "config": {
+      "SNAP": "qwen38-heretic2 colibri-dev (Qwen3.8-Flash-Next heretic-2 IQ4_XS GGUF, 5 files, 117 GB, read in place)",
+      "BUILD": "make -C c qwen38 METAL=1 at cecdd723 (rm c/qwen38 first), copied to bench/bin/qwen38-metal-m3, one binary for both arms",
+      "ENGINE": "the Metal chain, default (fast) kernels, GPU experts on (M3), the default GPU expert cache (6.82 GiB, 2751 slots of 2,662,400 B)",
+      "ENV": "SNAP COLI_TEMP=0 Q38_MAXT=32768 USAGE_SAVE=0, OMP_NUM_THREADS unset; argv 32 8 <prompt>",
+      "PROMPT": "bench/prompts/short.txt (61 tokens, chat template), 64 greedy tokens",
+      "ORDER": "1 warm-up run (discarded) then 3 decode runs and 3 long12k prefill runs per arm, noahead arm first, then ahead; one process each",
+      "MEASURED": "decode tok/s = 63 / (decode seconds - TTFT) of each short.txt run",
+      "QWEN38_METAL_AHEAD": "0"
+    },
+    "samples": {
+      "tok_s": [
+        4.4904,
+        4.5885,
+        4.5259
+      ],
+      "prefill_s": [
+        749.0,
+        752.36,
+        750.67
+      ]
+    },
+    "median_tok_s": 4.5259,
+    "quality": {
+      "method": "the generated text and the run's report (loads 19,655, hits 18,531 on every decode run; loads 504,053, hits 115,555 on every prefill run) identical in all 14 runs of both arms; tiny fixtures: bit-identical logits on/off (test-qwen38-metal-engine, ahead tokens)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-metal-ahead-2026-11-19/baseline.json",
+      "sha256": "d80651edb060d8a1d2d794404841a9ee6179448c72bfc55d53ab6703b3a0e4b5"
+    }
+  },
+  "trial": {
+    "config": {
+      "SNAP": "qwen38-heretic2 colibri-dev (Qwen3.8-Flash-Next heretic-2 IQ4_XS GGUF, 5 files, 117 GB, read in place)",
+      "BUILD": "make -C c qwen38 METAL=1 at cecdd723 (rm c/qwen38 first), copied to bench/bin/qwen38-metal-m3, one binary for both arms",
+      "ENGINE": "the Metal chain, default (fast) kernels, GPU experts on (M3), the default GPU expert cache (6.82 GiB, 2751 slots of 2,662,400 B)",
+      "ENV": "SNAP COLI_TEMP=0 Q38_MAXT=32768 USAGE_SAVE=0, OMP_NUM_THREADS unset; argv 32 8 <prompt>",
+      "PROMPT": "bench/prompts/short.txt (61 tokens, chat template), 64 greedy tokens",
+      "ORDER": "1 warm-up run (discarded) then 3 decode runs and 3 long12k prefill runs per arm, noahead arm first, then ahead; one process each",
+      "MEASURED": "decode tok/s = 63 / (decode seconds - TTFT) of each short.txt run",
+      "QWEN38_METAL_AHEAD": "1"
+    },
+    "samples": {
+      "tok_s": [
+        5.0766,
+        5.1767,
+        5.2544
+      ],
+      "prefill_s": [
+        753.27,
+        750.86,
+        749.21
+      ]
+    },
+    "median_tok_s": 5.1767,
+    "quality": {
+      "method": "the generated text and the run's report (loads 19,655, hits 18,531 on every decode run; loads 504,053, hits 115,555 on every prefill run) identical in all 14 runs of both arms; tiny fixtures: bit-identical logits on/off (test-qwen38-metal-engine, ahead tokens)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-metal-ahead-2026-11-19/trial.json",
+      "sha256": "f56c6fd14cd5083b30a9a6a077b4d4b9388579069f1be3315e0a39065ae03606"
+    }
+  },
+  "outcome": "improvement"
+}

@@ -1129,6 +1129,9 @@ static void q38_df_attach(Model *m) {
 #else
 static int q38_df_on(void) { return 0; }
 #endif
+/* COLI_LOOKUP's default: on, off beside the Metal chain (Ruling P2-5: its verifies run on the CPU,
+ * each one the whole state down and up again); COLI_LOOKUP=1 drafts anyway */
+static int g_q38_lookup_default = 1;
 static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     Q38Spec sp; memset(&sp, 0, sizeof sp);
     sp.on = m->mtp || q38_df_on();
@@ -1141,7 +1144,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
         else if (depth[0] >= '1' && depth[0] <= '0' + dmax && !depth[1]) sp.depth = depth[0] - '0';
         else { fprintf(stderr, "Q38_MTP_DRAFTS must be 1 to %d, or 0 (auto: the gate picks)\n", dmax); exit(1); }
     }
-    sp.lookup = q38_env_bool("COLI_LOOKUP", 1);   /* on by default, always gated (docs/speculative.md) */
+    sp.lookup = q38_env_bool("COLI_LOOKUP", g_q38_lookup_default);   /* on by default, always gated (docs/speculative.md) */
     sp.lookup_max = q38_env_positive_int("COLI_LOOKUP_DRAFTS", Q38_SPEC_ROWS - 1, Q38_SPEC_ROWS - 1);
     sp.lk_force = q38_spec_force_mode("COLI_LOOKUP_FORCE", getenv("COLI_LOOKUP_FORCE"), Q38_SPEC_ROWS - 1, 1,
                                       &sp.lk_force_row);
@@ -1658,6 +1661,9 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
 #ifdef COLI_CUDA
     if (to_state) q38cc_sync_host(m);
 #endif
+#ifdef QWEN38_METAL
+    if (to_state) q38m_sync_host(m);   /* the Metal chain keeps the newest state on the GPU */
+#endif
     if (!q38_prefix_geometry(m, &rec, &conv, &ple)) return 0;
     Q38PinState *st = *slot;
     if (st && st->n_layers != c->layers){ q38_pin_state_free(st); st = NULL; }
@@ -1713,6 +1719,9 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
 #endif
 #ifdef COLI_CUDA
     if (!to_state) q38cc_host_wrote(m, 0);
+#endif
+#ifdef QWEN38_METAL
+    if (!to_state) q38m_host_wrote(m, 0);
 #endif
     return 1;
 }
@@ -1841,6 +1850,10 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
     if(to_cache)q38cc_sync_host(m);
     else q38cc_host_wrote(m,0);
 #endif
+#ifdef QWEN38_METAL
+    if(to_cache)q38m_sync_host(m);
+    else q38m_host_wrote(m,0);
+#endif
     }
     for(int i=0;i<m->c.layers&&!dev;i++)if(!m->c.is_attn[i]){
         float *rec=to_cache?g_q38_prefix.dn_rec[i]:m->DN_rec[i];
@@ -1937,7 +1950,8 @@ static int q38_format_prof(char *out,size_t capacity,double wall_s,int prompt_to
  * Same stdout lines colibri.c emits for the web dashboard's Brain tab. Every
  * layer here is a MoE layer, so rows are all layers, columns the experts.
  * EMAP: one byte per expert as two hex digits, tier<<6 | heat (tier 1 =
- * resident in the layer cache; heat 0, no usage counter here). Printed after
+ * resident in the layer cache, 2 = on a GPU: the Vulkan tier's, or the Metal chain's GPU
+ * expert cache; heat 0, no usage counter here). Printed after
  * READY and STAT, and again after every turn. HITS: one bit per expert routed
  * in the turn, packed 8 per hex pair, printed after DONE next to PROF. */
 /* EMAP's tier 2, an expert on the GPU: the Vulkan tier's, or the CUDA tier's, or the CUDA chain's own
@@ -1966,15 +1980,27 @@ static int q38_emap_in_pool(Model *m,int i,int e){
 static void serve_emap(Model *m){
     const Cfg *c=&m->c; int E=c->experts, rows=c->layers;
     char *hex=(char*)malloc((size_t)rows*E*2+1); int w=0;
+#ifdef QWEN38_METAL
+    unsigned char *gpu=(unsigned char*)calloc((size_t)E,1);
+#endif
     for(int i=0;i<rows;i++){
         LCache *lc=&m->cache[i];
+#ifdef QWEN38_METAL
+        if(gpu&&g_q38x.cache_on)qgc_present(&g_q38x.cache,i*E,E,gpu);   /* key = layer * E + expert */
+#endif
         for(int e=0;e<E;e++){
             int si=lc->by_expert?lc->by_expert[e]:-1;
             int b=(q38_emap_on_card(m,i,e)?2:(si>=0&&si<lc->n&&lc->slots[si].eid==e)||q38_emap_in_pool(m,i,e)?1:0)<<6;   /* 2 on the GPU, 1 in RAM */
+#ifdef QWEN38_METAL
+            if(gpu&&gpu[e])b=2<<6;   /* in the Metal chain's GPU expert cache */
+#endif
             hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
         }
     }
     hex[w]=0;
+#ifdef QWEN38_METAL
+    free(gpu);
+#endif
     printf("EMAP %d %d %s\n",rows,E,hex); fflush(stdout); free(hex);
 }
 static void serve_hits(Model *m){
@@ -2103,6 +2129,15 @@ static void q38_report_request_split(const Model *m,const Q38ReqClock *clk,const
  * the CPU's loop sees the stop before its first layer, and the copy goes back here too. An
  * echo (logprobs) and a prompt with an image are read in one call, as before.
  * COLI_PROMPT_SEGMENT sets the rows (2048 on the CPU, 8192 for a chain). */
+/* A serve's Metal chain failed with the recurrent state on the GPU only (q38m_forward): the turn
+ * ends with an error and nothing more of it runs (q38_chain_lost_end). 0 in other builds. */
+static int q38_chain_lost(void){
+#ifdef QWEN38_METAL
+    return g_q38m_lost;
+#else
+    return 0;
+#endif
+}
 static int q38_prompt_poll(ColiPromptBreak *b){   /* control: 1 STOP, 3 CANCEL (serve_read_req) */
     while(!b->control&&!b->eof&&coli_stdin_readable()){
         int r=serve_read_req(stdin,stdout,NULL,b->id);
@@ -2132,6 +2167,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
         for(int at=from;at<np;){
             int n=np-at<seg?np-at:seg;
             float *next=step(m,ids+at,n,at);
+            if(next&&q38_chain_lost()){free(next);next=NULL;}   /* the rest of the prompt not read */
             free(lo);lo=next;
             if(!next)break;
             at+=n;
@@ -2157,6 +2193,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
         if(!one&&(empty||q38_pin_state_copy(m,&st,1)))g_coli_prompt_break=ctl;
         float *next=step(m,ids+at,n,at);
         g_coli_prompt_break=NULL;
+        if(next&&q38_chain_lost()){free(next);next=NULL;}   /* the rest of the prompt not read */
         if(!next){
             if(empty)reset_recurrent(m);
             else q38_pin_state_copy(m,&st,0);
@@ -2255,6 +2292,9 @@ static void q38_unpark(Model *m){
 #ifdef COLI_CUDA
     q38cc_rollback(m,-1,0);
     q38cc_mtp_host(m,0);
+#endif
+#ifdef QWEN38_METAL
+    q38m_rollback(m,-1,0);   /* the rows came back on the host: the GPU takes them all up again */
 #endif
     if(getenv("COLI_PREFIX_LOG"))fprintf(stderr,"[PREFIX] the %d-token conversation is back\n",g_q38_park.len);
     q38_park_free_rows();
@@ -2396,6 +2436,9 @@ static int q38_ps_take_ram(Model *m,const int *ids,int np,int held,int floor){
 #ifdef COLI_CUDA
     q38cc_rollback(m,-1,keep);
     q38cc_mtp_host(m,keep);
+#endif
+#ifdef QWEN38_METAL
+    q38m_rollback(m,-1,keep);   /* the GPU's rows past what stayed go up again */
 #endif
     if(getenv("COLI_PREFIX_LOG")){
         fprintf(stderr,"[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint, %d rows in place; the slot held %d)\n",
@@ -2743,6 +2786,27 @@ static void q38_psd_flush(Model *m){
     if(pthread_create(&g_q38_psd_th,NULL,q38_psd_write,j))q38_psd_write(j);   /* no thread: here */
     else g_q38_psd_busy=1;
 }
+/* A serve's Metal chain lost its state (q38_chain_lost_end): every checkpoint of this identity on
+ * disk goes with the store's RAM, written by this run or an earlier one, and the marks not yet
+ * written, so no later request starts from a state the GPU computed. Called after q38_psd_join. */
+static void q38_psd_purge(void){
+    for(int i=0;i<g_q38_psd_n;i++)free(g_q38_psd_ids[i]);
+    g_q38_psd_n=0;
+    if(!g_q38_psd_dir[0]||g_q38_psd_dir[0]=='-')return;   /* never worked out, or none: nothing on disk */
+    char want[32],path[1200];
+    const int wl=snprintf(want,sizeof want,"q38_%016llx_",(unsigned long long)g_q38_psd_id);
+    DIR *d=opendir(g_q38_psd_dir);
+    if(!d)return;
+    struct dirent *de; struct stat st; int gone=0;
+    while((de=readdir(d))){
+        if(!q38_psd_ours(de->d_name)||strncmp(de->d_name,want,(size_t)wl))continue;
+        snprintf(path,sizeof path,"%s/%s",g_q38_psd_dir,de->d_name);
+        if(lstat(path,&st)||!S_ISREG(st.st_mode))continue;
+        if(!remove(path))gone++;
+    }
+    closedir(d);
+    if(gone)fprintf(stderr,"[PREFIX] disk: %d checkpoint file(s) removed (the GPU's state was lost)\n",gone);
+}
 /* The deepest file of this identity that ids[0, np) starts with, floor < P < np and P within the
  * context: its P (its path in out), 0 none. Reads the heads and ids only; every file the prompt
  * starts with gets this request's age (g_q38_psd_now). */
@@ -2832,6 +2896,9 @@ static int q38_psd_restore(Model *m,const char *path,const int *ids,int P,int np
 #ifdef COLI_CUDA
     q38cc_rollback(m,-1,0);
     q38cc_mtp_host(m,0);
+#endif
+#ifdef QWEN38_METAL
+    q38m_rollback(m,-1,0);   /* every row came from the file */
 #endif
     rc=ok?P:-1;
 out:
@@ -3007,6 +3074,31 @@ static void q38_prefix_miss_log(Model *m,const int *ids,int np){
     q38_log_ids_text("[PREFIX]   held:  ",held,at,at+16<len?at+16:len);
 }
 
+/* The turn after a serve's Metal chain failed with the recurrent state on the GPU only: the chain
+ * is off (q38m_forward freed it and put the CPU's expert cache back), and every state that came
+ * from the GPU goes, so the next request reads its whole prompt on the CPU: the recurrent state
+ * and the K/V rows (reset_recurrent, kv_len), the prompt-end snapshot, a parked conversation and
+ * the prefix store's prompts in RAM and on disk (the pins go with the live state's record, which no longer
+ * holds their tokens). Then the request's ERROR. 0 when the chain did not fail. */
+static int q38_chain_lost_end(Model *m,const char *id){
+    if(!q38_chain_lost())return 0;
+#ifdef QWEN38_METAL
+    g_q38m_lost=0;
+#endif
+    reset_recurrent(m);m->kv_len=0;
+    q38_prefix_cache_invalidate();
+    if(g_q38_park.on){
+        q38_prefix_cache_dispose(&g_q38_park.snap);memset(&g_q38_park.snap,0,sizeof g_q38_park.snap);
+        q38_park_free_rows();
+    }
+    q38_psd_join();   /* a disk write in flight holds copies, not the store's entries: it ends first */
+    coli_ps_clear(&g_q38_ps);
+    q38_psd_purge();   /* and the store's checkpoints on disk (Q38_PREFIX_DISK=1) */
+    coli_serve_write_error(stdout,id,"GPU_FAILED the GPU path failed; the conversation will be re-read on the CPU");
+    fflush(stdout);
+    return 1;
+}
+
 /* lone: one conversation, whose prompt reads its STOP or CANCEL while it is read
  * (q38_serve_prefill); the multiplexed loop owns its command stream and passes 0. */
 static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
@@ -3141,6 +3233,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         lo=q38_serve_prefill_at(m,ids,0,np,pc,snap_ok,&snapped);
     }
     g_echo_k=0; g_echo_id=NULL; g_echo_pin_logit=NULL;   /* la lettura e finita col prefill */
+    if(q38_chain_lost_end(m,q->id)){q38_vision_detach(m);free(lo);free(ids);return 0;}
     if(ctl.control){
         /* stopped while reading: what was read stays the live state; a STOP ends the turn
          * with no token, a CANCEL with the error the gateway waits for */
@@ -3247,6 +3340,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
         if(m->draft_vocab)draft_vocab_count_token(m->draft_vocab,tk);
         lo = q38_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
         picked = lo ? spec.next_tok : -1;
+        if(q38_chain_lost())break;   /* the GPU's state is gone: the turn ends with an error below */
     }
     q38_spec_end(m, &spec);
     /* I vettori dell'immagine valgono per QUESTO turno soltanto: lasciarli
@@ -3255,6 +3349,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
      * silenziosamente invece di dare errore. */
     q38_vision_detach(m);
     free(lo); free(ids);
+    if(q38_chain_lost_end(m,q->id)){q38_spec_free(&spec);return input_eof?-1:0;}
     if(cancelled){coli_serve_write_error(stdout,q->id,"CANCELLED");return input_eof?-1:0;}
     if(stopped)limited=0;
     unsigned char tail[3];int tail_n=0;
@@ -3369,7 +3464,13 @@ static void q38_mux_free(Model *m){
  * ERROR of a cancel. */
 static void q38_mux_finish(Model *m,Q38MuxReq *r){
     free(r->lo);r->lo=NULL;free(r->ids);r->ids=NULL;r->active=0;
-    if(r->cancel){coli_serve_write_error(stdout,r->q.id,"CANCELLED");return;}
+    if(r->cancel){
+        coli_serve_write_error(stdout,r->q.id,"CANCELLED");
+#ifdef QWEN38_METAL
+        q38m_frame();   /* one per finished request, as the one-conversation loop's */
+#endif
+        return;
+    }
     if(r->stop)r->limited=0;
     unsigned char tail[3];int tail_n=0;
     if(utf8_finish(r->sbuf,&r->sbn,tail,sizeof tail,&tail_n)<0){
@@ -3388,6 +3489,9 @@ static void q38_mux_finish(Model *m,Q38MuxReq *r){
     else fprintf(stderr,"[qwen38] internal error: PROF frame overflow\n");
     fflush(stdout);
     serve_hits(m);
+#ifdef QWEN38_METAL
+    q38m_frame();   /* the chain is off with KV_SLOTS>1 (q38m_decide): chain=0 and why */
+#endif
     q38_tm_report_bank(&timers,"request");
     q38_report_request_split(m,&r->clk,r->q.id);
     /* the slot's conversation as the turn left it, for its next turn on another slot (one as long
@@ -3523,6 +3627,9 @@ static void serve_mux(Model *m){
 
 static void serve_loop(Model *m){
     g_serve_model=m;
+#ifdef QWEN38_METAL
+    g_q38m_serve=1;   /* a chain failure ends a turn, not the engine (q38m_forward) */
+#endif
     coli_serve_binary_mode();
     setvbuf(stdin,NULL,_IONBF,0);
     int max_ctx=qwen38_max_ctx();
@@ -3560,6 +3667,10 @@ static void serve_loop(Model *m){
             q38_vk_report();   /* stderr: the wire protocol on stdout is untouched */
             q38c_report(m);
             vkt_report("turn", m->hits, m->miss);
+#endif
+#ifdef QWEN38_METAL
+            q38m_report();
+            q38m_frame();   /* stdout: the gateway's /health (docs/serve_protocol.md, METAL) */
 #endif
             if(status<0){q38_prefix_cache_release(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
             serve_emap(m);
@@ -3814,6 +3925,27 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[qwen38] KV_SLOTS=%d: DeltaNet on the CPU (Q38_DN_GPU keeps one conversation's state on the card)\n",
                 g_q38_mux_slots);
     }
+#ifdef QWEN38_METAL
+    /* METAL=1: every layer's dense chain on the Apple GPU (qwen38_metal_chain.h), on by
+     * default; COLI_METAL=0, and every case it does not run, leave the CPU engine with a
+     * line. The MTP head stays on the CPU and costs more than it saves (Plan 1), so unset,
+     * Q38_MTP leaves it off beside the chain; Q38_MTP=1 keeps it and the chain off. */
+    /* Before q38_trunk_cpu_int8: q38m_start uploads the BF16/F32 matrices that frees (and maps
+     * a GGUF's blocks in place, which the CPU keeps). */
+    if (q38m_decide(&m, g_q38_mux_slots) && q38m_start(&m)) g_mtl_chain = 1;
+    if (g_mtl_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
+        m.mtp = 0;
+        fprintf(stderr, "[qwen38-metal] speculative decoding with the MTP head: off (the Metal chain runs every layer; "
+                        "Q38_MTP=1 drafts on the CPU engine)\n");
+    }
+    /* the chain declines a verify (its per-row state copies are the CPU's): prompt-lookup drafts
+     * would send every verify to the CPU, the recurrent state down and up again (Ruling P2-5) */
+    if (g_mtl_chain && !(getenv("COLI_LOOKUP") && *getenv("COLI_LOOKUP"))) {
+        g_q38_lookup_default = 0;
+        fprintf(stderr, "[qwen38-metal] prompt-lookup drafts: off (their verifies run on the CPU beside the Metal chain; "
+                        "COLI_LOOKUP=1 drafts anyway)\n");
+    }
+#endif
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
     q38_draft_head_build(&m);  /* Q38_DRAFT_HEAD=int4: the MTP drafts' lm_head in int4 */
 #ifdef COLI_CUDA
@@ -3881,6 +4013,9 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
         dev=dev||g_vk_ready;
 #endif
+#ifdef QWEN38_METAL
+        dev=dev||g_mtl_chain;
+#endif
         if(!dev)q38_trunk_q8_interleave(&m);
     }
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
@@ -3917,6 +4052,9 @@ int main(int argc, char **argv) {
         q38_vk_report();
         q38c_report(&m);
         vkt_report("run", m.hits, m.miss);
+#endif
+#ifdef QWEN38_METAL
+        q38m_report();
 #endif
         rt_save(g_q38_usage,0);
         q38_vocab_save(&m);
@@ -4007,6 +4145,9 @@ int main(int argc, char **argv) {
     q38_vk_report();
     q38c_report(&m);
     vkt_report("run", m.hits, m.miss);
+#endif
+#ifdef QWEN38_METAL
+    q38m_report();
 #endif
     rt_save(g_q38_usage, 0);
     q38_vocab_save(&m);

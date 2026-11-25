@@ -304,9 +304,28 @@ def gateway_model_dir():
     return os.path.realpath(os.path.join(p["cwd"], os.path.expanduser(m))) if m else None
 
 
+#: the families whose engine has a Metal chain (the GPU computes, the experts stream from the SSD)
+METAL_CHAIN_FAMILIES = {"qwen38"}
+
+
+def apple_gpu():
+    return any(g.get("vendor") == "Apple" for g in MACHINE.get("gpus") or [])
+
+
+def gateway_metal():
+    """the gateway's /health `metal` block (authenticated), {} when it has none or is unreachable"""
+    try:
+        m = gw_json("/health", timeout=3).get("metal")
+    except (OSError, ValueError):
+        return {}
+    return m if isinstance(m, dict) else {}
+
+
 def tier_of(argv, env):
     """ram when the server keeps everything on the CPU, gpu otherwise on a machine with one"""
     if not MACHINE.get("gpus"):
+        return "ram"
+    if apple_gpu() and env.get("COLI_METAL") == "0":
         return "ram"
     gpu = _argval(argv, "--gpu")
     if gpu == "none":
@@ -318,6 +337,11 @@ def tier_of(argv, env):
 
 def gateway_tier():
     p = gateway_proc()
+    if apple_gpu():     # the Metal chain decides: gpu only when the engine says it is on
+        if p and p["coli"] and p["env"].get("COLI_METAL") == "0":
+            return "ram"
+        m = gateway_metal()
+        return "gpu" if m.get("chain") == 1 else "ram"
     return tier_of(p["argv"], p["env"]) if p and p["coli"] else None
 
 
@@ -711,6 +735,15 @@ def tiers_for(g, disk_bytes, ram_min_gb=0, have=False, family="", mtp=None, acce
                      else "servono %.0f GB, VRAM + RAM fanno %.0f GB" % (total / GB, cap / GB))}
         if not accel:
             t.update(fits=False, est_note=None, why="il motore %s gira solo sulla CPU" % (family or "di questo modello"))
+        elif not disc and apple_gpu() and family in METAL_CHAIN_FAMILIES:
+            # the GPU computes, the dense part sits in RAM, the experts are cached or streamed from the SSD
+            mcache = ram - resident
+            mfits = mcache > 0 and ram_min_gb * GB <= (MACHINE.get("ram_total_gb") or 0) * GB
+            t.update(fits=mfits, label="GPU Metal + SSD", est=None,
+                     est_note="velocità non stimata per la GPU Apple: guarda il Monitor durante l'uso",
+                     why=("la GPU calcola, parte densa %.0f GB in RAM, cache esperti %.0f GB, il resto dall'SSD"
+                          % (resident / GB, mcache / GB) if mfits
+                          else "la parte densa (%.0f GB) non entra nella RAM utile" % (resident / GB)))
         elif not disc and family in setup_flow.VULKAN_IGPU_MEASURED:
             ratio = IGPU_RATIO.get(family) if IGPU_NAME in (name or "") else None
             if ratio and fits and full:

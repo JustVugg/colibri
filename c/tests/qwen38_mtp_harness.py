@@ -275,8 +275,8 @@ def serve_session(engine, model, extra, turns=SERVE_TURNS):
                 p.stdin.flush()
                 while True:
                     fields, line = frame()
-                    if not fields or fields[0] in (b"STAT", b"PROF", b"EMAP", b"HITS", b"HITL", b"CAPS"):
-                        continue    # timings, and the expert residency and routes (HITL) the draft rows change
+                    if not fields or fields[0] in (b"STAT", b"PROF", b"EMAP", b"HITS", b"HITL", b"CAPS", b"METAL"):
+                        continue    # timings, the expert residency and routes (HITL) the draft rows change, the Metal chain's state
                     if fields[0] == b"DONE":    # tokens/s and RSS vary: keep the count and the reason
                         line = b" ".join(fields[:4] + fields[-2:])
                     frames.append(line)

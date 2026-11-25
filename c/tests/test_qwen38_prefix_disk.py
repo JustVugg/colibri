@@ -249,6 +249,26 @@ class Qwen38PrefixDiskTest(unittest.TestCase):
         self.assertNotIn("[PREFIX] disk", log)
         self.assertFalse(list(d.iterdir()))
 
+    def test_a_lost_gpu_state_removes_the_files(self):
+        """METAL=1 serve (tests/metal_qwen38.sh runs it): a chain failure with the state on the GPU
+        only (Q38M_FAIL_AT_STEP, debug) clears the store and removes this model's files on disk, so
+        no later request starts from a state the GPU computed. Skipped on a build without the chain."""
+        d = self.tmp()
+        _, log = self.run1(d, chat(Q1))
+        if "[qwen38-metal]" not in log or "the Metal chain is off" in log:
+            self.skipTest("not the Metal chain")
+        self.assertTrue(files(d))
+        # any prompt: the files of this model all go. A raw one whose reply is long enough for a
+        # decode step after a decode step (the state on the GPU only: a chat prompt's snapshot at the
+        # answer brings it down, and this fixture's chat replies end after one token)
+        e = self.spawn(Q38_PREFIX_DISK="1", Q38_PREFIX_DIR=str(d), Q38M_FAIL_AT_STEP="3")
+        with self.assertRaisesRegex(RuntimeError, "GPU_FAILED"):
+            e.ask("r", b"12+34=46; 7*8=56; 9-3=", max_tok=8)
+        self.assertEqual(e.ask("r2", Q3, max_tok=8), b"########")   # the engine still serves
+        log = e.close()
+        self.assertIn("checkpoint file(s) removed (the GPU's state was lost)", log)
+        self.assertEqual(files(d), {})
+
 
 if __name__ == "__main__":
     unittest.main()

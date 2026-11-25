@@ -89,6 +89,116 @@ class LiveSnapshotTest(unittest.TestCase):
         self.assertGreaterEqual(stats["cores"], 1)
 
 
+SYSCTL = "25769803776\n12\n"
+VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                     8620.
+Pages active:                                 294317.
+Pages inactive:                               293226.
+Pages speculative:                               520.
+Pages throttled:                                   0.
+"""
+PS_OUT = "  37.5 2097152\n"
+IOREG = ('    | |   "PerformanceStatistics" = {"In use system memory (driver)"=0,"Tiler Utilization %"=0,'
+         '"Device Utilization %"=45,"In use system memory"=343597384}\n'
+         '    | |   "model" = "Apple M4 Pro"\n')
+
+
+def fake_run(table):
+    def run(cmd, **kw):
+        assert kw.get("timeout") == 0.5, kw
+        out = table.get(cmd[0])
+        if isinstance(out, Exception):
+            raise out
+        return mock.Mock(stdout=out or "", returncode=0 if out is not None else 1)
+    return run
+
+
+class DarwinStatsTest(unittest.TestCase):
+    def setUp(self):
+        gw._GPU_DARWIN.update(t=0.0, v=None)
+        getattr(gw, "_CPU_DARWIN", {}).clear()
+        self.eng = mock.Mock(process=mock.Mock(pid=4242))
+        self.table = {"sysctl": SYSCTL, "vm_stat": VM_STAT, "ps": PS_OUT, "ioreg": IOREG}
+
+    def stats(self, table=None):
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(gw.subprocess, "run", fake_run(table or self.table)), \
+             mock.patch.object(gw.os, "getloadavg", return_value=(2.345, 1.0, 1.0)):
+            return gw._system_stats(self.eng)
+
+    def test_darwin_system_stats(self):
+        s = self.stats()
+        self.assertEqual(s["ram_total_gb"], 24.0)
+        self.assertEqual(s["cores"], 12)
+        self.assertEqual(s["ram_avail_gb"], round((8620 + 293226 + 520) * 16384 / 2**30, 2))
+        self.assertEqual(s["load1"], 2.35)
+        self.assertEqual(s["engine_cpu_pct"], 37.5)
+        self.assertEqual(s["engine_rss_gb"], 2.0)
+
+    def test_darwin_gpu_stats(self):
+        g = self.stats()["gpus"]
+        self.assertEqual(len(g), 1)
+        self.assertEqual((g[0]["name"], g[0]["util_pct"]), ("Apple M4 Pro", 45))
+        self.assertAlmostEqual(g[0]["mem_used_gb"], 0.32, places=2)
+
+    def test_gpu_cached_one_second(self):
+        calls = []
+        base = fake_run(self.table)
+        def counting(cmd, **kw):
+            calls.append(cmd[0])
+            return base(cmd, **kw)
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(gw.subprocess, "run", counting), \
+             mock.patch.object(gw.os, "getloadavg", return_value=(1, 1, 1)):
+            gw._system_stats(self.eng)
+            gw._system_stats(self.eng)
+        self.assertEqual(calls.count("ioreg"), 1)
+
+    def test_darwin_stats_degrade(self):
+        import subprocess
+        bad = {"sysctl": subprocess.TimeoutExpired("sysctl", 0.5), "vm_stat": "garbage\n",
+               "ps": "x y\n", "ioreg": "nothing here"}
+        s = self.stats(bad)
+        for k in ("ram_total_gb", "cores", "ram_avail_gb", "engine_cpu_pct", "engine_rss_gb", "gpus"):
+            self.assertNotIn(k, s)
+        self.assertEqual(s["load1"], 2.35)
+        gw._GPU_DARWIN.update(t=0.0, v=None)
+        self.assertEqual(self.stats({"ps": None, "ioreg": OSError("x")}).get("load1"), 2.35)
+
+    def test_ps_time_parse(self):
+        self.assertEqual(gw._ps_time_s("0:00.03"), 0.03)
+        self.assertEqual(gw._ps_time_s("12:34.50"), 754.5)
+        self.assertEqual(gw._ps_time_s("1:02:03.25"), 3723.25)
+        self.assertEqual(gw._ps_time_s("2-01:00:00"), 2 * 86400 + 3600)
+        self.assertIsNone(gw._ps_time_s("x"))
+        self.assertIsNone(gw._ps_time_s(""))
+
+    def test_darwin_cpu_instantaneous(self):
+        """%cpu on macOS is a decayed lifetime average; the engine's CPU is the delta of its
+        cumulative CPU time over the wall time since the previous sample (first call: %cpu)."""
+        clock = [100.0]
+        def at(t, cpu_time):
+            clock[0] = t
+            table = dict(self.table, ps="  37.5 2097152 %s\n" % cpu_time)
+            with mock.patch.object(gw.time, "monotonic", lambda: clock[0]):
+                return self.stats(table).get("engine_cpu_pct")
+        self.assertEqual(at(100.0, "1:00.00"), 37.5)        # no previous sample: ps's %cpu
+        self.assertEqual(at(102.0, "1:03.00"), 150.0)       # 3 s of CPU in 2 s: 1.5 cores
+        self.assertEqual(at(102.2, "1:03.10"), 150.0)       # < 0.5 s since: the last value
+        self.assertEqual(at(104.0, "1:02.00"), 0.0)         # a smaller time (pid reused): never negative
+        self.assertEqual(at(106.0, "1:04.00"), 100.0)
+
+    def test_darwin_cpu_without_time_column(self):
+        self.assertEqual(self.stats(dict(self.table, ps="  12.5 2097152\n"))["engine_cpu_pct"], 12.5)
+        self.assertEqual(self.stats(dict(self.table, ps="  12.5 2097152\n"))["engine_cpu_pct"], 12.5)
+
+    def test_linux_unchanged(self):
+        with mock.patch.object(sys, "platform", "linux"), \
+             mock.patch.object(gw, "_system_stats_darwin", side_effect=AssertionError), \
+             mock.patch.object(gw, "_gpu_stats", return_value=None), \
+             mock.patch("builtins.open", side_effect=OSError):
+            self.assertEqual(gw._system_stats(self.eng), {})
+
+
 class LiveEngine:
     """what /health and /experts read of an engine"""
     supports_logprobs_echo = supports_tok_ids = False
@@ -141,6 +251,181 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual((body["rows"], body["cols"], body["live_seq"]), (2, 8, 3))
         self.assertEqual(body["steps"], ["0002", "0009"])
         self.assertEqual(self.get("/experts")["live_seq"], 3)
+
+
+class FailingEngine(LiveEngine):
+    """ACCEPTs (the streaming 200 goes out), writes one piece, then fails as the engine's ERROR does"""
+
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, *args, on_accept=None, **kwargs):
+        if on_accept is not None:
+            on_accept({"prompt_tokens": 5})
+        on_text("partial")
+        raise self.error
+
+
+class StreamErrorTest(unittest.TestCase):
+    """an engine error after the streaming 200 reaches an OpenAI client as a final `data:` chunk
+    with the error object (the SDKs raise it, the chat page shows it), never a faked [DONE]"""
+
+    def stream(self, error, path="/v1/chat/completions"):
+        server = gw.APIServer(("127.0.0.1", 0), FailingEngine(error), "test-model", "secret", 16)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        body = ({"model": "test-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+                if path == "/v1/chat/completions" else {"model": "test-model", "stream": True, "prompt": "hi"})
+        req = Request(f"http://127.0.0.1:{server.server_port}{path}", data=json.dumps(body).encode(),
+                      headers={"Content-Type": "application/json", "Authorization": "Bearer secret"})
+        with urlopen(req, timeout=10) as r:
+            self.assertEqual(r.status, 200)
+            raw = r.read().decode()
+        chunks = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+        return raw, chunks
+
+    def test_gpu_failed_after_accept_ends_with_an_error_chunk(self):
+        raw, chunks = self.stream(gw._engine_error(["GPU_FAILED", "the", "GPU", "path", "failed"], "GPU_FAILED"))
+        self.assertIn("partial", raw)                 # what was written before stays
+        self.assertNotIn("[DONE]", raw)               # the reply is not passed off as complete
+        last = json.loads(chunks[-1])
+        self.assertEqual((last["error"]["code"], last["error"]["type"]), ("gpu_failed", "server_error"))
+        self.assertIn("read again on the CPU", last["error"]["message"])
+        self.assertEqual(raw.count("\"error\""), 1)
+
+    def test_any_engine_error_after_accept_ends_with_an_error_chunk(self):
+        raw, chunks = self.stream(gw._engine_error(["SOMETHING_ELSE", "went", "wrong"], "SOMETHING_ELSE went wrong"))
+        self.assertNotIn("[DONE]", raw)
+        self.assertEqual(json.loads(chunks[-1])["error"]["code"], "engine_error")
+
+    def test_a_gateway_fault_after_accept_still_only_closes(self):
+        """not an engine ERROR frame (a pipe that broke, #597): no error object, as before"""
+        raw, _ = self.stream(RuntimeError("failed to write STOP to the engine (broken pipe)"))
+        self.assertIn("partial", raw)
+        self.assertNotIn("[DONE]", raw)
+        self.assertNotIn("\"error\"", raw)
+
+    def test_completions_stream_too(self):
+        raw, chunks = self.stream(gw._engine_error(["GPU_FAILED"], "GPU_FAILED"), "/v1/completions")
+        self.assertNotIn("[DONE]", raw)
+        self.assertEqual(json.loads(chunks[-1])["error"]["code"], "gpu_failed")
+
+    def test_the_page_shows_an_error_chunk(self):
+        """ui/index.html's stream reader throws on a chunk's `error`, which its catch shows as the
+        reply's error (a.error, the error styling), instead of ending the reply as complete"""
+        page = (C.parent / "ui" / "index.html").read_text()
+        self.assertIn("if(ev.error)throw new Error(", page)
+        reader = page[page.index("let ev;try{ev=JSON.parse(d)}"):]
+        self.assertLess(reader.index("if(ev.error)throw new Error("), reader.index("const ch=ev.choices"))
+
+
+def dispatched(*frames):
+    """an Engine whose dispatcher read these stdout lines, then the engine's exit"""
+    import io
+    e = gw.Engine.__new__(gw.Engine)
+    e.__dict__.update(closed=False, dispatcher_error=None, pending={}, pending_lock=threading.Lock(),
+                      live={}, live_lock=threading.Lock(), tiers=None, hwinfo=None, emap=None, hits=None,
+                      hits_seq=0, hits_live=collections.deque(maxlen=256), hits_live_seq=0,
+                      profile=collections.deque(maxlen=8), profile_seq=0, metal=None, metal_total=None,
+                      process=mock.Mock(stdout=io.BytesIO(b"".join(f.encode() + b"\n" for f in frames)),
+                                        **{"wait.return_value": None, "poll.return_value": None}))
+    e._fail_pending = lambda error: None
+    with mock.patch("sys.stderr"):
+        e._dispatch_stdout()
+    assert str(e.dispatcher_error) == "colibri engine exited unexpectedly", e.dispatcher_error
+    return e
+
+
+FRAME1 = ("METAL chain=1 reason=- forwards=12 declined=0 experts_gpu=1 cache_gb=0.125 slots=64 loads=40 "
+          "hits=10 wait_s=0.5 ahead=1 guesses=30 right=20 kv_regrow=0")
+FRAME2 = ("METAL chain=1 reason=- forwards=20 declined=1 experts_gpu=1 cache_gb=0.125 slots=64 loads=2 "
+          "hits=48 wait_s=0.25 ahead=1 guesses=36 right=30 kv_regrow=1")
+
+
+class MetalFrameTest(unittest.TestCase):
+    """the engine's METAL frame (one per turn, METAL=1 builds) into /health's `metal`"""
+
+    def test_metal_frame_parsed(self):
+        e = dispatched(FRAME1, FRAME2)
+        self.assertEqual(e.metal, {"chain": 1, "reason": None, "forwards": 20, "declined": 1, "experts_gpu": 1,
+                                   "cache_gb": 0.125, "slots": 64, "loads": 2, "hits": 48, "wait_s": 0.25,
+                                   "ahead": 1, "guesses": 36, "right": 30, "kv_regrow": 1})
+        self.assertEqual(e.metal_total, {"loads": 42, "hits": 58, "wait_s": 0.75, "guesses": 66, "right": 50})
+        eng = LiveEngine()
+        eng.metal, eng.metal_total = e.metal, e.metal_total
+        server = gw.APIServer(("127.0.0.1", 0), eng, "test-model", "secret", 16)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with urlopen(Request(f"http://127.0.0.1:{server.server_port}/health",
+                                 headers={"Authorization": "Bearer secret"}), timeout=5) as r:
+                body = json.load(r)
+        finally:
+            server.scheduler.close(); server.shutdown(); server.server_close()
+        self.assertEqual(body["metal"], {**e.metal, "totals": e.metal_total})
+
+    def test_metal_frame_off_reason(self):
+        e = dispatched("METAL chain=0 reason=COLI_METAL%3D0 forwards=0 declined=0 experts_gpu=0 cache_gb=0.000 "
+                       "slots=0 loads=0 hits=0 wait_s=0.0000 ahead=0 guesses=0 right=0 kv_regrow=0")
+        self.assertEqual((e.metal["chain"], e.metal["reason"], e.metal["experts_gpu"]), (0, "COLI_METAL=0", 0))
+
+    def test_metal_frame_unknown_keys_ignored(self):
+        e = dispatched("METAL chain=1 future=7 reason=- loads=3 hits=1 bare wait_s=0.1 later=x%20y guesses=0 right=0")
+        self.assertNotIn("future", e.metal)
+        self.assertNotIn("later", e.metal)
+        self.assertEqual((e.metal["chain"], e.metal["loads"], e.metal["hits"]), (1, 3, 1))
+        self.assertEqual(e.metal_total["loads"], 3)
+
+    def test_gpu_failed_error_then_chain_off(self):
+        """a serve's Metal failure: ERROR GPU_FAILED ends that request as a 503 the client can
+        read, and the METAL frame after it says chain=0 with the reason"""
+        import io
+        e = gw.Engine.__new__(gw.Engine)
+        pending = gw._Pending()
+        e.__dict__.update(closed=False, dispatcher_error=None, pending={"7": pending}, pending_lock=threading.Lock(),
+                          live={}, live_lock=threading.Lock(), tiers=None, hwinfo=None, emap=None, hits=None,
+                          hits_seq=0, hits_live=collections.deque(maxlen=256), hits_live_seq=0,
+                          profile=collections.deque(maxlen=8), profile_seq=0, metal=None, metal_total=None)
+        frames = ["ERROR 7 GPU_FAILED the GPU path failed; the conversation will be re-read on the CPU",
+                  "METAL chain=0 reason=the%20attention%20of%20layer%203%20at%20position%2040%20did%20not%20run"
+                  "%20on%20the%20GPU forwards=9 declined=1 experts_gpu=0 cache_gb=0.000 slots=0 loads=0 hits=0 "
+                  "wait_s=0.0000 ahead=0 guesses=0 right=0 kv_regrow=0"]
+        e.process = mock.Mock(stdout=io.BytesIO(b"".join(f.encode() + b"\n" for f in frames)),
+                              **{"wait.return_value": None, "poll.return_value": None})
+        e._fail_pending = lambda error: None
+        with mock.patch("sys.stderr"):
+            e._dispatch_stdout()
+        kind, error = pending.events.get_nowait()
+        self.assertEqual(kind, "error")
+        self.assertIsInstance(error, gw.APIError)
+        self.assertEqual((error.status, error.code), (503, "gpu_failed"))
+        self.assertIn("read again on the CPU", error.message)
+        self.assertEqual((e.metal["chain"], e.metal["experts_gpu"]), (0, 0))
+        self.assertEqual(e.metal["reason"], "the attention of layer 3 at position 40 did not run on the GPU")
+
+    def test_no_metal_frame(self):
+        e = dispatched("TIERS 0 4 4 0.0 1.5")
+        self.assertIsNone(e.metal)
+        self.assertIsNone(e.metal_total)
+        eng = LiveEngine()   # no metal attributes at all: /health exactly as before
+        server = gw.APIServer(("127.0.0.1", 0), eng, "test-model", "secret", 16)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def health():
+                with urlopen(Request(f"http://127.0.0.1:{server.server_port}/health",
+                                     headers={"Authorization": "Bearer secret"}), timeout=5) as r:
+                    return json.load(r)
+            before = health()
+            eng.metal, eng.metal_total = None, None   # an Engine that has seen no frame
+            after = health()
+        finally:
+            server.scheduler.close(); server.shutdown(); server.server_close()
+        self.assertNotIn("metal", before)
+        for body in (before, after):
+            body.pop("system", None)   # the box's numbers move between two reads
+        self.assertEqual(before, after)
 
 
 class WebSearchTest(unittest.TestCase):
@@ -223,6 +508,43 @@ class ModelsServiceTest(unittest.TestCase):
         t = self.m.tiers_for(g, 0, have=True, family="olmoe")
         self.assertFalse(t["gpu"]["fits"])          # an engine coli setup keeps on the CPU there
         self.assertIn("resta sulla CPU", t["gpu"]["why"])
+
+    APPLE = [{"name": "Apple M3 Max GPU", "kind": "integrated", "vendor": "Apple", "vram_gb": 0}]
+
+    def test_apple_metal_qwen38_fits_gpu_tier(self):
+        self.machine(self.APPLE, ram_gb=64)
+        t = self.m.tiers_for(self.geo(dense=4, experts=100), 0, have=True, family="qwen38")
+        self.assertFalse(t["ram"]["fits"])
+        self.assertTrue(t["gpu"]["fits"])           # dense resident, experts cached or streamed
+        self.assertEqual(t["gpu"]["label"], "GPU Metal + SSD")
+        self.assertIn("dall'SSD", t["gpu"]["why"])
+        self.assertIn("GPU calcola", t["gpu"]["why"])
+        self.machine(self.APPLE, ram_gb=8)          # the dense part alone does not fit
+        t = self.m.tiers_for(self.geo(dense=10, experts=100), 0, have=True, family="qwen38")
+        self.assertFalse(t["gpu"]["fits"])
+
+    def test_apple_other_family_unchanged(self):
+        self.machine(self.APPLE, ram_gb=64)
+        t = self.m.tiers_for(self.geo(dense=4, experts=100), 0, have=True, family="olmoe")
+        self.assertFalse(t["gpu"]["fits"])
+        self.assertNotIn("label", t["gpu"])
+        self.assertIn("servono", t["gpu"]["why"])
+
+    def test_tier_follows_gateway_metal_state(self):
+        self.machine(self.APPLE)
+        for health, tier in (({"metal": {"chain": 1}}, "gpu"), ({"metal": {"chain": 0}}, "ram"), ({"status": "ok"}, "ram")):
+            with mock.patch.object(self.m, "gateway_proc", return_value=None), \
+                 mock.patch.object(self.m, "gw_json", return_value=health):
+                self.assertEqual(self.m.gateway_tier(), tier)
+
+    def test_coli_metal_0_is_not_gpu(self):
+        self.machine(self.APPLE)
+        self.assertEqual(self.m.tier_of(["coli"], {"COLI_METAL": "0"}), "ram")
+        self.assertEqual(self.m.tier_of(["coli"], {}), "gpu")
+        proc = {"coli": True, "argv": ["coli"], "env": {"COLI_METAL": "0"}, "pid": 1}
+        with mock.patch.object(self.m, "gateway_proc", return_value=proc), \
+             mock.patch.object(self.m, "gw_json", return_value={"metal": {"chain": 1}}):
+            self.assertEqual(self.m.gateway_tier(), "ram")
 
     def test_a_cpu_only_engine_has_no_gpu_way(self):
         self.machine([{"name": "Card", "kind": "discrete", "vendor": "NVIDIA", "vram_gb": 24}])

@@ -1,0 +1,6 @@
+<|im_start|>system
+Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>
+<|im_start|>user
+What is the capital of France? Answer in one sentence, then briefly explain why it became the capital.<|im_end|>
+<|im_start|>assistant
+<think>

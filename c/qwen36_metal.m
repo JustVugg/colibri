@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "qwen36_gpu.h"
+#include "qwen36_metal_internal.h"
 #include "ggml_grids.h"
 #include "shaders/blockdec_table.h"
 
@@ -64,7 +65,7 @@ enum {
     K_GQ_DEQUANT, K_DOT_GQ_EXACT, K_DOT_GQ_VEC, K_DOT_GQ_MM, K_DOT_F32, K_EXPERT_GATE_UP_GQ, K_EXPERT_DOWN_GQ,
     K_EXPERT_GATE_UP_GQ_VEC, K_EXPERT_DOWN_GQ_VEC, K_EXPERT_GATE_UP_GQ_MM, K_EXPERT_DOWN_GQ_MM, K_DOT_GQ_ROW32,
     K_EXPERT_GATE_UP_GQ_VEC32, K_EXPERT_DOWN_GQ_VEC16, K_EXPERT_DOWN_GQ_VEC32, K_EXPERT_GATE_UP_GQ_MM4,
-    K_EXPERT_DOWN_GQ_MM4, K_COUNT
+    K_EXPERT_DOWN_GQ_MM4, K_ROUTER_SELECT_WIDE, K_COUNT
 };
 static const char *const q36_kernel_names[K_COUNT] = {
     "q36_rmsnorm", "q36_rmsnorm_fast", "q36_dot_i8", "q36_gate", "q36_add",
@@ -92,11 +93,13 @@ static const char *const q36_kernel_names[K_COUNT] = {
     "q36_expert_down_gq", "q36_expert_gate_up_gq_vec", "q36_expert_down_gq_vec", "q36_expert_gate_up_gq_mm",
     "q36_expert_down_gq_mm", "q36_dot_gq_row32", "q36_expert_gate_up_gq_vec32", "q36_expert_down_gq_vec16",
     "q36_expert_down_gq_vec32", "q36_expert_gate_up_gq_mm4", "q36_expert_down_gq_mm4",
+    "q36_router_select_wide",
 };
 
 static id<MTLDevice> g_device;
 static id<MTLBuffer> g_dn_chunk_scratch;       /* q36_dn_chunk: eight prepared chunks */
 static id<MTLBuffer> g_gq_table;               /* the GGUF decoders' values (q36_gq_table_fill) */
+static id<MTLBuffer> g_zero_bias;              /* q36_router_softmax without a bias: zeros */
 static id<MTLCommandQueue> g_queue;
 static id<MTLComputePipelineState> g_pipe[K_COUNT];
 static id<MTLCommandBuffer> g_batch;           /* open, not committed yet */
@@ -137,6 +140,9 @@ static id<MTLLibrary> q36_compile(id<MTLDevice> device) {
         options.fastMathEnabled = NO;
 #pragma clang diagnostic pop
     }
+#ifdef Q38_COUNTER_TEST   /* test-only: counter-test 4 perturbs q36_router_select_wide; never set in production */
+    options.preprocessorMacros = @{@"Q38_COUNTER_TEST" : @(Q38_COUNTER_TEST)};
+#endif
     NSError *error = nil;
     id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:q36_source]
                                                   options:options error:&error];
@@ -244,6 +250,7 @@ void q36_gpu_cleanup(void) {
         for (int i = 0; i < K_COUNT; i++) g_pipe[i] = nil;
         g_dn_chunk_scratch = nil;
         g_gq_table = nil;
+        g_zero_bias = nil;
         g_queue = nil;
         g_device = nil;
     }
@@ -384,14 +391,20 @@ void q36_map_free(q36_map *m) {
  * encoded before it, so no explicit barriers are needed. */
 static int g_concurrent;                        /* q36_gpu_concurrent */
 
-static id<MTLComputeCommandEncoder> q36_encoder(int kernel) {
+/* The current batch's encoder with pso set; q36's kernels and other libraries'
+ * (q36_metal_encoder) share it. */
+static id<MTLComputeCommandEncoder> q36_encoder_pso(id<MTLComputePipelineState> pso) {
     if (!g_encoder) {
         if (!g_batch) g_batch = [g_queue commandBuffer];
         g_encoder = [g_batch computeCommandEncoderWithDispatchType:g_concurrent ? MTLDispatchTypeConcurrent
                                                                                 : MTLDispatchTypeSerial];
     }
-    [g_encoder setComputePipelineState:g_pipe[kernel]];
+    [g_encoder setComputePipelineState:pso];
     return g_encoder;
+}
+
+static id<MTLComputeCommandEncoder> q36_encoder(int kernel) {
+    return q36_encoder_pso(g_pipe[kernel]);
 }
 
 void q36_gpu_concurrent(int on) {
@@ -584,6 +597,20 @@ static void q36_bind(id<MTLComputeCommandEncoder> e, q36_tensor *t, NSUInteger i
 static void q36_bind_at(id<MTLComputeCommandEncoder> e, q36_tensor *t, uint64_t skip, NSUInteger index) {
     [e setBuffer:t->buffer offset:t->offset + skip atIndex:index];
 }
+
+/* ---- qwen36_metal_internal.h: the device and stream for other Metal layers -- */
+
+id<MTLDevice> q36_metal_device(void) { return g_device; }
+
+id<MTLComputeCommandEncoder> q36_metal_encoder(id<MTLComputePipelineState> pso) {
+    return q36_encoder_pso(pso);
+}
+
+void q36_metal_bind(id<MTLComputeCommandEncoder> e, q36_tensor *t, int index) {
+    q36_bind(e, t, (NSUInteger)index);
+}
+
+int q36_metal_fits(q36_tensor *t, uint64_t bytes) { return q36_fits(t, bytes); }
 
 static void q36_threads(id<MTLComputeCommandEncoder> e, uint64_t n) {
     [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(n < 64 ? n : 64, 1, 1)];
@@ -1177,8 +1204,16 @@ int q36_shared_dot(q36_tensor *y, q36_tensor *x, q36_tensor *q, q36_tensor *sc, 
 
 int q36_router_softmax(q36_tensor *prob, q36_tensor *logits, q36_tensor *bias, int rows, int experts) {
     if (rows < 1 || experts < 1 || !q36_fits(logits, (uint64_t)rows * experts * F4) ||
-        !q36_fits(prob, (uint64_t)rows * experts * F4) || !q36_fits(bias, (uint64_t)experts * F4)) return 0;
+        !q36_fits(prob, (uint64_t)rows * experts * F4) || (bias && !q36_fits(bias, (uint64_t)experts * F4))) return 0;
     @autoreleasepool {
+        if (!bias && (!g_zero_bias || g_zero_bias.length < (uint64_t)experts * F4)) {
+            /* no bias (Qwen3.8): the kernels add zeros, which leaves every logit as it is */
+            id<MTLBuffer> zeros = [g_device newBufferWithLength:(NSUInteger)experts * F4
+                                                        options:MTLResourceStorageModeShared];
+            if (!zeros) return 0;
+            memset(zeros.contents, 0, (size_t)experts * F4);
+            g_zero_bias = zeros;
+        }
         q36_router_args a = {(uint32_t)rows, 0, (uint32_t)experts, 0, 1, 0, 0};
         int row = rows <= Q36_ROW_ROWS && experts <= Q36_ROW_MAX;
         /* fast mode: a threadgroup per row and the sum in parallel, not in expert
@@ -1186,7 +1221,8 @@ int q36_router_softmax(q36_tensor *prob, q36_tensor *logits, q36_tensor *bias, i
         int fast = !g_exact && g_pipe[K_ROUTER_SOFTMAX_FAST].maxTotalThreadsPerThreadgroup >= 256;
         id<MTLComputeCommandEncoder> e = q36_encoder(fast ? K_ROUTER_SOFTMAX_FAST : row ? K_ROUTER_SOFTMAX_ROW
                                                                                       : K_ROUTER_SOFTMAX);
-        q36_bind(e, logits, 0); q36_bind(e, bias, 1); q36_bind(e, prob, 2);
+        q36_bind(e, logits, 0); q36_bind(e, prob, 2);
+        if (bias) q36_bind(e, bias, 1); else [e setBuffer:g_zero_bias offset:0 atIndex:1];
         [e setBytes:&a length:sizeof(a) atIndex:3];
         if (fast || row) q36_rows(e, (uint64_t)rows); else q36_threads(e, (uint64_t)rows);
     }
@@ -1195,9 +1231,23 @@ int q36_router_softmax(q36_tensor *prob, q36_tensor *logits, q36_tensor *bias, i
 
 int q36_router_select(q36_tensor *ids, q36_tensor *weights, q36_tensor *prob, int rows, int experts,
                       int topk, int groups, int topk_groups) {
-    if (rows < 1 || experts < 1 || experts > 256 || topk < 1 || topk > 8 || topk > experts ||
-        groups < 1 || experts % groups || !q36_fits(prob, (uint64_t)rows * experts * F4) ||
+    /* qwen36's routers (up to 256 experts, top-k 8) on the kernels below; wider
+     * ones without groups (Qwen3.8: 512 experts, top-k 10) on q36_router_select_wide */
+    int wide = !(experts <= 256 && topk <= 8);
+    if (rows < 1 || experts < 1 || experts > 512 || topk < 1 || topk > 16 || topk > experts ||
+        (wide && groups != 1) || groups < 1 || experts % groups || !q36_fits(prob, (uint64_t)rows * experts * F4) ||
         !q36_fits(ids, (uint64_t)rows * topk * 4) || !q36_fits(weights, (uint64_t)rows * topk * F4)) return 0;
+    if (wide) {
+        if (g_pipe[K_ROUTER_SELECT_WIDE].maxTotalThreadsPerThreadgroup < 256) return 0;
+        @autoreleasepool {
+            q36_router_args a = {(uint32_t)rows, 0, (uint32_t)experts, (uint32_t)topk, 1, 1, 0};
+            id<MTLComputeCommandEncoder> e = q36_encoder(K_ROUTER_SELECT_WIDE);
+            q36_bind(e, prob, 0); q36_bind(e, ids, 1); q36_bind(e, weights, 2);
+            [e setBytes:&a length:sizeof(a) atIndex:3];
+            q36_rows(e, (uint64_t)rows);
+        }
+        return 1;
+    }
     @autoreleasepool {
         q36_router_args a = {(uint32_t)rows, 0, (uint32_t)experts, (uint32_t)topk, (uint32_t)groups,
                              (uint32_t)topk_groups, 0};
@@ -1348,7 +1398,7 @@ int q36_expert_down(q36_tensor *y, q36_tensor *h, q36_tensor *pairs, int first, 
 int q36_expert_sum(q36_tensor *out, q36_tensor *y, q36_tensor *weights, q36_tensor *shared,
                    q36_tensor *residual, int rows, int hidden, int topk) {
     uint64_t cells = (uint64_t)rows * hidden;
-    if (rows < 1 || hidden < 1 || topk < 1 || topk > 8 || cells > UINT32_MAX ||
+    if (rows < 1 || hidden < 1 || topk < 1 || topk > 16 || cells > UINT32_MAX ||
         !q36_fits(out, cells * F4) || !q36_fits(y, cells * topk * F4) ||
         !q36_fits(weights, (uint64_t)rows * topk * F4) || !q36_fits(shared, cells * F4) ||
         !q36_fits(residual, cells * F4)) return 0;
@@ -1457,7 +1507,7 @@ static int q36_experts_gq(int kernel, q36_tensor *out, uint64_t out_bytes, q36_t
                           int inter, int topk, const q36_gq_experts *t, int width) {
     uint64_t rbg = t ? q36_gq_row_bytes(t->gate, hidden) : 0, rbu = t ? q36_gq_row_bytes(t->up, hidden) : 0;
     uint64_t rbd = t ? q36_gq_row_bytes(t->down, inter) : 0;
-    if (rows < 1 || topk < 1 || topk > 8 || !rbg || !rbu || !rbd || rbg > UINT32_MAX || rbu > UINT32_MAX ||
+    if (rows < 1 || topk < 1 || topk > 16 || !rbg || !rbu || !rbd || rbg > UINT32_MAX || rbu > UINT32_MAX ||
         rbd > UINT32_MAX || !q36_fits(out, out_bytes) || !q36_fits(in, in_bytes) ||
         !q36_pairs_ok(pairs, first, n, slots, rows, topk, (rbg + rbu) * inter + rbd * hidden)) return 0;
     for (int k = 0; k < 8; k++)

@@ -1,0 +1,604 @@
+# Setting up colibri with an AI coding assistant
+
+This page is written for an AI coding assistant that a user asked to install,
+start, check or stop colibri on their machine. Every step is a command with a
+machine-readable result. A person can follow it too; the one-step path for
+people is `START-HERE.bat` (Windows) or `./start-here.sh` (Linux, macOS), see
+[quickstart.md](quickstart.md).
+
+If your client speaks the Model Context Protocol, the same operations are
+available as tools: see [MCP_SERVER.md](MCP_SERVER.md).
+
+## Ground rules
+
+- **Ask before downloading.** Models are 19 GB to 1.6 TB. Show the user the
+  recommended model, its size and where it will go, and get a yes.
+- **Ask before installing system packages.** The setup never runs `sudo`,
+  `apt`, `pacman` or `winget` itself. When it needs a package it prints the
+  exact command; show it to the user and run it only with their consent.
+- **Reruns are safe.** Every step is idempotent. If a command stops (network,
+  timeout, Ctrl+C), run the same command again: it continues where it stopped.
+- **Prefer the Linux disk on WSL.** Never put the model under `/mnt/c` (or any
+  `/mnt/<drive>`): the engine streams the model from disk, and that path is
+  many times slower. The default, `~/colibri-models`, is right.
+
+## 0. Prerequisites
+
+Python 3.10 or newer and a copy of the repository.
+
+```bash
+python3 --version                              # Windows: py -3 --version
+git clone https://github.com/JustVugg/colibri  # or use the folder the user already has
+cd colibri
+```
+
+On Windows run the commands below from PowerShell or cmd in the repository
+folder, with `py -3 c\coli` where this page writes `python3 c/coli`. If Python
+is missing on Windows, `winget install -e --id Python.Python.3.12 --scope user`
+installs it for the current user (ask first).
+
+A C compiler is optional. With one (gcc and make on Linux, Xcode tools on
+macOS, MSYS2 UCRT64 on Windows) the engine is built for this machine, with the
+GPU when one is usable. Without one, the prebuilt engine from the GitHub
+release is used, which runs on the CPU.
+
+## 1. Look at the machine
+
+```bash
+python3 c/setup_hw.py --json             # RAM, disk, CPU features, GPUs
+python3 c/coli setup --list --json       # every model against this machine
+```
+
+`setup_hw.py --json` reports `memory.total` and `memory.available` (bytes),
+`disk.free_bytes` for `~/colibri-models` (pass another folder as an argument),
+`cpu.features`, `gpu.vulkan` (the Vulkan device the engine would use, with its
+`type`, `integrated` or `discrete`, and `budget_bytes` or `device_local_bytes`),
+`gpu.vulkan_icd` (a driver manifest found under the home folder, typical on
+WSL) and `gpu.nvidia` (from nvidia-smi, each card with its `compute_cap`,
+for example `7.0`, or null when nothing reported it).
+
+`setup --list --json` returns one object per model:
+
+| Field | Meaning |
+|---|---|
+| `id` | what `--model` takes |
+| `download_gb` | size of the download |
+| `ram_min_gb`, `ram_good_gb` | below the first it does not run; from the second it runs as measured |
+| `dense_gb` | the part that always stays in RAM |
+| `runs` | `from RAM` (small models) or `streams experts from the SSD` (large ones) |
+| `status` | `good`, `tight`, `needs-ram`, `needs-disk` or `unsupported` |
+| `fits`, `reason` | whether it can be installed here, and why |
+| `recommended` | exactly one model is the default |
+
+"Fits" means: the dense part, which always stays in RAM, plus a minimum
+expert cache fit in RAM, and the download fits on the disk.
+
+Tell the user the recommendation and the alternatives that fit, with their
+sizes. Large models stream from the SSD and are much slower than the small
+ones that run from RAM.
+
+## 2. Install
+
+Non-interactive, with the model the user chose:
+
+```bash
+python3 c/coli setup --yes --model qwen36-35b --no-start
+```
+
+What it does, in order: detects the hardware, picks the engine build (see
+[How the engine build is chosen](#how-the-engine-build-is-chosen)), builds or
+fetches the engine, downloads the model with resume, runs the planner on the
+files, and writes the run configuration. It prints each step.
+
+The download can take hours. If your command runner has a time limit, start
+it detached and poll the status instead of waiting:
+
+```bash
+# Linux, macOS, WSL
+nohup python3 c/coli setup --yes --model qwen36-35b --no-start > colibri-setup.log 2>&1 &
+```
+
+```powershell
+# Windows
+Start-Process -WindowStyle Hidden py -ArgumentList '-3','c\coli','setup','--yes','--model','qwen36-35b','--no-start' `
+  -RedirectStandardOutput colibri-setup.log -RedirectStandardError colibri-setup.err
+```
+
+Then poll every minute or so:
+
+```bash
+python3 c/coli status --json
+```
+
+`install.phase` moves through `build`, `download`, `ready` (configured) and
+`started` (server launched); `error` and `interrupted` end it early, and
+`install.running` says whether the install process is still alive. During the
+download `install.done` and `install.total` are bytes and `install.rate` is
+bytes per second. On `error`, `install.message` says why; fix the cause and
+rerun the same setup command.
+
+### The setup options
+
+| Option | Effect |
+|---|---|
+| `--yes`, `-y` | no questions: the recommendation and every default |
+| `--model ID` | the model to install (ids from `--list`) |
+| `--model-dir DIR` | use a model already on disk instead of downloading |
+| `--dir DIR` | where models are downloaded (default `~/colibri-models`) |
+| `--backend auto\|cpu\|vulkan\|cuda` | force the engine build (`auto`: see below); `--no-gpu` is `--backend cpu` |
+| `--host H`, `--port N` | where the server listens (default `127.0.0.1:8000`) |
+| `--ctx N` | the context the server starts with, kept for `coli start` (default: automatic, from the memory there is); a rerun with `--ctx` on a finished setup changes it, `--ctx 0` restores automatic, and an interrupted setup keeps the choice |
+| `--no-start` | stop after writing the configuration |
+| `--background` | start the server detached at the end |
+| `--no-browser` | do not open a browser tab |
+| `--reconfigure` | choose again even if a setup is complete |
+| `--list`, `--all` | show the catalog against this machine and exit |
+| `--via-windows auto\|yes\|no` | WSL only: download through Windows' `curl.exe` |
+| `--no-verify` | skip the checksums of downloaded files |
+| `--json` | machine-readable result (implies `--yes` and a background start) |
+
+The configuration starts the server with `--auto-tier`, so the expert cache the
+setup's `Plan:` line prints (and a `coli tune` profile) is the one the engine gets:
+on CUDA for every model, on Vulkan and the CPU for the families with a fixed default
+cache (Qwen3.6, Qwen3.8, Kimi K3, Inkling, DeepSeek V4 and V4.1, MiMo). The GLM
+engines and OLMoE size their cache themselves there. A setup written before this
+started those families' Vulkan or CPU engine on the default (eight slots a layer for
+Qwen3.6), and `coli start` now adds the flag to it.
+
+On a completed setup, explicit `--backend`, `--no-gpu`, `--host` and `--port`
+update the saved configuration for the same model. Options left out keep their
+saved values.
+
+### How the engine build is chosen
+
+With `--backend auto` (the default):
+
+1. **CUDA**, for an NVIDIA card, when all of these hold:
+   - the engine has a CUDA path on Linux: Qwen3.6 (with Qwen3-Coder and
+     Qwen3.8-27B), Qwen3.8 Flash Next, GLM-5.2/5.3 (the `colibri` engine; not
+     GLM-5.3-Flash), Kimi K3, Inkling and DeepSeek V4 Flash;
+   - a CUDA toolkit (`nvcc`) is installed;
+   - the toolkit builds for every NVIDIA card here. The card's compute
+     capability comes from `nvidia-smi` (`gpu.nvidia[].compute_cap` in
+     `setup_hw.py --json`, for example `7.0` for a V100). The toolkit's list
+     comes from `nvcc --list-gpu-arch`, or from its version for an nvcc too
+     old to answer. CUDA 13 dropped Maxwell, Pascal and Volta (compute 5.x to
+     7.2), and Blackwell (compute 12.0) needs CUDA 12.8 or newer;
+   - the engine's own CUDA code supports the card and the toolkit.
+     DeepSeek V4 Flash needs compute 6.0 or newer and CUDA 12.0 or newer, and
+     below CUDA 12.8 the setup builds it with `NO_TC=1`.
+2. **Vulkan**, when a Vulkan GPU answered and the Vulkan headers and `glslc`
+   are installed. On an integrated GPU, which shares the CPU's RAM, only the
+   engines measured faster there (today Qwen3.6, Qwen3-Coder and Qwen3.8)
+   use it, unless `--backend vulkan` asks for it.
+3. **The CPU** otherwise.
+
+When the toolkit cannot build for the card, the setup does not try. It says
+why and what to install, and takes the next backend:
+
+```
+Engine: qwen36 with VULKAN (the CUDA 13.0 toolkit cannot build for the Tesla V100-SXM2-16GB (compute 7.0, dropped in CUDA 13): using Vulkan; install a CUDA 12.x toolkit for the CUDA path)
+```
+
+With `--backend cuda` the same check stops the setup before any build, with
+the same reason. `--backend auto` then takes the next backend.
+
+If a build still fails, the setup prints the end of the log and the log's
+path, then moves to the next backend: CUDA, then Vulkan, then the CPU. With
+someone at the terminal it asks first; with `--yes` it goes ahead. A setup
+resumed later does not retry a backend whose build failed. A failed CPU build
+stops the setup. Each backend has its own log, `logs/build-cuda.log`,
+`logs/build-vulkan.log` or `logs/build-cpu.log`, so the log of the failed
+build is still there after the fallback.
+
+### When a GPU package is missing
+
+If the machine has a GPU that the build cannot use yet, the setup continues
+on the CPU and prints a line like:
+
+```
+  to use the GPU through VULKAN, first run:  sudo apt install libvulkan-dev glslc mesa-vulkan-drivers
+```
+
+Show that command to the user. If they run it (or let you run it), run
+`python3 c/coli setup --yes --no-start` again: the setup remembers that a GPU
+was waiting for packages, sees that they are there, rebuilds the engine for
+the GPU and rewrites the configuration. The download is not repeated.
+
+On Windows the GPU build needs MSYS2 with its UCRT64 packages; the line names
+them. The prebuilt Windows engine runs on the CPU.
+
+### WSL
+
+The setup measures the download speed from WSL and from Windows with a short
+ranged request when the download is larger than a few GB. If Windows is much
+faster (it can be: 63 KB/s against 3.3 MB/s was measured on one machine), it
+downloads through Windows' `curl.exe` into the same Linux folder. Force it with
+`--via-windows yes`, or disable it with `--via-windows no`.
+
+A Vulkan driver installed by hand under the home folder (Mesa's Dozen driver is
+the usual one on WSL) is found and written into the run configuration as
+`VK_ICD_FILENAMES`.
+
+## 3. Start
+
+```bash
+python3 c/coli start --background --no-browser
+python3 c/coli status --json
+```
+
+Wait until `server.state` is `ready` (`loading` first; loading takes from
+seconds to minutes depending on the model). Then give the user:
+
+| Field in `status --json` | Use |
+|---|---|
+| `server.urls.browser` | the dashboard, for the user |
+| `server.urls.openai_base_url` | `.../v1`, for OpenAI-compatible clients |
+| `server.urls.anthropic_base_url` | for Anthropic-compatible clients (they append `/v1/messages`) |
+| `server.model_id` | the `model` value API requests must send |
+| `server.tokens_per_second` | speed of the last answer, prompt time included |
+
+A quick check that it answers:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "<server.model_id>", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+`python3 c/coli start` without `--background` runs in the foreground and opens
+the browser: that is what a person wants, not a tool call.
+
+If the configured port is taken by another program, the server moves to the
+next free port and the configuration is updated; read the URLs from
+`status`.
+
+## 4. Check, read the logs, stop
+
+```bash
+python3 c/coli status          # human-readable; --json for the fields above
+python3 c/coli logs -n 50      # server log of a background start (a foreground one prints to its terminal)
+python3 c/coli logs --install  # log of a detached install
+python3 c/coli stop            # stops the configured server and its engine
+```
+
+`coli stop` without `--port` stops the server the setup configured. Rerunning
+`python3 c/coli setup` later starts the configured server directly (in the
+foreground; add `--background --no-browser` for a detached start), with no
+download. Before it starts, `make` brings the engine up to date with the sources:
+nothing to do (a fraction of a second) unless they changed, as after a `git pull`,
+and then only what changed is rebuilt. `coli start` does the same.
+
+## Files
+
+Everything the setup writes lives in one folder: `~/.local/share/colibri` on
+Linux, `~/Library/Application Support/colibri` on macOS,
+`%LOCALAPPDATA%\colibri` on Windows. `COLI_SETUP_HOME` overrides it.
+
+| File | Content |
+|---|---|
+| `setup.json` | the run configuration: model, engine, backend, environment, launcher arguments, URLs |
+| `install-state.json` | phase and progress of the current or last install |
+| `logs/serve.log`, `logs/install.log`, `logs/build-<backend>.log` | logs (one build log per backend: `cuda`, `vulkan`, `cpu`) |
+| `runtime/` | a prebuilt release, when there is no compiler |
+
+The model folder holds `.colibri-download.json`, which lists the files and
+says when the download is complete. Partial files end in `.part`.
+
+`HF_TOKEN` (or the token `hf auth login` saved) is used for gated repositories.
+`HF_ENDPOINT` points the downloads at a mirror.
+
+## Troubleshooting
+
+| Symptom | What to do |
+|---|---|
+| `download stopped: ...` | rerun the same command; it resumes from the bytes on disk |
+| `checksum mismatch` | the partial file was removed; rerun |
+| `needs N GB free for the download` | pass `--dir` with a folder on a bigger disk |
+| `the published release ... predates <model>` | there is no compiler and the last release cannot run that model: install the compiler (the message names the command) or pick another model |
+| `... toolkit cannot build for the <card> (compute X.Y, ...)` | the setup took Vulkan or the CPU; for CUDA, install the toolkit the line names and rerun with `--reconfigure` |
+| `the <engine> CUDA build failed (full log: ...)` | the setup moved to the next backend; the log says why the CUDA build failed |
+| `Already set up: ...` but the user wants another model | `--reconfigure`, or `--model ID` |
+| `server.state` stays `loading` | `coli logs -n 50`; large models take minutes to load |
+| `plan warning: RAM budget cannot hold one expert slot` | the model does not fit in the free RAM: close programs or choose a smaller model |
+
+
+# Building the CUDA backend on glibc ≥ 2.41 (Debian trixie and newer)
+
+**Author:** Peter Groom · 2026-07-18
+
+Symptom: `make glm CUDA=1` fails with four errors like
+
+    mathcalls.h(79): error: exception specification is incompatible with that of
+    previous function "cospi" (declared at ... crt/math_functions.h)
+
+Cause: glibc 2.41 added C23 `sinpi/cospi/sinpif/cospif` with exception specs that clash
+with CUDA ≤ 12.9's `math_functions.h` declarations. **CUDA 13.x headers fix it.**
+
+Recipe that needs neither root-owned toolkits nor distro driver packages (safe next to a
+`.run`-installed or dkms driver — important in LXC setups where userland must match the
+host kernel module version):
+
+```bash
+# micromamba (single static binary) + NVIDIA's conda channel = complete nvcc
+curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C /opt bin/micromamba
+/opt/bin/micromamba create -y -p /opt/cuda13 -c nvidia -c conda-forge cuda-nvcc=13 cuda-cudart-dev=13
+ln -s /opt/cuda13/lib /opt/cuda13/lib64      # Makefile expects lib64; conda ships lib
+
+make glm CUDA=1 CUDA_ARCH=sm_86 CUDA_HOME=/opt/cuda13   # your arch here
+```
+
+The binary links `libcudart.so.13` dynamically — ship it next to the binary and run with
+`LD_LIBRARY_PATH`, or drop it in `/usr/local/lib`. Driver ≥ the runtime's minimum is the
+only host requirement (any recent driver runs CUDA 13 binaries).
+
+Dead ends, for the record: Debian's `nvidia-cuda-toolkit` hard-depends on Debian's driver
+userland (version-clashes a `.run`/dkms driver — and its `nvidia-installer-cleanup`
+postinst will try to delete your hand-installed userland); pip's `nvidia-cuda-nvcc-cu12`
+wheel ships only `ptxas`, not the compiler frontend.
+
+The main Makefile enables `glibc_c23_math_compat.h` by default on Linux CUDA
+builds. If your toolchain already handles these declarations, omit only this
+forced include with `make -C c colibri CUDA=1 CUDA_GLIBC_MATH_COMPAT=0`.
+The switch preserves the other CUDA flags and triggers a rebuild when changed.
+It does not affect Windows or macOS builds.
+
+
+# CACHE_ROUTE — opt-in cache-aware MoE routing
+
+**Default: OFF.** Stock full top-K router behavior unless `CACHE_ROUTE=1`.
+
+Paper-style max-rank selection (arXiv:2412.00099): keep true top-`J` always;
+fill remaining slots preferring experts already **resident** (pin ∪ LRU) that
+still rank inside top-`M`.
+
+This is **routing-side** (can change which experts run). Complementary to
+**PILOT** (next-layer *prefetch* of weights; does not change expert IDs).
+
+## Engines and residency levels
+
+| engine | "resident" means | levels |
+|---|---|---|
+| `colibri` (GLM-5.2) | in the pin set or the RAM LRU cache | one |
+| `qwen36` | in the VRAM expert tier (CUDA / Vulkan), else in the RAM LRU cache | two: VRAM first, then RAM |
+
+In `qwen36` a slot past the sacred top-`J` is filled, inside the top-`M`
+window, by the highest-ranked VRAM-resident expert, then the highest-ranked
+RAM-resident one, then the plain ranking. With no tier enabled the VRAM level
+is empty and the lever degrades to the single-level GLM behaviour. The knobs
+and meters are the same in both engines; the `qwen36` footer additionally
+splits the swap count into `N to VRAM`.
+
+The only substitutable slots are ranks `J..K-1`. On a model that routes
+top-2, the default `ROUTE_J=2` leaves nothing to substitute and the footer
+reports `swap 0.0%`; lower `ROUTE_J` to trade agreement for hits.
+
+## Flags
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `CACHE_ROUTE` | `0` | `1` = max-rank cache-aware fill (pin∪LRU prefer) |
+| `ROUTE_J` | `2` | Always take true top-J (even if uncached) |
+| `ROUTE_M` | `12` | Max-rank window for resident preference |
+| `ROUTE_P` | `0` | Optional cumulative mass window (`0` = use fixed M) |
+| `ROUTE_ALPHA` | `1` | Scale gate mass of *substituted* experts before renorm (`1` = off) |
+| `ROUTE_AGREE` | auto | Overlap% + KL vs true top-K; auto-on when `CACHE_ROUTE=1` |
+
+## One-liners
+
+```bash
+# Stock full-K (leaderboard-comparable routing)
+CACHE_ROUTE=0 ./coli chat
+
+# Experimental CACHE_ROUTE
+CACHE_ROUTE=1 ROUTE_J=2 ROUTE_M=12 ./coli chat
+
+# Wider prefer window (more hit, more possible swap)
+CACHE_ROUTE=1 ROUTE_J=2 ROUTE_M=16 ./coli chat
+```
+
+## Stats
+
+Footer / serve `STAT` when enabled:
+
+- `swap N%` / `swap_pct` — fraction of chosen slots not in true top-K
+- `route_swaps` / `route_slots` — raw substitution counters
+- `route_agree` — |chosen ∩ true top-K| / K
+- `route_kl` — mass KL (true top-K vs chosen)
+- `hit N%` — expert cache hit (disk residency)
+- `N to VRAM` (`qwen36` only) — of the swaps, how many landed on a tier-resident expert
+
+## A/B vs PILOT
+
+```bash
+# A: cache-aware routing only
+CACHE_ROUTE=1 PILOT=0 ...
+
+# B: lookahead prefetch only (does not change expert IDs)
+CACHE_ROUTE=0 PILOT=1 ...
+
+# C: both
+CACHE_ROUTE=1 PILOT=1 ...
+```
+
+## Scope of this PR
+
+**Routing-only** + telemetry + this note. Does **not** require CUDA/fuse/device-tier
+patches — CPU streaming + pin/LRU is enough to A/B the lever against PILOT / #119.
+
+The `qwen36` port keeps that shape: `route_select()` is a pure function of the
+softmax row, the group mask and a residency callback, pinned by
+`tests/test_qwen36_cache_route.c` without a model. With the lever unset the
+router runs the original top-K loop and emits byte-identical token ids.
+
+Treat as experimental until quality gates (e.g. `./coli bench`) pass; do not
+default `CACHE_ROUTE=1`.
+
+
+# Environment Variables
+
+Reference for the environment variables read by the colibrì engine.
+
+**Baseline generated from `dev @ def8419`** by scanning every `getenv()` / `getenv_utf8()` site in `c/*.c`, `c/*.h`, `c/*.cu` and `c/*.mm`. Individual entries are also maintained with their owning source. Defaults and behavior are taken from the source; see [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate the full inventory after the code changes.
+
+## Which program reads these?
+
+**There are ten engine binaries, and they do not share a knob set.** The main
+engine `c/colibri` (built from `c/colibri.c`, formerly `glm.c`) reads most of
+what follows, but the sister engines read their own:
+
+| Engine | Source | Its own variables |
+|---|---|---|
+| `colibri` | `c/colibri.c` | everything below except the three sections named for another engine |
+| `glm53` | `c/glm53.c` | the `GLM53_*` family and `COLI_MAP_EXPERTS`: see [GLM-5.3-Flash engine](#glm-53-flash-engine-glm53) |
+| `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family, and the Vulkan expert tier's `COLI_VK_TIER*` — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
+| `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU`, the Vulkan expert tier's `COLI_VK_TIER*` — see [Inkling engine](#inkling-engine-inkling) |
+| `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, its dense/CUDA-tier controls, the `CACHE_ROUTE` family (VRAM tier over RAM cache), and the Vulkan expert tier's `COLI_VK_TIER*` — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
+| `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_EXPERT_INT4`, `Q38_MTP`, `Q38_MTP_DRAFTS`, `COLI_LOOKUP`, `Q38_PREFILL_BATCH`, `Q38_TRUNK_CPU_INT8`, `Q38_FP8_KERNEL`, `COLI_TIMERS`, the Vulkan expert tier's `COLI_VK_TIER*` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
+| `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP`, the Vulkan expert tier's `COLI_VK_TIER*` — see [OLMoE engine](#olmoe-engine-olmoe) |
+| `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families, the two `COLI_CUDA_*_BATCH` gates and the Vulkan expert tier's `COLI_VK_TIER*` — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
+| `qwenimage` | `c/qwenimage.c` | `COLI_IMG_*`, `QWENIMAGE_*` and `QIV_PROFILE` |
+| `deepseek_v41` | `c/deepseek_v41.c` | the `V41_*` family and the Vulkan expert tier's `COLI_VK_TIER*`: see [DeepSeek V4.1 engine](#deepseek-v41-engine-deepseek_v41) |
+| `mimo` | `c/mimo.c` | the `MIMO_*` family, and the Vulkan expert tier's `COLI_VK_TIER*`: see [MiMo-V2.6 engine](#mimo-v26-engine-mimo) |
+
+Setting an `INK_*` variable while running `colibri` does nothing, and vice
+versa; the startup registry warns about that mismatch. A few variables are genuinely shared because
+they live in headers every engine includes (`COLI_USAGE`, `USAGE_SAVE`,
+`COLI_USAGE_DECAY` in `route_trace.h`; `RANS_*` in `rans.h`;
+`COLI_NO_OMP_TUNE` / `OMP_NUM_THREADS` in `omp_tune.h`).
+
+You rarely export any of them by hand — the `coli` CLI and `openai_server.py`
+translate most of their flags into these variables before launching the engine
+(e.g. `--temp` → `TEMP`, `--ctx` → `CTX`). See [SETTINGS.md](SETTINGS.md) for
+the flag → variable mapping. Export a variable directly only to reach a knob the
+CLI doesn't surface, or to override what the CLI would set.
+
+Format: `VAR` — default — effect.
+
+## Checking what the engine actually received
+
+Every engine validates the environment at startup against the registry in
+`c/coli_env.h` and reports what it cannot use:
+
+```console
+$ COLI_PREFIL_CHUNK=512 ./colibri ...
+[env] unknown variable COLI_PREFIL_CHUNK -- did you mean COLI_PREFILL_CHUNK?
+
+$ K3_BITS=8 ./colibri ...
+[env] K3_BITS is not read by colibri (it belongs to kimi_k3) -- it will have no effect
+```
+
+Both of those used to be silent: the run proceeded with the default and
+produced a plausible number for a configuration you did not set. That is the
+mistake this check exists to catch, and it is why the engine-ownership table
+above matters.
+
+What the user did not set for the engine is left out. `coli serve` and its
+gateway give every engine they start the same few variables (`NGEN`,
+`SERVE_BATCH`, `KV_SLOTS`, `COLI_SERVE_PORT`, ...), and Windows' cmd keeps its
+own prompt in `PROMPT` and its temporary folder in `TEMP`: an engine that does
+not read one of them says nothing, and `TEMP` is reported as the deprecated
+temperature only when it holds a number.
+
+It warns rather than exits, so nothing that works today stops working. Two
+knobs:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_ENV_STRICT` | `0` | `=1` turns those warnings into `exit(2)`. For CI and for anyone who wants the guarantee rather than the notice. |
+| `COLI_ENV_DUMP` | `0` | `=1` prints every variable this engine reads, its type, and whether it is currently set — the fastest answer to "is my export reaching the engine?" |
+
+Variables the engine does not own are left alone: an unrelated `EDITOR` or
+`MY_VAR` in the environment is never reported. Unknown names are checked only
+under `COLI_*`, `COLIBRI_*`, `K3_*`, `KIMI_*`, `INK_*`, `GLM53_*`, `Q38_*`,
+`Q36_*`, `QWEN_*`, `DSV4_*`, `V4_*`, and `V41_*`. These prefixes belong to the
+project. Shared external prefixes such as `CUDA_*`, `OMP_*`, `QT_*`, and `VK_*`
+are not claimed: unregistered names under them are ignored. Registered names
+are still checked for engine ownership regardless of prefix.
+
+
+---
+
+## Common — everyday use
+
+| Variable | Default | Effect |
+|---|---|---|
+| `RAM_GB` | `0` (auto ≈ 88% of free RAM) | RAM budget in GB for the resident/streamed expert working set. Higher → more experts stay hot → higher cache hit rate. Read by colibri, kimi_k3, glm53 and olmoe; on olmoe it sizes the expert cache once the dense weights are resident, and only when no `--cap` was given. |
+| `CTX` | `4096` | Maximum context length (tokens) the KV cache is sized for. |
+| `COLI_PREFILL_CHUNK` | `0` (off) | Run a long prompt through the layers in N-token slices instead of one pass. Every S-scaled activation buffer shrinks from prompt-sized to chunk-sized, which is the remedy when a long prompt exhausts CUDA scratch. Byte-identical output (verified at N=256). Skipped under an active MTP draft. **Cost:** a slice of 512 tokens already routes to essentially every expert of every layer (`P(miss) = (1-topk/n_experts)^N`), so each slice re-reads the whole non-resident expert set -- prefer the largest N that still fits your scratch. |
+| `NGEN` | `256` (engine) | Max tokens to generate before stopping (stop tokens can end sooner). `coli --ngen` defaults to `1024`. |
+| `COLI_TEMP` | `-1` (auto: `1.0` for chat/text, greedy elsewhere) | Sampling temperature. **`COLI_TEMP=0` = greedy/argmax = deterministic.** `TEMP` still works as a deprecated alias, but only if fully numeric: `$TEMP` is the temp-*directory* path on Windows and for the ROCm runtime (#509), so prefer `COLI_TEMP`. |
+| `NUCLEUS` | `0.90` | Nucleus (top-p) mass kept when sampling. Slightly tighter than the official 0.95 because the int4 tail is noisy. |
+| `TOPK` | `0` (off) | Top-k filter on the sampling distribution (`0` = no limit). |
+| `TOPP` | `0` (off) | Top-p filter (`0` = use `NUCLEUS`). |
+| `SEED` | unset → seeded from clock + PID | RNG seed for sampling. **Unset = different every run.** Set a fixed value for reproducible sampling. |
+| `KVSAVE` | `1` (on) | Persist the KV cache to `<model>/.coli_kv` so a conversation reopens warm. `KVSAVE=0` disables save+load (lossless round-trip; does not change output). |
+| `KV_SLOTS` | `1` | Number of independent KV conversation slots (1–16), used in serve mode. Every text engine decodes the active slots' requests together, one row each a step ([api.md](api.md#isolated-kv-contexts)). |
+| `KV16` | on (off with `COLI_CUDA`, Metal, `KV8`, `KV_TQ`) | colibri's MLA latent KV cache (the latent and the roped key, the MTP layer's too) in float16: half the KV RAM of float32 (GLM-5.3 at 131072 tokens: 11.9 GB instead of 23.9), each value clamped to +-65504 and rounded to the nearest float16 (`kv16.h`), the rows in the same byte arrays as `KV8`'s and no scale. The CPU's attention, the `COLI_VK_ATTN` mirror (rows go up widened, the floats the CPU reads), the dense chain (it rounds its new rows alike: the same numbers on the device and the host), the KV split, the conversations' adoption and `.coli_kv` (the v4 format; an f32 v1 file converts on resume and is rewritten, and a v4 file under `KV16=0` widens exactly) all read it. Off where a path reads float32 rows: `COLI_CUDA`'s attention kernels and pipe, Metal's fused kernel. An oracle run (`ref_glm.json`) keeps float32 unless this is set. The DSA index keys stay float32: they pick the rows the attention reads. olmoe reads it too: each K and V value it computes is clamped and rounded alike before anything reads it, in its float32 arrays, so its Vulkan chain's mirror holds them in float16 (`COLI_VK_KV16`); its oracle run (`ref_olmoe.json`) keeps float32 unless this is set. `0`: float32. |
+| `KV8` | `0` (off) | Store the MLA latent KV cache in fp8 e4m3 with a per-row scale: ~3.9× less KV RAM, and `.coli_kv` shrinks ~4× (saved as the v2 format; f32 v1 files are quantized on resume and rewritten). Adds DeepSeek-V3-class KV quantization noise to attention. CPU attention path only for now: the CUDA/Metal fused-attention fast paths read f32 KV rows, so under KV8 they fall back to the CPU consumer (native fp8 decode; a one-time notice is printed under `COLI_CUDA_ATTN=1`). Forces `COLI_CUDA_PIPE=0`. Native CUDA/Metal fp8-KV kernels are follow-up PRs. |
+| `KV_TQ` | `0` (off) | Sub-byte MLA latent KV quantization, mutually exclusive with `KV8` (`KV_TQ` wins). `KV_TQ=4` is the recommended tier: rotated-int4 codec (randomized-Hadamard rotation + Lloyd codebook, per-row radius as the scale), ~7.6× less KV RAM than f32. `KV_TQ=2|3|5|6` selects the PolarQuant codec at that bit width (`KV_TQ_POLAR=1` forces PolarQuant at 4 bits too). Requires power-of-two row widths (`kv_lora`/`qk_rope`; the GLM MLA shapes 512/64 qualify) — on a model whose shapes don't, the engine refuses to start rather than silently zeroing the cache. A value below the 2–6 grid (e.g. `KV_TQ=1`) is treated as the recommended `4` with a notice, not as the most aggressive tier. `.coli_kv` is saved as the v3 format; a file saved under a different KV mode, codec, or bit width is refused with an explicit message and the cache restarts. Same CPU-only status as `KV8`: GPU fast paths fall back to the CPU consumer; native kernels are follow-up PRs. Forces `COLI_CUDA_PIPE=0`. |
+| `THINK` | `0` (off) | Emit a `<think>` reasoning block. `THINK=1` turns on visible reasoning. |
+| `MTP` | on | Multi-Token Prediction (speculative draft head). `MTP=0` disables it. |
+
+---
+
+## Performance / tuning
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_METAL` | off; qwen36: on in a `METAL=1` build | Enable the Apple-Silicon Metal GPU backend. Requires a `make METAL=1` build. In a `make qwen36 METAL=1` build the Metal graph ([qwen36-metal.md](qwen36-metal.md)) runs unless `COLI_METAL` is set to `0` (any value `atoi` reads as 0). |
+| `COLI_METAL_GEMM_MIN` | `16` | Minimum matmul rows to dispatch a GEMM to the GPU (below this, stays on CPU). |
+| `COLI_METAL_SPIN` | off | Keep a GPU keep-alive spinner running (reduces dispatch latency; costs power). |
+| `COLI_METAL_PREFILL` | `0` (off) | `=1` runs S>4 (prefill) attention on the GPU. Off by default because the CPU path is bit-exact; this one is an opt-in speed/exactness trade. |
+| `COLI_GEMM_CHUNK` | `1` (on) | Split a large GEMM dispatch into ≤2^25-thread chunks. `=0` restores the single full dispatch (the pre-fix behaviour), so the fix can be A/B'd on one binary. |
+| `COLI_RTOP8` | `1` (on) | Parallel top-8 router kernel. `=0` falls back to the serial one. |
+| `COLI_METAL_RESSET` | off | `=1` uses an `MTLResidencySet` (macOS 15+) for the resident buffers instead of per-dispatch `useResource` calls. |
+| `PIPE` | `0` (off) | Overlap expert disk-load with matmul via I/O worker threads. Byte-identical output; reorders I/O. `PIPE=1` opts in. |
+| `PIPE_WORKERS` | `8` | Number of pthread loaders when `PIPE=1`, or the io-wq worker maximum per ring when `URING=1` (capped at 64). Tune to SSD queue depth and available cores. |
+| `COLI_PIPE_BLOCK` | `0` (spin) | `=1` makes `pipe_wait` block instead of spinning. Spinning wins on an idle box; blocking is better when the cores are contended. |
+| `PILOT_WORKERS` | `1` | Pilot loader threads on the blocking (non-`URING`) `PILOT_REAL` path, via an SPMC ring. `>1` raises NVMe queue depth. Clamped to [1,16]; `1` is byte-identical to the historic behaviour. |
+| `PILOT_EVICT_GUARD` | `1` (on) | Keep pilot-prefetched experts from being evicted before they are used. `=0` restores plain LRU eviction (A/B). Also read by `olmoe`. |
+| `RSS_GUARD_GB` | the resolved RAM budget | Resident-set ceiling (GB) checked every 16 emitted tokens; the cache is trimmed when it is crossed. Set explicitly to guard tighter or looser than the RAM budget. |
+| `XEXP` | `0` (off) | `=1` runs ONE OpenMP region across all experts of a batch-union block instead of ~2 fork/joins per expert. Engages only at S=1 with an all-resident int4 block, off the speculation window, and with the int4-IDOT S=1 family (`I4S<=1`); output is byte-identical to that family. Measured +11.6% on a 2-socket 48-core Ice Lake, but neutral-to-negative on a 24-core box — hence opt-in. Measure on your host. |
+| `COLI_KV_SHARE` | `0` (off) | `=1` lets a new serve slot adopt an existing slot's KV prefix instead of re-prefilling it. Measured on 6x5090 with a 675-token shared prefix: slot TTFT 50.1s → 1.7s, generated tokens identical. |
+| `KVB_FLASH_MB` | `2048` | Ceiling (MB) for the one-shot `kvb_all` k/v reconstruction buffer in prefill attention (#768 — 30.1 GB at ctx 262144, and `cap_for_ram` reserved it permanently). Above the ceiling the reconstruction is tiled with an online (flash-style) softmax: same rebuild total, ~tile-sized transient, output may differ from one-shot by rounding (same divergence class as the CUDA/Metal attention arms). `=0` disables tiling (always one-shot). DSA-selected rows always take the one-shot path. |
+| `KVB_TILE_MB` | `512` | Tile size (MB) for the tiled reconstruction above. |
+| `KVB_FLASH` | unset | `=1` forces the tiled path at any size, `=0` forces one-shot — overrides the `KVB_FLASH_MB` trigger (A/B switch). |
+| `COLI_GROUP_ASYNC` | `0` (off) | `=1` issues and collects CUDA expert groups asynchronously so CPU and GPU overlap at decode (S≤4). |
+| `COLI_DISKCLASS_WINDOW` | see source | Recency window (in ticks) for the DISK-CLASS heat statistic. |
+| `URING` | `0` (off) | Linux-only queued expert I/O. `URING=1` implies `PIPE=1`, forces cold reads through io-wq (`IOSQE_ASYNC`), replaces blocking loader pthreads and spin waits with batched SQEs/CQEs, and batches `PILOT_REAL` loads on a separate ring. Use `DIRECT=1` for cold NVMe to avoid page-cache copy/readahead limits. Fails clearly if the kernel denies io_uring; incompatible with `COLI_MMAP=1`. |
+| `DIRECT` | `0` (off) | Use `O_DIRECT`/unbuffered reads for expert slabs. **Drive-dependent — measure it on your hardware.** On real NVMe with DRAM cache and headroom it is often a large win (measured +34% decode with `PIPE=1` on a Blackwell/Windows box, and 4.25→9.69 GB/s in iobench on a GB10); on QLC/DRAM-less drives or slow/virtualised disks it can be neutral to negative. Helps sustained NVMe; keeps the zero-copy GPU path. |
+| `COLI_NO_OMP_TUNE` | off | **Kill-switch** for the OpenMP hot-thread tuning (`OMP_WAIT_POLICY=active` spin + proc-bind). Set `=1` when the CPU is mostly waiting on the GPU (Metal) so spin doesn't steal the shared power budget. Hybrid CUDA/CPU hosts may test an explicit user-owned policy only with controlled profiling; see [tuning.md](tuning.md#hybrid-cudacpu-openmp-override). |
+| `COLI_NUMA` | auto in generated plans on multi-socket Linux; otherwise off | `COLI_NUMA=1` selectively interleaves large expert and dense slabs across NUMA nodes via `mbind` (raw syscall, no libnuma). Helps multi-socket hosts (+7–40% expert matmul); silent no-op on single-node or non-Linux. Explicit `COLI_NUMA=0` overrides the generated plan. |
+| `MLOCK` | `-1` (auto: on for macOS) | Wire the streamed expert cache into physical RAM (`mlock`) to dodge the memory compressor. `0` off, `1` force. |
+| `CAP` | unset | Expert-cache cap (slots/layer) when no CLI positional was given. Precedence: explicit `--cap`/positional > `CAP` > platform default > historic default (#379). Mainly for direct `./glm` use — `coli` users should prefer `--cap`. |
+| `CAP_RAISE` | `1` (on); `0` on Metal + macOS + fast model volume (#379) | Let the engine raise the expert-cache cap above `topk` when RAM allows (bigger batches). `0` fixes the cap. When the platform-aware Metal cache default engages (F_NOCACHE probe measured the model volume fast), the *default* flips to `0` — auto-raise re-creates the Metal residency churn the minimal cache avoids. An explicit `CAP_RAISE` always wins. |
+| `COLI_SSD_FAST_GBS` | `4.0` | Threshold (GB/s, measured F_NOCACHE, cached in `<model>/.coli_ssd` — see [The `.coli_ssd` probe cache](#the-coli_ssd-probe-cache) below) at or above which the model volume counts as "fast" for the platform-aware Metal cache defaults (#379). |
+| `PREFETCH` | `0` | Prefetch depth for streamed experts. |
+| `COLI_MMAP` | `0` | colibri: serve the routed experts as read-only `mmap` views of their shards instead of copying each one into a cache slab, so the page cache is the expert cache. Experts only; for the dense weights see `TRUNK_RESIDENT_LAYERS`. Linux, macOS, FreeBSD and Windows: elsewhere the experts are read into slabs as without it. Incompatible with `URING=1`. See [Weights from disk instead of RAM](#weights-from-disk-instead-of-ram). |
+| `TRUNK_RESIDENT_LAYERS` | unset (the whole trunk resident) | colibri: keep the dense tensors of only the top N layers resident. In the layers below, the attention projections, the dense MLP and the shared expert become read-only `mmap` views of the shards, paged in from disk when the OS has evicted them; `0` maps every layer. Embeddings, LM head, norms, router, MTP layer and DSA indexer stay resident, and so does a tensor without its `.qs` companion (a bf16 checkpoint maps nothing). CPU-only: exits 2 with `COLI_METAL`, `COLI_VULKAN` or `COLI_CUDA` set. Linux, macOS, FreeBSD and Windows. The RAM it frees goes to the expert cache: lower `RAM_GB` or `CAP` to lower the total (#1399). |
+| `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
+| `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
+| `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. Automatic pinning is capped so it cannot reduce the adaptive LRU capacity that fits before pinning; explicit `PIN`/`PIN_GB` settings remain authoritative. |
+| `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC). |
+| `PILOT` | `0` (off) | Router-piloted cross-layer expert prefetch. |
+| `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). |
+| `PILOT_K` | `6` if `PILOT_REAL` else `8` | Number of experts the pilot prefetches per step. |
+| `PILOT_TWO` | `0` (off) | Two-step shared-expert-corrected router prediction for the pilot. |
+| `COUPLE` | unset | Path to a coupling-score file driving cross-layer expert prefetch (#176). When set, `couple_load` reads it. |
+| `COUPLE_K` | `8` | Top-K coupled experts per layer when `COUPLE` is set. |
+| `COUPLE_D` | `1` | Coupling lookahead depth (`1` or `2`) when `COUPLE` is set. |
+| `CACHE_ROUTE` | `0` (off) | Opt-in max-rank cache-aware MoE routing (pin∪LRU prefer within top-M). Also read by `qwen36`, where the VRAM tier outranks the RAM cache. See [CACHE_ROUTE.md](CACHE_ROUTE.md). |
+| `ROUTE_J` | `2` | Sacred top ranks always taken when `CACHE_ROUTE=1`. |
+| `ROUTE_M` | `12` | Max-rank window for resident preference when `CACHE_ROUTE=1`. |
+| `ROUTE_P` | `0` | Cumulative mass window for CACHE_ROUTE (`0` = fixed M). |
+| `ROUTE_ALPHA` | `1` | Scale gate mass of substituted experts before renorm (`1` = off). |
+| `ROUTE_AGREE` | auto | Overlap% + KL vs true top-K; auto-on when `CACHE_ROUTE=1`. Alone it changes nothing and prints the meters (always 100% / 0). |
+| `ROUTE_TRACE` | unset | If set to a path, logs every routing decision there (testing/analysis). |
+| `ABSORB` | `-1` (auto: absorbed for S≤4) | MLA attention absorption mode. |
+| `IDOT` | `1` | Integer dot-product kernel. `IDOT=0` uses exact f32 kernels (for A/B numerical checks). |
+| `COLI_POLICY` | `quality` | Resource policy: `quality`, `balanced`, or `experimental-fast`. |
+| `PROF` | `0` (off) | Performance profile: a startup header (machine + effective config), then per run — or per turn in serve mode, on stderr — forward-latency percentiles (p50/p90/p99/max), expert-I/O totals and cache-tier fill, phase shares of wall time, and a verdict naming the knob most likely to help on this machine. Output is additive; `PROF` unset changes nothing. |
+| `COLI_NO_FUSED_PAIR` | `0` (off) | `=1` disables the fused-pair matmul kernel. |
+| `DISK_SPLIT` | `0` (off) | `=1` splits the reported disk-load time across the draft/absorb/forward phases in stats. |
+| `I4S` | per-ISA (`1` on AVX-512-VNNI / NEON-dotprod, `2` elsewhere) | Engage the int4 `IDOT` kernel for batch `S>=<n>`. `I4S=1` turns IDOT on at decode too: int8-quantized activations on expert matmuls — **not bit-identical** to the f32 decode path (measured 0.39% of scale on the gate output; the same numerics prefill already uses at `S>=2`, and the shipped default on AVX-512-VNNI, measured +5.5% end-to-end there). Attention projections always stay exact regardless. A default flip on AVX-VNNI awaits the quality ablation. |
+| `IDOT_GS` | `0` (off) | **Opt-in** grouped planar IDOT for `fmt=4` (gs64/gs128) tensors: int8 activations with the K1 plane layout, one integer dot per scale group. Same numerics family as `I4S=1` — not bit-identical to the f32 grouped kernel, hence off until the ablation. Requires the planar family: an x86 build with SSSE3, AVX2 or AVX-512 (on AVX-512 and on a pre-AVX2 build such as Sandy or Ivy Bridge only the fmt=4 tensors planarize, fmt=2 keeps the pair layout), no GPU backend,

@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "hypothesis": "Running the qwen38 engine's layers, routed experts (GPU expert cache) and expert read-ahead on the Metal GPU instead of the CPU makes decode after the 61-token short.txt prompt faster on a 24 GB M4 Pro, with the model's experts streamed from the SSD.",
+  "commit": "5cc5507e2efaed874a76f97cc724f67eb9b973e3",
+  "model": "Qwen3.8-Flash-Next heretic-2, llama.cpp IQ4_XS GGUF (routed experts IQ4_XS gate/up, IQ4_NL down, 2.54 MiB each; trunk mostly Q8_0), imported in link mode (colibri-dev)",
+  "command": "BUILD='5cc5507e METAL=1' METAL=1 WARMUP=1 PREFILL_RUNS=0 ARM_ENV='USAGE_SAVE=0 COLI_METAL=<0|1>' docs/experiments/qwen38-metal-chain-2026-11-21/q38_bench.sh bench/bin/qwen38-metal-pr ~/models/qwen38-heretic2/colibri-dev pr-<cpu|gpu> 3",
+  "prompt_hash": "1d86e7a6a60915badaf1a1321d9fd24d3fa99dc1da139372b26437f7912ed8f8",
+  "hardware": {
+    "cpu": "Apple M4 Pro, 8 performance + 4 efficiency cores (Mac16,8)",
+    "ram": "24 GB unified memory",
+    "storage": "internal Apple SSD, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.1.1.101), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "COLI_METAL"
+  ],
+  "baseline": {
+    "config": {
+      "SNAP": "qwen38-heretic2 colibri-dev (Qwen3.8-Flash-Next heretic-2 IQ4_XS GGUF, 5 files, 117 GB, read in place)",
+      "BUILD": "make -C c qwen38 METAL=1 at 5cc5507e, copied to bench/bin/qwen38-metal-pr, one binary for both arms",
+      "ENGINE": "default (fast) kernels; GPU experts on and read-ahead on when the chain runs; default GPU expert cache (6.82 GiB)",
+      "ENV": "SNAP COLI_TEMP=0 Q38_MAXT=32768 USAGE_SAVE=0, OMP_NUM_THREADS unset; argv 32 8 <prompt>",
+      "PROMPT": "q38_bench.sh prompts/short.txt (61 tokens, chat template), 64 greedy tokens",
+      "ORDER": "1 warm-up run (discarded) then 3 decode runs per arm, CPU arm first, then GPU; one process each; decode only (PREFILL_RUNS=0)",
+      "MEASURED": "decode tok/s = 63 / (decode seconds - TTFT) of each short.txt run",
+      "COLI_METAL": "0"
+    },
+    "samples": {
+      "tok_s": [
+        3.3582,
+        3.3528,
+        3.3404
+      ]
+    },
+    "median_tok_s": 3.3528,
+    "quality": {
+      "method": "tiny fixtures at this commit: make -C c test-qwen38-metal-engine METAL=1 PASS (60 checks, chain vs CPU engine), test-qwen38-metal-kernels PASS, qwen38-tiny-check 8/8; real model: generated text identical across the 4 runs within each arm (CPU arm text sha256 c60c4769f092...); peak footprint 9.79 GB",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-metal-chain-2026-11-21/baseline.json",
+      "sha256": "7a920b95e32a83e3fd8f5d96e2cda87e0117772313bdefb7427cfb2a70fcc758"
+    }
+  },
+  "trial": {
+    "config": {
+      "SNAP": "qwen38-heretic2 colibri-dev (Qwen3.8-Flash-Next heretic-2 IQ4_XS GGUF, 5 files, 117 GB, read in place)",
+      "BUILD": "make -C c qwen38 METAL=1 at 5cc5507e, copied to bench/bin/qwen38-metal-pr, one binary for both arms",
+      "ENGINE": "default (fast) kernels; GPU experts on and read-ahead on when the chain runs; default GPU expert cache (6.82 GiB)",
+      "ENV": "SNAP COLI_TEMP=0 Q38_MAXT=32768 USAGE_SAVE=0, OMP_NUM_THREADS unset; argv 32 8 <prompt>",
+      "PROMPT": "q38_bench.sh prompts/short.txt (61 tokens, chat template), 64 greedy tokens",
+      "ORDER": "1 warm-up run (discarded) then 3 decode runs per arm, CPU arm first, then GPU; one process each; decode only (PREFILL_RUNS=0)",
+      "MEASURED": "decode tok/s = 63 / (decode seconds - TTFT) of each short.txt run",
+      "COLI_METAL": "1"
+    },
+    "samples": {
+      "tok_s": [
+        5.1136,
+        5.1053,
+        5.1895
+      ]
+    },
+    "median_tok_s": 5.1136,
+    "quality": {
+      "method": "tiny fixtures at this commit: make -C c test-qwen38-metal-engine METAL=1 PASS (60 checks, chain vs CPU engine), test-qwen38-metal-kernels PASS, qwen38-tiny-check 8/8; real model: generated text identical across the 4 runs within each arm (GPU arm text sha256 60ada95e3479..., 64 forwards, 0 declined). The free-running GPU text matches the CPU arm's for its first 138 characters, then words differ: the default fast kernels flip near-ties (docs/qwen38-metal.md, Known limits); in reference precision the chain agrees 128/128 teacher-forced with the CPU engine on the two short prompts (docs/qwen38-metal.md, Measured). Peak footprint 12.89 GB",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen38-metal-chain-2026-11-21/trial.json",
+      "sha256": "e8991923d436bfc2354db1cea159df6f8964c4f038c6162f73eb17ae9b8ac128"
+    }
+  },
+  "outcome": "improvement"
+}
