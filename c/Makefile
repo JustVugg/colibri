@@ -2520,6 +2520,9 @@ tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c $(VK_OBJ)
 tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_qwen38_group_overlap$(EXE): tests/test_qwen38_group_overlap.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c tests/segment_runtime_nocuda.o $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< tests/segment_runtime_nocuda.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 # segment_runtime.c as its own object, compiled with the flags this test gave it on
