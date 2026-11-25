@@ -3474,6 +3474,16 @@ def bound_team(cores, quota_cpus=None, allowed_cpus=None):
     return team
 
 
+def default_omp_team(env, threads):
+    """Give `env` the launcher's default OpenMP team unless the user chose one, and say it is
+    a default (COLI_OMP_TEAM_AUTO): an engine leaves a user's OMP_NUM_THREADS alone, but a
+    count it is told is ours it may still lower when it measures that the machine does not
+    give it that many CPUs at once (omp_tune.h's team probe: a busy host under WSL or a VM)."""
+    if "OMP_NUM_THREADS" not in env:
+        env["OMP_NUM_THREADS"] = str(threads)
+        env["COLI_OMP_TEAM_AUTO"] = "1"
+
+
 def team_cpu_count():
     """The OpenMP team a launch defaults to: the performance cores of a hybrid CPU
     (performance_core_count), else the physical cores (physical_cpu_count), no more
@@ -4105,7 +4115,7 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     """Apply a plan without overriding explicit user environment settings."""
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
-    result.setdefault("OMP_NUM_THREADS", str(plan["cpu"].get("team_threads", plan["cpu"]["physical_cores"])))
+    default_omp_team(result, plan["cpu"].get("team_threads", plan["cpu"]["physical_cores"]))
     # NOTE: we intentionally do NOT set OMP_PROC_BIND / OMP_PLACES here.
     # The engine's own hot-thread tuning (glm.c main(), the COLI_OMP_TUNED
     # self-exec) sets OMP_PROC_BIND=close with overwrite=0 -- it prefers

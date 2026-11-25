@@ -136,7 +136,6 @@ static VkcFit g_v4c_fit2;
 static int g_v4c_fit2_on;
 static V4Chain *v4c_of(int d) { return d ? g_v4c2 : g_v4c; }
 static const char *v4c_name(const V4Chain *ch) { return ch && ch->d ? "deepseek_v4 dev2" : "deepseek_v4"; }
-static int v4c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 /* The second device's copies, by their host data (the per-matrix path's map is the
  * primary's): an open table, grown at half full. */
 typedef struct { const void *k; ColiVkTensor *t; } V4cD2;
@@ -570,7 +569,7 @@ static int v4c_fit_now(ColiV4Engine *engine) {
          * layer n0 (the head stays on the host), with that device's free memory, its
          * pipelines up now */
         int n0 = g_v4c_fit.n;
-        if (vkc_fit_partial(&g_v4c_fit) && n0 > 0 && n0 < L && v4c_dev2_wanted() && getenv("COLI_VK_DEV2") &&
+        if (vkc_fit_partial(&g_v4c_fit) && n0 > 0 && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
             coli_vk_dev2_open_env()) {
             vkc_device(1);
             int n2 = vkc_fit("deepseek_v4 dev2", L - n0, per + n0, mat + n0, fixed, 0, &g_v4c_fit2);

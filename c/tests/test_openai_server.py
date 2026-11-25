@@ -1904,6 +1904,47 @@ class SchedulerTest(unittest.TestCase):
         stats = scheduler.snapshot()
         self.assertEqual((stats["rejected"], stats["timed_out"], stats["completed"]), (0, 0, 2))
 
+    def test_cache_key_avoids_hash_collision_eviction_and_sticks_to_slot(self):
+        # Two distinct conversations that hash to the same prefer slot should not evict
+        # each other when another slot is unused, and each subsequent turn should hit
+        # the exact slot that already holds its prefix.
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=3)
+        with scheduler.admit(prefer=1, cache_key=b"conv-A") as (_, slot_a1):
+            self.assertEqual(slot_a1, 1)
+        with scheduler.admit(prefer=1, cache_key=b"conv-B") as (_, slot_b1):
+            self.assertEqual(slot_b1, 0)  # unused slot instead of evicting conv-A in slot 1
+        with scheduler.admit(prefer=1, cache_key=b"conv-A") as (_, slot_a2):
+            self.assertEqual(slot_a2, 1)  # exact prefix hit
+        with scheduler.admit(prefer=1, cache_key=b"conv-B") as (_, slot_b2):
+            self.assertEqual(slot_b2, 0)  # follows its cached slot instead of prefer=1
+
+    def test_cache_key_evicts_lru_cold_slot_not_lowest_id(self):
+        # Fill all 3 slots, refresh slot 0 so slot 1 becomes the LRU cold slot; a new
+        # conversation must evict slot 1 rather than slot 0 (min(candidates)).
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=3)
+        with scheduler.admit(prefer=0, cache_key=b"k0") as (_, s0):
+            self.assertEqual(s0, 0)
+        with scheduler.admit(prefer=1, cache_key=b"k1") as (_, s1):
+            self.assertEqual(s1, 1)
+        with scheduler.admit(prefer=2, cache_key=b"k2") as (_, s2):
+            self.assertEqual(s2, 2)
+        # Touch k0 (slot 0) so slot 1 is now the least recently used.
+        with scheduler.admit(prefer=0, cache_key=b"k0") as (_, s0_again):
+            self.assertEqual(s0_again, 0)
+        with scheduler.admit(prefer=0, cache_key=b"k3") as (_, s3):
+            self.assertEqual(s3, 1)  # evicts LRU slot 1, preserving hot slot 0
+
+    def test_pinned_slot_clears_previous_cache_key(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=2)
+        with scheduler.admit(prefer=0, cache_key=b"conv-A") as (_, s0):
+            self.assertEqual(s0, 0)
+        # An explicit pinned request overwrites slot 0 without a cache_key.
+        with scheduler.admit(slot=0) as (_, pinned):
+            self.assertEqual(pinned, 0)
+        # conv-A no longer matches slot 0; it prefers the unused slot 1 over hot slot 0.
+        with scheduler.admit(prefer=0, cache_key=b"conv-A") as (_, s_next):
+            self.assertEqual(s_next, 1)
+
     def test_preference_does_not_bypass_older_any_slot_waiter(self):
         scheduler = GenerationScheduler(max_queue=1, capacity=2)
         older = (object(), None)

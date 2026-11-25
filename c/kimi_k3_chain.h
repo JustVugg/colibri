@@ -126,7 +126,6 @@ static VkcFit g_k3c_fit2;
 static int g_k3c_fit2_on, g_k3c_dev;
 static K3Chain *k3c_of(int d) { return d ? g_k3c2 : g_k3c; }
 static const char *k3c_name(const K3Chain *ch) { return ch && ch->d ? "kimi_k3 dev2" : "kimi_k3"; }
-static int k3c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 /* The chain's own f32 tensors (the router, the KDA decay pair, beta): with the dense
  * weights on the device only (COLI_VK_DENSE_HOST) the per-matrix path multiplies by them
  * too, and the CPU drops its copies. which: 0 the router, 1 f_a, 2 f_b, 3 b_proj. */
@@ -427,7 +426,7 @@ static int k3c_fit_now(Model *m, int tier_on, int cuda_on) {
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n0 (the head stays on the host), with that device's free memory, its pipelines up now */
     int n0 = g_k3_fit.n;
-    if (g_k3_partial && n0 > 0 && n0 < L && k3c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+    if (g_k3_partial && n0 > 0 && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
         vkc_device(1);
         int n2 = vkc_fit("kimi_k3 dev2", L - n0, per + n0, mat + n0, fixed, 0, &g_k3c_fit2);
         if (n2 > 0 && !(vkc_init() && vkc_mla_ready() && vkc_kda_ready() && vkc_ares_ready())) {
