@@ -18,6 +18,8 @@
 #include "kv16.h"         /* Q38_KV=f16: K and V rounded to float16 (q38_kv16) */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "spec_draft.h"   /* prompt-lookup drafts and the gate that decides when drafting pays */
+#include "spec_exact.h"   /* sampled requests: MTP drafts drawn from the head, kept by min(1, p/q) */
+static double q38_rand01(void) { return (double)rand() / ((double)RAND_MAX + 1.0); }
 #include "draft_vocab.h"  /* the tokens the MTP head scores for a draft (Q38_MTP_VOCAB) */
 #include "expert_ffn.h"   /* the int4-g64 routed experts (experts-int4g64/ sidecar) run through its f32 kernel */
 #include "fma_compat.h"   /* coli_fmaf: fmaf where the CPU fuses, else a vectorizable exact product (#2606) */
@@ -5823,7 +5825,7 @@ static float q38_draft_p(const float *l,int n,int best) {
     for(int i=0;i<n;i++){float d=l[i]-mx;if(d>-20.0f)s+=exp((double)d);}
     return s>0.0?(float)(1.0/s):0.0f;
 }
-static int q38_mtp_best_token(Model *m,const float *mixed) {
+static int q38_mtp_best_token(Model *m,const float *mixed,SpecQ *q,int drawn,float temp,float top_p) {
     Cfg *c=&m->c;DraftVocab *v=m->draft_vocab;
 #ifdef COLI_VULKAN
     if(g_vk_chain)v=NULL;   /* the chain's device scores the whole vocabulary (q38c_draft_logits): the list is for the CPU */
@@ -5837,6 +5839,11 @@ static int q38_mtp_best_token(Model *m,const float *mixed) {
         for(int j=1;j<v->list_n;j++)
             if(score[j]>best||(score[j]==best&&v->list[j]<pick)){best=score[j];pick=v->list[j];at=j;}
         m->mtp_p=q38_draft_p(score,v->list_n,at);
+        if(q){
+            specq_from_logits(q,score,v->list_n,temp,top_p,SPEC_Q_MAX);
+            for(int j=0;j<q->n;j++) q->id[j]=v->list[q->id[j]];
+            if(drawn) pick=specq_draw(q,q38_rand01());
+        }
         free(score);
         return pick;
     }
@@ -5844,6 +5851,10 @@ static int q38_mtp_best_token(Model *m,const float *mixed) {
     q38_draft_logits(m,logit,mixed);
     pick=q38_argmax(logit,c->vocab);
     m->mtp_p=q38_draft_p(logit,c->vocab,pick);
+    if(q){
+        specq_from_logits(q,logit,c->vocab,temp,top_p,SPEC_Q_MAX);
+        if(drawn) pick=specq_draw(q,q38_rand01());
+    }
     free(logit);
     return pick;
 }
@@ -5876,7 +5887,7 @@ static void q38_mtp_dump_logits(Model *m,const float *mixed,Q38MtpDumpRow at) {
  * do not need a prompt-sized workspace; the head's attention is causal, so
  * chunking changes no result. */
 static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,int *draft,
-                         float *hidden) {
+                         float *hidden,SpecQ *q,int drawn,float temp,float top_p) {
     Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
 #ifdef COLI_VULKAN
     float *logit=draft?falloc(c->vocab):NULL;
@@ -5884,6 +5895,7 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
     if(ran&&draft){
         *draft=q38_argmax(logit,c->vocab);
         m->mtp_p=q38_draft_p(logit,c->vocab,*draft);
+        if(q){specq_from_logits(q,logit,c->vocab,temp,top_p,SPEC_Q_MAX);if(drawn)*draft=specq_draw(q,q38_rand01());}
         if(g_q38_mtp_dump)q38_mtp_dump_record(m,logit,(Q38MtpDumpRow){pos_base+S-1,next[S-1]});
     }
     free(logit);
@@ -5895,10 +5907,11 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
         float *lc=draft?falloc(c->vocab):NULL;
         int pk=-1;float pp=0.f;
         int rc=q38cc_mtp_rows(m,streams,next,S,pos_base,lc,hidden,1,draft&&!g_q38_mtp_dump?&pk:NULL,&pp);
-        if(rc==2&&draft){*draft=pk;m->mtp_p=pp;}   /* the draft list scored on the card */
+        if(rc==2&&draft){*draft=pk;m->mtp_p=pp;if(q)specq_point(q,pk);}   /* the draft list scored on the card */
         else if(rc&&draft){
             *draft=q38_argmax(lc,c->vocab);
             m->mtp_p=q38_draft_p(lc,c->vocab,*draft);
+            if(q){specq_from_logits(q,lc,c->vocab,temp,top_p,SPEC_Q_MAX);if(drawn)*draft=specq_draw(q,q38_rand01());}
             if(g_q38_mtp_dump)q38_mtp_dump_record(m,lc,(Q38MtpDumpRow){pos_base+S-1,next[S-1]});
         }
         free(lc);
@@ -5918,7 +5931,7 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
         if(draft&&base+rows==S){
             double started=now_s();
             q38_gr_read(m,&m->mtp_mixer,hyper+(int64_t)(rows-1)*W,1,mixed,NULL);
-            *draft=q38_mtp_best_token(m,mixed);
+            *draft=q38_mtp_best_token(m,mixed,q,drawn,temp,top_p);
             q38_tm_add(m,Q38_TM_LM_DRAFT,started);
             if(g_q38_mtp_dump)q38_mtp_dump_logits(m,mixed,(Q38MtpDumpRow){pos_base+S-1,next[S-1]});
         }
@@ -5928,11 +5941,11 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
 
 /* The pending rows meet their next token: the head reads them (each but the
  * last with the token already known in mtp_pend_tok, the last with `tok`). */
-static void q38_mtp_take_pending(Model *m,int tok,int *draft,float *hidden) {
+static void q38_mtp_take_pending(Model *m,int tok,int *draft,float *hidden,SpecQ *q,int drawn,float temp,float top_p) {
     int next[Q38_SPEC_ROWS],n=m->mtp_pend_n;
     for(int j=0;j+1<n;j++)next[j]=m->mtp_pend_tok[j];
     next[n-1]=tok;
-    q38_mtp_rows(m,m->mtp_pend,next,n,m->mtp_len,draft,hidden);
+    q38_mtp_rows(m,m->mtp_pend,next,n,m->mtp_len,draft,hidden,q,drawn,temp,top_p);
     m->mtp_pend_n=0;
 }
 
@@ -5948,20 +5961,23 @@ static void q38_mtp_feed(Model *m,const int *ids,int S,int pos_base,const float 
         m->mtp_pend_n=0;
         if(m->mtp_len>pos_base-1)m->mtp_len=pos_base>0?pos_base-1:0;
     }
-    if(m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos_base)q38_mtp_take_pending(m,ids[0],NULL,NULL);
+    if(m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos_base)q38_mtp_take_pending(m,ids[0],NULL,NULL,NULL,0,0.f,1.f);
     if(m->mtp_len!=pos_base){m->mtp_pend_n=0;return;}
-    if(S>1)q38_mtp_rows(m,streams,ids+1,S-1,pos_base,NULL,NULL);
+    if(S>1)q38_mtp_rows(m,streams,ids+1,S-1,pos_base,NULL,NULL,NULL,0,0.f,1.f);
     memcpy(m->mtp_pend,streams+(int64_t)(S-1)*W,(size_t)W*sizeof(float));
     m->mtp_pend_n=1;
 }
 
 /* The draft made by the head for the token after `tok`, which is about to be fed at
  * `pos`: the pending rows take `tok`, and `hidden` gets the streams of the last row.
- * -1 when the head has not read up to pos. */
-static int q38_mtp_draft(Model *m,int tok,int pos,float *hidden) {
+ * -1 when the head has not read up to pos.
+ * q != NULL (a sampled request): the head's distribution at the request's temperature and
+ * nucleus goes to *q, and with drawn the draft is drawn from it (spec_exact.h); without,
+ * the draft stays the argmax and *q only feeds the rule gate. */
+static int q38_mtp_draft(Model *m,int tok,int pos,float *hidden,SpecQ *q,int drawn,float temp,float top_p) {
     if(!m->mtp_pend_n||m->mtp_len+m->mtp_pend_n!=pos)return -1;
     int draft;
-    q38_mtp_take_pending(m,tok,&draft,hidden);
+    q38_mtp_take_pending(m,tok,&draft,hidden,q,drawn,temp,top_p);
     return draft;
 }
 
@@ -5972,12 +5988,16 @@ static int q38_mtp_draft(Model *m,int tok,int pos,float *hidden) {
  * once the verify has run overwrites it before anything reads past it.
  * mtp_len stays where the settled rows end; `hidden` becomes this row's
  * streams, for the draft after. */
-static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
+static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row,SpecQ *q,int drawn,float temp,float top_p) {
     Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
 #ifdef COLI_VULKAN
     {   /* the dense chain runs the head's layer: its tail row at `row`, hidden in and out */
         float *lo=falloc(c->vocab);
-        if(q38c_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
+        if(q38c_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){
+            int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);
+            if(q){specq_from_logits(q,lo,c->vocab,temp,top_p,SPEC_Q_MAX);if(drawn)d=specq_draw(q,q38_rand01());}
+            free(lo);return d;
+        }
         free(lo);
         q38c_mtp_host(m,row);
     }
@@ -5987,8 +6007,12 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
         float *lo=falloc(c->vocab);
         int pk=-1;float pp=0.f;
         int rc=q38cc_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0,&pk,&pp);
-        if(rc==2){m->mtp_p=pp;free(lo);return pk;}   /* the draft list scored on the card */
-        if(rc){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
+        if(rc==2){m->mtp_p=pp;if(q)specq_point(q,pk);free(lo);return pk;}   /* the draft list scored on the card */
+        if(rc){
+            int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);
+            if(q){specq_from_logits(q,lo,c->vocab,temp,top_p,SPEC_Q_MAX);if(drawn)d=specq_draw(q,q38_rand01());}
+            free(lo);return d;
+        }
         free(lo);
         q38cc_mtp_host(m,row);
     }
@@ -5999,7 +6023,7 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
     memcpy(hidden,hyper,(size_t)W*sizeof(float));
     double started=now_s();
     q38_gr_read(m,&m->mtp_mixer,hyper,1,mixed,NULL);
-    int draft=q38_mtp_best_token(m,mixed);
+    int draft=q38_mtp_best_token(m,mixed,q,drawn,temp,top_p);
     q38_tm_add(m,Q38_TM_LM_DRAFT,started);
     free(hyper);free(mixed);free(inject);free(block);
     return draft;
@@ -6075,7 +6099,17 @@ typedef struct {
      * ahead_tok: a greedy verify's picks past its first row (its ahead_logit NULL) */
     int greedy, next_tok;
     int ahead_tok[Q38_SPEC_ROWS];
+    /* sampled requests (spec_exact.h): the caller's temperature and nucleus, set before
+     * each step; the verify's MTP/DFlash2 drafts' q, whether they were drawn from it, and
+     * whether q describes them (not under a forced mode, which replaces the drafts) */
+    float temp, top_p;
+    SpecQ q[Q38_SPEC_ROWS];
+    int drawn, q_ok;
 } Q38Spec;
+
+/* The rule the MTP drafts of sampled requests are settled with, for the process
+ * (COLI_SPEC_SOFT, default auto): it learns across requests. */
+static SpecSoftGate g_q38_soft; static int g_q38_soft_ready=0;
 
 /* Copy slots for a verify of up to rows+1 rows: allocated the first time they are
  * needed, kept for the model's life. 0 = out of memory (the caller drafts less). */
@@ -6243,12 +6277,16 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
         if(kl>0&&(km==0||sp->lk_force||vl>vm||(vl==vm&&kl>km))){k=kl;src=SPEC_SRC_LOOKUP;memcpy(d,dl,(size_t)k*sizeof(int));}
         else if(km>0)k=km;
         if(k>0&&!q38_spec_alloc(m,k))k=0;   /* no memory for the copies: a plain step */
+        sp->q_ok=sp->drawn=0;
 #ifdef COLI_CUDA
         if(k>0&&src==SPEC_SRC_MTP&&dfl){
             float pr[Q38_SPEC_ROWS],*emb=falloc(c->hidden);
+            if(!g_q38_soft_ready){spec_soft_gate_init(&g_q38_soft,2);g_q38_soft_ready=1;}
+            int sampled=sp->temp>0.f&&g_q38_soft.mode!=0&&!sp->force;
+            sp->q_ok=sampled;sp->drawn=sampled&&spec_soft_gate_drawn(&g_q38_soft,sp->temp);
             t_verify=now_s();   /* the block, then the verify: one cycle */
             q38_embed_row(m,tok,pos,emb);
-            int n=df_draft(&g_q38_df,emb,tok,pos,k,d,pr);
+            int n=df_draft(&g_q38_df,emb,tok,pos,k,d,pr,sampled?sp->q:NULL,sp->drawn,sp->temp,q38_rand01);
             free(emb);
             if(n<k)k=n;
             for(int j=0;j<k;j++)sp->ahead_p[j]=pr[j];
@@ -6265,10 +6303,13 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
 #endif
         if(k>0&&src==SPEC_SRC_MTP){
             float *hidden=falloc(c->hc_width);
+            if(!g_q38_soft_ready){spec_soft_gate_init(&g_q38_soft,2);g_q38_soft_ready=1;}
+            int sampled=sp->temp>0.f&&g_q38_soft.mode!=0&&!sp->force;
+            sp->q_ok=sampled;sp->drawn=sampled&&spec_soft_gate_drawn(&g_q38_soft,sp->temp);
             t_verify=now_s();   /* the head's first draft is the head pass a plain step makes too */
             m->mtp_p=-1.0f;
             q38_ple_advise(m,&tok,1,0);   /* the verify's first row's PLE rows, read while the head drafts */
-            d[0]=q38_mtp_draft(m,tok,pos,hidden);
+            d[0]=q38_mtp_draft(m,tok,pos,hidden,sampled?&sp->q[0]:NULL,sp->drawn,sp->temp,sp->top_p);
             sp->ahead_p[0]=m->mtp_p;
             double t_first=now_s();
             for(int j=1;j<k;j++){
@@ -6277,7 +6318,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
                 double t0=now_s();
                 m->mtp_p=-1.0f;
                 {int seq[Q38_SPEC_ROWS];seq[0]=tok;memcpy(seq+1,d,(size_t)j*sizeof(int));q38_ple_advise(m,seq,j+1,j);}   /* the last draft's */
-                d[j]=q38_mtp_draft_more(m,hidden,d[j-1],pos+j-1);
+                d[j]=q38_mtp_draft_more(m,hidden,d[j-1],pos+j-1,sampled?&sp->q[j]:NULL,sp->drawn,sp->temp,sp->top_p);
                 sp->ahead_p[j]=m->mtp_p;
                 spec_gate_draft_cost(&sp->gate,SPEC_SRC_MTP,now_s()-t0);
             }
@@ -6313,7 +6354,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
      * lookup verify has them take `tok` here */
     if(!t_verify)t_verify=now_s();
     if(m->mtp&&src!=SPEC_SRC_MTP&&m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos)
-        q38_mtp_take_pending(m,tok,NULL,NULL);
+        q38_mtp_take_pending(m,tok,NULL,NULL,NULL,0,0.f,1.f);
     /* the rows no draft above asked for, asked together: the head's last draft's (known only as
      * the verify starts; a trim leaves one asked for), a lookup proposal's every row's. The
      * verify's reads (q38_ple_prefetch) then wait for one round of the disk, not one a thread:

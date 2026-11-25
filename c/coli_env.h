@@ -360,6 +360,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_SERVE_ALL_STOPS",             CE_STR   , CE_ALL | CE_COLIBRI | CE_OLMOE, 0             , NULL},
     {"COLI_SLAB_SHRINK",                 CE_BOOL  , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_SPEC_GATE", CE_INT, CE_COLIBRI | CE_QWEN | CE_QWEN38, 0, NULL},
+    {"COLI_SPEC_SOFT", CE_STR, CE_COLIBRI | CE_QWEN | CE_QWEN38, 0, NULL},
     {"COLI_SSD_FAST_GBS",                CE_FLOAT , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_TEMP", CE_FLOAT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_MIMO, CE_LAUNCHER, NULL},
     {"COLI_TIMERS",                      CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},

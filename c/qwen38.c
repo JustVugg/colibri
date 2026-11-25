@@ -1190,6 +1190,13 @@ static void q38_spec_report(const Model *m, const Q38Spec *sp, const char *scope
         }
 #endif
     }
+    if ((m->mtp || q38_df_on()) && g_q38_soft.rows)
+        fprintf(stderr, "[qwen38 MTP sampled] %s: expected keep %.1f%% drawn vs %.1f%% argmax over %llu rows | "
+                        "drawn drafts kept %llu/%llu (COLI_SPEC_SOFT=%s)\n", scope,
+                100.0 * g_q38_soft.keep_drawn, 100.0 * g_q38_soft.keep_point,
+                (unsigned long long)g_q38_soft.rows, (unsigned long long)g_q38_soft.drawn_kept,
+                (unsigned long long)g_q38_soft.drawn_drafts,
+                g_q38_soft.mode == 2 ? "auto" : g_q38_soft.mode ? "1" : "0");
     if (!sp->gate.off && ((m->mtp && sp->depth == 0) || sp->lookup)) {
         char g[384];
         spec_gate_describe(&sp->gate, m->mtp && sp->depth == 0 ? SPEC_SRC_MTP : SPEC_SRC_LOOKUP, g, sizeof g);
@@ -1504,6 +1511,34 @@ static int serve_sample(const float *lo, int V, float temp, float top_p){
         for(int i=0;i<n;i++){ acc+=head[i].p; if(acc>=r){ pick=head[i].id; break; } }
     }
     free(p); free(head); return pick;
+}
+
+/* The caller's pick when a verify's MTP / DFlash2 draft waits for it (spec_exact.h).
+ * The drafts are settled by the caller's picks (q38_spec_step): a pick equal to the next
+ * draft stands it. With the draft drawn from the drafter's q, the pick is the settle of that
+ * row -- the draft with probability min(1, p/q), else a token of the residual, which is
+ * never the draft -- so the emitted tokens follow p as a plain serve_sample would. With
+ * an argmax draft the pick stays the plain serve_sample (the same rand() draws as
+ * without drafts); the row only tells the gate what each rule would have kept. */
+static int q38_spec_pick(Q38Spec *sp,const float *lo,int V,float temp,float top_p) {
+    sp->temp=temp; sp->top_p=top_p;   /* the next verify drafts at the request's sampling */
+    if(temp>0.f&&sp->q_ok&&sp->ahead_n&&sp->ahead_i<sp->ahead_n&&sp->ahead_src==SPEC_SRC_MTP){
+        int i=sp->ahead_i;
+        float *p=(float*)malloc((size_t)V*sizeof(float));
+        if(p&&!spec_exact_target(p,lo,V,temp,top_p)){
+            spec_soft_gate_observe(&g_q38_soft,p,V,&sp->q[i-1]);
+            if(sp->drawn){
+                coli_logit_dump(lo,V);
+                double keep=q38_rand01(),res=q38_rand01();
+                int kept,tok=spec_exact_settle(p,V,&sp->q[i-1],sp->ids[i],keep,res,&kept);
+                g_q38_soft.drawn_drafts++; if(kept) g_q38_soft.drawn_kept++;
+                free(p);
+                return tok;
+            }
+        }
+        free(p);
+    }
+    return serve_sample(lo,V,temp,top_p);
 }
 
 /* Chat turns end on <|im_end|>, base completions on <|endoftext|>. Resolve
@@ -3179,7 +3214,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
             if(control==3)cancelled=1;
         }
         if(cancelled||stopped)break;
-        int tk = picked>=0 ? picked : serve_sample(lo, m->c.vocab, q->temp, q->top_p);
+        int tk = picked>=0 ? picked : q38_spec_pick(&spec, lo, m->c.vocab, q->temp, q->top_p);
         char lptail[1024]; lptail[0]=0;
         if(q->logprobs>0) coli_logprob_tail(lptail,sizeof lptail,lo,m->c.vocab,tk,q->logprobs);
         free(lo); lo=NULL;

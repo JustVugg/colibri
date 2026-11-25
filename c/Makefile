@@ -2049,6 +2049,23 @@ qwen38-tiny-mtp-generate:
 	@for d in qwen38_tiny_mtp qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do \
 		$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./$$d || exit $$?; done
 
+# Drawn MTP drafts (spec_exact.h, COLI_SPEC_SOFT=1): sampled turns follow plain decoding's
+# distribution (per-position two-sample chi-square; position 0, never drafted, is the control).
+.PHONY: qwen38-spec-soft-check
+qwen38-spec-soft-check: qwen38-tiny-mtp-generate qwen38$(EXE)
+	$(PYTHON) tests/qwen38_spec_soft_harness.py --engine ./qwen38$(EXE) --model ./qwen38_tiny_mtp
+
+# The same on qwen36, over tests/basalt_fixture.py's pack converted by tools/convert_basalt_to_gguf.py:
+# its nextn MTP head on the CPU. DFlash2 drafts take the same pick (q36_spec_pick); their selector's
+# drawn path is gated by tests/test_dflash_select.c.
+.PHONY: qwen36-spec-soft-check
+qwen36-spec-soft-check: qwen36$(EXE)
+	@rm -rf build/q36soft && mkdir -p build/q36soft
+	$(PYTHON) -c "import sys; sys.path[:0] = ['tests', 'tools']; import basalt_fixture as B; from pathlib import Path; B.write_pack(Path('build/q36soft/pack.basalt'), ref=False)"
+	$(PYTHON) tools/convert_basalt_to_gguf.py build/q36soft/pack.basalt build/q36soft/pack.gguf
+	$(PYTHON) tools/gguf_import.py build/q36soft/pack.gguf build/q36soft/m
+	$(PYTHON) tests/qwen38_spec_soft_harness.py --family qwen36 --engine ./qwen36$(EXE) --model build/q36soft/m --turns 20000
+
 qwen38-tiny-mtp-check: qwen38-tiny-mtp-generate qwen38$(EXE)
 	$(PYTHON) tests/qwen38_mtp_harness.py --engine ./qwen38$(EXE) --bf16 ./qwen38_tiny_mtp \
 		--fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
@@ -2881,6 +2898,15 @@ tests/test_cfg_topk$(EXE): tests/test_cfg_topk.c colibri.c $(VK_OBJ)
 
 tests/test_topp$(EXE): tests/test_topp.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# spec_exact.h: drawn drafts kept by min(1, p/q) follow the target exactly (Monte Carlo),
+# top-p ban-in-logits leak vs probability-space settle, nucleus vs full sort, rule gate.
+tests/test_spec_exact$(EXE): tests/test_spec_exact.c spec_exact.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# DFlash2's host path selector: greedy bit-identical to the old one, drawn paths follow q.
+tests/test_dflash_select$(EXE): tests/test_dflash_select.c dflash_select.h spec_exact.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
 # gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp

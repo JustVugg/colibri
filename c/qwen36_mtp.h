@@ -20,6 +20,10 @@ typedef struct {
     uint64_t voc_gen; int voc_reuse; /* one more at every rebuild of voc's list; the prompt tokens serve kept */
     float last_p;                    /* the newest draft's probability under the head */
     int pick_id, pick_ok;            /* q36_mg_row / q36_mc_row compact pick */
+    /* a sampled request's verify (q36_spec_step, spec_exact.h): the next draft's q goes to *q,
+     * from the head's logits at qtemp/qtopp; qdrawn draws the draft from it. A compact pick
+     * on the device leaves no logits: a point mass then, and the argmax. */
+    SpecQ *q; int qdrawn; float qtemp, qtopp;
     int *vid;                        /* Q36_MTP_VOCAB_IDS: row j of dvoc scores id vid[j] (NULL: id j) */
     void *Kc, *Vc; int stride;       /* the head's KV rows [KV][stride][hd], q36_kv_es() bytes an element */
     void **Kp, **Vp;                 /* the model's per-layer pointers and the head's after them */
@@ -776,6 +780,27 @@ static void q36_mtp_pend_at(Model *m, int pos) {
     memcpy(p->pend, p->last + (int64_t)(pos - 1 - p->last_base) * D, sizeof(float) * D);
     p->len = pos - 1; p->has_pend = 1;
 }
+/* The draft from a head row's logits lg (or the device's compact pick): the argmax, its
+ * probability in last_p; under a sampled verify (p->q) also its q, and with qdrawn the draft
+ * drawn from q instead. */
+static int q36_mtp_pick(Q36Mtp *p, const float *lg, int V) {
+    int best = 0;
+    if (p->pick_ok) {   /* last_p set there */
+        best = p->pick_id; p->pick_ok = 0;
+        if (p->q) specq_point(p->q, best);
+        return best;
+    }
+    for (int i = 1; i < V; i++) if (lg[i] > lg[best]) best = i;
+    /* the draft's softmax probability: how deep a verify should go (Q36_MTP_PMIN) */
+    float z = 0, mx = lg[best];
+    for (int i = 0; i < V; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
+    p->last_p = z > 0 ? (float)(1.0 / z) : 0.f;
+    if (p->q) {
+        specq_from_logits(p->q, lg, V, p->qtemp, p->qtopp, SPEC_Q_MAX);
+        if (p->qdrawn) best = specq_draw(p->q, (double)rand() / ((double)RAND_MAX + 1.0));
+    }
+    return best;
+}
 /* The head's draft for the token after `tok` (about to be fed at pos): its row at pos;
  * `hidden` (D floats, may be NULL) gets the row's state for a deeper draft */
 static float *q36_mtp_scratch(float **buf, int *cap, int need) {
@@ -800,16 +825,7 @@ static int q36_mtp_draft(Model *m, int tok, int pos, float *hidden) {
         fclose(f);
     }
     p->done_pos = pos; p->done_tok = tok; p->drafts++;
-    int best = 0;
-    if (p->pick_ok) { best = p->pick_id; p->pick_ok = 0; }   /* last_p set there */
-    else {
-        for (int i = 1; i < V; i++) if (lg[i] > lg[best]) best = i;
-        /* the draft's softmax probability: how deep a verify should go (Q36_MTP_PMIN) */
-        float z = 0, mx = lg[best];
-        for (int i = 0; i < V; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
-        p->last_p = z > 0 ? (float)(1.0 / z) : 0.f;
-    }
-    return best;
+    return q36_mtp_pick(p, lg, V);
 }
 
 /* A deeper draft: the head's row at `pos` on its own state of the row before (`hidden`,
@@ -831,16 +847,7 @@ static int q36_mtp_draft_more(Model *m, float *hidden, int tok, int pos) {
 #endif
     q36_mtp_rows(m, &tok, h, 1, pos, lg, hidden);
     p->drafts++;
-    int best = 0;
-    if (p->pick_ok) { best = p->pick_id; p->pick_ok = 0; }   /* last_p set there */
-    else {
-        for (int i = 1; i < V; i++) if (lg[i] > lg[best]) best = i;
-        /* the draft's softmax probability: how deep a verify should go (Q36_MTP_PMIN) */
-        float z = 0, mx = lg[best];
-        for (int i = 0; i < V; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
-        p->last_p = z > 0 ? (float)(1.0 / z) : 0.f;
-    }
-    return best;
+    return q36_mtp_pick(p, lg, V);
 }
 
 /* Q36_MTP=1: the head, after the model and the device are up */

@@ -77,6 +77,8 @@ static int qwen36_max_ctx(void) {
 #include "omp_tune.h"
 #include "kv_prefix.h"
 #include "spec_draft.h" /* prompt-lookup drafts and the gate that decides when they pay (COLI_LOOKUP=1) */
+#include "spec_exact.h" /* sampled requests: MTP / DFlash2 drafts drawn from the drafter, kept by min(1, p/q) */
+static double q36_rand01(void) { return (double)rand() / ((double)RAND_MAX + 1.0); }   /* serve_sample's RNG */
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
 #include "serve_codec.h"  /* the request frames, as the sibling engines read them */
@@ -9712,7 +9714,15 @@ typedef struct {
     float min_p, draft_p;
     uint64_t skipped, idle;
     unsigned past;
+    /* sampled requests (spec_exact.h): the caller's temperature and nucleus, set at each pick;
+     * the verify's MTP/DFlash2 drafts' q, whether they were drawn from it, and whether q
+     * describes them (not under a forced mode, which replaces drafts) */
+    float temp, top_p;
+    SpecQ q[Q36_SPEC_ROWS];
+    int q_ok, drawn;
 } Q36Spec;
+/* the rule for sampled requests' head drafts, for the process (COLI_SPEC_SOFT, default auto) */
+static SpecSoftGate g_q36_soft; static int g_q36_soft_ready = 0;
 static const int *g_q36_oracle; static int g_q36_oracle_n;   /* ref.json's full ids (COLI_LOOKUP_FORCE) */
 
 static int q36_spec_force_mode(const char *v, int *row) {
@@ -10018,16 +10028,22 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
         }
         if (k > 0 && !q36_spec_alloc(m, k)) k = 0;
     } else if (sp->mtp && room > 0 && q36_draft_ready(pos)) k = -q36_mtp_depth(sp, room, NULL);
+    sp->q_ok = sp->drawn = 0;
     if (k < 0) {   /* the MTP head's drafts: the first from the model's row, the deeper ones
                     * from the head's own row before */
         int km = -k;
         k = q36_spec_alloc(m, km) ? km : 0;
+        if (!g_q36_soft_ready) { spec_soft_gate_init(&g_q36_soft, 2); g_q36_soft_ready = 1; }
+        const int forced = sp->mtp_force != 0;
+        sp->q_ok = sp->temp > 0.f && g_q36_soft.mode != 0 && !forced;
+        sp->drawn = sp->q_ok && spec_soft_gate_drawn(&g_q36_soft, sp->temp);
 #ifdef COLI_CUDA
         if (k && g_q36_df.on) {   /* DFlash2's drafter: the block in one pass, its time the verify's */
             float pr[Q36_SPEC_ROWS], *emb = falloc(c->hidden);
             t_verify = now_s();
             q36_embed_row(m, tok, pos, emb);
-            int n = df_draft(&g_q36_df, emb, tok, pos, k, d, pr);
+            int n = df_draft(&g_q36_df, emb, tok, pos, k, d, pr, sp->q_ok ? sp->q : NULL, sp->drawn,
+                             sp->temp, q36_rand01);
             free(emb);
             if (n < k) k = n;
             for (int j = 0; j < k; j++) sp->ahead_p[j] = pr[j];
@@ -10048,6 +10064,8 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
         if (k) {
             float *hd = falloc(c->hidden);
             t_verify = now_s();
+            g_q36_mtp.q = sp->q_ok ? &sp->q[0] : NULL; g_q36_mtp.qdrawn = sp->drawn;
+            g_q36_mtp.qtemp = sp->temp; g_q36_mtp.qtopp = sp->top_p;
             d[0] = q36_mtp_draft(m, tok, pos, hd);
             sp->ahead_p[0] = g_q36_mtp.last_p;
             double t_first = now_s();
@@ -10060,6 +10078,7 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
                     (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force &&
                      !spec_gate_deeper_p(&sp->gate, SPEC_SRC_MTP, j, sp->ahead_p))) { k = j; break; }
                 double t1 = now_s();
+                g_q36_mtp.q = sp->q_ok ? &sp->q[j] : NULL;
                 d[j] = q36_mtp_draft_more(m, hd, d[j - 1], pos + j);
                 sp->ahead_p[j] = g_q36_mtp.last_p;
                 spec_gate_draft_cost(&sp->gate, SPEC_SRC_MTP, now_s() - t1);
@@ -10074,6 +10093,7 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
                 k = kp < 1 ? 1 : kp;
             }
             t_verify += now_s() - t_first;   /* the deeper drafts are the gate's draft cost, not the verify's */
+            g_q36_mtp.q = NULL;
             free(hd);
             if (sp->mtp_force) {
                 Q36Spec forced = *sp; forced.force = sp->mtp_force; forced.force_row = sp->mtp_force_row;
@@ -10117,6 +10137,12 @@ static void q36_spec_end(Model *m, Q36Spec *sp) {
 }
 
 static void q36_spec_report(const Q36Spec *sp, const char *scope) {
+    if (sp->mtp_drafts && g_q36_soft.rows)
+        fprintf(stderr, "[qwen36 mtp sampled] %s: expected keep %.1f%% drawn vs %.1f%% argmax over %llu rows | "
+                        "drawn drafts kept %llu/%llu (COLI_SPEC_SOFT=%s)\n", scope,
+                100.0 * g_q36_soft.keep_drawn, 100.0 * g_q36_soft.keep_point, (unsigned long long)g_q36_soft.rows,
+                (unsigned long long)g_q36_soft.drawn_kept, (unsigned long long)g_q36_soft.drawn_drafts,
+                g_q36_soft.mode == 2 ? "auto" : g_q36_soft.mode ? "1" : "0");
     if (sp->mtp_drafts) {
         char g[384]; spec_gate_describe(&sp->gate, SPEC_SRC_MTP, g, sizeof g);
         /* the graph's drafts skip the gate: what it measured follows "off:" */
@@ -10375,6 +10401,31 @@ static void serve_data(const char *id, const char *p, int n){
 }
 
 #include "qwen36_sample.h"
+
+/* The caller's pick when a verify's head draft (MTP or DFlash2) waits for it (spec_exact.h,
+ * as qwen38.c's q38_spec_pick): a draft drawn from the drafter's q is settled by
+ * min(1, p/q), else a residual token (never the draft); an argmax draft keeps the plain
+ * serve_sample, the same rand() draws as without drafts, and only tells the gate. */
+static int q36_spec_pick(Q36Spec *sp, const float *lo, int V, float temp, float top_p) {
+    sp->temp = temp; sp->top_p = top_p;   /* the next verify drafts at the request's sampling */
+    if (temp > 0.f && sp->q_ok && sp->ahead_n && sp->ahead_i < sp->ahead_n && sp->ahead_src == SPEC_SRC_MTP) {
+        int i = sp->ahead_i;
+        float *p = (float *)malloc((size_t)V * sizeof(float));
+        if (p && !spec_exact_target(p, lo, V, temp, top_p)) {
+            spec_soft_gate_observe(&g_q36_soft, p, V, &sp->q[i - 1]);
+            if (sp->drawn) {
+                coli_logit_dump(lo, V);
+                double keep = q36_rand01(), res = q36_rand01();
+                int kept, tok = spec_exact_settle(p, V, &sp->q[i - 1], sp->ids[i], keep, res, &kept);
+                g_q36_soft.drawn_drafts++; if (kept) g_q36_soft.drawn_kept++;
+                free(p);
+                return tok;
+            }
+        }
+        free(p);
+    }
+    return serve_sample(lo, V, temp, top_p);
+}
 
 /* Chat turns end on <|im_end|>, base completions on <|endoftext|>. Resolve
  * both ids from the tokenizer's added_tokens: Qwen3.6's 248320-token vocab
@@ -10945,7 +10996,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
     unsigned char sbuf[16]; int sbn=0;
     Q36Spec spec; q36_spec_begin(m, &spec, ids, np);   /* COLI_LOOKUP=1: drafts, every token still sampled from the exact logits */
     for(int s=0;s<q->max_tok;s++){
-        int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
+        int tk = q36_spec_pick(&spec, lo, m->c.vocab, q->temp, q->top_p);
         /* La coda si calcola PRIMA della free: dopo, lo non c'e piu. */
         char lptail[1024]; lptail[0]=0;
         if(q->logprobs>0) coli_logprob_tail(lptail,sizeof lptail,lo,m->c.vocab,tk,q->logprobs);
