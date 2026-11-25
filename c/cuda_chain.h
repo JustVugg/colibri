@@ -534,6 +534,18 @@ typedef struct ColiCudaChainOps {
     int (*swiglu_pair_codes)(ColiCudaTensor *g, ColiCudaTensor *u, CcBuf *x, CcBuf *y, int S);
     /* Report the current device's profile without enabling it. */
     int (*probe_qwen36_profile)(void);
+    /* graphs: graph_begin starts capturing the chain's stream (relaxed mode); graph_end ends and
+     * instantiates; graph_launch replays on the stream; graph_free destroys; graph_scratch returns
+     * the GGUF block-matmul scratch address (or NULL). NULL entries on HIP. */
+    int  (*graph_begin)(void);
+    void *(*graph_end)(int *broke);
+    int  (*graph_launch)(void *g);
+    void (*graph_free)(void *g);
+    const void *(*graph_scratch)(void);
+    /* graph-safe Inkling-2 dynamic attention + KV scatter reading pos_base from a device int buffer */
+    int  (*relattn_pb)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
+                       CcBuf *pb, CcBuf *part, int nc, const CcRelAttn *p);
+    int  (*ink2_kv_put)(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb, int S, int KV, int hd, int cap, int vs_off);
 } ColiCudaChainOps;
 #define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
 #define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
@@ -894,6 +906,31 @@ static inline void cc_set_kernel_mask(unsigned mask) {
     const ColiCudaChainOps *t = cc_ops();
     if (t && t->size >= offsetof(ColiCudaChainOps, set_kernel_mask) + sizeof t->set_kernel_mask &&
         t->set_kernel_mask) t->set_kernel_mask(mask);
+}
+static inline int cc_graph_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, graph_free) + sizeof t->graph_free && t->graph_begin && t->graph_end &&
+           t->graph_launch && t->graph_free;
+}
+static inline int cc_graph_begin(void) { return cc_graph_ready() ? cc_ops()->graph_begin() : 0; }
+static inline void *cc_graph_end(int *broke) { *broke = 0; return cc_graph_ready() ? cc_ops()->graph_end(broke) : NULL; }
+static inline int cc_graph_launch(void *g) { return cc_graph_ready() && g ? cc_ops()->graph_launch(g) : 0; }
+static inline void cc_graph_free(void *g) { if (g && cc_graph_ready()) cc_ops()->graph_free(g); }
+static inline int cc_graph_scratch_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, graph_scratch) + sizeof t->graph_scratch && t->graph_scratch;
+}
+static inline const void *cc_graph_scratch(void) { return cc_graph_scratch_ready() ? cc_ops()->graph_scratch() : NULL; }
+static inline int cc_ink2_pb_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ink2_kv_put) + sizeof t->ink2_kv_put && t->relattn_pb && t->ink2_kv_put;
+}
+static inline int cc_relattn_pb(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
+                                CcBuf *pb, CcBuf *part, int nc, const CcRelAttn *p) {
+    return cc_ink2_pb_ready() ? cc_ops()->relattn_pb(q, kc, vc, o, kvs, r, relp, tau, pb, part, nc, p) : 0;
+}
+static inline int cc_ink2_kv_put(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb, int S, int KV, int hd, int cap, int vs_off) {
+    return cc_ink2_pb_ready() ? cc_ops()->ink2_kv_put(kc, vc, kvs, pb, S, KV, hd, cap, vs_off) : 0;
 }
 #endif
 
