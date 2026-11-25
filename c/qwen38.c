@@ -3968,6 +3968,8 @@ int main(int argc, char **argv) {
     qt_stats();   /* VRAM tier hits/misses/swaps, if on */
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
+    if (m.expert_direct || g_q38_direct_reads)
+        fprintf(stderr, "Expert ranges read past the file cache: %llu\n", g_q38_direct_reads);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
 #ifdef COLI_CUDA
     q38cc_report(&m);
@@ -4272,8 +4274,8 @@ static int q38_vk_read_direct(Model *m,int layer,int e,uint8_t *buf,int64_t cap,
     if(!q38_native_fp8_expert_tensors(m,layer,e,w)||m->expert_scales[layer].ready!=1)return 0;
     int64_t pair=w[0]->nbytes+w[1]->nbytes;
     if(pair+w[2]->nbytes>cap)return 0;
-    st_read_range_raw_cap(&m->S,w[0]->fd,w[0]->off,pair,buf,cap,1,"pread Qwen3.8 gate/up expert (Vulkan tier)");
-    st_read_range_raw_cap(&m->S,w[2]->fd,w[2]->off,w[2]->nbytes,buf+pair,cap-pair,1,"pread Qwen3.8 down expert (Vulkan tier)");
+    q38_read_expert_range(m,w[0]->fd,w[0]->off,pair,buf,cap,"pread Qwen3.8 gate/up expert (Vulkan tier)");
+    q38_read_expert_range(m,w[2]->fd,w[2]->off,w[2]->nbytes,buf+pair,cap-pair,"pread Qwen3.8 down expert (Vulkan tier)");
     const Q38ExpertScaleCache *bank=&m->expert_scales[layer];
     const float *sc=bank->values+(int64_t)e*3*bank->scale_count;
     *src=(VktExpertSrc){buf,buf+w[0]->nbytes,buf+pair,sc,sc+bank->scale_count,sc+2*bank->scale_count};
