@@ -281,6 +281,7 @@ static ColiCudaTensor *q38cc_t(Q38CChain *ch, Q38Weight *w) {
         if (t) return NULL;   /* on another card: the chain does not span cards */
     }
     if (w->cc) return (ColiCudaTensor *)w->cc;
+    if (w->q8_gone) q38_trunk_reload(w);   /* the tier's handle is off and the host released its rows */
     ColiCudaTensor *t = NULL;
     const int gf = q38_cuda_gq_fmt(w);
     if (w->q8 && w->q8sc) {
