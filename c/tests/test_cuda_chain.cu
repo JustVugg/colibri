@@ -517,40 +517,55 @@ static ColiCudaTensor *moe_mat(int fmt, int gs, int I, int O, unsigned seed, std
     return ok ? t : NULL;
 }
 
-/* COLI_CUDA_CHAIN_BENCH=adec: one decode row's attention over L = 10 layers of caches of their
- * own, float16 (attn_h; COLI_CUDA_BENCH_KV16=0 float32), COLI_CUDA_BENCH_ADEC "H KVH hd pos"
- * (Qwen3.6's 16 2 256 18000 by default): the time a layer, the best of five frames */
+/* COLI_CUDA_CHAIN_BENCH=adec: a decode row's attention (or a verify's rows) over L = 10 layers of caches
+ * of their own, float16 (attn_h; COLI_CUDA_BENCH_KV16=0 float32), COLI_CUDA_BENCH_ADEC "H KVH hd pos [rows]"
+ * (Qwen3.6's 16 2 256 18000 1 by default): the time a layer, the best of five frames. With 2 to 8 rows
+ * (a verify after pos positions) COLI_CUDA_ATTN_DEC_ROWS unset and 1 take turns (ABBA), five frames
+ * each, and the line says whether the two gave the same bits */
 static void bench_adec(void) {
-    int H = 16, KVH = 2, hd = 256, pos = 18000, n = 10;
+    int H = 16, KVH = 2, hd = 256, pos = 18000, n = 10, S = 1;
     const char *sh = getenv("COLI_CUDA_BENCH_ADEC"), *k16 = getenv("COLI_CUDA_BENCH_KV16");
-    if (sh && *sh) sscanf(sh, "%d %d %d %d", &H, &KVH, &hd, &pos);
+    if (sh && *sh) sscanf(sh, "%d %d %d %d %d", &H, &KVH, &hd, &pos, &S);
+    if (S < 1 || S > 8) S = 1;
     int h16 = !(k16 && *k16 == '0') && T->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h && T->kvh();
-    size_t kv = (size_t)KVH * (pos + 1) * hd;
-    std::vector<float> q = rnd((size_t)H * hd, 5), k = rnd(kv, 6);
+    size_t kv = (size_t)KVH * (pos + S) * hd, no = (size_t)S * H * hd;
+    std::vector<float> q = rnd(no, 5), k = rnd(kv, 6);
     std::vector<uint16_t> kh(kv);
     kv16_round(k.data(), (int64_t)kv); kv16_pack(kh.data(), k.data(), (int64_t)kv);
-    CcBuf *qb = up(q), *ob = T->buf((size_t)H * hd * 4, CC_DEV), *kb[10], *vb[10];
+    CcBuf *qb = up(q), *ob = T->buf(no * 4, CC_DEV), *kb[10], *vb[10];
     int ok = qb && ob;
     for (int l = 0; l < n; l++) {
         kb[l] = T->buf(kv * (h16 ? 2 : 4), CC_DEV); vb[l] = T->buf(kv * (h16 ? 2 : 4), CC_DEV);
         ok = ok && kb[l] && vb[l] && T->begin() && T->write(kb[l], 0, h16 ? (const void *)kh.data() : (const void *)k.data(), kv * (h16 ? 2 : 4)) &&
              T->write(vb[l], 0, h16 ? (const void *)kh.data() : (const void *)k.data(), kv * (h16 ? 2 : 4)) && T->submit(1);
     }
-    double best = 1e9;
-    for (int r = 0; r < 5 && ok; r++) {
+    const int modes = S > 1 ? 2 : 1;
+    double best[2] = {1e9, 1e9};
+    std::vector<float> out[2];
+    for (int r = 0; r < 5 * modes && ok; r++) {
+        int m = modes > 1 ? (r + 1) / 2 % 2 : 0;   /* 0 1 1 0 0 1 1 0 0 1 */
+        if (m) setenv("COLI_CUDA_ATTN_DEC_ROWS", "1", 1); else unsetenv("COLI_CUDA_ATTN_DEC_ROWS");
         ok = T->begin();
         for (int l = 0; l < n && ok; l++) {
-            CcAttn a = {1, H, KVH, hd, pos, pos + 1, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
+            CcAttn a = {S, H, KVH, hd, pos, pos + S, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
             ok = h16 ? T->attn_h(qb, kb[l], vb[l], ob, NULL, NULL, &a) : T->attn(qb, kb[l], vb[l], ob, NULL, NULL, &a);
         }
         auto t0 = std::chrono::steady_clock::now();
         ok = T->submit(1) && ok;
         double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (dt < best) best = dt;
+        if (dt < best[m]) best[m] = dt;
+        if (ok && out[m].empty()) out[m] = down(ob, no);
     }
-    if (ok) printf("bench adec H %d/%d hd %d at %d positions%s: %.1f us a layer (%.1f GB/s of K and V)\n", H, KVH, hd, pos,
-                   h16 ? ", float16" : "", best * 1e6 / n, 2.0 * kv * (h16 ? 2 : 4) * n / best / 1e9);
-    else printf("bench adec: the frame failed\n");
+    if (modes > 1) unsetenv("COLI_CUDA_ATTN_DEC_ROWS");
+    char rs[32] = "";
+    if (S > 1) snprintf(rs, sizeof rs, ", %d rows", S);
+    if (ok) printf("bench adec H %d/%d hd %d at %d positions%s%s: %.1f us a layer (%.1f GB/s of K and V)\n", H, KVH, hd, pos,
+                   h16 ? ", float16" : "", rs, best[0] * 1e6 / n, 2.0 * kv * (h16 ? 2 : 4) * n / best[0] / 1e9);
+    if (ok && modes > 1)
+        printf("bench adec COLI_CUDA_ATTN_DEC_ROWS=1: %.1f us a layer (%.1f GB/s of K and V), %.3fx the time, the same bits: %s\n",
+               best[1] * 1e6 / n, 2.0 * kv * (h16 ? 2 : 4) * n / best[1] / 1e9, best[1] / best[0],
+               out[0].size() == no && out[1].size() == no && !memcmp(out[0].data(), out[1].data(), no * 4) ? "yes" : "NO");
+    if (!ok) printf("bench adec: the frame failed\n");
     for (int l = 0; l < n; l++) { T->free(kb[l]); T->free(vb[l]); }
     T->free(qb); T->free(ob);
 }
@@ -1314,6 +1329,49 @@ int main(void) {
                      T->read(dbuf, 0, got.data(), got.size() * 2);
             ck(ok && got == want, "copy_regions_h: a grid of rows and a region alone, each value its float16");
             T->free(sbuf); T->free(dbuf);
+        }
+    }
+    {   /* COLI_CUDA_ATTN_DEC_ROWS=1 (cc_decg_launch): a verify's rows of one block of positions launched next to
+         * each other give the bits of the rows launched one row after the other: one block length for every row
+         * (Qwen3.8-27B's heads past 8192 positions), rows across a length's change (4096), a window, a window in a
+         * ring. The split path runs here from sm_75, or on any card with COLI_CUDA_ATTN_DEC=2 */
+        cudaDeviceProp pr;
+        const char *de = getenv("COLI_CUDA_ATTN_DEC");
+        int split = de && *de == '2' ? 1 : de && *de == '0' ? 0 : cudaGetDeviceProperties(&pr, 0) == cudaSuccess && pr.major * 10 + pr.minor >= 75;
+        int h16 = T->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h && T->kvh();
+        struct { int H, KV, hd, S, pos_base, win, ring, f16; } cs[] = {
+            {24, 4, 256, 8, 9000, 0, 0, 1}, {24, 4, 256, 8, 9000, 0, 0, 0}, {24, 4, 256, 8, 4090, 0, 0, 1},
+            {16, 2, 256, 2, 2500, 0, 0, 1}, {32, 4, 128, 5, 3000, 128, 0, 1}, {32, 4, 128, 3, 900, 129, 230, 1}};
+        for (auto &k : cs) {
+            if (k.f16 && !h16) continue;
+            const int cap = k.ring ? k.ring : k.pos_base + k.S + 9, k_off = 32;
+            const size_t no = (size_t)k.S * k.H * k.hd;
+            std::vector<float> q = rnd(no, 96), kc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 97), vc = rnd(kc.size(), 98);
+            CcBuf *qb = up(q), *ob = T->buf(no * 4, CC_DEV), *kb, *vb;
+            int ok = qb && ob;
+            if (k.f16) {
+                std::vector<uint16_t> kh(kc.size()), vh(vc.size());
+                kv16_pack(kh.data(), kc.data(), (int64_t)kc.size()); kv16_pack(vh.data(), vc.data(), (int64_t)vc.size());
+                kb = T->buf(kh.size() * 2, CC_DEV); vb = T->buf(vh.size() * 2, CC_DEV);
+                ok = ok && kb && vb && T->begin() && T->write(kb, 0, kh.data(), kh.size() * 2) && T->write(vb, 0, vh.data(), vh.size() * 2) && T->submit(1);
+            } else { kb = up(kc); vb = up(vc); ok = ok && kb && vb; }
+            CcAttn a = {k.S, k.H, k.KV, k.hd, k.pos_base, cap, 0, k.H * k.hd, k.hd, 0, 0, 0, 0, 0, k.H * k.hd, 0, 0,
+                        1.f / sqrtf((float)k.hd), k_off, k_off};
+            CcAttnW w = {a, k.win, 0, 0};
+            std::vector<float> got[2];
+            for (int on = 0; on < 2 && ok; on++) {
+                if (on) setenv("COLI_CUDA_ATTN_DEC_ROWS", "1", 1); else unsetenv("COLI_CUDA_ATTN_DEC_ROWS");
+                ok = T->begin() && (k.win ? T->attn_wh(qb, kb, vb, ob, NULL, NULL, &w, k.ring)
+                                          : k.f16 ? T->attn_h(qb, kb, vb, ob, NULL, NULL, &a) : T->attn(qb, kb, vb, ob, NULL, NULL, &a)) && T->submit(1);
+                if (ok) got[on] = down(ob, no);
+            }
+            unsetenv("COLI_CUDA_ATTN_DEC_ROWS");
+            char what[220];
+            snprintf(what, sizeof what, "COLI_CUDA_ATTN_DEC_ROWS=1: H %d KV %d hd %d, %d rows after %d%s%s%s: the rows' bits one after the other%s",
+                     k.H, k.KV, k.hd, k.S, k.pos_base, k.f16 ? ", float16" : "", k.win ? ", a window" : "", k.ring ? " in a ring" : "",
+                     split ? "" : " (no split path on this card: cc_attn_k both times)");
+            ck(ok && !memcmp(got[0].data(), got[1].data(), no * 4), what);
+            T->free(qb); T->free(ob); T->free(kb); T->free(vb);
         }
     }
     printf("dnconv\n");
