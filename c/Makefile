@@ -3112,6 +3112,10 @@ tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
 tests/test_glm53_serve_framing$(EXE): tests/test_glm53_serve_framing.c glm53.c
 	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
+# glm53 native FP8 e4m3 load dequant + tiny end-to-end exactness (CPU-only, self-contained)
+tests/test_glm53_fp8_load$(EXE): tests/test_glm53_fp8_load.c glm53.c fp8_format.h
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
+
 # Exact sampler order, cumulative mass, selected token and RNG-use regression.
 tests/glm53_nucleus_reference.o: tests/glm53_nucleus_reference.c
 	$(CC) $(NOCUDA_CFLAGS) -c $< -o $@
