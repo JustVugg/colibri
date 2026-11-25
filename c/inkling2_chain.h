@@ -124,7 +124,11 @@ static int ink2c_geometry_ok(const Model *m, int say) {
 static size_t ink2c_plan_bytes(const Model *m) {
     const Cfg *c = &m->c;
     size_t D = (size_t)c->hidden, E = (size_t)c->n_experts, CK = (size_t)c->conv_k, b = 0, row = 0;
+    /* Mirrors grow lazily with m->max_t; reserving the full 1M+ served context upfront starves
+     * the Vulkan expert tier on 32 GiB cards. Reserve an initial working horizon and let
+     * ink2c_mirror claim more via vkt_give_back. */
     int t = ink_ctx_max() + 8;
+    if (t > 16392) t = 16392;
     for (int v = c->n_layers; v < c->n_state; v++) {                   /* the loop's later passes' state */
         size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v);
         b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2 + 2 * kvo * (size_t)kv_ring_rows(c, v, t) * 4;
@@ -144,7 +148,7 @@ static size_t ink2c_plan_bytes(const Model *m) {
         if (r1 > row) row = r1;
     }
     if (c->loop_p > 1) row += ((size_t)(7 + ink2c_maxb(c)) * D + (size_t)c->loop_r) * 4;   /* a row's loop scratch */
-    {   /* the split attention's partials at the whole context (ink2c_mirror) */
+    {   /* the split attention's partials at the planned context (ink2c_mirror) */
         size_t hm = 0, hdm = 0;
         for (int i = 0; i < c->n_layers; i++) { if ((size_t)L_HEADS(c, i) > hm) hm = L_HEADS(c, i); if ((size_t)L_HD(c, i) > hdm) hdm = L_HD(c, i); }
         b += (size_t)VKC_DMOE_ROWS * hm * (((size_t)t + 127) / 128) * (hdm + 2) * 4;
@@ -341,6 +345,11 @@ static int ink2c_chunk_rows(Ink2Chain *ch, Model *m) {
                  (c->loop_p > 1 ? ((size_t)(9 + ch->maxb) * D + (size_t)c->loop_r) * 4 : 0);
     return vkc_chunk_rows("inkling2", row);
 }
+static VkcBuf *ink2c_dev_buf(size_t bytes) {
+    VkcBuf *b = vkc_buf(bytes, VKC_DEV);
+    if (!b) { vkt_give_back(bytes + (64u << 20)); b = vkc_buf(bytes, VKC_DEV); }
+    return b;
+}
 /* the K/V mirrors at the host's layout, made again when the host's cache was */
 static int ink2c_mirror(Ink2Chain *ch, Model *m) {
     Cfg *c = &m->c;
@@ -350,8 +359,9 @@ static int ink2c_mirror(Ink2Chain *ch, Model *m) {
         int cap = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i), KV = L_KV(c, i);
         ch->cap[i] = cap;
         ch->dlo[i] = 0; ch->dhi[i] = cap < m->max_t ? m->max_t : m->kv_len;   /* a ring: every row; else the positions held */
-        ch->kc[i] = vkc_buf((size_t)KV * cap * hd * sizeof(float), VKC_DEV);
-        ch->vc[i] = vkc_buf((size_t)KV * cap * hd * sizeof(float), VKC_DEV);
+        size_t nb = (size_t)KV * cap * hd * sizeof(float);
+        ch->kc[i] = ink2c_dev_buf(nb);
+        ch->vc[i] = ink2c_dev_buf(nb);
         if (!ch->kc[i] || !ch->vc[i]) { ch->max_t = 0; ch->hostK = NULL; return 0; }
     }
     /* the split attention's partials: a decode step's rows (VKC_DMOE_ROWS) at the whole context;
