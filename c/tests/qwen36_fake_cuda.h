@@ -520,6 +520,11 @@ static int fcc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *p
     return 1;
 }
 static float fcc_sig(float x) { return 1.f / (1.f + expf(-x)); }
+/* ew's CC_EW_F16 (op 11): a test that wants it sets the rounding (kv16.h's, which this
+ * header does not include: the tier tests have no engine) and the table's kv16; unset, the
+ * op is refused as an older backend's would be. fake_chain_f16_ops counts its launches. */
+static float (*fake_chain_f16)(float);
+static int fake_chain_f16_ops;
 static int fcc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *p) {
     if (!fcc_ready() || !y || !p) return 0;
     fake_chain_ops++;
@@ -542,8 +547,10 @@ static int fcc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *
         else if (p->op == 7) Y[p->y_off + i] = A[p->a_off + i] * p->fc;
         else if (p->op == 8) Y[p->y_off + i] = A[p->a_off + i] + E[p->e_off + i % p->D] * B[p->b_off + i];
         else if (p->op == 12) Y[p->y_off + i] = A[p->a_off + i] * fcc_sig(B[p->b_off + i / p->D]);
+        else if (p->op == 11 && fake_chain_f16) Y[p->y_off + i] = fake_chain_f16(A[p->a_off + i]);
         else return 0;
     }
+    if (p->op == 11) fake_chain_f16_ops++;
     return 1;
 }
 static int fcc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) {

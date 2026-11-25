@@ -2149,7 +2149,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
  * it may write; COLI_PARK=0 never parks. */
 #define Q38_PARK_MIN 1024
 #define Q38_PARK_GEN 4096    /* the request's tokens whose rows are kept apart: past them it is not a short one */
-static struct { int on, len, kv_len, rows, nl; int *fed; Q38PinState *st; float **K, **V, **IK;
+static struct { int on, len, kv_len, rows, nl; int *fed; Q38PinState *st; void **K, **V; float **IK;
                 Q38PrefixCache snap; } g_q38_park;   /* snap: the conversation's prompt-end snapshot, kept too */
 
 static void q38_park_free_rows(void){
@@ -2159,19 +2159,19 @@ static void q38_park_free_rows(void){
         if(g_q38_park.IK)free(g_q38_park.IK[i]);
     }
     free(g_q38_park.K);free(g_q38_park.V);free(g_q38_park.IK);free(g_q38_park.fed);
-    g_q38_park.K=g_q38_park.V=g_q38_park.IK=NULL;g_q38_park.fed=NULL;g_q38_park.nl=0;g_q38_park.on=0;
+    g_q38_park.K=g_q38_park.V=NULL;g_q38_park.IK=NULL;g_q38_park.fed=NULL;g_q38_park.nl=0;g_q38_park.on=0;
 }
 /* rows [0, n) of an attention layer's K, V (head by head) and index keys, between the cache and a copy */
 static void q38_park_rows(Model *m,int i,int n,int out){
-    const Cfg *c=&m->c;const size_t D=(size_t)c->head_dim,ID=(size_t)c->idx_dim;
+    const Cfg *c=&m->c;const size_t D=(size_t)c->head_dim*q38_kv_es(),ID=(size_t)c->idx_dim*sizeof(float);
     for(int h=0;h<c->kv_heads;h++){
-        float *k=m->K[i]+(size_t)h*m->kv_cap*D,*v=m->V[i]+(size_t)h*m->kv_cap*D;
-        float *pk=g_q38_park.K[i]+(size_t)h*n*D,*pv=g_q38_park.V[i]+(size_t)h*n*D;
-        if(out){memcpy(pk,k,(size_t)n*D*sizeof(float));memcpy(pv,v,(size_t)n*D*sizeof(float));}
-        else{memcpy(k,pk,(size_t)n*D*sizeof(float));memcpy(v,pv,(size_t)n*D*sizeof(float));}
+        char *k=(char*)m->K[i]+(size_t)h*m->kv_cap*D,*v=(char*)m->V[i]+(size_t)h*m->kv_cap*D;
+        char *pk=(char*)g_q38_park.K[i]+(size_t)h*n*D,*pv=(char*)g_q38_park.V[i]+(size_t)h*n*D;
+        if(out){memcpy(pk,k,(size_t)n*D);memcpy(pv,v,(size_t)n*D);}
+        else{memcpy(k,pk,(size_t)n*D);memcpy(v,pv,(size_t)n*D);}
     }
-    if(out)memcpy(g_q38_park.IK[i],m->IK[i],(size_t)n*ID*sizeof(float));
-    else memcpy(m->IK[i],g_q38_park.IK[i],(size_t)n*ID*sizeof(float));
+    if(out)memcpy(g_q38_park.IK[i],m->IK[i],(size_t)n*ID);
+    else memcpy(m->IK[i],g_q38_park.IK[i],(size_t)n*ID);
 }
 static void q38_park(Model *m,int np,int max_tok){
     const char *e=getenv("COLI_PARK"),*mn=getenv("COLI_PARK_MIN");
@@ -2179,15 +2179,15 @@ static void q38_park(Model *m,int np,int max_tok){
     if((e&&*e=='0')||g_q38_park.on||!m->kvp.fed||m->kvp.tainted||H<least||m->kv_len!=H||
        g_pending_image.present||np+gen+Q38_SPEC_ROWS>=H)return;
     const Cfg *c=&m->c;const int L=q38_layer_rows(m),n=np+gen+Q38_SPEC_ROWS;
-    const size_t D=(size_t)c->head_dim,ID=(size_t)c->idx_dim;
+    const size_t es=q38_kv_es(),D=(size_t)c->head_dim,ID=(size_t)c->idx_dim;
     g_q38_park.nl=L;
-    g_q38_park.K=(float**)calloc((size_t)L,sizeof(float*));g_q38_park.V=(float**)calloc((size_t)L,sizeof(float*));
+    g_q38_park.K=(void**)calloc((size_t)L,sizeof(void*));g_q38_park.V=(void**)calloc((size_t)L,sizeof(void*));
     g_q38_park.IK=(float**)calloc((size_t)L,sizeof(float*));g_q38_park.fed=(int*)malloc((size_t)H*sizeof(int));
     int ok=g_q38_park.K&&g_q38_park.V&&g_q38_park.IK&&g_q38_park.fed;
     for(int i=0;ok&&i<L;i++){
         if(!m->K[i])continue;
-        g_q38_park.K[i]=(float*)malloc((size_t)c->kv_heads*n*D*sizeof(float));
-        g_q38_park.V[i]=(float*)malloc((size_t)c->kv_heads*n*D*sizeof(float));
+        g_q38_park.K[i]=malloc((size_t)c->kv_heads*n*D*es);
+        g_q38_park.V[i]=malloc((size_t)c->kv_heads*n*D*es);
         g_q38_park.IK[i]=(float*)malloc((size_t)n*ID*sizeof(float));
         ok=g_q38_park.K[i]&&g_q38_park.V[i]&&g_q38_park.IK[i];
         if(ok)q38_park_rows(m,i,n,1);
@@ -2280,7 +2280,7 @@ static int q38_ps_on(const Model *m){
 static size_t q38_ps_plan(const Model *m){ q38_ps_on(m); return g_q38_ps.on?g_q38_ps.budget:0; }
 /* every attention layer's K and V rows (head by head) and index keys, the MTP head's with them */
 static int q38_ps_parts(const Model *m,ColiPsPart *parts){
-    const Cfg *c=&m->c;const size_t D=(size_t)c->head_dim*sizeof(float),ID=(size_t)c->idx_dim*sizeof(float);
+    const Cfg *c=&m->c;const size_t D=(size_t)c->head_dim*q38_kv_es(),ID=(size_t)c->idx_dim*sizeof(float);
     int n=0;
     for(int i=0;i<q38_layer_rows(m);i++){
         if(!m->K[i]||!m->V[i]||!m->IK[i])continue;
@@ -3286,10 +3286,10 @@ static size_t q38_state_later(Model *m){
     if(ctx>c->max_positions)ctx=c->max_positions;
     size_t t=(size_t)ctx,kv=0,dn=0;
     for(int i=0;i<c->layers;i++)
-        if(c->is_attn[i])kv+=t*((size_t)2*c->kv_heads*c->head_dim+(size_t)c->idx_dim)*sizeof(float);
+        if(c->is_attn[i])kv+=t*((size_t)2*c->kv_heads*c->head_dim*q38_kv_es()+(size_t)c->idx_dim*sizeof(float));
         else dn+=((size_t)c->dn_vheads*c->dn_kdim*c->dn_vdim+(size_t)c->dn_conv_dim*(c->dn_convk-1))*sizeof(float);
     int n=g_q38_mux_slots>1?g_q38_mux_slots:1;
-    size_t mtp=q38_layer_rows(m)>c->layers&&n==1?t*((size_t)2*c->kv_heads*c->head_dim+(size_t)c->idx_dim)*sizeof(float):0;
+    size_t mtp=q38_layer_rows(m)>c->layers&&n==1?t*((size_t)2*c->kv_heads*c->head_dim*q38_kv_es()+(size_t)c->idx_dim*sizeof(float)):0;
     return kv*(size_t)n+dn*(size_t)(n-1)+mtp;
 }
 
@@ -4562,7 +4562,7 @@ static int q38_segment_session_state_bytes(const Cfg *c,uint32_t begin,
         if(c->is_attn[layer]){
             if(q38_u64_mul((uint64_t)c->kv_heads,context,&cells)||
                q38_u64_mul(cells,(uint64_t)c->head_dim,&cells)||
-               q38_u64_mul(cells,2u*sizeof(float),&bytes)||
+               q38_u64_mul(cells,2u*q38_kv_es(),&bytes)||
                q38_u64_add(&total,bytes)||
                q38_u64_mul(context,(uint64_t)c->idx_dim,&cells)||
                q38_u64_mul(cells,sizeof(float),&bytes)||q38_u64_add(&total,bytes))return -1;
@@ -4594,7 +4594,8 @@ typedef struct {
 
 typedef struct {
     Qwen38SegmentEngine *engine;
-    float **K, **V, **IK, **DN_rec, **DN_conv;
+    void **K, **V;          /* q38_kv_es() bytes an element (Q38_KV) */
+    float **IK, **DN_rec, **DN_conv;
     int64_t ple_history[2];
     int ple_history_len;
     float *PLE_conv_state;
@@ -4696,7 +4697,7 @@ static int qwen38_segment_session_create(void *impl,void **out,const ColiSegment
         return coli_segment_adapter_error(error,error_size,"Qwen3.8 session state exceeds memory limit");
     Qwen38SegmentSession *s=(Qwen38SegmentSession*)calloc(1,sizeof(*s)); if(!s)return coli_segment_adapter_error(error,error_size,"out of memory creating Qwen3.8 session");
     s->engine=e;s->context_tokens=options->context_tokens;
-    int n=e->model.c.layers; s->K=(float**)calloc((size_t)n,sizeof(float*));s->V=(float**)calloc((size_t)n,sizeof(float*));s->IK=(float**)calloc((size_t)n,sizeof(float*));
+    int n=e->model.c.layers; s->K=(void**)calloc((size_t)n,sizeof(void*));s->V=(void**)calloc((size_t)n,sizeof(void*));s->IK=(float**)calloc((size_t)n,sizeof(float*));
     s->DN_rec=(float**)calloc((size_t)n,sizeof(float*));s->DN_conv=(float**)calloc((size_t)n,sizeof(float*));
     if(!s->K||!s->V||!s->IK||!s->DN_rec||!s->DN_conv)goto oom;
     Cfg *c=&e->model.c;
@@ -4704,8 +4705,8 @@ static int qwen38_segment_session_create(void *impl,void **out,const ColiSegment
         size_t cells,bytes;
         if(c->is_attn[i]){
             if(coli_segment_size_mul((size_t)c->kv_heads,s->context_tokens,&cells)||coli_segment_size_mul(cells,(size_t)c->head_dim,&cells))goto oom;
-            if(coli_segment_size_mul(cells,sizeof(float),&bytes))goto oom;
-            s->K[i]=(float*)calloc(cells,sizeof(float));s->V[i]=(float*)calloc(cells,sizeof(float));
+            if(coli_segment_size_mul(cells,q38_kv_es(),&bytes))goto oom;
+            s->K[i]=calloc(cells,q38_kv_es());s->V[i]=calloc(cells,q38_kv_es());
             if(coli_segment_size_mul((size_t)s->context_tokens,(size_t)c->idx_dim,&cells)||coli_segment_size_mul(cells,sizeof(float),&bytes))goto oom;s->IK[i]=(float*)calloc(cells,sizeof(float));
             if(!s->K[i]||!s->V[i]||!s->IK[i])goto oom;
         }else{
@@ -4764,8 +4765,8 @@ static int qwen38_segment_spans(Qwen38SegmentSession *s,uint32_t position,ColiSe
     ColiSegmentStateSpan *v=(ColiSegmentStateSpan*)calloc(cap,sizeof(*v));if(cap&&!v)return coli_segment_adapter_error(error,error_size,"out of memory describing Qwen3.8 state");size_t n=0;
     for(uint32_t i=s->engine->layer_begin;i<s->engine->layer_end;i++)if(c->is_attn[i]){
         size_t cells,rb,stride;
-        if(coli_segment_size_mul((size_t)position,(size_t)c->head_dim,&cells)||coli_segment_size_mul(cells,sizeof(float),&rb)||coli_segment_size_mul((size_t)s->context_tokens,(size_t)c->head_dim,&stride)){free(v);return coli_segment_adapter_error(error,error_size,"Qwen3.8 attention state size overflow");}
-        for(int h=0;h<c->kv_heads;h++){v[n++]=(ColiSegmentStateSpan){s->K[i]+(size_t)h*stride,rb};v[n++]=(ColiSegmentStateSpan){s->V[i]+(size_t)h*stride,rb};}
+        if(coli_segment_size_mul((size_t)position,(size_t)c->head_dim,&cells)||coli_segment_size_mul(cells,q38_kv_es(),&rb)||coli_segment_size_mul((size_t)s->context_tokens,(size_t)c->head_dim,&stride)){free(v);return coli_segment_adapter_error(error,error_size,"Qwen3.8 attention state size overflow");}
+        for(int h=0;h<c->kv_heads;h++){v[n++]=(ColiSegmentStateSpan){q38_kv_at(s->K[i],(int64_t)h*stride),rb};v[n++]=(ColiSegmentStateSpan){q38_kv_at(s->V[i],(int64_t)h*stride),rb};}
         if(coli_segment_size_mul((size_t)position,(size_t)c->idx_dim,&cells)||coli_segment_size_mul(cells,sizeof(float),&cells)){free(v);return coli_segment_adapter_error(error,error_size,"Qwen3.8 indexer state size overflow");} v[n++]=(ColiSegmentStateSpan){s->IK[i],cells};
     }else{
         size_t cells;
