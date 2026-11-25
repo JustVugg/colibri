@@ -762,10 +762,23 @@ static void q38cc_dm_caps_back(Q38CChain *ch, Model *m) {
  * The host's K/V/index rows are canonical, those are not: rebuild them on the CPU by
  * running the `upto` positions the prefix record names (the PLE n-gram history replayed
  * with them), then leave the chain off. */
+static void q38cc_bank_back(Model *m);   /* below */
+/* the bytes the process can still commit (Windows: the commit limit's free part; else the free and
+ * reclaimable RAM); 0: unknown */
+static double q38cc_commit_free(void) {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (double)ms.ullAvailPageFile : 0.0;
+#else
+    double gb = compat_mem_available_gb();
+    return gb > 0.0 ? gb * 1e9 : 0.0;
+#endif
+}
 static void q38cc_recover(Model *m, int upto) {
     Q38CChain *ch = q38cc_of(m);
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, nl = c->layers;
     int ple = c->ple_layer >= 0 && c->ple_layer < nl;
+    q38cc_bank_back(m);   /* before the chain is marked failed: the mirror may still be readable */
     g_cuda_chain = 0;
     if (ch) { ch->failed = 1; ch->dn_where = Q38CC_HOST; ch->host_zero = 0; ch->snap_valid = 0; q38cc_dm_caps_back(ch, m); }
     for (int i = 0; i < nl; i++) {
@@ -796,6 +809,52 @@ static void q38cc_recover(Model *m, int upto) {
     free(m->ple_pref);
     m->ple_pref = pref; m->ple_pref_rows = pref_rows; m->snap_rows = snap; g_q38_rowwise = rowwise;
     free(ids); free(hyper); free(mixed); free(inject); free(block);
+}
+/* Q38_KV_HOSTBANK=0 (g_q38_kv_defer): the host is about to run a step (or the whole model from here on),
+ * so the attention layers' host bank comes back, filled with the rows the card's mirror holds (as floats:
+ * halves under Q38_KV=f16, which the host's copy would have held rounded anyway). A lost device leaves
+ * the rows unread and the watermark at 0: q38cc_recover rebuilds them from the token ids. */
+static void q38cc_bank_back(Model *m) {
+    if (!g_q38_kv_defer) return;
+    Q38CChain *ch = q38cc_of(m); Cfg *c = &m->c;
+    int D = c->head_dim, KVH = c->kv_heads, ID = c->idx_dim, read = 0, R = c->idx_ratio > 0 ? c->idx_ratio : 1;
+    {   /* the bank is the whole context's (~54 KiB a position on Qwen3.8): check against commitable
+         * memory first so a fallback that cannot hold it stops with an actionable message */
+        const double need = q38_kv_bank_pos_bytes(m) * (double)m->kv_cap, have = q38cc_commit_free();
+        if (have > 0 && need > have - 512.0 * 1048576.0) {
+            char msg[320];
+            snprintf(msg, sizeof msg, "the CPU's fallback needs the attention layers' K/V bank of %d positions (%.1f GB) and %.1f GB "
+                     "can be committed; a smaller --ctx or Q38_KV_HOSTBANK=1 would fit it",
+                     m->kv_cap, need / 1e9, have / 1e9);
+            q38cc_fatal(msg);
+        }
+    }
+    double gb = q38_kv_bank_alloc(m) / 1e9;
+    const int dev = ch && ch->ok && ch->cap == m->kv_cap && !cc_lost();
+    uint16_t *h = NULL;
+    for (int i = 0; i < c->layers; i++) {
+        if (!c->is_attn[i]) continue;
+        int n = dev && ch->kc[i] ? ch->kv_valid[i] : 0, ok = n > 0;
+        if (ok && ch->kvh && !h) ok = (h = (uint16_t *)malloc((size_t)m->kv_cap * D * sizeof(uint16_t))) != NULL;
+        for (int k = 0; k < KVH && ok; k++) {
+            size_t at = (size_t)k * m->kv_cap * D, cnt = (size_t)n * D;
+            float *dk = m->K[i] + at, *dv = m->V[i] + at;
+            /* offsets in floats (cc_write's): a head of halves starts at at / 2 (at even, as q38cc_kv_up) */
+            if (ch->kvh) ok = cc_read(ch->kc[i], at / 2, h, cnt * 2) && (kv16_unpack(dk, h, (int64_t)cnt), 1) &&
+                              cc_read(ch->vc[i], at / 2, h, cnt * 2) && (kv16_unpack(dv, h, (int64_t)cnt), 1);
+            else ok = cc_read(ch->kc[i], at, dk, cnt * 4) && cc_read(ch->vc[i], at, dv, cnt * 4);
+        }
+        ok = ok && cc_read(ch->ik[i], 0, m->IK[i], (size_t)n * ID * 4);
+        if (ch && ch->ok) {   /* what the host now holds is what the mirror may assume */
+            if (!ok) n = 0;
+            if (ch->kv_valid[i] > n) ch->kv_valid[i] = n;
+            if (ch->pk_valid[i] > n / R) ch->pk_valid[i] = n / R;
+        }
+        if (ok && n > read) read = n;
+    }
+    free(h);
+    fprintf(stderr, "[chain] qwen38: Q38_KV_HOSTBANK=0: the host runs a step, so the attention rows' host bank comes back "
+                    "(%.2f GB, %d positions read from the card's mirror)\n", gb, read);
 }
 static int q38cc_sync_one(Model *m, Q38CChain *ch) {
     if (!ch || !ch->ok || ch->dn_where != Q38CC_DEV) return 1;
@@ -880,6 +939,7 @@ static void q38cc_host_wrote(Model *m, int zero) {
 }
 static void q38cc_cpu_step(Model *m, int pos_base) {
     Q38CChain *ch = q38cc_of(m);
+    q38cc_bank_back(m);
     if (!ch || !ch->ok) return;
     if (!q38cc_sync_one(m, ch)) { q38cc_recover(m, m->kv_len); return; }
     ch->dn_where = Q38CC_HOST; ch->host_zero = 0; ch->snap_valid = 0;
@@ -937,6 +997,7 @@ static int q38cc_push_kv(Q38CChain *ch, Model *m, int i, int pos_base) {
     Cfg *c = &m->c; int D = c->head_dim, KVH = c->kv_heads, ID = c->idx_dim, R = c->idx_ratio, ok = 1;
     if (ch->pk_valid[i] > pos_base / R) ch->pk_valid[i] = pos_base / R;   /* blocks this step rewrites */
     if (ch->kv_valid[i] >= pos_base) return 1;
+    if (!m->K || !m->K[i] || !m->V[i] || !m->IK[i]) return 0;
     int t0 = ch->kv_valid[i], n = pos_base - t0;
     for (int h = 0; h < KVH && ok; h++) {
         size_t src = ((size_t)h * m->kv_cap + t0) * D, dst = ((size_t)h * ch->cap + t0) * D;
@@ -1189,7 +1250,7 @@ static int q38cc_moe_apply(Q38CChain *ch, Model *m, int n, CcBuf *routed) {
  * their frame is done */
 static void q38cc_kv_down(Q38CChain *ch, Model *m, int i, int n, int pb) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->head_dim, ID = c->idx_dim;
-    if (!q38cc_attn_at(c, i)) return;
+    if (!q38cc_attn_at(c, i) || !m->K || !m->K[i]) return;   /* no host bank (Q38_KV_HOSTBANK=0): the mirror holds the rows */
     const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * q38cc_kv_stride(ch, c);
     for (int s = 0; s < n; s++) {
         for (int h = 0; h < c->kv_heads; h++) {
@@ -3581,6 +3642,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         (nlogits > 2 && !cc_reserve(&ch->outd, (size_t)nlogits * V * 4, CC_DOWN)) ||
         (mixed_h && !cc_reserve(&ch->find, (size_t)rows * H * 4, CC_DOWN))) {
         fprintf(stderr, "[chain] qwen38: device memory for %d rows refused; the per-matrix path\n", rows);
+        q38cc_bank_back(m);         /* Q38_KV_HOSTBANK=0: the mirror's rows to the host first */
         q38cc_mirror_free(ch, c);   /* the chain stays off (failed): its mirrors would hold the card until the process ends */
         ch->failed = 1;
         return 0;

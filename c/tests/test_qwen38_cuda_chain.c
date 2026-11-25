@@ -18,6 +18,7 @@
 #ifdef _WIN32
 #undef unsetenv
 #define unsetenv(name) _putenv_s(name, "")
+#undef IN
 #endif
 
 #include "qwen36_fake_cuda.h"
@@ -39,6 +40,165 @@ static void t_fill(int t, uint8_t *w, int rows, int cols) {
 struct SrvCtx { uint8_t *pool; size_t st; int ne; };
 static const uint8_t *t_srv_where(void *ctx, int k) { const struct SrvCtx *c = ctx; return c->pool + (size_t)(k % c->ne) * c->st; }
 static int brake_frame(Q38CChain *b, unsigned routes, unsigned miss) { b->routes += routes; b->pool_reads += miss; return q38cc_braked(b); }
+
+/* ---- Q38_KV_HOSTBANK=0 serve helpers & tests (no host bank, mirror-only K/V, bank_back, prefix store, park) ---- */
+static char *hb_slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb"); char *b = NULL; long len = 0;
+    if (f && !fseek(f, 0, SEEK_END) && (len = ftell(f)) >= 0 && !fseek(f, 0, SEEK_SET) && (b = (char *)malloc((size_t)len + 1)))
+        len = (long)fread(b, 1, (size_t)len, f);
+    if (f) fclose(f);
+    if (b) b[len] = 0;
+    *n = b ? (size_t)len : 0;
+    return b;
+}
+static void hb_write_tok(const char *path) {
+    FILE *f = fopen(path, "wb");
+    fputs("{\"version\":\"1.0\",\"added_tokens\":[{\"id\":1,\"content\":\"<|im_start|>\",\"special\":true}],"
+          "\"model\":{\"type\":\"BPE\",\"merges\":[],\"vocab\":{\"<|im_start|>\":1", f);
+    for (int b = 0; b < 64; b++) {
+        if (b == 1) continue;
+        if (b > 32) fprintf(f, b == '"' ? ",\"\\\"\":%d" : ",\"%c\":%d", b, b);
+        else fprintf(f, ",\"%c%c\":%d", 0xC4, 0x80 + b, b);
+    }
+    fputs("}}}", f);
+    fclose(f);
+}
+static int hb_serve(const char *in, const char *out, const char *err) {
+    char *argv[] = { (char *)"qwen38", (char *)"4", (char *)"8" };
+    coli_ps_clear(&g_q38_ps); g_q38_ps_init = 0; g_q38_kv_defer = 0; g_cuda_chain = 0;
+    fflush(stdout); fflush(stderr);
+    int so = dup(1), se = dup(2), rc = -1;
+    if (freopen(in, "rb", stdin) && freopen(out, "wb", stdout) && freopen(err, "wb", stderr)) rc = qwen38_main_unused(3, argv);
+    fflush(stdout); fflush(stderr); dup2(so, 1); dup2(se, 2); close(so); close(se);
+    qt_shutdown();
+    coli_ps_clear(&g_q38_ps); g_q38_ps_init = 0; g_q38_kv_defer = 0;
+    return rc;
+}
+static void hb_submit(FILE *f, const char *id, const char *p, size_t n, int max_tok) {
+    fprintf(f, "SUBMIT %s 0 %zu %d 0 1\n", id, n, max_tok); fwrite(p, 1, n, f); fputc('\n', f);
+}
+static size_t hb_data(const char *t, size_t n, const char *id, char *o, size_t cap) {
+    size_t i = 0, w = 0, idn = strlen(id);
+    while (i < n) {
+        const char *nl = (const char *)memchr(t + i, '\n', n - i);
+        size_t len = nl ? (size_t)(nl - (t + i)) + 1 : n - i;
+        int body = 0;
+        if (!strncmp(t + i, "DATA ", 5) && !strncmp(t + i + 5, id, idn) && t[i + 5 + idn] == ' ' && sscanf(t + i + 6 + idn, "%d", &body) == 1) {
+            if (w + (size_t)body <= cap && i + len + (size_t)body <= n) { memcpy(o + w, t + i + len, (size_t)body); w += (size_t)body; }
+            len += (size_t)body + 1;
+        } else if (!strncmp(t + i, "DATA ", 5) && sscanf(t + i + 5, "%*s %d", &body) == 1) len += (size_t)body + 1;
+        i += len;
+    }
+    return w;
+}
+static void hb_logits(const char *e, int k, char *o, size_t cap) {
+    int r = -1; size_t w = 0; o[0] = 0;
+    for (const char *l = e; l && *l; l = strchr(l, '\n'), l = l ? l + 1 : NULL) {
+        if (!strncmp(l, "[PREFIX] reusing", 16) || !strncmp(l, "[PREFIX] no reuse", 17)) r++;
+        else if (r == k && !strncmp(l, "[LOGITS]", 8)) {
+            const char *end = strchr(l, '\n'); size_t len = end ? (size_t)(end - l) + 1 : strlen(l);
+            if (w + len < cap) { memcpy(o + w, l, len); w += len; o[w] = 0; }
+        }
+    }
+}
+static int hb_hits(const char *e, int *P, int n) {
+    int got = 0;
+    for (const char *s = e; (s = strstr(s, "[PREFIX] ")); s++) {
+        int a, b, c;
+        if (sscanf(s, "[PREFIX] %d of %d prompt tokens from the stor%n", &a, &b, &c) == 2 && got < n) P[got++] = a;
+    }
+    return got;
+}
+#define HB_OPEN "<|im_start|>"
+static size_t hb_cat(char *o, size_t w, const char *s, size_t n) { memcpy(o + w, s, n); return w + n; }
+static size_t hb_chat(char *o, const char *sys, const char *q, const char *ans, size_t na, const char *q2) {
+    size_t w = 0;
+    w = hb_cat(o, w, HB_OPEN, 12); w = hb_cat(o, w, sys, strlen(sys));
+    w = hb_cat(o, w, HB_OPEN, 12); w = hb_cat(o, w, q, strlen(q));
+    if (ans) {
+        w = hb_cat(o, w, HB_OPEN "=\n", 14); w = hb_cat(o, w, ans, na);
+        w = hb_cat(o, w, HB_OPEN, 12); w = hb_cat(o, w, q2, strlen(q2));
+    }
+    return hb_cat(o, w, HB_OPEN "=\n", 14);
+}
+static void t_hostbank_chain(void) {
+    printf(" Q38_KV_HOSTBANK=0 on the chain: mirror-only K/V, bank_back, prefix store, and park\n");
+    const char *SYS = "(12+34=46; 7*8=56; 9-3=6; 5*5=25;)", *OTH = "(40-8=32; 6*6=36; 2+9=11; 8/4=2;)";
+    const char *Q1 = " 1+1=2; 2+2=4; 3+3=", *Q2 = " 9*9=81; 8*8=64; 7*7=", *Q3 = " 5-1=4; 6-1=5; 7-1=";
+    static char p1[512], pb[512], po[512], p2[1024], a[64], got[4][64], lo[4][8192];
+    size_t n1 = hb_chat(p1, SYS, Q1, NULL, 0, NULL), nb = hb_chat(pb, SYS, Q2, NULL, 0, NULL), no = hb_chat(po, OTH, Q2, NULL, 0, NULL);
+    hb_write_tok("q38hb_tok.json");
+    setenv("SNAP", "./qwen38_tiny_fp8", 1);
+    setenv("SERVE", "1", 1); setenv("TOK", "q38hb_tok.json", 1); setenv("Q38_MAXT", "256", 1);
+    setenv("COLI_CUDA_CHAIN", "1", 1); setenv("COLI_CUDA_CHAIN_ROWS", "8", 1); setenv("COLI_LOOKUP", "0", 1);
+    setenv("COLI_PREFIX_LOG", "1", 1); setenv("COLI_LOGIT_DUMP", "1", 1); setenv("COLI_PREFIX_STORE", "0", 1);
+    FILE *f = fopen("q38hb_in.bin", "wb"); hb_submit(f, "a1", p1, n1, 6); fclose(f);
+    int rc = hb_serve("q38hb_in.bin", "q38hb_out.bin", "q38hb_err.txt");
+    size_t tn, en, na;
+    char *t = hb_slurp("q38hb_out.bin", &tn), *e;
+    na = t ? hb_data(t, tn, "a1", a, sizeof a) : 0; free(t);
+    size_t n2 = hb_chat(p2, SYS, Q1, a, na, Q3), gn[4] = {0, 0, 0, 0};
+    /* 0: host bank on, a2 alone; 1: no bank, a1 then a2; 2: no bank, a2 with mid-decode frame failure;
+     * 3: no bank, a1 parked for a short request s1 (pulls bank back), then a2 unparks */
+    for (int k = 0; k < 4; k++) {
+        if (k) setenv("Q38_KV_HOSTBANK", "0", 1); else unsetenv("Q38_KV_HOSTBANK");
+        if (k == 3) { setenv("COLI_PARK", "1", 1); setenv("COLI_PARK_MIN", "16", 1); }
+        else { unsetenv("COLI_PARK"); unsetenv("COLI_PARK_MIN"); }
+        f = fopen("q38hb_in.bin", "wb");
+        if (k == 1 || k == 3) hb_submit(f, "a1", p1, n1, 6);
+        if (k == 3) hb_submit(f, "s1", " 1+2=", 5, 2);
+        hb_submit(f, "a2", p2, n2, 6); fclose(f);
+        fake_chain_frames = 0; fake_chain_fail_at = k == 2 ? 30 : 0;
+        rc |= hb_serve("q38hb_in.bin", "q38hb_out.bin", "q38hb_err.txt");
+        fake_chain_fail_at = 0;
+        t = hb_slurp("q38hb_out.bin", &tn); e = hb_slurp("q38hb_err.txt", &en);
+        gn[k] = t ? hb_data(t, tn, "a2", got[k], sizeof got[k]) : 0;
+        if (e) hb_logits(e, k == 1 ? 1 : k == 3 ? 2 : 0, lo[k], sizeof lo[k]);
+        if (k == 1) tk(e && strstr(e, "Q38_KV_HOSTBANK=0: the attention layers' K/V rows on the card only") && !strstr(e, "host bank comes back"),
+                       "no bank: attention rows stay on the card only, nothing brings the bank back");
+        if (k == 2) tk(e && strstr(e, "host bank comes back") && fake_chain_frames >= 30,
+                       "a failed frame brings the bank back from the mirror");
+        if (k == 3) tk(e && strstr(e, "host bank comes back") && strstr(e, "parked for a") && strstr(e, "conversation is back"),
+                       "park with Q38_KV_HOSTBANK=0 pulls the bank back and unparks cleanly");
+        free(t); free(e);
+    }
+    tk(rc == 0 && na > 0 && gn[0] > 0, "the turns answer");
+    tk(gn[1] == gn[0] && !memcmp(got[1], got[0], gn[0]) && lo[0][0] && !strcmp(lo[1], lo[0]),
+       "no bank, a2 on a1's live rows: identical bytes and top-five logits");
+    tk(gn[2] == gn[0] && !memcmp(got[2], got[0], gn[0]),
+       "no bank, a frame failing mid-decode: identical bytes");
+    tk(gn[3] == gn[0] && !memcmp(got[3], got[0], gn[0]),
+       "no bank, park and unpark: identical bytes");
+    /* prefix store with Q38_KV_HOSTBANK=0: reads/writes card mirrors directly without bank_back */
+    unsetenv("COLI_PARK"); unsetenv("COLI_PARK_MIN");
+    setenv("COLI_PREFIX_STORE", "1", 1); setenv("COLI_PREFIX_STORE_BLOCK", "16", 1); setenv("COLI_PREFIX_STORE_MB", "1", 1);
+    static char b1[2][64], a2[2][64], plo[2][2][8192];
+    size_t nb1[2] = {0, 0}, na2[2] = {0, 0};
+    int P[2][8], nh[2] = {0, 0};
+    for (int k = 0; k < 2; k++) {
+        if (k) setenv("Q38_KV_HOSTBANK", "0", 1); else unsetenv("Q38_KV_HOSTBANK");
+        f = fopen("q38hb_in.bin", "wb");
+        hb_submit(f, "a1", p1, n1, 6); hb_submit(f, "b1", pb, nb, 6); hb_submit(f, "o1", po, no, 6); hb_submit(f, "a2", p2, n2, 6);
+        fclose(f);
+        int prc = hb_serve("q38hb_in.bin", "q38hb_out.bin", "q38hb_err.txt");
+        t = hb_slurp("q38hb_out.bin", &tn); e = hb_slurp("q38hb_err.txt", &en);
+        nb1[k] = t ? hb_data(t, tn, "b1", b1[k], sizeof b1[k]) : 0;
+        na2[k] = t ? hb_data(t, tn, "a2", a2[k], sizeof a2[k]) : 0;
+        if (e) { hb_logits(e, 1, plo[k][0], sizeof plo[k][0]); hb_logits(e, 3, plo[k][1], sizeof plo[k][1]); nh[k] = hb_hits(e, P[k], 8); }
+        if (k == 1) tk(prc == 0 && e && strstr(e, "the attention layers' K/V rows on the card only") && !strstr(e, "host bank comes back"),
+                       "no bank + prefix store: session ran on the card's mirrors alone");
+        free(t); free(e);
+    }
+    tk(nh[0] == 2 && nh[1] == 2 && P[1][0] == P[0][0] && P[1][1] == P[0][1],
+       "no bank + prefix store: b1 and a2 took the same checkpoints");
+    tk(nb1[1] == nb1[0] && na2[1] == na2[0] && nb1[0] > 0 && !memcmp(b1[1], b1[0], nb1[0]) && !memcmp(a2[1], a2[0], na2[0]) &&
+       !strcmp(plo[1][0], plo[0][0]) && !strcmp(plo[1][1], plo[0][1]),
+       "no bank + prefix store: identical bytes and top-five logits");
+    unsetenv("Q38_KV_HOSTBANK"); unsetenv("COLI_PREFIX_STORE"); unsetenv("COLI_PREFIX_STORE_BLOCK"); unsetenv("COLI_PREFIX_STORE_MB");
+    unsetenv("SERVE"); unsetenv("TOK"); unsetenv("Q38_MAXT"); unsetenv("COLI_CUDA_CHAIN_ROWS");
+    unsetenv("COLI_LOOKUP"); unsetenv("COLI_PREFIX_LOG"); unsetenv("COLI_LOGIT_DUMP");
+    remove("q38hb_tok.json"); remove("q38hb_in.bin"); remove("q38hb_out.bin"); remove("q38hb_err.txt");
+}
 
 int main(void) {
     setenv("SNAP", "./qwen38_tiny_fp8", 1);
@@ -456,6 +616,8 @@ int main(void) {
         G.on = on0; G.nl = nl0; G.wfmt = wf0; G_gtg = gtg0; G_gtd = gtd0;
         fake_chain_table.size = sz0;
     }
+
+    t_hostbank_chain();
 
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }
     printf("OK test_qwen38_cuda_chain: Qwen3.8's chain on the card gives the oracle's tokens\n");

@@ -5380,6 +5380,30 @@ enum { Q38_MTP_WHOLE_NORM='a', Q38_MTP_STREAM_NORM='b' };   /* the MTP head's wi
 static void q38_embed_row(Model *m,int id,int abs_pos,float *out);   /* below; the chain's MTP head embeds its tokens too */
 #include "qwen38_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
+/* Q38_KV_HOSTBANK=0 (serve with the CUDA chain, one conversation): the card's K/V mirror is the
+ * only copy of the attention layers' rows, and their host bank (54 KiB a position on Qwen3.8) is
+ * not allocated. A step the host must run brings it back (q38cc_bank_back). The MTP head's rows
+ * (index c.layers) stay on the host: the chain never writes them alone. */
+static int g_q38_kv_defer;
+/* the attention layers' K, V and index-key bytes a position (what g_q38_kv_defer leaves out) */
+static double q38_kv_bank_pos_bytes(const Model *m){
+    const Cfg *c=&m->c;double b=0;
+    for(int i=0;i<c->layers;i++)if(c->is_attn[i])b+=(2.0*c->kv_heads*c->head_dim+c->idx_dim)*sizeof(float);
+    return b;
+}
+/* the deferred rows allocated (uninitialised: the caller fills them); returns the bytes */
+static double q38_kv_bank_alloc(Model *m){
+    Cfg *c=&m->c;double b=0;
+    if(!m->K||m->kv_cap<1)return 0;
+    for(int i=0;i<c->layers;i++)if(c->is_attn[i]&&!m->K[i]){
+        m->K[i]=falloc((int64_t)c->kv_heads*m->kv_cap*c->head_dim);m->V[i]=falloc((int64_t)c->kv_heads*m->kv_cap*c->head_dim);
+        m->IK[i]=falloc((int64_t)m->kv_cap*c->idx_dim);
+        b+=(2.0*c->kv_heads*c->head_dim+c->idx_dim)*sizeof(float)*m->kv_cap;
+    }
+    g_q38_kv_defer=0;
+    return b;
+}
+
 #ifdef COLI_CUDA
 #include "cuda_chain.h"
 #include "dflash_cuda.h"        /* COLI_DFLASH: DFlash2's drafter on the CUDA chain's device */
@@ -5411,7 +5435,7 @@ static void ensure_kv(Model *m) {
     if(m->K){for(int i=0;i<rows;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);}free(m->K);free(m->V);free(m->IK);}
     /* +1: the MTP head's attention rows at index c.layers */
     m->K=(float**)calloc((size_t)c->layers+1,sizeof(float*));m->V=(float**)calloc((size_t)c->layers+1,sizeof(float*));m->IK=(float**)calloc((size_t)c->layers+1,sizeof(float*));
-    for(int i=0;i<rows;i++)if(i==c->layers||c->is_attn[i]){
+    for(int i=0;i<rows;i++)if(i==c->layers||(c->is_attn[i]&&!g_q38_kv_defer)){
         m->K[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->V[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->IK[i]=falloc((int64_t)m->max_t*c->idx_dim);
     }
     m->kv_cap=m->max_t;

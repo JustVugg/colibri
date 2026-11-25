@@ -2178,6 +2178,9 @@ static void q38_park(Model *m,int np,int max_tok){
     const int H=m->kvp.len,gen=max_tok<Q38_PARK_GEN?max_tok:Q38_PARK_GEN,least=mn&&atoi(mn)>0?atoi(mn):Q38_PARK_MIN;
     if((e&&*e=='0')||g_q38_park.on||!m->kvp.fed||m->kvp.tainted||H<least||m->kv_len!=H||
        g_pending_image.present||np+gen+Q38_SPEC_ROWS>=H)return;
+#ifdef COLI_CUDA
+    if(g_q38_kv_defer)q38cc_bank_back(m);   /* Q38_KV_HOSTBANK=0: parking copies host rows, so bring the bank back first */
+#endif
     const Cfg *c=&m->c;const int L=q38_layer_rows(m),n=np+gen+Q38_SPEC_ROWS;
     const size_t D=(size_t)c->head_dim,ID=(size_t)c->idx_dim;
     g_q38_park.nl=L;
@@ -2268,13 +2271,25 @@ static void q38_park_decide(Model *m,const int *ids,int np,int max_tok){
 #include "prefix_store.h"
 static ColiPrefixStore g_q38_ps;
 static int g_q38_ps_init;
+/* Q38_KV_HOSTBANK=0: no host bank holds the attention rows, the CUDA chain's mirrors do. The
+ * store then reads them off the card for a save and writes them back on a take (q38_ps_parts_at),
+ * so a sub-agent's call between two turns of a conversation no longer costs that conversation its
+ * prefix. Only with the chain up, its mirrors as long as the slot and the device not lost. */
+static int q38_ps_dev_on(Model *m){
+#ifdef COLI_CUDA
+    Q38CChain *ch=q38cc_of(m);
+    return g_q38_kv_defer&&ch&&ch->ok&&ch->cap==m->kv_cap&&!cc_lost();
+#else
+    (void)m;return 0;
+#endif
+}
 static int q38_ps_on(const Model *m){
     if(!g_q38_ps_init){
         const char *e=getenv("COLI_KV_PREFIX");
         g_q38_ps_init=1;
         coli_ps_init_env(&g_q38_ps,e&&*e=='0',compat_mem_available_gb()*1024.0);
     }
-    return g_q38_ps.on&&!(m->vis_map&&m->vis_rows_n>0);
+    return g_q38_ps.on&&(!g_q38_kv_defer||q38_ps_dev_on((Model *)m))&&!(m->vis_map&&m->vis_rows_n>0);
 }
 /* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
 static size_t q38_ps_plan(const Model *m){ q38_ps_on(m); return g_q38_ps.on?g_q38_ps.budget:0; }
@@ -2290,6 +2305,86 @@ static int q38_ps_parts(const Model *m,ColiPsPart *parts){
     }
     return n;
 }
+/* The card-only attention layers' rows (Q38_KV_HOSTBANK=0) as host buffers of P positions, head after
+ * head: K, V, then the index keys, layer after layer as in mem. */
+typedef struct { float *mem; int *layer; int n, P; } Q38PsDev;
+static void q38_ps_dev_free(Q38PsDev *d){ free(d->mem); free(d->layer); memset(d,0,sizeof *d); }
+/* q38_ps_parts with the card-only layers in their places (the same row sizes and heads, so the same
+ * layout as a host bank's), their buffers P positions long; P 0: no buffers, the layout only. The
+ * part count; 0 when the buffers cannot be had. Without g_q38_kv_defer: q38_ps_parts. */
+static int q38_ps_parts_at(Model *m,ColiPsPart *parts,int P,Q38PsDev *d){
+    memset(d,0,sizeof *d);
+    if(!g_q38_kv_defer)return q38_ps_parts(m,parts);
+    const Cfg *c=&m->c;const size_t D=(size_t)c->head_dim,ID=(size_t)c->idx_dim,KVH=(size_t)c->kv_heads;
+    const size_t per=2*KVH*(size_t)P*D+(size_t)P*ID;   /* floats a card-only layer takes */
+    int nd=0,n=0;
+    for(int i=0;i<c->layers;i++)nd+=c->is_attn[i]&&!m->K[i];
+    if(nd&&!(d->layer=(int*)malloc((size_t)nd*sizeof(int))))return 0;
+    if(nd&&P>0&&!(d->mem=(float*)malloc((size_t)nd*per*sizeof(float)))){q38_ps_dev_free(d);return 0;}
+    d->P=P;
+    for(int i=0;i<q38_layer_rows(m);i++){
+        if(m->K[i]&&m->V[i]&&m->IK[i]){
+            parts[n++]=(ColiPsPart){m->K[i],D*4,m->kv_cap,c->kv_heads,(size_t)m->kv_cap*D*4,1};
+            parts[n++]=(ColiPsPart){m->V[i],D*4,m->kv_cap,c->kv_heads,(size_t)m->kv_cap*D*4,1};
+            parts[n++]=(ColiPsPart){m->IK[i],ID*4,m->kv_cap,1,0,1};
+        }else if(i<c->layers&&c->is_attn[i]){
+            float *k=d->mem?d->mem+(size_t)d->n*per:NULL,*v=k?k+KVH*P*D:NULL,*ik=v?v+KVH*P*D:NULL;
+            d->layer[d->n++]=i;
+            parts[n++]=(ColiPsPart){k,D*4,P,c->kv_heads,(size_t)P*D*4,1};
+            parts[n++]=(ColiPsPart){v,D*4,P,c->kv_heads,(size_t)P*D*4,1};
+            parts[n++]=(ColiPsPart){ik,ID*4,P,1,0,1};
+        }
+    }
+    return n;
+}
+#ifdef COLI_CUDA
+/* positions [0, P) of the card's mirrors into d's buffers: 0 when the mirrors hold fewer, or a read fails */
+static int q38_ps_dev_read(Model *m,Q38PsDev *d){
+    Q38CChain *ch=q38cc_of(m);const Cfg *c=&m->c;
+    const size_t D=(size_t)c->head_dim,ID=(size_t)c->idx_dim,KVH=(size_t)c->kv_heads,P=(size_t)d->P,cnt=P*D;
+    uint16_t *h=NULL;
+    int ok=d->n==0||(d->mem&&q38_ps_dev_on(m));
+    if(ok&&d->n&&ch->kvh)ok=(h=(uint16_t*)malloc(cnt*sizeof(uint16_t)))!=NULL;
+    for(int j=0;j<d->n&&ok;j++){
+        const int i=d->layer[j];
+        float *K=d->mem+(size_t)j*(2*KVH*cnt+P*ID),*V=K+KVH*cnt,*IK=V+KVH*cnt;
+        ok=ch->kc[i]&&ch->kv_valid[i]>=(int)P;
+        for(size_t k=0;k<KVH&&ok;k++){
+            const size_t at=k*(size_t)ch->cap*D;   /* in floats (cc_read's); a head of halves starts at at / 2 */
+            if(ch->kvh)ok=cc_read(ch->kc[i],at/2,h,cnt*2)&&(kv16_unpack(K+k*cnt,h,(int64_t)cnt),1)&&
+                         cc_read(ch->vc[i],at/2,h,cnt*2)&&(kv16_unpack(V+k*cnt,h,(int64_t)cnt),1);
+            else ok=cc_read(ch->kc[i],at,K+k*cnt,cnt*4)&&cc_read(ch->vc[i],at,V+k*cnt,cnt*4);
+        }
+        ok=ok&&cc_read(ch->ik[i],0,IK,P*ID*4);
+    }
+    free(h);
+    return ok;
+}
+/* d's positions [from[layer], P) up to the card's mirrors, their watermarks to P (the pooled keys made
+ * again from the first block written); 0 when a write fails */
+static int q38_ps_dev_write(Model *m,Q38PsDev *d){
+    Q38CChain *ch=q38cc_of(m);const Cfg *c=&m->c;
+    const size_t D=(size_t)c->head_dim,ID=(size_t)c->idx_dim,KVH=(size_t)c->kv_heads,P=(size_t)d->P,cnt=P*D;
+    const int R=c->idx_ratio>0?c->idx_ratio:1;
+    int ok=d->n==0||(d->mem&&q38_ps_dev_on(m));
+    for(int j=0;j<d->n&&ok;j++){
+        const int i=d->layer[j];
+        const size_t t0=ch->kv_valid[i]<0?0:(size_t)ch->kv_valid[i];
+        if(!ch->kc[i]){ok=0;break;}
+        if(t0>=P)continue;
+        const float *K=d->mem+(size_t)j*(2*KVH*cnt+P*ID),*V=K+KVH*cnt,*IK=V+KVH*cnt;
+        for(size_t k=0;k<KVH&&ok;k++){
+            const size_t dst=(k*(size_t)ch->cap+t0)*D,src=k*cnt+t0*D;
+            ok=q38cc_kv_up(ch,ch->kc[i],dst,K+src,(P-t0)*D)&&q38cc_kv_up(ch,ch->vc[i],dst,V+src,(P-t0)*D);
+        }
+        ok=ok&&cc_write(ch->ik[i],t0*ID,IK+t0*ID,(P-t0)*ID*4);
+        if(!ok)break;
+        ch->kv_valid[i]=(int)P;
+        if(ch->pk_valid[i]>(int)t0/R)ch->pk_valid[i]=(int)t0/R;
+    }
+    return ok;
+}
+#endif
 /* ids[0, P) as the Model holds them now, with its state at P (a pin's: the devices' newest first) */
 static int q38_ps_save(Model *m,const int *ids,int P){
     if(!q38_ps_on(m)||P<g_q38_ps.B)return 0;
@@ -2306,17 +2401,32 @@ static int q38_ps_save(Model *m,const int *ids,int P){
     }
     ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
     if(!parts)return 0;
-    const int np=q38_ps_parts(m,parts);
+    Q38PsDev dev;
+    int np=q38_ps_parts_at(m,parts,0,&dev);   /* the layout only: the cost before any copy off the card */
+    q38_ps_dev_free(&dev);
     Q38PinState *st=NULL;
     size_t rec=0,conv=0,ple=0;
     int kept=0;
     double avail=-1;
-    if(q38_prefix_geometry(m,&rec,&conv,&ple)&&q38_pin_state_copy(m,&st,1)){
+    if(np&&q38_prefix_geometry(m,&rec,&conv,&ple)){
         size_t sb=sizeof *st+ple*sizeof(float);
         for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i])sb+=(rec+conv)*sizeof(float);
+        const size_t cost=coli_ps_cost(parts,np,P,sb);
         avail=compat_mem_available_gb()*1024.0;
-        kept=coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,avail);
-    }else q38_pin_state_free(st);
+        if(cost<=g_q38_ps.budget&&g_q38_kv_defer){
+            const double need_mb=(double)cost/1048576.0;
+            if(avail>=0&&avail-need_mb<COLI_PS_RAM_FLOOR_MB)np=0;
+            else if(!(np=q38_ps_parts_at(m,parts,P,&dev)))np=0;
+#ifdef COLI_CUDA
+            else if(!q38_ps_dev_read(m,&dev))np=0;
+#endif
+            if(!np&&log)fprintf(stderr,"[PREFIX] store: checkpoint at %d not kept: the card's rows could not be read "
+                                       "(%.0f MiB needed, %.0f MiB of RAM free)\n",P,need_mb,avail);
+        }
+        if(np&&cost<=g_q38_ps.budget&&q38_pin_state_copy(m,&st,1))
+            kept=coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,avail);
+        else q38_pin_state_free(st);
+    }
     if(log){
         char held[32];   /* bytes below a MiB: a small store does not read as an empty one */
         if(g_q38_ps.bytes<1048576)snprintf(held,sizeof held,"%zu bytes",g_q38_ps.bytes);
@@ -2325,23 +2435,27 @@ static int q38_ps_save(Model *m,const int *ids,int P){
                 P,kept?"kept":"not kept",held,coli_ps_live_ckpts(&g_q38_ps),avail,COLI_PS_RAM_FLOOR_MB);
         fflush(stderr);
     }
+    q38_ps_dev_free(&dev);
     free(parts);
     return kept;
 }
 /* The deepest prefix the store holds of ids[0, np), when it reaches past `floor` positions (the slot
  * holds `held`): its rows and state put back, the record and the chains told. The positions now
- * held; 0 when nothing. */
+ * held; 0 when nothing; -1 when the card write failed and the slot was cleared. */
 static int q38_ps_take_ram(Model *m,const int *ids,int np,int held,int floor){
     if(!q38_ps_on(m)||np<2)return 0;
     ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
     if(!parts)return 0;
-    const int nparts=q38_ps_parts(m,parts);
-    if(!coli_ps_layout(&g_q38_ps,parts,nparts)){free(parts);return 0;}
+    Q38PsDev dev;
+    int nparts=q38_ps_parts_at(m,parts,0,&dev);   /* the layout only */
+    q38_ps_dev_free(&dev);
+    if(!nparts||!coli_ps_layout(&g_q38_ps,parts,nparts)){free(parts);return 0;}
     ColiPsHit h;
     const int P=coli_ps_lookup(&g_q38_ps,ids,np,np-1,1,&h);
     Q38PinState *st=P>0&&h.ck>=0?(Q38PinState*)g_q38_ps.ck[h.ck].state:NULL;
-    if(P<=floor||!st||st->n_layers!=m->c.layers||(m->mtp&&!st->mtp_pend)||P>m->kv_cap||
-       !coli_ps_parts_hold(parts,nparts,P)){coli_ps_hit_free(&h);free(parts);return 0;}
+    if(P>floor&&st&&g_q38_kv_defer)nparts=q38_ps_parts_at(m,parts,P,&dev);   /* the card-only layers' buffers, P long */
+    if(P<=floor||!st||st->n_layers!=m->c.layers||(m->mtp&&!st->mtp_pend)||P>m->kv_cap||!nparts||
+       !coli_ps_parts_hold(parts,nparts,P)){q38_ps_dev_free(&dev);coli_ps_hit_free(&h);free(parts);return 0;}
     q38_prefix_settle(m);   /* the chain's prompt-end snapshot is the host's before the state moves */
     /* the whole blocks the slot holds already (its record shares them with the prompt; the MTP
      * head's rows stand below its own length) stay in place, on the host and in the mirrors. The
@@ -2365,7 +2479,22 @@ static int q38_ps_take_ram(Model *m,const int *ids,int np,int held,int floor){
 #ifdef COLI_CUDA
     q38cc_rollback(m,-1,keep);
     q38cc_mtp_host(m,keep);
+    /* card-only rows: nothing on the host goes up again, so they go up from here. A mirror short of
+     * `keep` would take rows the buffers do not hold (below keep they were not loaded) */
+    if(g_q38_kv_defer){
+        int ok=1;
+        for(int j=0;j<dev.n&&ok;j++)ok=q38cc_of(m)->kv_valid[dev.layer[j]]>=keep;
+        if(!ok||!q38_ps_dev_write(m,&dev)){
+            fprintf(stderr,"[PREFIX] store: the card's rows could not be written back: the prompt is read whole\n");
+            m->kv_len=0;
+            kv_prefix_clear(&m->kvp);
+            q38cc_rollback(m,-1,0);
+            q38_ps_dev_free(&dev);coli_ps_hit_free(&h);
+            return -1;
+        }
+    }
 #endif
+    q38_ps_dev_free(&dev);
     if(getenv("COLI_PREFIX_LOG")){
         fprintf(stderr,"[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint, %d rows in place; the slot held %d)\n",
                 P,np,h.depth,g_q38_ps.B,keep,held);
@@ -2450,7 +2579,7 @@ static uint64_t q38_psd_dir_stamp(uint64_t h,const char *dir,const char *sfx){
 /* Q38_PREFIX_DISK=1 with the store on: the directory and the identity, worked out once a serve. */
 static int q38_psd_on(Model *m){
     const char *e=getenv("Q38_PREFIX_DISK");
-    if(!e||atoi(e)<1||!q38_ps_on(m))return 0;
+    if(!e||atoi(e)<1||!q38_ps_on(m)||g_q38_kv_defer)return 0;   /* Q38_KV_HOSTBANK=0 keeps checkpoints in RAM only (file restore writes host rows) */
     if(!g_q38_psd_dir[0]){
         const char *dir=getenv("Q38_PREFIX_DIR"),*snap=getenv("SNAP");
         if(dir&&*dir)snprintf(g_q38_psd_dir,sizeof g_q38_psd_dir,"%s",dir);
@@ -3288,6 +3417,7 @@ static size_t q38_state_later(Model *m){
     for(int i=0;i<c->layers;i++)
         if(c->is_attn[i])kv+=t*((size_t)2*c->kv_heads*c->head_dim+(size_t)c->idx_dim)*sizeof(float);
         else dn+=((size_t)c->dn_vheads*c->dn_kdim*c->dn_vdim+(size_t)c->dn_conv_dim*(c->dn_convk-1))*sizeof(float);
+    if(g_q38_kv_defer)kv=0;   /* Q38_KV_HOSTBANK=0: attention rows live on the card only */
     int n=g_q38_mux_slots>1?g_q38_mux_slots:1;
     size_t mtp=q38_layer_rows(m)>c->layers&&n==1?t*((size_t)2*c->kv_heads*c->head_dim+(size_t)c->idx_dim)*sizeof(float):0;
     return kv*(size_t)n+dn*(size_t)(n-1)+mtp;
@@ -3760,6 +3890,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[qwen38] KV_SLOTS=%d: the MTP head stays unloaded and nothing drafts "
                         "(speculation follows one conversation)\n", g_q38_mux_slots);
     else q38_mtp_attach(&m, cap);       /* Q38_MTP=1: the checkpoint's MTP head drafts (qwen38_core.h) */
+#ifdef COLI_CUDA
+    {   /* Q38_KV_HOSTBANK=0: keep the attention layers' K/V rows on the card only (q38_kv_bank_pos_bytes) */
+        const char *hb = getenv("Q38_KV_HOSTBANK");
+        g_q38_kv_defer = 0;   /* tests start the engine again in one process */
+        if (hb && *hb == '0') {
+            if (serve_mode && g_q38_mux_slots == 1 && q38cc_env_on()) {
+                g_q38_kv_defer = 1;
+                fprintf(stderr, "[qwen38] Q38_KV_HOSTBANK=0: the attention layers' K/V rows on the card only, no host bank "
+                                "(%.0f KiB a position less in RAM; the prefix store reads them off the card)\n",
+                                q38_kv_bank_pos_bytes(&m) / 1024.0);
+            } else
+                fprintf(stderr, "[qwen38] Q38_KV_HOSTBANK=0 needs serve, KV_SLOTS=1 and COLI_CUDA_CHAIN=1: the host bank stays\n");
+        }
+    }
+#endif
     q38_act_init(&m);                   /* Q38_ACT_STATS: the experts' input statistics, for a calibrated quantizer */
     q38_cov_init(&m);                   /* Q38_ACT_COV: their input second moments, for the error-compensating one */
     q38_dump_init(&m);                  /* Q38_ACT_DUMP: their inputs and routes, row by row */
@@ -3790,6 +3935,10 @@ int main(int argc, char **argv) {
      * now that the tier placed the trunk and the CPU holds its int8 rows (the chain's own
      * copies of the rest come from the same bytes) */
     if (q38cc_env_on() && q38cc_setup(&m, g_q38_mux_slots)) { g_cuda_chain=1; atexit(cc_shutdown); }
+    if (g_q38_kv_defer && !g_cuda_chain) {   /* the chain did not come up: the host runs attention, from its bank */
+        fprintf(stderr, "[qwen38] Q38_KV_HOSTBANK=0: no CUDA chain, so the host bank stays\n");
+        g_q38_kv_defer = 0;
+    }
     q38_df_attach(&m);   /* COLI_DFLASH=<dir>: DFlash2's drafter, in the MTP head's place */
     /* The MTP head stays on the CPU beside the CUDA chain, and its drafts cost more than they
      * save there (an RTX PRO 4000, Qwen3.8-Flash-Next IQ2_XS with the host pool: plain decode

@@ -832,6 +832,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q38_HEAD_PIN_MARKS", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_ILV16", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_KV", CE_STR, CE_QWEN38, 0, NULL},
+    {"Q38_KV_HOSTBANK",                  CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
     {"Q38_MAXT",                         CE_INT   , CE_QWEN38                                       , 0             , NULL},
     {"Q38_MOE_GROUPED", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_MTP", CE_BOOL, CE_QWEN38, 0, NULL},
