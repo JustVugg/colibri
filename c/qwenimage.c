@@ -5,7 +5,7 @@
  *
  *   text_encoder  Qwen3-VL's language model (36 layers, 8B). Only a prefill: the
  *                 last layer's hidden states, before the final norm, are the
- *                 prompt's embedding. lm_head and the vision tower are not read.
+ *                 prompt's embedding. Text-to-image skips the vision tower.
  *   transformer   the DiT: 32 single-stream blocks over [prompt ; image tokens].
  *                 Prompt tokens are modulated as if t = 0 and attend causally, so
  *                 their keys and values do not depend on the step: they are
@@ -57,6 +57,7 @@
 #if defined(__has_include)
 #if __has_include("qwenimage_vae.h")
 #include "qwenimage_vae.h"
+#include "qwenimage_encoder.h"
 #define QI_HAVE_VAE 1
 #endif
 #endif
@@ -67,10 +68,7 @@
 static int g_vk_ready, g_vk_tried;
 #endif
 
-static double now_s(void){
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
+static double now_s(void) { return compat_now_s(); }
 static void *xmalloc(size_t n){
     void *p = malloc(n ? n : 1);
     if (!p) { fprintf(stderr, "[qwenimage] out of memory (%zu bytes)\n", n); exit(1); }
@@ -461,6 +459,7 @@ static void attention(float *out, int ldo, const float *Q, int ldq, int Tq,
 typedef struct { Lin q, k, v, o, gate, up, down; float *ln1, *ln2, *qn, *kn; } TeLayer;
 typedef struct {
     int hidden, layers, heads, kv, hd, inter, vocab;
+    int mrope[3];
     float eps, theta;
     shards S; int open;
     st_tensor *embed;
@@ -483,9 +482,19 @@ static void te_config(Te *te, const char *model){
     te->vocab = (int)jnum(c, "vocab_size", 0);
     te->eps = (float)jnum(c, "rms_norm_eps", 1e-6);
     te->theta = (float)jnum(c, "rope_theta", 0);
-    if (te->theta == 0) {
-        jval *rp = json_get(c, "rope_parameters");
-        te->theta = (float)jnum(rp, "rope_theta", 5000000.0);
+    jval *rp = json_get(c, "rope_parameters");
+    if (te->theta == 0) te->theta = (float)jnum(rp, "rope_theta", 5000000.0);
+    jval *sections = json_get(rp, "mrope_section");
+    if (!sections) sections = json_get(json_get(c, "rope_scaling"), "mrope_section");
+    if (sections && sections->t == J_ARR && sections->len == 3) {
+        int sizes[3], i = 0;
+        for (; i < 3; i++) {
+            jval *section = sections->kids[i];
+            if (section->t != J_NUM || !(section->num >= 0 && section->num <= 512) ||
+                section->num != floor(section->num)) break;
+            sizes[i] = (int)section->num;
+        }
+        if (i == 3) memcpy(te->mrope, sizes, sizeof sizes);
     }
     json_free(root); free(arena);
     /* Model files come from mirrors nobody vouches for: every dimension that
@@ -580,16 +589,18 @@ static void te_tokenizer(Te *te, const char *model){
 
 /* The pipeline's template, tokenized as one string (not through
  * apply_chat_template: the checkpoint was trained on this one). */
+#define QI_MAX_PROMPT_TOKENS 1024
+
 static const char *QI_SYS = "Comprehend and analyze the provided prompt.";
 
-static int *te_encode_prompt(Te *te, const char *prompt, int *n_out, int *drop_out){
+static int *te_encode_prompt_impl(Te *te, const char *prompt, int image, int *n_out, int *drop_out){
     char *norm = NULL; size_t norm_len = 0;
     const char *p = prompt && *prompt ? prompt : " ";   /* the pipeline's rule: no empty prompt */
     if (q38_nfc_normalize(p, strlen(p), &norm, &norm_len) != 0) { norm = strdup(p); norm_len = strlen(p); }
     size_t cap = norm_len + 512;
     char *text = xmalloc(cap);
-    snprintf(text, cap, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%.*s<|im_end|>\n<|im_start|>assistant\n",
-             QI_SYS, (int)norm_len, norm);
+    snprintf(text, cap, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s%.*s<|im_end|>\n<|im_start|>assistant\n",
+             QI_SYS, image ? "<image1><|vision_start|><|image_pad|><|vision_end|>" : "", (int)norm_len, norm);
     int max = (int)strlen(text) + 16;
     int *ids = xmalloc(sizeof(int) * max);
     int n = tok_encode(&te->tok, text, (int)strlen(text), ids, max);
@@ -602,9 +613,18 @@ static int *te_encode_prompt(Te *te, const char *prompt, int *n_out, int *drop_o
     return ids;
 }
 
+static int *te_encode_prompt(Te *te, const char *prompt, int *n_out, int *drop_out){
+    return te_encode_prompt_impl(te, prompt, 0, n_out, drop_out);
+}
+
+typedef struct {
+    int start, count;
+    const float *merged, *deepstack[3], *cosines, *sines;
+} TeVisual;
+
 /* rotate-half RoPE over the full head (text only: Qwen3-VL's M-RoPE with three
  * equal position components is the plain 1D rotary). */
-static void te_rope(float *x, int T, int nh, int hd, int ld, float theta){
+static void te_rope(float *x, int T, int nh, int hd, int ld, float theta, const TeVisual *visual){
     int half = hd / 2;
     float *inv = fmalloc(half);
     for (int i = 0; i < half; i++) inv[i] = 1.f / powf(theta, (float)(2 * i) / (float)hd);
@@ -613,7 +633,10 @@ static void te_rope(float *x, int T, int nh, int hd, int ld, float theta){
         for (int h = 0; h < nh; h++) {
             float *r = x + (int64_t)t * ld + (int64_t)h * hd;
             for (int i = 0; i < half; i++) {
-                float a = (float)t * inv[i], c = cosf(a), s = sinf(a);
+                float a = (float)t * inv[i];
+                size_t lane = (size_t)t * half + i;
+                float c = visual ? visual->cosines[lane] : cosf(a);
+                float s = visual ? visual->sines[lane] : sinf(a);
                 float x0 = r[i], x1 = r[i + half];
                 r[i] = x0 * c - x1 * s;
                 r[i + half] = x1 * c + x0 * s;
@@ -623,7 +646,7 @@ static void te_rope(float *x, int T, int nh, int hd, int ld, float theta){
 }
 
 /* ids[T] -> hidden[T][hidden]: the last layer's output before the final norm. */
-static float *te_forward(Te *te, const int *ids, int T){
+static float *te_forward_impl(Te *te, const int *ids, int T, const TeVisual *visual){
     int H = te->hidden, qd = te->heads * te->hd, kd = te->kv * te->hd, I = te->inter;
     float *x = fmalloc((size_t)T * H), *h = fmalloc((size_t)T * H);
     float *q = fmalloc((size_t)T * qd), *k = fmalloc((size_t)T * kd), *v = fmalloc((size_t)T * kd);
@@ -632,6 +655,11 @@ static float *te_forward(Te *te, const int *ids, int T){
     const int64_t rb = gq_row_bytes(et, H);
     uint8_t *row = xmalloc((size_t)rb);
     for (int t = 0; t < T; t++) {
+        if (visual && t >= visual->start && t - visual->start < visual->count) {
+            memcpy(x + (size_t)t * H, visual->merged + (size_t)(t - visual->start) * H,
+                   (size_t)H * sizeof(float));
+            continue;
+        }
         if (ids[t] < 0 || ids[t] >= te->vocab) { fprintf(stderr, "[qwenimage] token id %d out of range\n", ids[t]); exit(1); }
         st_pread_full(te->embed->fd, row, rb, te->embed->off + (int64_t)ids[t] * rb, "embed row");
         gq_dequant_row(et, row, x + (int64_t)t * H, H);
@@ -643,8 +671,8 @@ static float *te_forward(Te *te, const int *ids, int T){
         linear(q, h, T, &L->q); linear(k, h, T, &L->k); linear(v, h, T, &L->v);
         rmsnorm_rows(q, q, L->qn, T * te->heads, te->hd, te->eps, 0);
         rmsnorm_rows(k, k, L->kn, T * te->kv, te->hd, te->eps, 0);
-        te_rope(q, T, te->heads, te->hd, qd, te->theta);
-        te_rope(k, T, te->kv, te->hd, kd, te->theta);
+        te_rope(q, T, te->heads, te->hd, qd, te->theta, visual);
+        te_rope(k, T, te->kv, te->hd, kd, te->theta, visual);
         attention(a, qd, q, qd, T, k, v, kd, T, te->heads, te->kv, te->hd, 0);
         linear(h, a, T, &L->o);
         for (int64_t i = 0; i < (int64_t)T * H; i++) x[i] += h[i];
@@ -654,10 +682,21 @@ static float *te_forward(Te *te, const int *ids, int T){
         for (int64_t i = 0; i < (int64_t)T * I; i++) g[i] = silu(g[i]) * u[i];
         linear(h, g, T, &L->down);
         for (int64_t i = 0; i < (int64_t)T * H; i++) x[i] += h[i];
+        if (visual && l < 3) {
+            float *image = x + (size_t)visual->start * H;
+            for (size_t i = 0; i < (size_t)visual->count * H; i++)
+                image[i] += visual->deepstack[l][i];
+        }
     }
     free(h); free(q); free(k); free(v); free(a); free(g); free(u);
     return x;
 }
+
+static float *te_forward(Te *te, const int *ids, int T){
+    return te_forward_impl(te, ids, T, NULL);
+}
+
+#include "qwenimage_vision.h"
 
 /* ---- DiT ------------------------------------------------------------------- */
 
@@ -828,9 +867,12 @@ static void dit_rope_apply(float *x, int T, int heads, int hd, const float *cs, 
         }
 }
 
-/* The prompt side of the DiT, computed once per prompt: per block, the keys and
- * values of the text tokens (after norm and RoPE). */
-typedef struct { int L; float **K, **V; unsigned gen; } Prefix;
+/* The step-independent text and reference-image keys and values. */
+typedef struct { int L, target_position; float **K, **V; unsigned gen; } Prefix;
+typedef struct {
+    const float *latent;              /* [height][width][in_ch], normalized */
+    int slot, slots, height, width;   /* slot range in the VLM token sequence */
+} DitReference;
 static unsigned g_qi_gen;   /* every prefix and step layout a number of its own (the device chain's uploads) */
 
 static void prefix_free(Prefix *p, int layers){
@@ -838,14 +880,14 @@ static void prefix_free(Prefix *p, int layers){
     free(p->K); free(p->V); memset(p, 0, sizeof *p);
 }
 
-/* One block over T tokens. q/k/v are written into kbuf/vbuf at row koff (the
- * caller lays the prefix before the image tokens); attention runs over the
- * first ktotal rows. causal: -1 full, >=0 as in attention(). */
+/* One block over T tokens. Q/K/V are projected once. A reference block in the
+ * prefix is bidirectional internally, with causal text on either side. */
 typedef struct { float *h, *q, *a, *g, *u; } DitScratch;
 
 static void dit_block(Dit *d, DitBlock *B, float *x, int T, const float *mod,
                       float *kbuf, float *vbuf, int koff, int ktotal, int causal,
-                      const float *cs, const float *sn, DitScratch *w, int need_out){
+                      const float *cs, const float *sn, DitScratch *w, int need_out,
+                      int image_start, int image_end){
     int D = d->dim;
     const float *scale1 = mod, *gate1 = mod + D, *scale2 = mod + 2 * D, *gate2 = mod + 3 * D;
     layernorm_mod(w->h, x, scale1, T, D, d->eps);
@@ -856,7 +898,18 @@ static void dit_block(Dit *d, DitBlock *B, float *x, int T, const float *mod,
     dit_rope_apply(w->q, T, d->heads, d->hd, cs, sn);
     dit_rope_apply(k, T, d->heads, d->hd, cs, sn);
     if (!need_out) return;
-    attention(w->a, D, w->q, D, T, kbuf, vbuf, D, ktotal, d->heads, d->heads, d->hd, causal);
+    if (image_start < image_end) {
+        if (image_start)
+            attention(w->a, D, w->q, D, image_start, kbuf, vbuf, D, image_start, d->heads, d->heads, d->hd, 0);
+        int64_t i = (int64_t)image_start * D, end = (int64_t)image_end * D;
+        attention(w->a + i, D, w->q + i, D, image_end - image_start,
+                  kbuf, vbuf, D, image_end, d->heads, d->heads, d->hd, -1);
+        if (image_end < T)
+            attention(w->a + end, D, w->q + end, D, T - image_end,
+                      kbuf, vbuf, D, T, d->heads, d->heads, d->hd, image_end);
+    } else {
+        attention(w->a, D, w->q, D, T, kbuf, vbuf, D, ktotal, d->heads, d->heads, d->hd, causal);
+    }
     linear(w->h, w->a, T, &B->o);
     #pragma omp parallel for schedule(static)
     for (int t = 0; t < T; t++)
@@ -877,8 +930,19 @@ static void scratch_alloc(DitScratch *w, const Dit *d, int T){
 }
 static void scratch_free(DitScratch *w){ free(w->h); free(w->q); free(w->a); free(w->g); free(w->u); }
 
-/* emb[L][ctx] (the text encoder's output after drop_idx) -> per-block K/V of the prefix. */
-static void dit_prefix(Dit *d, const float *emb, int L, Prefix *p, float *txt_out /* optional [L][dim] */){
+static void dit_image_positions(int *pos, int gh, int gw, int frame){
+    for (int y = 0; y < gh; y++)
+        for (int x = 0; x < gw; x++, pos += 3) {
+            pos[0] = frame;
+            pos[1] = y - (gh - gh / 2);
+            pos[2] = x - (gw - gw / 2);
+        }
+}
+
+/* Replace each VLM image slot with four unpatched VAE latents. The resulting
+ * reference block keeps its location relative to the surrounding text. */
+static void dit_prefix(Dit *d, const float *emb, int L, const DitReference *ref,
+                       Prefix *p, float *txt_out /* optional [L][dim] */){
     int D = d->dim;
     float *n = fmalloc((size_t)L * d->ctx), *x = fmalloc((size_t)L * D);
     rmsnorm_rows(n, emb, d->txt_norm, L, d->ctx, d->eps, 1);
@@ -889,19 +953,37 @@ static void dit_prefix(Dit *d, const float *emb, int L, Prefix *p, float *txt_ou
     linear(y, x, L, &d->txt2);
     free(x); x = y;
     if (txt_out) memcpy(txt_out, x, (size_t)L * D * 4);
+    int image_start = 0, image_end = 0, position_jump = 0;
+    if (ref) {
+        int N = ref->height * ref->width;
+        int trailing = L - ref->slot - ref->slots;
+        image_start = ref->slot; image_end = image_start + N;
+        position_jump = ref->height > ref->width ? ref->height : ref->width;
+        y = fmalloc((size_t)(image_end + trailing) * D);
+        memcpy(y, x, (size_t)image_start * D * sizeof(float));
+        linear(y + (int64_t)image_start * D, ref->latent, N, &d->img_in);
+        memcpy(y + (int64_t)image_end * D, x + (int64_t)(ref->slot + ref->slots) * D,
+               (size_t)trailing * D * sizeof(float));
+        free(x); x = y;
+        L = image_end + trailing;
+    }
     float *mod = fmalloc(4 * (size_t)D), *outs = fmalloc(D);
     dit_modulation(d, 0.f, mod, outs);
     int *pos = xmalloc(sizeof(int) * 3 * L);
-    for (int t = 0; t < L; t++) pos[3 * t] = pos[3 * t + 1] = pos[3 * t + 2] = t;
+    int offset = position_jump - (image_end - image_start);
+    for (int t = 0; t < image_start; t++) pos[3 * t] = pos[3 * t + 1] = pos[3 * t + 2] = t;
+    if (ref) dit_image_positions(pos + 3 * image_start, ref->height, ref->width, image_start);
+    for (int t = image_end; t < L; t++) pos[3 * t] = pos[3 * t + 1] = pos[3 * t + 2] = t + offset;
     float *cs = fmalloc((size_t)L * d->hd / 2), *sn = fmalloc((size_t)L * d->hd / 2);
     dit_rope_table(d, pos, L, cs, sn);
-    p->L = L; p->gen = ++g_qi_gen;
+    p->L = L; p->target_position = L + offset; p->gen = ++g_qi_gen;
     p->K = calloc(d->layers, sizeof(float *)); p->V = calloc(d->layers, sizeof(float *));
     DitScratch w; scratch_alloc(&w, d, L);
     for (int l = 0; l < d->layers; l++) {
         p->K[l] = fmalloc((size_t)L * D); p->V[l] = fmalloc((size_t)L * D);
         /* the last block's output is never read: only its keys and values are */
-        dit_block(d, &d->B[l], x, L, mod, p->K[l], p->V[l], 0, L, 0, cs, sn, &w, l + 1 < d->layers);
+        dit_block(d, &d->B[l], x, L, mod, p->K[l], p->V[l], 0, L, 0, cs, sn, &w,
+                  l + 1 < d->layers, image_start, image_end);
     }
     scratch_free(&w);
     free(x); free(mod); free(outs); free(pos); free(cs); free(sn);
@@ -917,15 +999,8 @@ static void dit_step_init(DitStep *s, Dit *d, const Prefix *p, int gh, int gw){
     s->cs = fmalloc((size_t)N * d->hd / 2); s->sn = fmalloc((size_t)N * d->hd / 2);
     s->x = fmalloc((size_t)N * d->dim);
     scratch_alloc(&s->w, d, N);
-    /* image tokens: frame = the position after the text, height and width centred on zero */
     int *pos = xmalloc(sizeof(int) * 3 * N);
-    for (int y = 0; y < gh; y++)
-        for (int xx = 0; xx < gw; xx++) {
-            int t = y * gw + xx;
-            pos[3 * t] = p->L;
-            pos[3 * t + 1] = y - (gh - gh / 2);
-            pos[3 * t + 2] = xx - (gw - gw / 2);
-        }
+    dit_image_positions(pos, gh, gw, p->target_position);
     dit_rope_table(d, pos, N, s->cs, s->sn);
     free(pos);
 }
@@ -960,7 +1035,7 @@ static void dit_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, f
     for (int l = 0; l < d->layers; l++) {
         memcpy(s->kbuf, p->K[l], (size_t)L * D * 4);
         memcpy(s->vbuf, p->V[l], (size_t)L * D * 4);
-        dit_block(d, &d->B[l], s->x, N, mod, s->kbuf, s->vbuf, L, L + N, -1, s->cs, s->sn, &s->w, 1);
+        dit_block(d, &d->B[l], s->x, N, mod, s->kbuf, s->vbuf, L, L + N, -1, s->cs, s->sn, &s->w, 1, 0, 0);
     }
     layernorm_mod(s->w.h, s->x, outs, N, D, d->eps);
     linear(out, s->w.h, N, &d->proj_out);
@@ -1133,6 +1208,7 @@ typedef struct {
 } Engine;
 
 typedef struct { const char *id; int (*cancelled)(const char *id); int preview; } Progress;
+typedef struct { const uint8_t *pixels; int width, height; } QiReference;
 
 #include "qwenimage_preview.h"   /* QI_PREVIEW_RGB: the fitted latent -> RGB map */
 
@@ -1216,6 +1292,56 @@ static QiVae *engine_vae(Engine *e, char *msg, size_t msgn){
     }
     return v;
 }
+
+static int reference_size(int w, int h){
+    return w >= 32 && h >= 32 && w <= 2048 && h <= 2048 &&
+           w % 32 == 0 && h % 32 == 0 && w * h <= 1024 * 1088;
+}
+
+static float *engine_reference_latents(Engine *e, const QiReference *ref, char *msg, size_t msgn){
+    char dir[2100]; qi_part(e->model, "vae", dir, sizeof dir);
+    QiVaeEncoder *v = qie_load(dir);
+    if (!v) { snprintf(msg, msgn, "cannot load the VAE encoder"); return NULL; }
+    int h = ref->height, w = ref->width;
+    float *z = NULL;
+    if (v->scale == 16 && v->z_dim == e->dit.in_ch) {
+        z = fmalloc((size_t)(h / 16) * (w / 16) * v->z_dim);
+        if (qie_encode(v, ref->pixels, h, w, 4, z)) { free(z); z = NULL; }
+    }
+    qie_free(v);
+    if (!z) snprintf(msg, msgn, "reference image VAE encode failed");
+    return z;
+}
+
+static int engine_edit_condition(Engine *e, const char *prompt, const QiReference *ref,
+                                 QiImagePrompt *emb, float **latent, char *msg, size_t msgn){
+    int w = ref->width, h = ref->height;
+    if (!ref->pixels || !reference_size(w, h)) {
+        snprintf(msg, msgn, "invalid reference image dimensions");
+        return -1;
+    }
+    int rc = te_encode_image_prompt(&e->te, e->model, prompt, ref->pixels, w, h, emb);
+    if (!e->te_resident) te_unload(&e->te);
+    if (rc) {
+        snprintf(msg, msgn, "cannot encode reference image with Qwen3-VL");
+        return -1;
+    }
+    if (emb->image_slot_count != w * h / (32 * 32) || emb->image_slot_start < 0 ||
+        emb->image_slot_start > emb->tokens - emb->image_slot_count) {
+        snprintf(msg, msgn, "visual slots do not match reference image latents");
+        return -1;
+    }
+    *latent = engine_reference_latents(e, ref, msg, msgn);
+    return *latent ? 0 : -1;
+}
+
+static void engine_edit_prefix(Engine *e, const QiReference *ref, const QiImagePrompt *emb,
+                               const float *latent, Prefix *prefix){
+    DitReference conditioning = { latent, emb->image_slot_start, emb->image_slot_count,
+                                  ref->height / 16, ref->width / 16 };
+    dit_load(&e->dit, e->model);
+    dit_prefix(&e->dit, emb->hidden, emb->tokens, &conditioning, prefix, NULL);
+}
 #endif
 
 /* The prompt's prefix, cached for the next request with the same prompt. */
@@ -1223,7 +1349,6 @@ static QiVae *engine_vae(Engine *e, char *msg, size_t msgn){
  * score matrix, so an unbounded prompt is an unbounded allocation (40000 digits,
  * one token each, took 6.4 GB on the tiny model); the pipeline's own prompts
  * are a few dozen tokens. */
-#define QI_MAX_PROMPT_TOKENS 1024
 
 static int engine_prefix(Engine *e, const char *prompt, float **emb_out, int *L_out, char *msg, size_t msgn){
     if (e->last_prompt && !strcmp(e->last_prompt, prompt) && e->prefix.K && !emb_out) {
@@ -1247,34 +1372,28 @@ static int engine_prefix(Engine *e, const char *prompt, float **emb_out, int *L_
     memcpy(emb, h + (int64_t)drop * e->te.hidden, (size_t)L * e->te.hidden * 4);
     free(h);
     dit_load(&e->dit, e->model);
-    dit_prefix(&e->dit, emb, L, &e->prefix, NULL);
+    dit_prefix(&e->dit, emb, L, NULL, &e->prefix, NULL);
     if (emb_out) *emb_out = emb; else free(emb);
     e->last_prompt = strdup(prompt);
     *L_out = L;
     return 0;
 }
 
-/* Generates one image. rgba is [height][width][4]. Returns 0, or -1 with msg. */
-static int engine_generate(Engine *e, const char *prompt, int width, int height, int steps, uint64_t seed,
-                           uint8_t *rgba, double timings[3], const Progress *pg, char *msg, size_t msgn){
-    double t0 = now_s();
-    int gh = height / 16, gw = width / 16, N = gh * gw, C = e->dit.in_ch;
-    emit_progress(pg, "encode", 0, steps, t0);
-    int L;
-    if (engine_prefix(e, prompt, NULL, &L, msg, msgn) < 0) return -1;
-    double t1 = now_s();
-    float *lat = fmalloc((size_t)N * C), *np = fmalloc((size_t)N * C);
-    randn(lat, (size_t)N * C, seed);
+/* The schedule and solver only see target tokens in both modes. */
+static int engine_denoise(Engine *e, const Prefix *prefix, int gh, int gw, int steps, float *lat,
+                          const Progress *pg, double t0, char *msg, size_t msgn){
+    int N = gh * gw, C = e->dit.in_ch;
+    float *np = fmalloc((size_t)N * C);
     float *sig = fmalloc(steps + 1), *ts = fmalloc(steps);
     sched_sigmas(&e->sch, steps, N, sig, ts, NULL);
-    DitStep s; dit_step_init(&s, &e->dit, &e->prefix, gh, gw);
+    DitStep s; dit_step_init(&s, &e->dit, prefix, gh, gw);
     int rc = 0;
     for (int i = 0; i < steps; i++) {
         emit_progress(pg, "denoise", i, steps, t0);
         if (pg && pg->cancelled && pg->cancelled(pg->id)) { snprintf(msg, msgn, "cancelled"); rc = -1; break; }
         double ts0 = now_s();
         g_t_lin = g_t_att = 0;
-        dit_forward(&e->dit, &e->prefix, &s, lat, ts[i], np);
+        dit_forward(&e->dit, prefix, &s, lat, ts[i], np);
         emit_preview(pg, i + 1, lat, np, sig[i], gh, gw, C);
         float dt = sig[i + 1] - sig[i];
         for (int64_t k = 0; k < (int64_t)N * C; k++) lat[k] += dt * np[k];
@@ -1284,6 +1403,42 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
         fputc('\n', stderr);
     }
     dit_step_free(&s);
+    free(np); free(sig); free(ts);
+    return rc;
+}
+
+/* Generates one image, optionally conditioned on a reference.
+ * rgba is [height][width][4]. Returns 0, or -1 with msg. */
+static int engine_generate(Engine *e, const char *prompt, int width, int height, int steps, uint64_t seed,
+                           uint8_t *rgba, double timings[3], const Progress *pg, char *msg, size_t msgn,
+                           const QiReference *ref){
+    double t0 = now_s();
+    int gh = height / 16, gw = width / 16, N = gh * gw, C = e->dit.in_ch;
+    emit_progress(pg, "encode", 0, steps, t0);
+    Prefix edit = {0};
+    const Prefix *prefix = &e->prefix;
+    if (ref) {
+#ifdef QI_HAVE_VAE
+        QiImagePrompt emb = {0};
+        float *latent = NULL;
+        int rc = engine_edit_condition(e, prompt, ref, &emb, &latent, msg, msgn);
+        if (!rc) engine_edit_prefix(e, ref, &emb, latent, &edit);
+        free(emb.hidden); free(latent);
+        if (rc) return -1;
+        prefix = &edit;
+#else
+        snprintf(msg, msgn, "the engine was built without the reference VAE");
+        return -1;
+#endif
+    } else {
+        int L;
+        if (engine_prefix(e, prompt, NULL, &L, msg, msgn) < 0) return -1;
+    }
+    double t1 = now_s();
+    float *lat = fmalloc((size_t)N * C);
+    randn(lat, (size_t)N * C, seed);
+    int rc = engine_denoise(e, prefix, gh, gw, steps, lat, pg, t0, msg, msgn);
+    prefix_free(&edit, e->dit.layers);
     double t2 = now_s();
     if (rc == 0) {
         emit_progress(pg, "decode", steps, steps, t0);
@@ -1303,7 +1458,7 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
     }
     double t3 = now_s();
     if (timings) { timings[0] = t1 - t0; timings[1] = t2 - t1; timings[2] = t3 - t2; }
-    free(lat); free(np); free(sig); free(ts);
+    free(lat);
     return rc;
 }
 
@@ -1455,7 +1610,7 @@ static int serve_loop(Engine *e, int dw, int dh, int dsteps){
             uint8_t *rgba = xmalloc((size_t)w * h * 4);
             double tm[3];
             Progress pg = { id, serve_cancelled, (int)jnum(j, "preview", 0) };
-            if (engine_generate(e, prompt, w, h, steps, seed, rgba, tm, &pg, msg, sizeof msg)) send_error(id, msg);
+            if (engine_generate(e, prompt, w, h, steps, seed, rgba, tm, &pg, msg, sizeof msg, NULL)) send_error(id, msg);
             else {
                 printf("IMAGE {\"id\":\""); json_escape_out(id);
                 printf("\",\"width\":%d,\"height\":%d,\"channels\":4,\"bytes\":%lld,\"seed\":%llu,\"steps\":%d,"
@@ -1508,6 +1663,106 @@ static float *ref_named(shards *S, const char *fmt, int i){
     return ref_tensor(S, name, NULL);
 }
 
+#ifdef QI_HAVE_VAE
+static float *edit_ref_tensor(shards *r, const char *name, size_t n){
+    st_tensor *t = st_find(r, name);
+    return t && t->dtype == 2 && t->numel == (int64_t)n ? ref_tensor(r, name, NULL) : NULL;
+}
+
+/* Match the production reference-latent path and solver to Diffusers, with
+ * the input noise supplied by the oracle instead of the C generator. */
+static int run_edit_oracle(Engine *e, const char *refdir, jval *meta){
+    int w = (int)jnum(meta, "width", 0), h = (int)jnum(meta, "height", 0);
+    int rw = (int)jnum(meta, "reference_width", 0), rh = (int)jnum(meta, "reference_height", 0);
+    int steps = (int)jnum(meta, "steps", 0), slot = (int)jnum(meta, "image_slot_start", -1);
+    int slots = (int)jnum(meta, "image_slot_count", 0), C = e->dit.in_ch;
+    jval *prompt = json_get(meta, "prompt");
+    if (!prompt || prompt->t != J_STR || !reference_size(rw, rh) || w < 32 || h < 32 || w > 2048 || h > 2048 ||
+        w % 32 || h % 32 || steps < 2 || steps > 200 ||
+        slot < 0 || slots != rw * rh / (32 * 32)) {
+        fprintf(stderr, "[oracle] invalid edit fixture geometry\n");
+        return 2;
+    }
+    shards r; st_init(&r, refdir);
+    st_tensor *img = st_find(&r, "reference_pixels"), *emb = st_find(&r, "prompt_embeds");
+    st_tensor *want_pixels = st_find(&r, "rgba");
+    int L = emb && emb->rank == 2 && emb->shape[1] == e->dit.ctx && emb->shape[0] > slots &&
+            emb->shape[0] <= QI_MAX_PROMPT_TOKENS + slots
+          ? (int)emb->shape[0] : 0;
+    size_t ref_bytes = (size_t)rw * rh * 4, out_bytes = (size_t)w * h * 4;
+    int gh = h / 16, gw = w / 16, rgh = rh / 16, rgw = rw / 16;
+    size_t nr = (size_t)rgh * rgw * C, nt = (size_t)gh * gw * C;
+    float *embedding = edit_ref_tensor(&r, "prompt_embeds", (size_t)L * e->dit.ctx);
+    float *want_ref = edit_ref_tensor(&r, "reference_latents", nr);
+    float *lat = edit_ref_tensor(&r, "latents_init", nt);
+    float *want_pred = edit_ref_tensor(&r, "noise_pred_000", nt);
+    float *want_final = edit_ref_tensor(&r, "latents_final", nt);
+    uint8_t *pixels = NULL, *rgba = NULL, *want = NULL;
+    float *ref_lat = NULL, *pred = NULL, *sig = NULL, *ts = NULL;
+    QiImagePrompt actual = {0};
+    Prefix prefix = {0};
+    QiVae *vae = NULL;
+    char msg[256] = "";
+    int rc = 2;
+    if (slots > L || slot > L - slots || !img || img->dtype != 3 || img->nbytes != (int64_t)ref_bytes ||
+        !want_pixels || want_pixels->dtype != 3 || want_pixels->nbytes != (int64_t)out_bytes ||
+        !embedding || !want_ref || !lat || !want_pred || !want_final) {
+        fprintf(stderr, "[oracle] missing or incompatible edit fixture tensors\n");
+        goto done;
+    }
+    pixels = xmalloc(ref_bytes);
+    st_pread_full(img->fd, pixels, (int64_t)ref_bytes, img->off, "reference_pixels");
+    QiReference ref = { pixels, rw, rh };
+    if (engine_edit_condition(e, prompt->str, &ref, &actual, &ref_lat, msg, sizeof msg)) goto done;
+    if (actual.tokens != L || actual.image_slot_start != slot || actual.image_slot_count != slots) {
+        snprintf(msg, sizeof msg, "vision conditioning geometry does not match the edit fixture");
+        goto done;
+    }
+    double err = cmp("edit prompt embeddings", actual.hidden, embedding, (size_t)L * e->dit.ctx);
+    int fails = !(err <= 2e-4);
+    err = cmp("reference latents", ref_lat, want_ref, nr);
+    fails += !(err <= 2e-4);
+    engine_edit_prefix(e, &ref, &actual, ref_lat, &prefix);
+
+    sig = fmalloc(steps + 1); ts = fmalloc(steps); pred = fmalloc(nt);
+    sched_sigmas(&e->sch, steps, gh * gw, sig, ts, NULL);
+    DitStep step; dit_step_init(&step, &e->dit, &prefix, gh, gw);
+    dit_forward(&e->dit, &prefix, &step, lat, ts[0], pred);
+    err = cmp("edit first prediction", pred, want_pred, nt);
+    fails += !(err <= 2e-3);
+    dit_step_free(&step);
+    if (engine_denoise(e, &prefix, gh, gw, steps, lat, NULL, now_s(), msg, sizeof msg)) goto done;
+    err = cmp("edit final latents", lat, want_final, nt);
+    fails += !(err <= 2e-3);
+
+    vae = engine_vae(e, msg, sizeof msg);
+    if (!vae) goto done;
+    rgba = xmalloc(out_bytes); want = xmalloc(out_bytes);
+    if (qi_vae_decode(vae, lat, gh, gw, rgba, NULL)) {
+        snprintf(msg, sizeof msg, "VAE decode failed");
+        goto done;
+    }
+    st_pread_full(want_pixels->fd, want, (int64_t)out_bytes, want_pixels->off, "rgba");
+    int max_diff = 0;
+    for (size_t i = 0; i < out_bytes; i++) {
+        int diff = abs((int)rgba[i] - want[i]);
+        if (diff > max_diff) max_diff = diff;
+    }
+    fprintf(stderr, "[oracle] edit RGBA: maximum difference %d\n", max_diff);
+    fails += max_diff > 1;
+    fprintf(stderr, "[oracle] edit: %s\n", fails ? "MISMATCH" : "all stages within tolerance");
+    rc = fails ? 1 : 0;
+done:
+    if (*msg) fprintf(stderr, "[oracle] %s\n", msg);
+    qiv_free(vae);
+    prefix_free(&prefix, e->dit.layers);
+    free(actual.hidden); free(embedding); free(want_ref); free(lat); free(want_pred); free(want_final);
+    free(pixels); free(rgba); free(want); free(ref_lat); free(pred); free(sig); free(ts);
+    st_destroy(&r);
+    return rc;
+}
+#endif
+
 /* Every stage against a reference dump (tools/make_qwenimage_tiny.py for the tiny
  * pipeline, tools/qwenimage_ref.py for the real one). Each stage starts from the
  * REFERENCE input of that stage, so an error is reported where it is made and not
@@ -1517,6 +1772,13 @@ static float *ref_named(shards *S, const char *fmt, int i){
 static int run_oracle(Engine *e, const char *refdir){
     char *arena = NULL;
     jval *meta = read_json(refdir, "ref.json", &arena);
+#ifdef QI_HAVE_VAE
+    if (json_get(meta, "reference_width")) {
+        int rc = run_edit_oracle(e, refdir, meta);
+        json_free(meta); free(arena);
+        return rc;
+    }
+#endif
     jval *pv = json_get(meta, "prompt");
     const char *prompt = pv && pv->t == J_STR ? pv->str : NULL;
     int width = (int)jnum(meta, "width", 0), height = (int)jnum(meta, "height", 0);
@@ -1554,7 +1816,7 @@ static int run_oracle(Engine *e, const char *refdir){
     int D = e->dit.dim;
     float *txt = fmalloc((size_t)L * D);
     Prefix P; memset(&P, 0, sizeof P);
-    dit_prefix(&e->dit, emb, L, &P, txt);
+    dit_prefix(&e->dit, emb, L, NULL, &P, txt);
     float *txt_ref = ref_tensor(&R, "step0_txt_in", NULL);
     if (txt_ref) fails += cmp("txt_in", txt, txt_ref, (size_t)L * D) > TIGHT;
     int gh = height / 16, gw = width / 16, N = gh * gw, C = e->dit.in_ch;
@@ -1740,7 +2002,7 @@ int main(int argc, char **argv){
     if (check_size(width, height, steps, msg, sizeof msg)) { fprintf(stderr, "%s\n", msg); return 2; }
     uint8_t *rgba = xmalloc((size_t)width * height * 4);
     double tm[3];
-    if (engine_generate(&e, prompt, width, height, steps, seed, rgba, tm, NULL, msg, sizeof msg)) {
+    if (engine_generate(&e, prompt, width, height, steps, seed, rgba, tm, NULL, msg, sizeof msg, NULL)) {
         fprintf(stderr, "[qwenimage] %s\n", msg); return 1;
     }
     if (write_png(out, rgba, width, height)) { fprintf(stderr, "[qwenimage] cannot write %s\n", out); return 1; }

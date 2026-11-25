@@ -42,7 +42,9 @@
  * tests. */
 #ifndef COLI_CUDA_CHAIN_H
 #define COLI_CUDA_CHAIN_H
+#include <limits.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -183,10 +185,33 @@ static inline int cc_moe_block_type(int t) {
  * through the tensor cores' GEMM where the device has it (gate and up, then down); hid
  * then also holds the sort's integers, cc_moe_hid_floats in all. */
 #define CC_MOE_FRAME_ROWS 8
+/* The original device layout sorts 64 routes per tile. An engine using an earlier
+ * operation table can pass a buffer of this size to moe or moe_cols. */
 static inline size_t cc_moe_hid_floats(int S, int K, int D, int I, int E) {
     size_t A = (size_t)S * K, n = A * (size_t)(I + D);
     if (S > CC_MOE_FRAME_ROWS) n += 3 * (size_t)E + 2 + 2 * ((A + 63) / 64 + (size_t)(E < (int)A ? E : (int)A)) + 2 * A;
     return n;
+}
+static inline size_t cc_moe_sort_floats(int S, int K, int E) {
+    if (S <= CC_MOE_FRAME_ROWS) return 0;
+    size_t A = (size_t)S * K;
+    size_t n = 3 * (size_t)E + 2 + 2 * ((A + 15) / 16 + (size_t)(E < (int)A ? E : (int)A)) + 2 * A;
+    return (n + 3) & ~(size_t)3;
+}
+static inline size_t cc_moe_tiled_hid_floats(int S, int K, int D, int I, int E) {
+    size_t A = (size_t)S * K;
+    return A * (size_t)(I + D) + cc_moe_sort_floats(S, K, E);
+}
+/* Tile selection uses the full layout even when this call only sums a slice of it. */
+static inline int cc_moe_tiled_layout(int rows, const CcMoe *p, const float *x) {
+    return rows > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 &&
+           (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0;
+}
+static inline int cc_moe_tiled_hid_fits(int rows, const CcMoe *p, size_t floats) {
+    /* The sort indexes route slots as ints. Bound the geometry before multiplying the full layout. */
+    return rows > 0 && p->K > 0 && rows <= INT_MAX / p->K &&
+           p->D >= 32 && p->D <= CC_MOE_DIM_MAX && p->I >= 32 && p->I <= CC_MOE_DIM_MAX &&
+           floats >= cc_moe_tiled_hid_floats(rows, p->K, p->D, p->I, p->E);
 }
 /* one copy over n regions (a KV row per head, say); offsets and counts in floats */
 typedef struct { size_t dst, src, n; } CcRegion;
@@ -493,6 +518,22 @@ typedef struct ColiCudaChainOps {
     int  (*fetch_done_at)(int bank);
     /* ink2_caps: what the backend takes of Inkling-2-Mini's chain (CC_INK2_*) */
     int  (*ink2_caps)(void);
+    /* Add or combine the residual into y and normalize each row in one launch.
+     * The float path writes yn in the ordinary reduction order. A packed INT8
+     * result can use a different reduction and omit yn when the caller allows it. */
+    int  (*ew_norm)(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *pe, CcBuf *w, CcBuf *yn, const CcNorm *pn);
+    /* matmul_swiglu: gate (tg) and up (tu) on S rows of x at xo, then silu(g) * u into y at yo
+     * with the kernel selected for the weight format and activation precision. Returns 1 on
+     * success, -1 when the format needs those three operations, 0 on invalid input or failure. */
+    int  (*matmul_swiglu)(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S);
+    /* Select the certified Qwen3.6 path if the current model and device qualify.
+     * Chain initialization and shutdown clear the selection. Returns the active profile ID, or zero. */
+    int  (*select_qwen36_profile)(int enable);
+    void (*set_kernel_mask)(unsigned mask);
+    /* As matmul_swiglu at offset zero, with packed decoding of the native INT8 weights. */
+    int (*swiglu_pair_codes)(ColiCudaTensor *g, ColiCudaTensor *u, CcBuf *x, CcBuf *y, int S);
+    /* Report the current device's profile without enabling it. */
+    int (*probe_qwen36_profile)(void);
 } ColiCudaChainOps;
 #define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
 #define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
@@ -723,7 +764,7 @@ static inline int cc_attn_wr(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *ga
 /* a float16 KV cache's ops (kvh): 0 from an older backend or HIP */
 static inline int cc_kvh_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
-    return t && t->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof t->copy_regions_h && t->kvh();
+    return t && t->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof t->copy_regions_h && t->kvh && t->kvh();
 }
 static inline int cc_attn_h(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
     return cc_kvh_ready() ? cc_ops()->attn_h(q, kc, vc, o, gate, sel, p) : 0;
@@ -818,6 +859,42 @@ static inline int cc_ink2_caps(void) {
 }
 static inline int cc_fetch_wait_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(bank) : 0; }
 static inline int cc_fetch_done_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(bank) : 0; }
+static inline int cc_ew_norm_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ew_norm) + sizeof t->ew_norm && t->ew_norm;
+}
+static inline int cc_ew_norm(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *pe, CcBuf *w, CcBuf *yn, const CcNorm *pn) {
+    return cc_ew_norm_ready() ? cc_ops()->ew_norm(y, a, b, c, e, pe, w, yn, pn) : 0;
+}
+static inline int cc_matmul_swiglu_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, matmul_swiglu) + sizeof t->matmul_swiglu && t->matmul_swiglu;
+}
+static inline int cc_matmul_swiglu(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
+    return cc_matmul_swiglu_ready() ? cc_ops()->matmul_swiglu(tg, tu, x, xo, y, yo, S) : 0;
+}
+static inline int cc_swiglu_pair_codes(ColiCudaTensor *g, ColiCudaTensor *u, CcBuf *x, CcBuf *y, int S) {
+    const ColiCudaChainOps *t = cc_ops();
+    if (t && t->size >= offsetof(ColiCudaChainOps, swiglu_pair_codes) + sizeof t->swiglu_pair_codes && t->swiglu_pair_codes)
+        return t->swiglu_pair_codes(g, u, x, y, S);
+    return cc_matmul_swiglu(g, u, x, 0, y, 0, S);
+}
+static inline int cc_select_qwen36_profile(int enable) {
+    const ColiCudaChainOps *t = cc_ops();
+    if (!t || t->size < offsetof(ColiCudaChainOps, set_kernel_mask) + sizeof t->set_kernel_mask ||
+        !t->select_qwen36_profile || !t->set_kernel_mask) return 0;
+    return t->select_qwen36_profile(enable);
+}
+static inline int cc_probe_qwen36_profile(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, probe_qwen36_profile) + sizeof t->probe_qwen36_profile
+        && t->probe_qwen36_profile ? t->probe_qwen36_profile() : 0;
+}
+static inline void cc_set_kernel_mask(unsigned mask) {
+    const ColiCudaChainOps *t = cc_ops();
+    if (t && t->size >= offsetof(ColiCudaChainOps, set_kernel_mask) + sizeof t->set_kernel_mask &&
+        t->set_kernel_mask) t->set_kernel_mask(mask);
+}
 #endif
 
 #ifdef __cplusplus

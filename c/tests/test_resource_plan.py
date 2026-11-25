@@ -1831,6 +1831,7 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(env["COLI_GPUS"], "1")
         # the plan's team: the physical cores, a hybrid CPU's performance cores
         self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["team_threads"]))
+        self.assertEqual(env["COLI_OMP_TEAM_AUTO"], "1")   # ours, so the engine's team probe may lower it
         self.assertLessEqual(plan["cpu"]["team_threads"], plan["cpu"]["physical_cores"])
         # The plan must NOT set OMP_PROC_BIND / OMP_PLACES on any platform:
         # the engine's own hot-thread tuning owns affinity (it prefers
@@ -1851,6 +1852,7 @@ memInfo.free:                     23.50 GB (97%)
         explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
                                                         "OMP_PROC_BIND": "close"})
         self.assertEqual(explicit_threads["OMP_NUM_THREADS"], "7")
+        self.assertNotIn("COLI_OMP_TEAM_AUTO", explicit_threads)   # the user's: left alone
         self.assertEqual(explicit_threads["OMP_PROC_BIND"], "close")
 
         if sys.platform.startswith("linux"):
@@ -3408,6 +3410,32 @@ class PhysicalCpuCountTest(unittest.TestCase):
         with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
              mock.patch.object(sys, "platform", "darwin"):
             self.assertEqual(physical_cpu_count(), 6)
+
+    def test_apple_tiers_are_picked_by_name(self):
+        # #2938, an M5 Pro: Super and Performance, no efficiency tier; the last-tier rule gave 6
+        m5_pro = {"hw.nperflevels": 2, "hw.perflevel0.logicalcpu": 6, "hw.perflevel0.name": "Super",
+                  "hw.perflevel1.logicalcpu": 12, "hw.perflevel1.name": "Performance",
+                  "hw.physicalcpu": 18}
+        m1_max = {"hw.nperflevels": 2, "hw.perflevel0.logicalcpu": 8, "hw.perflevel0.name": "Performance",
+                  "hw.perflevel1.logicalcpu": 2, "hw.perflevel1.name": "Efficiency", "hw.physicalcpu": 10}
+        for values, want in ((m5_pro, 18), (m1_max, 8)):
+            with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
+                 mock.patch.object(sys, "platform", "darwin"):
+                self.assertEqual(physical_cpu_count(), want)
+
+    def test_apple_team_rule_matches_omp_tune(self):
+        # the cases tests/test_omp_tune.c holds coli_apple_team to
+        from resource_plan import apple_team
+        cases = [([(8, "Performance"), (2, "Efficiency")], 8),
+                 ([(2, "Super"), (4, "Performance"), (6, "Efficiency")], 6),
+                 ([(6, "Super"), (12, "Performance")], 18),
+                 ([(6, None), (12, None)], 6),
+                 ([(2, "Super"), (4, None), (6, "Efficiency")], 6),
+                 ([(8, None)], 8),
+                 ([(4, "Efficiency")], 4)]
+        for tiers, want in cases:
+            with self.subTest(tiers=tiers):
+                self.assertEqual(apple_team(tiers), want)
 
     def test_apple_one_tier_is_every_core_and_older_macos_reads_perflevel0(self):
         one = {"hw.nperflevels": 1, "hw.perflevel0.logicalcpu": 8, "hw.physicalcpu": 8}

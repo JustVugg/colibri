@@ -682,7 +682,7 @@ __global__ void dg_swiglu_quant_rows(const __nv_bfloat16*in,uint8_t*q,int*sfa,fl
     for(int phase=0;phase<2;phase++){int group=phase*8+warp,base=group*128;float value[4],mx=0;
         #pragma unroll
         for(int j=0;j<4;j++){int k=base+lane+j*32;float gate=fminf(__bfloat162float(in[(long long)row*4096+k]),limit),up=fmaxf(-limit,fminf(__bfloat162float(in[(long long)row*4096+2048+k]),limit));value[j]=__bfloat162float(__float2bfloat16((gate/(1.f+expf(-gate)))*up));mx=fmaxf(mx,fabsf(value[j]));}
-        for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));uint8_t c=dg_scale_code(mx),cc=__shfl_sync(0xffffffff,c,0);float scale=dg_scale_value(cc);if(!lane)code[group]=cc;
+        for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));uint8_t c=dg_scale_code(mx),cc=__shfl_sync(0xffffffff,c,0,32);float scale=dg_scale_value(cc);if(!lane)code[group]=cc;
         #pragma unroll
         for(int j=0;j<4;j++){int k=base+lane+j*32;q[(long long)row*2048+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,value[j]/scale)),__NV_SATFINITE,__NV_E4M3);}}
     __syncthreads();if(threadIdx.x<4){int g=threadIdx.x*4;sfa[(long long)threadIdx.x*rows+row]=(int)((uint32_t)code[g]|((uint32_t)code[g+1]<<8)|((uint32_t)code[g+2]<<16)|((uint32_t)code[g+3]<<24));}}
@@ -2324,7 +2324,7 @@ __global__ void __launch_bounds__(32) fp8_ref_rows8_warp_kernel(float*y,const ui
         float sc=scl[c>>7];
         #pragma unroll 8
         for(int i=0;i<32;i++){
-            unsigned lo=__shfl_sync(0xffffffffu,cur.x,i),hi=__shfl_sync(0xffffffffu,cur.y,i);
+            unsigned lo=__shfl_sync(0xffffffffu,cur.x,i,32),hi=__shfl_sync(0xffffffffu,cur.y,i,32);
             unsigned word=r<4?lo:hi;unsigned b=(word>>((r&3)*8))&255u;
             float v=e4m3_exact(b);
             sum=__fadd_rn(sum,__fmul_rn(__fmul_rn(x[c+i],v),sc));
@@ -2988,7 +2988,7 @@ __global__ void __launch_bounds__(256) head_dot_warp_kernel(float*scores,const _
         #pragma unroll
         for(int j=0;j<32;j++){
             #pragma unroll
-            for(int k=0;k<8;k++){float v=__shfl_sync(0xffffffffu,p[k],j);sum=__fadd_rn(sum,v);}
+            for(int k=0;k<8;k++){float v=__shfl_sync(0xffffffffu,p[k],j,32);sum=__fadd_rn(sum,v);}
         }
         cur=nxt;
     }
@@ -3843,9 +3843,11 @@ extern "C" int dsv4_cuda_mirror_refill(Dsv4CudaTensor*g,Dsv4CudaTensor*u,Dsv4Cud
         if(soff[k]<0||soff[k]+sb>S||woff[k]<0||woff[k]+wb>Wb||(woff[k]&15))return 0;}
     Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror refill device"))return 0;
     if(host_pinned(w,(size_t)Wb))host_pinned(sc,(size_t)S);
-    if(!ok(cudaMemcpyAsync(g->block,w,(size_t)Wb,cudaMemcpyHostToDevice,c->stream),"mirror weights upload")||
-       !ok(cudaMemcpyAsync(g->block2,sc,(size_t)S,cudaMemcpyHostToDevice,c->stream),"mirror scales upload"))return 0;
-    if(sync&&!ok(cudaStreamSynchronize(c->stream),"mirror refill drain"))return 0;
+    cudaStream_t cs=sync>=2?c->aux:c->stream;   /* 2 and 3: the uploader thread's, as in dsv4_cuda_tensor_refill_fp4 */
+    if(!ok(cudaMemcpyAsync(g->block,w,(size_t)Wb,cudaMemcpyHostToDevice,cs),"mirror weights upload")||
+       !ok(cudaMemcpyAsync(g->block2,sc,(size_t)S,cudaMemcpyHostToDevice,cs),"mirror scales upload"))return 0;
+    if(sync==3)upload_submit(c);
+    else if(sync&&!ok(cudaStreamSynchronize(cs),"mirror refill drain"))return 0;
     for(int k=0;k<3;k++){t[k]->scale=(uint8_t*)g->block2+soff[k];t[k]->w=(uint8_t*)g->block+woff[k];}
     return 1;}
 /* V4_MIRROR_BLOCK_VERIFY: a run of a block mirror (0 the scales, 1 the

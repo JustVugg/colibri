@@ -1108,7 +1108,7 @@ jobs:
           make qwen36
           QWEN36_TINY=qwen36_tiny_c QWEN3_CODER_TINY=qwen3_coder_tiny_c \
             python3 -m unittest -v tests.test_qwen36_prefix_serve tests.test_qwen36_text_stops tests.test_qwen36_prefix_store \
-              tests.test_qwen36_prompt_snapshot
+              tests.test_qwen36_prompt_snapshot tests.test_qwen36_preload
           make tests/test_qwen36_prefill_control
           for dense in 0 1; do
             for cap in 1 8; do
@@ -1207,6 +1207,8 @@ jobs:
               COLI_DENSE_I8=$dense QWEN36_TINY=qwen36_tiny64_c ./tests/test_qwen36_prefill_control $cap
             done
           done
+          # the background preload on the int4 gs64 container, both expert kernels (the int8 one ran above)
+          QWEN36_TINY=qwen36_tiny_c QWEN36_TINY64=qwen36_tiny64_c python3 -m unittest -v tests.test_qwen36_preload
           for cap in 1 2 8 16; do
             for k in 0 1; do
               QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c DUMP=logits_${cap}_$k.f32 \
@@ -1506,6 +1508,7 @@ jobs:
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefill_tail
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prompt_block
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefetch
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dspark_gate
           # The prefix store: what a prompt read is kept by content, and a new conversation
           # on the same system prompt or a conversation's next turn takes it with the
@@ -1760,6 +1763,18 @@ jobs:
         run: |
           make -C c qwenimage-encoder-check
           python3 c/tools/check_qwenimage_encoder.py --sanitizers
+      - name: Single-reference conditioning and edit denoising against diffusers
+        run: |
+          cd c
+          fixture="$RUNNER_TEMP/qwenimage-edit"
+          python3 tools/make_qwenimage_tiny.py "$fixture" --vision-conditioning
+          make tests/test_qwenimage_vision
+          tests/test_qwenimage_vision "$fixture"
+          python3 tools/make_qwenimage_edit_ref.py "$fixture" "$fixture/edit"
+          export COLI_IMG_BITS=16 COLI_IMG_ACT8=0
+          for ref in a b; do
+            ./qwenimage --model "$fixture" --ref "$fixture/edit/$ref"
+          done
       - name: The shipping defaults (int8 weights) end to end, and the serve protocol
         run: |
           cd c
@@ -1772,6 +1787,11 @@ jobs:
           cd c
           make -B qwenimage EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
           export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2
+          fixture="$RUNNER_TEMP/qwenimage-edit"
+          for ref in a b; do
+            UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 COLI_IMG_BITS=16 COLI_IMG_ACT8=0 \
+              ./qwenimage --model "$fixture" --ref "$fixture/edit/$ref"
+          done
           COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref > qwenimage-san.log 2>&1 || true
           QWENIMAGE_TINY=qwenimage_tiny python3 -m unittest tests.test_qwenimage_engine_serve >> qwenimage-san.log 2>&1 || true
           # the GGUF path: the file's blocks packed for the f32 and the int8 x int8 products
@@ -2001,6 +2021,21 @@ jobs:
           /tmp/tg512
           gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_grid512.c -o /tmp/tg512v3 -lm
           /tmp/tg512v3
+          # grouped GQA attention in qwen36.c against the per-head loop, to the bit: the same two ISAs
+          gcc -O3 -march=native -fopenmp -pthread -I. tests/test_qwen36_attn_grouped.c -o /tmp/tq36ag -lm
+          /tmp/tq36ag
+          gcc -O3 -march=x86-64-v3 -fopenmp -pthread -I. tests/test_qwen36_attn_grouped.c -o /tmp/tq36agv3 -lm
+          /tmp/tq36agv3
+          # fused F32/F16/BF16 gq_matmul_f32 and vectorized gq_dequant_row: the same two ISAs
+          gcc -O3 -march=native -fopenmp -I. tests/test_gq_f32_fused.c -o /tmp/tgf32 -lm
+          /tmp/tgf32
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_f32_fused.c -o /tmp/tgf32v3 -lm
+          /tmp/tgf32v3
+          # single-region gq_matmul2_act (R16, TILE16_BIAS, F8) against two gq_matmul_act calls
+          gcc -O3 -march=native -fopenmp -I. tests/test_gq_matmul2.c -o /tmp/tgm2 -lm
+          /tmp/tgm2
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_matmul2.c -o /tmp/tgm2v3 -lm
+          /tmp/tgm2v3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)

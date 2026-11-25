@@ -554,11 +554,12 @@ CPU dan RAM mesin, GPU dan VRAM-nya serta profil setiap turn, peta pakar (`ctrl+
 dan kolibri dari halaman chat, digambar sebagai gambar di terminal yang menggambar
 sixel (Windows Terminal, foot, WezTerm). Ia terhubung ke `coli serve` yang sedang
 berjalan, atau menjalankan satu dengan `--model`. Lihat [docs/tui.md](docs/tui.md).
+`coli chat` tetap obrolan klasik, baris demi baris, yang juga bisa dijalankan oleh skrip atau pipe.
 
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="antarmuka terminal: daftar percakapan, sebuah pertanyaan, penalaran terlipat, jawaban dan kecepatannya, serta kolibri di atas kotak input">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next pada RTX PRO 4000 melalui <code>coli serve</code>, dengan konteks 256K.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next pada RTX PRO 4000 melalui <code>coli serve</code>, dengan konteks 64K.</em></p>
 
 ## Gunakan dari aplikasi lain
 
@@ -790,7 +791,7 @@ diekstrak. Launcher membaca `config.json` milik model dan memilih engine serta
 chat template-nya, sehingga perintahnya sama untuk setiap model:
 
 ```bash
-./coli chat  --model /nvme/qwen36          # chat in the terminal
+./coli chat  --model /nvme/qwen36          # the classic chat in the terminal, a line at a time (scripts and pipes too)
 ./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
 ./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
@@ -798,7 +799,7 @@ chat template-nya, sehingga perintahnya sama untuk setiap model:
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI alone, next to a running coli serve
-./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
+./coli tui                                 # the full-screen chat in the terminal, with the monitor and the expert map (on a running coli serve, or --model)
 ```
 
 Di Windows, archive rilis menyertakan `coli.cmd` (`coli.cmd chat --model

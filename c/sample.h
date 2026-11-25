@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "tok.h"
+#include "compat.h"       /* coli_logit_dump (#3059) */
 
 /* ---- RNG (xorshift64*) -------------------------------------------------- */
 static uint64_t g_rng = 0x9E3779B97F4A7C15ULL;
@@ -98,23 +99,7 @@ static int dist_sample(int V, int ban){
 /* next token from logits: greedy if g_temp<=0, sampling otherwise.
  * ban = token excluded because it was rejected by speculative verification. */
 static int pick_tok(const float *lo, int V, int ban){
-    /* COLI_LOGIT_DUMP=1: top-5 (id:logit) per step to stderr — for comparing two
-     * engine configs on identical forced context (backend-exactness triage). */
-    static int dump = -1;
-    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
-    if (dump){
-        int id[5]={-1,-1,-1,-1,-1}; float v[5]={-3e38f,-3e38f,-3e38f,-3e38f,-3e38f};
-        for (int t = 0; t < V; t++){
-            float x = lo[t];
-            for (int k = 0; k < 5; k++) if (x > v[k]){
-                for (int j = 4; j > k; j--){ v[j]=v[j-1]; id[j]=id[j-1]; }
-                v[k]=x; id[k]=t; break;
-            }
-        }
-        fprintf(stderr,"[LOGITS]");
-        for (int k = 0; k < 5; k++) fprintf(stderr," %d:%.6f", id[k], v[k]);
-        fprintf(stderr,"\n");
-    }
+    coli_logit_dump(lo, V);
     if (g_temp <= 0) {
         int a = argmax_v(lo, V);
         /* COLI_LOGIT_GAP=1: probe-only dump of the top-2 logits at each greedy

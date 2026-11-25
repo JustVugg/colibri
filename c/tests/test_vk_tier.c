@@ -924,6 +924,60 @@ static double stream_step(int layer, int S, const int *idx, const float *w, int 
     free(x); free(xq); free(cpu); free(out); free(ref); free(y); free(taken); free(dev); free(res);
     return worst;
 }
+/* vkt_give_back's books. The streaming slots are the tier's pool's too and are in no expert's
+ * place, so a block that holds them cannot be emptied: its experts leave and the block stays.
+ * The pool's limit came down by every block picked while vkt_take_back gives back only what
+ * was released, so each give-back that met such a block cost the tier that block for the rest
+ * of the process, and its places with it. Four warm experts and four slots in one block: a
+ * give-back releases nothing, and the limit and the places must then stand as they were. */
+static void give_back_ledger(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(12, f, f);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1);
+    setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);
+    setenv("COLI_VK_TIER_FILL", "0", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.load = load_cb; vc.release = release_cb;
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 - e : 0; }
+    int on = vkt_init(&vc, rows);
+    CHECK(on, "ledger: the tier did not start");
+    if (on) {
+        int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        enum { S = 32 };
+        int idx[S * K]; float w[S * K];
+        for (int i = 0; i < S * K; i++) { idx[i] = 4 + i % 2; w[i] = 1.0f / K; }   /* cold experts: the slots are made */
+        Books bk = {0, 0}; unsigned long long streamed = 0, kept = 0;
+        vkt_begin_forward(); stream_step(0, S, idx, w, 0, &bk, &streamed, &kept, 0);
+        vkt_begin_forward();
+        int res0 = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res0 += vkt_resident(l, e);
+        ColiVkPoolStats p0, p1, p2; coli_vk_pool_stats(1, &p0);
+        const size_t eb = vkt_expert_bytes(H, F, f, f);
+        const size_t gave = vkt_give_back(eb);
+        coli_vk_pool_stats(1, &p1);
+        const size_t back = vkt_take_back(gave ? gave : eb);
+        coli_vk_pool_stats(1, &p2);
+        /* the places are the tier's still: the experts that left come back as they are routed */
+        int again[K] = {0, 1, 2}; Books b = {0, 0};
+        for (int t = 0; t < 40; t++) { vkt_begin_forward(); step(0, 1, again, w, &b); }
+        int res1 = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res1 += vkt_resident(l, e);
+        printf("  ledger: streamed %llu rows; %d resident, pool limit %zu in %d blocks; gave back %zu, limit %zu; took back %zu, limit %zu; %d resident again\n",
+               streamed, res0, p0.limit, p0.blocks, gave, p1.limit, back, p2.limit, res1);
+        CHECK(streamed > 0, "ledger: nothing streamed, the slots were not made");
+        CHECK(res0 > 0 && res1 >= 3, "ledger: %d experts resident before, %d after the tier was routed again (its places went with the give-back)", res0, res1);
+        CHECK(p0.limit - p1.limit <= gave + 4096,
+              "ledger: the pool's limit came down by %zu for %zu bytes given back", p0.limit - p1.limit, gave);
+        CHECK(p2.limit + 4096 >= p0.limit && p2.limit <= p0.limit + 4096,
+              "ledger: after giving back %zu and taking back %zu the pool's limit is %zu, was %zu", gave, back, p2.limit, p0.limit);
+    }
+    vkt_shutdown(); model_free();
+    unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
+}
+
 static void stream(void) {
     struct { VktFmt gu, dn; int act; const char *name; } cs[] = {
         {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, VKT_ACT_SWIGLU, "planar int4-g64"},
@@ -1831,6 +1885,7 @@ int main(int argc, char **argv) {
     printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
+    printf("give back, the books:\n"); give_back_ledger();
     printf("empty prefetch:\n"); empty_prefetch();
     printf("layers:\n"); layers();
     printf("rooms:\n"); rooms();

@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "hypothesis": "Built as 64-lane waves on a gfx1102 (RDNA3), the decode's FP4 expert group runs 37-39 % faster than as 32-lane waves (a microbenchmark: 0.64 -> 0.39 ms per expert), and the HIP tier's decode spends much of its time there, so decode gets faster with the same greedy text.",
+  "commit": "258871535fb343f542e3ff7a739eaaedabb3dacd",
+  "model": "DeepSeek-V4-Flash architecture, REAP-pruned to 132 experts x 43 layers (79 GB), safetensors, native FP8/FP4",
+  "command": "make -C c -j16 deepseek-v4 HIP=1 HIP_ARCH=gfx1102 ROCM_HOME=/usr HIP_WAVE64=<0|1> (one binary per arm, same commit); deepseek_v4 <model> 'Count from 1 to 300, separated by single spaces.' --max-tokens 200 with the environment in config (--vram 5 as CUDA_EXPERT_GB=5); the arms alternate (trial, baseline) three times; tok_s = (generated - 1) / after_first from the engine's `timing` line (decode throughput)",
+  "prompt_hash": "a90836cb1e5f23f0ac423a0f9ef504126710ea8b4d5d329c2fc3f2ef8c551a66",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 7945HX, 16 cores / 32 threads, AVX-512",
+    "ram": "62 GB DDR5 (auto memory budget, about 57 GiB available)",
+    "storage": "Apacer AS2280Q4U 4TB NVMe (PCIe 4.0 x4), ext4, direct aligned reads",
+    "os": "Gentoo Linux 7.3.5, gcc 16.2.1, ROCm/HIP 7.16.0 (clang 23.1.5), AMD Radeon RX 7600M XT 8 GB (gfx1102, PCIe 4.0 x8; also the display GPU, desktop running)"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "HIP_WAVE64"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102",
+      "HIP_WAVE64": "0",
+      "args": "'Count from 1 to 300, separated by single spaces.' --max-tokens 200",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "5",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0"
+    },
+    "samples": {
+      "tok_s": [
+        1.6659,
+        1.6705,
+        1.6551
+      ]
+    },
+    "median_tok_s": 1.6659,
+    "quality": {
+      "method": "the answer is exactly '1 2 3 ... 100' (checked number by number) and the same text (md5 of stdout) in every run of both arms",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-hip-wave64-2026-11-19/baseline_runs.txt",
+      "sha256": "6f9ea743b876c3999e281006a76c8177adb93528b28f8359c9a81e05cb874244"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102",
+      "HIP_WAVE64": "1",
+      "args": "'Count from 1 to 300, separated by single spaces.' --max-tokens 200",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "5",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0"
+    },
+    "samples": {
+      "tok_s": [
+        1.8684,
+        1.8765,
+        1.8786
+      ]
+    },
+    "median_tok_s": 1.8765,
+    "quality": {
+      "method": "the answer is exactly '1 2 3 ... 100' (checked number by number) and the same text (md5 of stdout) in every run of both arms",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-hip-wave64-2026-11-19/trial_runs.txt",
+      "sha256": "457292afbcda442617af172f836b931f17eea81bebd24c8d42b4eef9b738d965"
+    }
+  },
+  "outcome": "improvement"
+}

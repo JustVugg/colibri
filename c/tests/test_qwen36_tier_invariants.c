@@ -238,7 +238,7 @@ static void test_budget_accounting(int ndev) {
     int swapped = 0;
     if (vict_l >= 0 && hot_l >= 0) {
         qs(vict_l, vict_e)->resident = 0;
-        swapped = enqueue_locked(hot_l, hot_e, vict_l, vict_e, 0);
+        swapped = enqueue_locked(hot_l, hot_e, vict_l, vict_e, 0, 0);
         if (!swapped) qs(vict_l, vict_e)->resident = 1;
     }
     pthread_mutex_unlock(&G.mx);
@@ -289,9 +289,9 @@ static void test_shutdown_wakes_everyone(void) {
     qs(0, 0)->resident = 0;
     int queued = 0;
     for (int e = 1; e < NE && queued < QT_QCAP; e++)
-        if (enqueue_locked(0, e, 0, 0, 0)) queued++;
+        if (enqueue_locked(0, e, 0, 0, 0, 0)) queued++;
     for (int e = 0; e < NE - 2 && queued < QT_QCAP; e++)      /* (1,30) and (1,31) stay for the waiter threads */
-        if (enqueue_locked(1, e, 0, 0, 0)) queued++;
+        if (enqueue_locked(1, e, 0, 0, 0, 0)) queued++;
     int qn_now = G.qn;
     pthread_mutex_unlock(&G.mx);
     check(queued >= 1, "at least one swap must be enqueued to park the uploader");
@@ -303,7 +303,7 @@ static void test_shutdown_wakes_everyone(void) {
     for (int l = 0; l < NL && G.qn < QT_QCAP; l++)
         for (int e = 0; e < NE && G.qn < QT_QCAP; e++)
             if (!(l == 1 && e >= 30) && !qs(l, e)->resident && !qs(l, e)->queued && qs(l, e)->g4)
-                enqueue_locked(l, e, 0, 0, 0);
+                enqueue_locked(l, e, 0, 0, 0, 0);
     int full = (G.qn == QT_QCAP);
     pthread_mutex_unlock(&G.mx);
     (void)parked_qn;

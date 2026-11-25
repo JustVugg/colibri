@@ -25,48 +25,13 @@
 #ifndef COLI_SERVE_POLL_H
 #define COLI_SERVE_POLL_H
 
-#if defined(_WIN32)
-#include <io.h>
-#include <windows.h>
-#else
-#include <sys/select.h>
-#include <unistd.h>
-#endif
-
-#ifndef STDIN_FILENO
-#define STDIN_FILENO 0
-#endif
+#include "compat.h"
 
 /* 1 = c'e' qualcosa da leggere su stdin adesso; 0 = niente, o piattaforma che
- * non sa dirlo. Non blocca mai. */
+ * non sa dirlo. Non blocca mai. Delegates to compat.h's single implementation. */
 static inline int coli_serve_stdin_ready(void)
 {
-#if defined(_WIN32)
-    HANDLE handle = (HANDLE)_get_osfhandle(_fileno(stdin));
-    DWORD available = 0;
-    /* PeekNamedPipe funziona sulle pipe, che e' come il gateway parla ai
-     * motori. Su una console o un file ritorna falso e si resta al
-     * comportamento di prima: nessun falso "pronto". */
-    if (PeekNamedPipe(handle, NULL, 0, NULL, &available, NULL))
-        return available > 0;
-    /* PeekNamedPipe FALLISCE su una pipe rotta, dove select() POSIX direbbe
-     * invece "leggibile" -- e ha ragione select: una lettura non bloccherebbe,
-     * ritornerebbe EOF. Se il gateway muore o chiude, il motore deve poterlo
-     * vedere, non restare cieco fino a fine turno. Quindi qui "pronto" vale
-     * anche per la fine del flusso, e il chiamante distingue leggendo.
-     * Trovato dal test su CI Windows: su Linux i due casi coincidono e questa
-     * differenza sarebbe partita per la produzione senza che me ne accorgessi. */
-    return GetLastError() == ERROR_BROKEN_PIPE ? 1 : 0;
-#elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-    fd_set readable;
-    struct timeval immediately = {0, 0};
-    FD_ZERO(&readable);
-    FD_SET(STDIN_FILENO, &readable);
-    return select(STDIN_FILENO + 1, &readable, NULL, NULL, &immediately) > 0
-        && FD_ISSET(STDIN_FILENO, &readable);
-#else
-    return 0;   /* piattaforma sconosciuta: mai fingere che ci sia input */
-#endif
+    return coli_stdin_readable();
 }
 
 #endif /* COLI_SERVE_POLL_H */

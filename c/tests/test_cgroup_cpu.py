@@ -76,6 +76,25 @@ class CgroupCpuQuotaTest(unittest.TestCase):
         self._write(self.root / "pod" / "job", "cpu.max", "765000 100000\n")
         self.assertAlmostEqual(self._quota(), 7.65)
 
+    def test_super_options_with_spaces_end_the_record(self):
+        # WSL with usbipd-win: its 9p mount prints a Windows path, spaces and all, in its
+        # super options, the one field the kernel does not escape
+        self._membership("0::/pod/job")
+        wsl = ("434 114 0:158 / /run/usbipd-win ro,relatime shared:157 - 9p "
+               "C:\\134Program\\040Files\\134usbipd-win\\134WSL "
+               "ro,aname=drvfs;path=C:\\Program Files\\usbipd-win\\WSL;umask=222;"
+               "symlinkroot=/mnt/,cache=5,access=client,msize=65536,trans=fd,rfd=3,wfd=3")
+        self._mounts(wsl, self._mount_line())
+        self._write(self.root / "pod" / "job", "cpu.max", "765000 100000\n")
+        self.assertAlmostEqual(self._quota(), 7.65)
+
+    def test_a_record_without_super_options_is_still_refused(self):
+        # the rest of the line is the super options, but there must be one
+        self._membership("0::/pod/job")
+        self._mounts(f"30 1 0:30 / {self.root} rw,nosuid,nodev - cgroup2 cgroup2")
+        self._write(self.root / "pod" / "job", "cpu.max", "765000 100000\n")
+        self.assertIsNone(self._quota())
+
     def test_v2_max_is_no_quota(self):
         self._membership("0::/pod/job")
         self._mounts(self._mount_line())

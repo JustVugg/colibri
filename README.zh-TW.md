@@ -444,11 +444,12 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 ### 終端介面
 
 `coli tui` 是在終端機裡的同一個聊天，只有一個 C 檔案，不依賴任何函式庫：對話列表、串流輸出的回答（推理摺疊起來）、監視器（`F2`，包括引擎的 CPU 與記憶體、GPU 及其顯示記憶體、每一輪的剖析）、專家地圖（`ctrl+e`），以及聊天頁面上的那隻蜂鳥，在支援 sixel 的終端機裡（Windows Terminal、foot、WezTerm）畫成圖片。它會連接執行中的 `coli serve`，或用 `--model` 自行啟動一個。請見 [docs/tui.md](docs/tui.md)。
+`coli chat` 仍是經典的逐行聊天，腳本或管線也能驅動它。
 
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="終端介面：對話列表、一個問題、摺疊的推理、回答及其速度，以及停在輸入框上的蜂鳥">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next 在 RTX PRO 4000 上透過 <code>coli serve</code> 執行，上下文 256K。</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next 在 RTX PRO 4000 上透過 <code>coli serve</code> 執行，上下文 64K。</em></p>
 
 ## 從其他應用程式使用
 
@@ -638,7 +639,7 @@ GLM-5.2 請使用帶 int8 MTP head 的 group-scaled（gs64）容器
 因此每個模型的指令都相同：
 
 ```bash
-./coli chat  --model /nvme/qwen36          # chat in the terminal
+./coli chat  --model /nvme/qwen36          # the classic chat in the terminal, a line at a time (scripts and pipes too)
 ./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
 ./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
@@ -646,7 +647,7 @@ GLM-5.2 請使用帶 int8 MTP head 的 group-scaled（gs64）容器
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI alone, next to a running coli serve
-./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
+./coli tui                                 # the full-screen chat in the terminal, with the monitor and the expert map (on a running coli serve, or --model)
 ```
 
 在 Windows 上，發布壓縮檔附有 `coli.cmd`（`coli.cmd chat --model D:\qwen36`）；

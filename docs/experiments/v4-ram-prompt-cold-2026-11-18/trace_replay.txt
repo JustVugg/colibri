@@ -1,0 +1,50 @@
+How the policy was chosen. A local build of the deployed stack wrote every RAM-cache event of one
+five-turn service (V4_RAM_PROMPT_COLD unset) to a file: each hit and miss (bank reads and read-ahead
+lanes uncounted, decode lookups counted), each victim, each union and repin touch, the pin sets, and
+at each request's start, the bank's release and the turn's end a dump of every layer's LRU list. A
+replay of those events, per layer with 133 slots, against several policies; "actual" is the event count
+the engine logged per phase. The replay of plain LRU reproduces the engine's misses within a few per
+turn (prompt 8758/9154/9178/9186/9142 logged, 8758/9157/9180/9186/9144 replayed), so the other rows are
+what those policies would have read from the same request stream (the stream itself would shift a
+little under another policy: the read-ahead lanes ask for what the cache does not hold).
+  prompt_cold     the bank's misses during a prompt linked at the oldest end (this change)
+  prompt_bypass   the bank's misses during a prompt not kept at all
+  protect_decode  the bank never evicts what the previous decode used
+The oracle (Belady with bypass: the future known, evict the expert needed furthest ahead) is the bound
+for any policy on this stream. Totals over the five turns, misses = reads from disk.
+
+actual prompt {'h': 2183, 'm': 8758, 'v': 8758, 't': 73278, 'R': 21453, 'p': 323120}
+actual decode {'m': 1101, 'v': 1580, 'H': 8221, 'M': 479, 'h': 4188, 'R': 1450, 'p': 22969}
+actual end {}
+actual prompt {'h': 1787, 'm': 9154, 'v': 9154, 't': 72987, 'R': 21427, 'p': 203144}
+actual decode {'h': 4180, 'm': 1107, 'v': 1564, 'H': 8273, 'M': 457, 'R': 1455, 'p': 22285}
+actual end {}
+actual prompt {'h': 1763, 'm': 9178, 'v': 9178, 't': 72522, 'R': 21462, 'p': 194993}
+actual decode {'m': 1092, 'v': 1533, 'M': 441, 'H': 8331, 'h': 4311, 'R': 1462, 'p': 22504}
+actual end {}
+actual prompt {'h': 1755, 'm': 9186, 'v': 9186, 't': 72724, 'R': 21422, 'p': 198534}
+actual decode {'m': 1129, 'v': 1575, 'M': 446, 'H': 8320, 'h': 4285, 'R': 1461, 'p': 22495}
+actual end {}
+actual prompt {'h': 1799, 'm': 9142, 'v': 9142, 't': 72290, 'R': 21298, 'p': 193251}
+actual decode {'h': 4165, 'm': 1094, 'v': 1524, 'M': 430, 'H': 8384, 'R': 1469, 'p': 22507}
+actual end {}
+lru                      prompt misses  45425  decode misses  7776 (counted  2252)
+   T1 p miss 8758/10941 (counted 0/0)
+   T1 d miss 1577/13989 (counted 476/8700)
+   T2 p miss 9157/10941 (counted 0/0)
+   T2 d miss 1565/14017 (counted 459/8730)
+   T3 p miss 9180/10941 (counted 0/0)
+   T3 d miss 1534/14175 (counted 441/8772)
+   T4 p miss 9186/10941 (counted 0/0)
+   T4 d miss 1575/14180 (counted 446/8766)
+   T5 p miss 9144/10941 (counted 0/0)
+   T5 d miss 1525/14073 (counted 430/8814)
+prompt_cold              prompt misses  26400  decode misses  2175 (counted   718)
+prompt_bypass            prompt misses  26188  decode misses  2198 (counted   733)
+protect_decode           prompt misses  38746  decode misses  3289 (counted  1082)
+
+belady (bypass allowed) misses {'prompt': 26121, 'decode': 219}
+
+prompt_cold is within 1% of the oracle on the prompt (26,400 vs 26,121 misses) and leaves decode
+2,175 misses against LRU's 7,776. The engine with the switch then logged (stack_service_turns.txt):
+prompt misses about 5,450 per turn (LRU 9,150), decode misses 220-436 on turns 2-5 (LRU ~1,550).

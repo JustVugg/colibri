@@ -39,6 +39,28 @@ static inline float dot_f32_lanes(const float *x, const float *w, int I){
     return a[0];
 }
 
+/* Two queries against one key row: same MATMUL_F32_LANES chains and reduction
+ * tree as two dot_f32_lanes calls, bit-identical, halving key loads. */
+static inline void dot_f32_lanes_x2(float out[2], const float *x0, const float *x1, const float *w, int I){
+    float a0[MATMUL_F32_LANES] = {0}, a1[MATMUL_F32_LANES] = {0};
+    int i = 0;
+    for (; i + MATMUL_F32_LANES <= I; i += MATMUL_F32_LANES)
+        for (int j = 0; j < MATMUL_F32_LANES; j++) {
+            float wv = w[i+j];
+            a0[j] = MATMUL_F32_MADD(a0[j], x0[i+j], wv);
+            a1[j] = MATMUL_F32_MADD(a1[j], x1[i+j], wv);
+        }
+    for (int j = 0; i + j < I; j++) {
+        float wv = w[i+j];
+        a0[j] = MATMUL_F32_MADD(a0[j], x0[i+j], wv);
+        a1[j] = MATMUL_F32_MADD(a1[j], x1[i+j], wv);
+    }
+    for (int h = MATMUL_F32_LANES/2; h > 0; h >>= 1)
+        for (int j = 0; j < h; j++) { a0[j] += a0[j+h]; a1[j] += a1[j+h]; }
+    out[0] = a0[0];
+    out[1] = a1[0];
+}
+
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++){

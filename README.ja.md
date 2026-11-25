@@ -322,11 +322,12 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 ### ターミナル UI
 
 `coli tui` はターミナルで動く同じチャットで、ライブラリなしの C ファイル 1 つです：会話の一覧、推論を折りたたんだストリーミングの回答、モニター（`F2`：エンジンの CPU と RAM、GPU とその VRAM、各ターンのプロファイル）、エキスパートマップ（`ctrl+e`）、そしてチャットページのハチドリ。sixel を描けるターミナル（Windows Terminal、foot、WezTerm）では画像として描かれます。実行中の `coli serve` に接続し、`--model` を付ければ自分で起動します。[docs/tui.md](docs/tui.md) を参照してください。
+`coli chat` は従来どおりの 1 行ずつのチャットで、スクリプトやパイプからも使えます。
 
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="ターミナル UI：会話の一覧、質問、折りたたまれた推論、回答とその速度、入力欄にとまるハチドリ">
 </p>
-<p align="center"><em>RTX PRO 4000 上の Qwen3.8-Flash-Next、<code>coli serve</code> 経由、コンテキスト 256K。</em></p>
+<p align="center"><em>RTX PRO 4000 上の Qwen3.8-Flash-Next、<code>coli serve</code> 経由、コンテキスト 64K。</em></p>
 
 ## ほかのアプリから使う
 
@@ -452,7 +453,7 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 **3. 実行する。** ソースのチェックアウトなら `c/` から、リリースなら展開したフォルダーから実行します。ランチャーはモデルの `config.json` を読んでエンジンとそのチャットテンプレートを選ぶので、コマンドはどのモデルでも同じです：
 
 ```bash
-./coli chat  --model /nvme/qwen36          # chat in the terminal
+./coli chat  --model /nvme/qwen36          # the classic chat in the terminal, a line at a time (scripts and pipes too)
 ./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
 ./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
@@ -460,7 +461,7 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI alone, next to a running coli serve
-./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
+./coli tui                                 # the full-screen chat in the terminal, with the monitor and the expert map (on a running coli serve, or --model)
 ```
 
 Windows では、リリースアーカイブに `coli.cmd` が同梱されています（`coli.cmd chat --model D:\qwen36`）。ソースのチェックアウトからは `py -3 c\coli` を使ってください。`.exe` ファイルはエンジンであり、ランチャーではありません。すべてのオプションと環境変数：[SETTINGS.md](docs/SETTINGS.md)、[ENVIRONMENT.md](docs/ENVIRONMENT.md)。

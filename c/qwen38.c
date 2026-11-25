@@ -1283,23 +1283,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
 }
 
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    if (a->len < 1 || (uint64_t)a->len > SIZE_MAX / sizeof(int)) {
-        fprintf(stderr, "ref.json: invalid array length for \"%s\"\n", key); exit(1);
-    }
-    int *r = malloc((size_t)a->len * sizeof(int));
-    if (!r) { fprintf(stderr, "ref.json: OOM reading \"%s\"\n", key); exit(1); }
-    for (int i = 0; i < a->len; i++) {
-        jval *v = a->kids[i];
-        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < 0 ||
-            v->num > INT_MAX || floor(v->num) != v->num) {
-            fprintf(stderr, "ref.json: %s[%d] must be a non-negative integer\n", key, i);
-            exit(1);
-        }
-        r[i] = (int)v->num;
-    }
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 1, 1, 0);
 }
 
 static jval *read_reference_logits(jval *root,int vocab){
@@ -1493,23 +1477,8 @@ static int sample_prob_desc(const void *a, const void *b){
     if(x->p!=y->p) return x->p>y->p?-1:1;
     return (x->id>y->id)-(x->id<y->id);
 }
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
- * (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V){
-    static int dump=-1;
-    if(dump<0)dump=getenv("COLI_LOGIT_DUMP")?1:0;
-    if(!dump)return;
-    int id[5]={-1,-1,-1,-1,-1};float v[5]={-3e38f,-3e38f,-3e38f,-3e38f,-3e38f};
-    for(int t=0;t<V;t++){
-        const float x=lo[t];
-        for(int k=0;k<5;k++)if(x>v[k]){for(int j=4;j>k;j--){v[j]=v[j-1];id[j]=id[j-1];}v[k]=x;id[k]=t;break;}
-    }
-    fprintf(stderr,"[LOGITS]");
-    for(int k=0;k<5;k++)fprintf(stderr," %d:%.6f",id[k],v[k]);
-    fprintf(stderr,"\n");
-}
 static int serve_sample(const float *lo, int V, float temp, float top_p){
-    serve_logit_dump(lo, V);
+    coli_logit_dump(lo, V);
     if(temp<=0.f) return argmax_first(lo, V);
     float *p=malloc((size_t)V*sizeof(float)); SampleProb *head=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!p||!head){ fprintf(stderr,"OOM sampling\n"); exit(1); }
@@ -1940,6 +1909,29 @@ static int q38_format_prof(char *out,size_t capacity,double wall_s,int prompt_to
  * resident in the layer cache; heat 0, no usage counter here). Printed after
  * READY and STAT, and again after every turn. HITS: one bit per expert routed
  * in the turn, packed 8 per hex pair, printed after DONE next to PROF. */
+/* EMAP's tier 2, an expert on the GPU: the Vulkan tier's, or the CUDA tier's, or the CUDA chain's own
+ * slots where it holds the arena (q38cc_promote_init). It read the Vulkan tier only, so the maps of the
+ * chat page and coli tui showed a CUDA card's experts as in RAM or on the disk ("VRAM 0%"). */
+static int q38_emap_on_card(Model *m,int i,int e){
+    if(vkt_resident(i,e))return 1;
+#ifdef COLI_CUDA
+    Q38CChain *ch=q38cc_of(m);
+    if(ch&&ch->ok&&ch->own&&ch->vslot)return ch->vslot[(size_t)i*m->c.experts+e]>=0;
+    return qt_is_resident(i,e);
+#else
+    (void)m;return 0;
+#endif
+}
+/* EMAP's tier 1 also for the CUDA chain's host pool: page-locked RAM the card reads over the bus
+ * (q38cc_pool_init), where the experts the card leaves live when the RAM cache holds none of them */
+static int q38_emap_in_pool(Model *m,int i,int e){
+#ifdef COLI_CUDA
+    Q38CChain *ch=q38cc_of(m);
+    return ch&&ch->ok&&ch->pool_of&&ch->pool_of[(size_t)i*m->c.experts+e]>=0;
+#else
+    (void)m;(void)i;(void)e;return 0;
+#endif
+}
 static void serve_emap(Model *m){
     const Cfg *c=&m->c; int E=c->experts, rows=c->layers;
     char *hex=(char*)malloc((size_t)rows*E*2+1); int w=0;
@@ -1947,7 +1939,7 @@ static void serve_emap(Model *m){
         LCache *lc=&m->cache[i];
         for(int e=0;e<E;e++){
             int si=lc->by_expert?lc->by_expert[e]:-1;
-            int b=(vkt_resident(i,e)?2:si>=0&&si<lc->n&&lc->slots[si].eid==e?1:0)<<6;   /* 2 = on the Vulkan device */
+            int b=(q38_emap_on_card(m,i,e)?2:(si>=0&&si<lc->n&&lc->slots[si].eid==e)||q38_emap_in_pool(m,i,e)?1:0)<<6;   /* 2 on the GPU, 1 in RAM */
             hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
         }
     }

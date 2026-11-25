@@ -102,20 +102,9 @@ static int g_mimo_dho;
 
 /* ------------------------------------------------------------------ utils ---- */
 
-static double now_s(void) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
+static double now_s(void) { return compat_now_s(); }
 
-static double rss_gb(void) {
-    struct rusage usage;
-    getrusage(RUSAGE_SELF, &usage);
-#ifdef __APPLE__
-    return usage.ru_maxrss / 1e9;
-#else
-    return usage.ru_maxrss / 1e6;
-#endif
-}
+static double rss_gb(void) { return compat_rss_gb(); }
 
 static void *xmalloc(size_t bytes, const char *what) {
     void *p = malloc(bytes ? bytes : 1);
@@ -1913,7 +1902,7 @@ static void mc_fit_start(Model *m) {
      * n0 with that device's free memory, its pipelines up now (the head goes with it when it
      * ends at the last layer with room; the tower stays on the CPU) */
     int n0 = g_mc_fit.n;
-    if (vkc_fit_partial(&g_mc_fit) && n0 > 0 && n0 < L && mc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
+    if (vkc_fit_partial(&g_mc_fit) && n0 > 0 && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
         coli_vk_dev2_open_env()) {
         vkc_device(1);
         size_t tail2 = vkc_fit_tensor(hf, m->head.I, m->head.O, hg);
@@ -2263,23 +2252,8 @@ static int sample_desc(const void *a, const void *b) {
     return (pb > pa) - (pa > pb);
 }
 
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
- * (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V) {
-    static int dump = -1;
-    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
-    if (!dump) return;
-    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
-    for (int t = 0; t < V; t++) {
-        const float x = lo[t];
-        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
-    }
-    fprintf(stderr, "[LOGITS]");
-    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
-    fprintf(stderr, "\n");
-}
 static int sample(const float *logits, int vocab, float temperature, float top_p) {
-    serve_logit_dump(logits, vocab);
+    coli_logit_dump(logits, vocab);
     if (temperature <= 0.0f) return argmax(logits, vocab);
     SampleProb *rank = xmalloc((size_t)vocab * sizeof(SampleProb), "sampling");
     float top = logits[0];

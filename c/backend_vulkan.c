@@ -1258,8 +1258,10 @@ static void vk_window_up_decided(void) {
                 (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20));
 }
 
-static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype,
-                        VkBufferUsageFlags usage) {
+/* quiet: a refused allocation (out of memory) says nothing, for a caller with a way back that says it once. The
+ * buffer of a refused allocation is destroyed (it was left behind: one VkBuffer a failed step, 484 on a prompt). */
+static int alloc_buf_mt_q(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype,
+                          VkBufferUsageFlags usage, int quiet) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes, .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -1275,10 +1277,20 @@ static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void *
         .priority = G.prio};
     if (G.has_prio) ai.pNext = &pri;
 #endif
-    VKCHECK(vkAllocateMemory(G.dev, &ai, NULL, mem), "vkAllocateMemory");
+    const VkResult ar = vkAllocateMemory(G.dev, &ai, NULL, mem);
+    if (ar != VK_SUCCESS) {
+        if (!quiet || (ar != VK_ERROR_OUT_OF_DEVICE_MEMORY && ar != VK_ERROR_OUT_OF_HOST_MEMORY))
+            fprintf(stderr, "[VK] vkAllocateMemory failed: %d\n", ar);
+        vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; *mem = VK_NULL_HANDLE;
+        return 0;
+    }
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
     return 1;
+}
+static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype,
+                        VkBufferUsageFlags usage) {
+    return alloc_buf_mt_q(bytes, buf, mem, ptr, memtype, usage, 0);
 }
 static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
     return alloc_buf_mt(bytes, buf, mem, ptr, memtype, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -4727,9 +4739,12 @@ typedef struct XbCtx {
     unsigned long long cbd_batches;
     /* a big step's whole-step buffers (coli_vk_xb_step_*): its token rows once (xt), every
      * assignment's output row in place (ys, s*K + k), the routed sum (out) and its inputs */
+    int grow_quiet, grow_said;   /* a scratch growth the memory refuses says nothing (vkAllocateMemory) and its line once */
     struct {
         int on, S, K; const float *xh;
         XbBuf xt, ys, out, w, use;
+        int refused;   /* the fewest rows whose buffers the memory refused (0: none yet): a step that big takes
+                          the sub-batches' route without asking again */
         VkShaderModule sh; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe;
         VkDescriptorPool pool; VkDescriptorSet set;
         unsigned long long steps, sums; double sum_ms;
@@ -4745,14 +4760,30 @@ struct PCGRP { int I, O; float limit; int ibase; int kgat; int rpw; int act; flo
 
 static size_t xb_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
+/* COLI_VK_XB_REFUSE_MB=n (tests): a scratch buffer of the expert batch over n MiB is refused as out of device
+ * memory, as a driver whose budget showed the room refuses it (a Windows desktop's card), so the way back runs
+ * on any device. */
+static size_t xb_refuse_bytes(void) {
+    static long long v = -1;
+    if (v < 0) {
+        const char *e = getenv("COLI_VK_XB_REFUSE_MB");
+        v = e && *e && atof(e) > 0 ? (long long)(atof(e) * 1048576.0) : 0;
+    }
+    return (size_t)v;
+}
 static int xb_buf(XbCtx *X, XbBuf *b, size_t region, uint32_t memtype, int map) {
     if (b->buf) { vkDestroyBuffer(X->dev, b->buf, NULL); vkFreeMemory(X->dev, b->mem, NULL); }
     memset(b, 0, sizeof(*b));
+    if (xb_refuse_bytes() && 2 * region > xb_refuse_bytes()) {
+        if (!X->grow_quiet) fprintf(stderr, "[VK] vkAllocateMemory failed: %d (COLI_VK_XB_REFUSE_MB)\n", VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        return 0;
+    }
     int ok;
     if (X->d) ok = alloc_hostvis_d2(2 * region, &b->buf, &b->mem, map ? &b->ptr : NULL, memtype);
     else {
         float p0 = G.prio; G.prio = 1.0f;        /* rides every batch: never evict */
-        ok = alloc_hostvis_mt(2 * region, &b->buf, &b->mem, map ? &b->ptr : NULL, memtype);
+        ok = alloc_buf_mt_q(2 * region, &b->buf, &b->mem, map ? &b->ptr : NULL, memtype,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, X->grow_quiet);
         G.prio = p0;
     }
     if (!ok) { memset(b, 0, sizeof(*b)); return 0; }
@@ -4845,10 +4876,11 @@ static int xb_reserve(XbCtx *X, size_t xr, size_t ir, size_t yr) {
                 vkDestroyBuffer(X->dev, bs[k]->buf, NULL); vkFreeMemory(X->dev, bs[k]->mem, NULL); memset(bs[k], 0, sizeof *bs[k]);
             }
         for (int k = 0; k < 5 && back; k++) if (bs[k]->region != old[k]) back = xb_buf(X, bs[k], old[k], mt[k], mp[k]);
-        fprintf(stderr, "[VK] %sexpert batch: scratch of %.1f MiB failed, %s\n", X->d ? "dev2 " : "",
-                (double)(nx + 3 * ni + ny) * 2 / 1048576.0,
-                back ? "this step's experts on the CPU (the batch keeps its scratch)"
-                     : X->d ? "the second device stops" : "the tier stops");
+        if (!back || !X->grow_said++)   /* a refusal the batch survives is said once: the caller takes fewer rows */
+            fprintf(stderr, "[VK] %sexpert batch: scratch of %.1f MiB refused, %s\n", X->d ? "dev2 " : "",
+                    (double)(nx + 3 * ni + ny) * 2 / 1048576.0,
+                    back ? "the batch keeps its scratch"
+                         : X->d ? "the second device stops" : "the tier stops");
         if (!back) { X->ready = 0; return 0; }
         ok = 0;
     }
@@ -6115,7 +6147,10 @@ int coli_vk_xb_sub_reserve(int rows, int experts) {
     if (X->has_ts && (!X->sub[0].qp || !X->sub[1].qp)) return 0;
     size_t hx, hi, hy;
     xb_sub_sizes(X, rows, experts, &hx, &hi, &hy);
-    if (!xb_reserve(X, 2 * hx, 2 * hi, 2 * hy)) return 0;
+    X->grow_quiet = 1;
+    const int ok = xb_reserve(X, 2 * hx, 2 * hi, 2 * hy);
+    X->grow_quiet = 0;
+    if (!ok) return 0;
     X->sub_x = hx; X->sub_i = hi; X->sub_y = hy;
     return 1;
 }
@@ -6205,18 +6240,46 @@ static int st_buf(XbCtx *X, XbBuf *b, size_t bytes, uint32_t memtype) {
     if (b->buf) { vkDestroyBuffer(X->dev, b->buf, NULL); vkFreeMemory(X->dev, b->mem, NULL); }
     memset(b, 0, sizeof(*b));
     size_t r = xb_up(bytes + bytes / 4, 65536);
-    if (!alloc_hostvis_mt(r, &b->buf, &b->mem, &b->ptr, memtype)) { memset(b, 0, sizeof(*b)); return 0; }
+    if (!alloc_buf_mt_q(r, &b->buf, &b->mem, &b->ptr, memtype, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 1)) {
+        memset(b, 0, sizeof(*b)); return 0;
+    }
     b->region = r;
     return 1;
+}
+/* The step's buffers did not fit (rows S, the buffer refused in `memtype`): no later step of S rows or more asks
+ * again. The token rows (xt) and the weights (w, use) are memory the CPU writes, which on a discrete card is the
+ * host-visible part of its memory: a
+ * window of 256 MiB without Resizable BAR (214 MiB free on a Windows desktop), which a prompt step of ten thousand
+ * rows or so outgrows. Put in system memory instead, the same step took 1-2% longer than the sub-batches' route
+ * (Inkling-2-Mini IQ2_XXS, 22240 tokens, RTX PRO 4000: 170.7-171.7 s against 167.0-168.5), so the route stays. */
+static void st_refused(XbCtx *X, int S, uint32_t memtype) {
+    if (X->st.refused && X->st.refused <= S) return;
+    if (!X->st.refused) {
+        VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(X->phys, &mp);
+        const VkMemoryType *t = &mp.memoryTypes[memtype];
+        fprintf(stderr, "[VK] expert batch: no room for a prompt step's rows of %d tokens in the %llu MiB heap of %s "
+                "memory type %u; steps of %d tokens or more take the sub-batches' route, with the same results%s\n",
+                S, (unsigned long long)(mp.memoryHeaps[t->heapIndex].size >> 20),
+                t->propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "the device's" : "the system's", memtype, S,
+                (t->propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !vk_integrated(X->phys) &&
+                        (mp.memoryHeaps[t->heapIndex].size >> 20) <= 1024
+                    ? " (the host-visible window of a card without Resizable BAR: turning it on in the BIOS gives it the whole card)"
+                    : "");
+    }
+    X->st.refused = S;
 }
 float *coli_vk_xb_step_begin(int S, int K, const float *x) {
     XbCtx *X = &g_xb[0];
     if (!X->ready || !X->st.pipe || !X->grp_rows || xb_busy(X) || S < 1 || K < 1) return NULL;
     const size_t dr = (size_t)X->D * 4;
     if ((size_t)S * K * dr > X->ssbo_range) return NULL;
-    if (!st_buf(X, &X->st.xt, (size_t)S * dr, X->mt_host) || !st_buf(X, &X->st.ys, (size_t)S * K * dr, X->mt_cached) ||
-        !st_buf(X, &X->st.out, (size_t)S * dr, X->mt_cached) || !st_buf(X, &X->st.w, (size_t)S * K * 4, X->mt_host) ||
-        !st_buf(X, &X->st.use, (size_t)S * K * 4, X->mt_host)) return NULL;
+    if (X->st.refused && S >= X->st.refused) return NULL;
+    struct { XbBuf *b; size_t bytes; uint32_t mt; } need[5] = {
+        {&X->st.xt, (size_t)S * dr, X->mt_host}, {&X->st.ys, (size_t)S * K * dr, X->mt_cached},
+        {&X->st.out, (size_t)S * dr, X->mt_cached}, {&X->st.w, (size_t)S * K * 4, X->mt_host},
+        {&X->st.use, (size_t)S * K * 4, X->mt_host}};
+    for (int i = 0; i < 5; i++)
+        if (!st_buf(X, need[i].b, need[i].bytes, need[i].mt)) { st_refused(X, S, need[i].mt); return NULL; }
     uint8_t *xt = X->st.xt.ptr;
     #pragma omp parallel for schedule(static) if (S >= 256)
     for (int s = 0; s < S; s++) memcpy(xt + (size_t)s * dr, x + (size_t)s * X->D, dr);

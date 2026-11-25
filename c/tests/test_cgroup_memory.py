@@ -28,6 +28,7 @@ from resource_plan import (
     _MEMINFO_MAX_BYTES,
     _cgroup_memory_remaining,
     memory_available,
+    memory_limit,
 )
 
 HOST_AVAILABLE = 16_384 * 1024
@@ -139,6 +140,30 @@ class CgroupMemoryAdmissionTest(unittest.TestCase):
         self._write_v2(self.root / "tenant" / "job", 12_000_000, 3_000_000)
         self.assertEqual(self._remaining(), 9_000_000)
         self.assertEqual(self._available(), 9_000_000)
+
+    def _limit(self):
+        return memory_limit(cgroup_root=self.root, proc_cgroup_path=self.proc_cgroup,
+                            proc_mountinfo_path=self.proc_mountinfo)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "cgroups are a Linux facility")
+    def test_the_limit_is_the_tightest_finite_one_whatever_is_charged(self):
+        self._standard_v2()
+        job = self.root / "tenant" / "job"
+        self._write_v2(job, 12_000_000, 3_000_000)
+        self.assertEqual(self._limit(), 12_000_000)          # not the 9 MB left of it
+        self._write_v2(self.root / "tenant", 5_000_000, 4_000_000)
+        self.assertEqual(self._limit(), 5_000_000)           # an ancestor's binds
+        self._write_v2(job, "max", 3_000_000)
+        self.assertEqual(self._limit(), 5_000_000)
+        self._write_v2(self.root / "tenant", "max", 4_000_000)
+        self.assertIsNone(self._limit())                     # nothing finite: not confined
+        self._write_v2(job, "lots", 3_000_000)
+        with self.assertRaises(CgroupFormatError):
+            self._limit()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "cgroups are a Linux facility")
+    def test_the_limit_without_any_cgroup_is_none(self):
+        self.assertIsNone(self._limit())
 
     def test_host_memavailable_wins_when_lower_than_cgroup_headroom(self):
         self._standard_v2()

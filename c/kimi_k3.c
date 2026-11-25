@@ -277,7 +277,7 @@ typedef struct {
     const K3Row *mux_rows;
 } Model;
 
-static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
+static double now_s(void) { return compat_now_s(); }
 
 /* How many expert slots per layer fit a budget. PURE -- no globals, no model,
  * no I/O -- so the arithmetic that #855 got wrong can be tested against the
@@ -305,16 +305,8 @@ static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_g
  * ullAvailPhys bounded by the commit still grantable, macOS
  * free+file-backed+purgeable. #855. */
 static double k3_mem_avail(void){ return compat_mem_available_gb(); }
-static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
-#if defined(__APPLE__)
-    return r.ru_maxrss/(1024.0*1024.0*1024.0);
-#else
-    return r.ru_maxrss/(1024.0*1024.0);
-#endif
-}
-static float *falloc(int64_t n){
-    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"alloc size overflow: %lld floats\n",(long long)n); exit(1); }
-    float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
+static double rss_gb(void) { return compat_rss_gb(); }
+static inline float *falloc(int64_t n){ return coli_falloc(n); }
 static float *fcalloc(int64_t n){
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"alloc size overflow: %lld floats\n",(long long)n); exit(1); }
     float *p=calloc((size_t)n,sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
@@ -3316,23 +3308,8 @@ static int sample_prob_desc(const void *a,const void *b){
     float d=((const SampleProb*)b)->p-((const SampleProb*)a)->p;
     return d>0?1:d<0?-1:0;
 }
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
- * (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V){
-    static int dump=-1;
-    if(dump<0) dump=getenv("COLI_LOGIT_DUMP")?1:0;
-    if(!dump) return;
-    int id[5]={-1,-1,-1,-1,-1}; float v[5]={-3e38f,-3e38f,-3e38f,-3e38f,-3e38f};
-    for(int t=0;t<V;t++){
-        const float x=lo[t];
-        for(int k=0;k<5;k++) if(x>v[k]){ for(int j=4;j>k;j--){ v[j]=v[j-1]; id[j]=id[j-1]; } v[k]=x; id[k]=t; break; }
-    }
-    fprintf(stderr,"[LOGITS]");
-    for(int k=0;k<5;k++) fprintf(stderr," %d:%.6f",id[k],v[k]);
-    fprintf(stderr,"\n");
-}
 static int sample_tok(const float *lo, int V, float temp, float top_p){
-    serve_logit_dump(lo, V);
+    coli_logit_dump(lo, V);
     if(temp<=0.f) return argmax_first(lo, V);
     SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
@@ -4026,12 +4003,6 @@ static int prepare_request_state(Model *m, const int *ids, int np, int max_t){
     return reuse;
 }
 
-static int serve_stdin_readable(void){
-    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
-     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
-    return coli_stdin_readable();
-}
-
 static int serve_read_req(FILE *in, FILE *out, ServeReq *q, const char *active){
     ColiServeCommand command;
     ColiServeReadResult result=coli_serve_read_command(in,&kimi_wire,&command);
@@ -4073,7 +4044,7 @@ typedef struct { const char *active; int fatal; } K3ServePoll;
 static int k3_serve_poll_cancel(void *context){
     K3ServePoll *poll=context;
     int cancelled=0;
-    while(serve_stdin_readable()){
+    while(coli_stdin_readable()){
         ServeReq queued={0}; int r=serve_read_req(stdin,stdout,&queued,poll->active);
         if(r<0){ if(r==-2) poll->fatal=1; return 1; }
         if(r==1) cancelled=1;
@@ -4496,7 +4467,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
             else serve_data_maybe_lp(q->id,buf,nb);
         }
         if(!eos) gen++;
-        while(serve_stdin_readable()){
+        while(coli_stdin_readable()){
             ServeReq queued={0};
             int r=serve_read_req(stdin,stdout,&queued,q->id);
             if(r==-2){ poll.fatal=1; cancelled=1; break; }
@@ -4655,7 +4626,7 @@ static void serve_mux(Model *m, Tok *T){
     for(;;){
         int active=0; for(int i=0;i<n;i++) active+=rq[i].active;
         /* idle: wait for a command; decoding: take one only when one is there */
-        if(!input_eof&&(!active||serve_stdin_readable())){
+        if(!input_eof&&(!active||coli_stdin_readable())){
             ColiServeCommand command;
             ColiServeReadResult result=coli_serve_read_command(stdin,&kimi_wire,&command);
             if(result==COLI_SERVE_READ_EOF||result==COLI_SERVE_READ_BAD_FRAME) input_eof=1;

@@ -1,7 +1,9 @@
 /* Dumps what gguf.h reads, for tests/test_gguf_c.py:
  *   test_gguf_c FILE            -> "OK", kv lines, tensor lines (with a float checksum)
  *   test_gguf_c FILE TENSOR     -> the tensor as float32 on stdout
- *   test_gguf_c --join DIR PATH -> the path an engine opens for gguf.json's PATH in DIR */
+ *   test_gguf_c --join DIR PATH -> the path an engine opens for gguf.json's PATH in DIR
+ *   test_gguf_c --concurrent FILE TENSOR -> "OK" if 8 threads reading random slices of the
+ *                               tensor at once get the bytes of one serial read */
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -20,6 +22,23 @@ int main(int argc, char **argv) {
         printf("%s\n", out); return 0;
     }
     gguf_ctx g;
+    if (argc == 4 && !strcmp(argv[1], "--concurrent")) {
+        if (gguf_open(&g, argv[2])) { printf("ERR %s\n", g.err); return 1; }
+        const gguf_tensor *t = gguf_find(&g, argv[3]);
+        if (!t || t->nbytes < 1) { fprintf(stderr, "no tensor %s\n", argv[3]); return 3; }
+        uint8_t *ref = malloc((size_t)t->nbytes);
+        if (!ref || gguf_read(&g, t, ref, 0, t->nbytes)) { fprintf(stderr, "read failed\n"); return 4; }
+        int bad = 0;
+        #pragma omp parallel for num_threads(8) schedule(static, 1) reduction(+:bad)
+        for (int i = 0; i < 4096; i++) {
+            uint32_t x = 0x9E3779B9u * (uint32_t)(i + 1); x ^= x >> 15; x *= 0x85EBCA6Bu; x ^= x >> 13;
+            int64_t off = (int64_t)(x % (uint32_t)t->nbytes), n = 1 + (int64_t)((x >> 7) % 97u);
+            if (n > t->nbytes - off) n = t->nbytes - off;
+            uint8_t buf[97];
+            bad += gguf_read(&g, t, buf, off, n) || memcmp(buf, ref + off, (size_t)n);
+        }
+        printf(bad ? "MISMATCH %d\n" : "OK\n", bad); free(ref); gguf_close(&g); return bad != 0;
+    }
     if (gguf_open(&g, argv[1])) { printf("ERR %s\n", g.err); return 1; }
     if (argc == 3) {
         const gguf_tensor *t = gguf_find(&g, argv[2]);

@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "hypothesis": "Adding step 13 to the previous L4 build changes prompt throughput at 16,384 tokens while preserving dev logits.",
+  "commit": "e677aaee4424d27b8eb0a7e7d7edbb32a309c267",
+  "commit_role": "Dev reference at the start of the measured campaign.",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64@c619aa594ad1e70af82168fb6b4878427896e21c",
+  "command": "COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=6 OMP_DISPLAY_AFFINITY=TRUE OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A /usr/bin/time -v ./qwen36-bench --model \"$MODEL_DIR\" --steps steps.tsv --text promessi_sposi.txt --lengths 2048,4096,8192,16384 --gen 128 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "gpu": "NVIDIA L4",
+    "vram_mib": 23034,
+    "cuda_arch": "sm_89",
+    "cpu": "Colab VM; CPU model not recorded for this allocation",
+    "threads": 6,
+    "ram": "53.0 GiB available to the workload",
+    "storage": "Model staged on the Colab VM. Device and filesystem details were not recorded for this allocation.",
+    "os": "Linux on Google Colab, CUDA 13.0.88, NVIDIA driver 580.82.07"
+  },
+  "metric": "Prefill tok/s at 16,384 tokens, the fourth row of the 2,048 to 16,384 sequence.",
+  "warmup_runs": 0,
+  "warmup_policy": "One reference warm-up per group on dev before the series. Cumulative builds ran three measured repetitions per group.",
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "engine_build": "pr12 (source 7efe604d95380ded913baf25434d57801c6f0f36, compiled c/ tree 911b1f7ecf33762a81ac08f8250d444503921724)"
+    },
+    "samples": {
+      "tok_s": [
+        3605.91,
+        3582.36,
+        3583.92
+      ],
+      "steady_decode_tok_s": [
+        65.956,
+        66.205,
+        66.206
+      ]
+    },
+    "median_tok_s": 3583.92,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-13-long-context-attention-2026-11-22/correctness.txt",
+      "sha256": "bd06472140546f5c078d4779d2fd68ed06a1defccdf004c7c4610bc0712704fc"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-13-long-context-attention-2026-11-22/base.md",
+      "sha256": "2a6f413a4b05eadd1f255fb1f6cdb5073ab912d3980bc5b74beb5604b81032b3"
+    }
+  },
+  "trial": {
+    "config": {
+      "engine_build": "pr13 (source b536a26f4162e7e2b24c5d5bcf1a9f9d6ecf66c4, compiled c/ tree f9e6a14305c8a2682c229dd341fb4d3ead32ee13)"
+    },
+    "samples": {
+      "tok_s": [
+        3607.27,
+        3581.69,
+        3577.4
+      ],
+      "steady_decode_tok_s": [
+        66.328,
+        66.202,
+        66.239
+      ]
+    },
+    "median_tok_s": 3581.69,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-13-long-context-attention-2026-11-22/correctness.txt",
+      "sha256": "bd06472140546f5c078d4779d2fd68ed06a1defccdf004c7c4610bc0712704fc"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-13-long-context-attention-2026-11-22/base.md",
+      "sha256": "2a6f413a4b05eadd1f255fb1f6cdb5073ab912d3980bc5b74beb5604b81032b3"
+    }
+  },
+  "outcome": "regression",
+  "change_pct": -0.06222237103507,
+  "change_method": "Percentage change between the two build medians"
+}

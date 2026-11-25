@@ -1904,6 +1904,47 @@ class SchedulerTest(unittest.TestCase):
         stats = scheduler.snapshot()
         self.assertEqual((stats["rejected"], stats["timed_out"], stats["completed"]), (0, 0, 2))
 
+    def test_cache_key_avoids_hash_collision_eviction_and_sticks_to_slot(self):
+        # Two distinct conversations that hash to the same prefer slot should not evict
+        # each other when another slot is unused, and each subsequent turn should hit
+        # the exact slot that already holds its prefix.
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=3)
+        with scheduler.admit(prefer=1, cache_key=b"conv-A") as (_, slot_a1):
+            self.assertEqual(slot_a1, 1)
+        with scheduler.admit(prefer=1, cache_key=b"conv-B") as (_, slot_b1):
+            self.assertEqual(slot_b1, 0)  # unused slot instead of evicting conv-A in slot 1
+        with scheduler.admit(prefer=1, cache_key=b"conv-A") as (_, slot_a2):
+            self.assertEqual(slot_a2, 1)  # exact prefix hit
+        with scheduler.admit(prefer=1, cache_key=b"conv-B") as (_, slot_b2):
+            self.assertEqual(slot_b2, 0)  # follows its cached slot instead of prefer=1
+
+    def test_cache_key_evicts_lru_cold_slot_not_lowest_id(self):
+        # Fill all 3 slots, refresh slot 0 so slot 1 becomes the LRU cold slot; a new
+        # conversation must evict slot 1 rather than slot 0 (min(candidates)).
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=3)
+        with scheduler.admit(prefer=0, cache_key=b"k0") as (_, s0):
+            self.assertEqual(s0, 0)
+        with scheduler.admit(prefer=1, cache_key=b"k1") as (_, s1):
+            self.assertEqual(s1, 1)
+        with scheduler.admit(prefer=2, cache_key=b"k2") as (_, s2):
+            self.assertEqual(s2, 2)
+        # Touch k0 (slot 0) so slot 1 is now the least recently used.
+        with scheduler.admit(prefer=0, cache_key=b"k0") as (_, s0_again):
+            self.assertEqual(s0_again, 0)
+        with scheduler.admit(prefer=0, cache_key=b"k3") as (_, s3):
+            self.assertEqual(s3, 1)  # evicts LRU slot 1, preserving hot slot 0
+
+    def test_pinned_slot_clears_previous_cache_key(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=2)
+        with scheduler.admit(prefer=0, cache_key=b"conv-A") as (_, s0):
+            self.assertEqual(s0, 0)
+        # An explicit pinned request overwrites slot 0 without a cache_key.
+        with scheduler.admit(slot=0) as (_, pinned):
+            self.assertEqual(pinned, 0)
+        # conv-A no longer matches slot 0; it prefers the unused slot 1 over hot slot 0.
+        with scheduler.admit(prefer=0, cache_key=b"conv-A") as (_, s_next):
+            self.assertEqual(s_next, 1)
+
     def test_preference_does_not_bypass_older_any_slot_waiter(self):
         scheduler = GenerationScheduler(max_queue=1, capacity=2)
         older = (object(), None)
@@ -5732,6 +5773,45 @@ class KeepAliveFramingTest(unittest.TestCase):
                                  b"Content-Length: abc\r\n\r\n{}"))
         self.assertIn("400", raw.splitlines()[0])
         self.assertNotIn("<STILL-OPEN>", raw)
+
+    def test_body_over_the_cap_reads_its_400_with_linger(self):
+        """COLI_BODY_LINGER_S: a client still sending a body over the cap reads the 400, on a
+        kept-alive connection and with Connection: close. Off, the close over the unread body
+        is an RST, and an image upload of 4.08 MiB saw ConnectionAbortedError 10053 instead."""
+        server = self._server()
+        payload = b"x" * (16 << 20)   # far past the loopback buffers: the client is still sending
+        for connection in (b"keep-alive", b"close"):
+            with patch.object(openai_server, "MAX_BODY", 1024), \
+                    patch.object(APIHandler, "BODY_LINGER_S", 5):
+                sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=10)
+                self.addCleanup(sock.close)
+                sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                             b"Content-Type: application/json\r\nConnection: " + connection +
+                             b"\r\nContent-Length: %d\r\n\r\n" % len(payload) + payload)
+                raw = b""
+                while chunk := sock.recv(65536):
+                    raw += chunk
+            self.assertIn(b" 400 ", raw.split(b"\r\n", 1)[0], connection)
+            self.assertIn(b"Request body must be between 1 and 1024 bytes.", raw, connection)
+
+    def test_idle_keep_alive_timeout_does_not_linger(self):
+        """The read deadline closing an idle kept-alive connection answered nothing: no linger, even
+        though the previous (fully read) request's headers still carry a Content-Length."""
+        server = self._server()
+        with patch.object(APIHandler, "BODY_LINGER_S", 5), patch.object(APIHandler, "READ_DEADLINE", 1), \
+                patch.object(APIHandler, "_linger_close") as linger:
+            raw = self._raw(server, self._request_bytes(self.CHAT))   # reads to the server's close
+        self.assertIn("200", raw.splitlines()[0])
+        self.assertNotIn("<STILL-OPEN>", raw)
+        linger.assert_not_called()
+
+    def test_body_under_a_raised_cap_is_read(self):
+        """A body over the 4 MiB default but under a raised MAX_BODY gets past the size check."""
+        server = self._server()
+        body = dict(self.CHAT, model="other", pad="x" * (5 << 20))
+        with patch.object(openai_server, "MAX_BODY", 8 << 20):
+            status, _ = self._post(self._conn(server), body)
+        self.assertEqual(status, 404)   # the model check, after the body was read
 
     # --- a streaming 200 is close-framed, and says so ------------------------------------
 

@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`coli setup` no longer promises a slow laptop CPU the speed of its RAM.** It estimated a decode on
+  the CPU from the RAM's bandwidth alone, so an i7-1355U laptop (RAM as fast as a desktop's, a third of
+  its compute) was offered Inkling-2-Mini at 11 tok/s where it decodes at 3. The setup now also
+  measures how much the cores compute (under a second) and slows the estimate where they are short.
+- **Vulkan: a long prompt's steps stay on the GPU when the driver refuses their scratch.** On a
+  Windows desktop (an RTX PRO 4500 with Qwen3.8) the driver refused memory its budget showed free,
+  and every prompt step's experts went to the CPU: a long prompt three times slower. The step now
+  takes sub-batches of fewer rows on the GPU. Without Resizable BAR, Inkling-2's long prompts no
+  longer print `vkAllocateMemory failed: -2` at every step: one line says what happened.
+- **`coli doctor` recognises a Metal engine.** A `METAL=1` build links Metal.framework rather than
+  loading a GPU runtime, and macOS has no `ldd`, so doctor found no GPU runtime and reported "GPU
+  detected but the engine is CPU-only" for a qwen36 that ran its Metal graph (an M5 Air and an M2
+  mini). It now reads the messages `backend_metal.o` compiles into every Metal engine, and the
+  switch that engine reads at run time: qwen36's Metal graph is on unless `COLI_METAL=0`; colibri,
+  GLM-5.3 and Inkling need `COLI_METAL=1` (an Inkling-2 model also `INK2_METAL=1` and a CUDA or
+  Vulkan build), Kimi K3 `K3_METAL=1`; qwen36 and Kimi K3 stay on the CPU with `KV_SLOTS` above 1.
+  When Metal is on the GPU check
+  passes ("Metal engine on the Apple GPU") and the plan shows the Apple GPU as unified memory with
+  no VRAM budget; when it is off it warns and names the variable; a Metal build on a Mac with no
+  Metal GPU found says so. (#2921)
+
 ### New
 
 - **qwen38: the MXFP4 experts (`experts-mxfp4/`, `Q38_EXPERT_LOWBIT=mxfp4`) stream to the CUDA
@@ -18,6 +41,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   it on the fake backend: with every group refused the last logits are the CPU run's to the bit,
   with the fake computing the residents the tokens are the oracle's;
   `tests/test_qwen36_tier_mxfp4.c` pins the staging and the uploads.
+- **`COLI_MAX_BODY` sets the gateway's request-body cap** (default 4 MiB, as before), for requests
+  with several base64 images. **`COLI_BODY_LINGER_S`** (default off) lets a client that is still
+  uploading a body over the cap read the 400 instead of a connection reset.
+- **`DSV4_CUDA_REQUIRE=1` makes DeepSeek V4 exit when its GPU tier does not start** (missing
+  backend DLL or CUDA runtime, init failure, unsupported device), with the cause on stderr,
+  instead of running the whole model on the CPU at a fraction of the speed. Default off.
+### Changed
+
+- **qwen38: a RAM expert cache smaller than a decode step's distinct experts no longer turns
+  off the grouped decode and the CUDA chain's in-frame experts.** `q38_moe_decode_grouped`
+  takes the distinct experts in waves of at most the cache's slots (each wave loaded, computed
+  and noted to the tier before the next recycles its slots), so `q38cc_dm_able` needs one slot
+  a layer instead of `Q38CC_DM_ROWS` x top-k. With the cache large enough it is one wave, as
+  before; the arithmetic per assignment is unchanged.
+- **qwen36 with a GGUF on the CUDA tier no longer holds the placed dense matrices in RAM.** The
+  loader read every matrix into RAM before the tier placed a byte, and kept each placed one
+  beside its VRAM copy: Qwen3.8-27B Q4_K_M with its trunk on a 32 GB card passed 19 GB of RAM, and
+  a 32 GB PC with 22 GB free ran out of memory during the load (now about 8 GB). Now each matrix the tier takes goes from the file
+  to the device through one staging buffer (`Q36_GGUF_STAGE_KB`, 64 MiB), and is read back from
+  the file only if the CPU ever needs it. New optional backend export:
+  `coli_cuda_tensor_upload_rows`.
 
 ## [2.2.0] - 2026-11-21
 
@@ -670,6 +714,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)).
 
 ### Fixed
+
+- **The expert map shows Qwen3.8's experts on a CUDA card.** Qwen3.8's map for the chat page and `coli tui`
+  read the Vulkan tier only, so on CUDA every expert the card held showed as in RAM or on the disk ("VRAM 0%").
+  It now reads the CUDA tier too and the CUDA chain's own slots where it holds the arena, and counts the
+  chain's host pool (page-locked RAM the card reads over the bus) as RAM, where it showed as the disk.
+
+- **A GGUF's reads no longer queue one behind the other on Windows.** `gguf_read` read through the
+  descriptor `open()` gives, a synchronous file object, and Windows runs one I/O at a time on one:
+  the OpenMP team that reads a prompt's PLE rows ahead (`q38_ple_prefetch`) read them in turn. Each
+  part is now also opened overlapped, and a read waits on an event of its own. 71,664 random 90-byte
+  rows of Qwen3.8-Flash-Next's 28.8 GB table (a 4.5K-token prompt's), 16 threads: 7.4 s to 1.2 s
+  cold, 0.55 s to 0.27 s from the page cache. Served on an RTX 5090 (Qwen3.8-Flash-Next IQ1_M,
+  every expert on the card, greedy, two sessions each way): a 4,479-token prompt's first token
+  5.37-5.75 s to 2.04-2.10 s, the engine ready 21.1-21.4 s to 12.7 s, decode unchanged
+  (47.4-52.4 tok/s to 48.8-54.5), the same text in every request. Same bytes; Linux and macOS
+  unchanged. (#2967)
 
 - **Qwen3.8's CUDA chain runs the routed experts on the card when every one of them is there, whatever the
   RAM cache's size.** A decode step's experts in the frame needed a layer's RAM cache of 8 x top-k slots, and

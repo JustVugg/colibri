@@ -577,7 +577,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
-	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
+	test_e8x4g64_loader test_qwenimage_vae test_qwenimage_vision test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 test_int_kernel_exact_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
 TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window test_vk_pcache
@@ -587,6 +587,8 @@ TEST_EXCLUDE += test_cu_tier
 TEST_EXCLUDE += test_qwen36_tier_mxfp4_gpu
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
+# runs qwen36.c's main on a GGUF named on its command line: tests/test_qwen36_gguf_hostdrop.py drives it
+TEST_EXCLUDE += test_qwen36_gguf_hostdrop
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -1119,7 +1121,7 @@ libcoli_xdna.so: backend_xdna_helper.cpp
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h
+cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h qwen36_cuda_profile.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
@@ -1149,7 +1151,7 @@ cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cud
 # survives. No path is hardcoded — see the HIP SDK contract above.
 #
 #   make hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk> HIP_ARCH=gfx1151
-hip-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_gpu_compat.h
+hip-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_gpu_compat.h qwen36_cuda_profile.h
 	@test -x "$(HIPCC)" || command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found at \"$(HIPCC)\": set HIP_SDK_ROOT=<path>, HIP_BIN_DIR=<path> or HIPCC=<path>" >&2; exit 1; }
 	@test -d "$(HIP_INCLUDE_DIR)" || { echo "HIP include dir not found: \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
 	@test -f "$(HIP_INCLUDE_DIR)/hip/hip_runtime.h" || { echo "hip/hip_runtime.h missing under \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
@@ -1168,13 +1170,13 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config
+backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config qwen36_cuda_profile.h
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
 # The dense chain on a CUDA device (cuda_chain.h): the backend's twin of vk_chain.c,
 # built into the same backend (one table export, coli_cuda_chain_ops).
-cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh cuda_k3c.cuh cuda_inkc.cuh cuda_dflash.cuh backend_cuda.h backend_gpu_compat.h .build-config
+cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh cuda_k3c.cuh cuda_inkc.cuh cuda_dflash.cuh backend_cuda.h backend_gpu_compat.h .build-config qwen36_cuda_profile.h
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cuda_chain.cu -o $@
 
@@ -1368,10 +1370,15 @@ expert-group-rows-test: tests/test_expert_group_rows_cuda.cu backend_cuda.cu bac
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
 	./expert_group_rows_test$(EXE)
 
-cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu tests/test_vision_attention_cuda.cu
+cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu tests/test_vision_attention_cuda.cu tests/test_gemv_sk_part_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
+	# gemv_i8_w4's split partials with COLI_CUDA_SK_PART=0 and =1, each in its own process (the
+	# switch is read once): the same bits, the buffers a stream, a call past its buffer, a graph.
+	# Includes backend_cuda.cu itself, so only the test file is compiled.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_gemv_sk_part_cuda.cu -o gemv_sk_part_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./gemv_sk_part_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
 	./expert_group_rows_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_init_failure.cu -o cuda_init_failure_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
@@ -1596,6 +1603,7 @@ gpu-compile: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_gemv_sk_part_cuda.cu -o gemv_sk_part_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -1940,6 +1948,25 @@ qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen3
 	echo "qwen38 int4-g64 experts: ref_int4.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
 	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_int4
 
+# The grouped decode (q38_moe_decode_grouped) with a RAM cache smaller than a step's distinct
+# experts: it takes them in waves of the cache's slots. The int4 fixture in the gguf-256 geometry
+# (the grouped path needs dims % 32; the default fixture's are 8) at caps 1, 2 and 8, the prompt
+# through the decode rows (Q38_PREFILL_BATCH=0: up to 8 distinct experts a step): the grouped path
+# runs at every cap and the last logits are identical to the bit (cap 8 is one wave). The run's
+# own oracle is not the gate: ref_int4.json is the small geometry's.
+.PHONY: qwen38-grouped-waves-check
+qwen38-grouped-waves-check: qwen38$(EXE)
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_g256_int4 --fp8-experts --int4-experts --expert-gain 3 --geometry gguf-256
+	@d=./qwen38_tiny_g256_int4/logits; rm -rf $$d; mkdir -p $$d; \
+	for cap in 1 2 8; do \
+		Q38_EXPERT_INT4=1 Q38_PREFILL_BATCH=0 DUMP=$$d/c$$cap.f32 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_g256_int4 \
+			./qwen38$(EXE) $$cap 8 ./qwen38_tiny_g256_int4/ref_int4.json > $$d/c$$cap.log 2>&1; \
+		grep -q '^C engine' $$d/c$$cap.log && [ -s $$d/c$$cap.f32 ] || { cat $$d/c$$cap.log; echo "FAIL cap=$$cap: no run"; exit 1; }; \
+		grep -q 'grouped by expert' $$d/c$$cap.log || { cat $$d/c$$cap.log; echo "FAIL cap=$$cap: the grouped decode did not run"; exit 1; }; \
+	done; \
+	for cap in 1 2; do cmp -s $$d/c$$cap.f32 $$d/c8.f32 || { echo "FAIL cap=$$cap: last logits differ from one wave (cap 8)"; exit 1; }; done; \
+	echo "qwen38 grouped decode in waves: caps 1, 2 and 8 give the same last logits"
+
 # The routed experts as AMD's Quark checkpoint ships them in MXFP4 (e2m1 nibbles, one E8M0
 # exponent per 32 inputs): --mxfp4-experts rounds the fixture's experts (scaled by 3, as the
 # int4 fixture's) to MXFP4, writes them under quark/ with Quark's tensor names and as FP8
@@ -2049,6 +2076,15 @@ qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
 	$(PYTHON) tests/test_qwen36_mtp_convert.py
 	$(PYTHON) tests/qwen36_mtp_harness.py --engine ./qwen36$(EXE) --source ./qwen36_tiny_mtp \
 		--model ./qwen36_tiny_mtp_i8 --model ./qwen36_tiny_mtp_i4
+
+# A Basalt .basalt qwen35 pack -> GGUF (tools/convert_basalt_to_gguf.py): the converter
+# on a tiny pack in Basalt's form (tests/basalt_fixture.py), then the converted file on
+# qwen36 (CPU): GGUF_CHECK, MTP drafts, residuals equal to the pack's values. Here the
+# engine part may not skip; test-python runs the same file and skips it when qwen36 is
+# not built.
+.PHONY: basalt-convert-check
+basalt-convert-check: qwen36$(EXE)
+	BASALT_CONVERT_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_convert_basalt_to_gguf
 
 # Speculative decoding with deeper verifies (docs/speculative.md): the MTP head's
 # drafts up to 3 per verify (Q38_MTP_DRAFTS) and prompt-lookup drafts up to 5
@@ -2468,6 +2504,15 @@ tests/test_qwenimage_encoder$(EXE): tests/test_qwenimage_encoder.c
 qwenimage-encoder-check: tests/test_qwenimage_encoder$(EXE) tests/test_qwenimage_vae$(EXE)
 	$(PYTHON) tools/check_qwenimage_encoder.py
 
+tests/test_qwenimage_vision$(EXE): tests/test_qwenimage_vision.c $(QWEN36_METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) $< $(QWEN36_METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
+
+.PHONY: qwenimage-vision-check
+qwenimage-vision-check: tests/test_qwenimage_vision$(EXE)
+	@set -e; fixture=$$(mktemp -d); trap 'rm -rf "$$fixture"' EXIT; \
+	  $(PYTHON) tools/make_qwenimage_tiny.py "$$fixture" --vision-conditioning && \
+	  ./tests/test_qwenimage_vision$(EXE) "$$fixture"
+
 # Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
 # generazione. Prova che due immagini diverse danno risposte diverse, che e'
 # l'unica domanda a cui una fixture con pesi casuali sa rispondere onestamente.
@@ -2536,6 +2581,9 @@ tests/test_st_overlay$(EXE): tests/test_st_overlay.c
 tests/test_compat_mem$(EXE): tests/test_compat_mem.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_compat_rss$(EXE): tests/test_compat_rss.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_compat_cgroup$(EXE): tests/test_compat_cgroup.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2599,6 +2647,15 @@ tests/test_gq_rows_exact$(EXE): tests/test_gq_rows_exact.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # Q2_K's fused row kernel against the unpack + gq_dot_i8 path it replaced, to the bit
 tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Grouped GQA attention in qwen36.c against the per-head loop, to the bit; `bench` times both.
+tests/test_qwen36_attn_grouped$(EXE): tests/test_qwen36_attn_grouped.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+# Fused F32/F16/BF16 paths in gq_matmul_f32 and vectorized gq_dequant_row, to the bit
+tests/test_gq_f32_fused$(EXE): tests/test_gq_f32_fused.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Single-region gq_matmul2_act (R16, TILE16_BIAS, F8) against two gq_matmul_act calls, to the bit
+tests/test_gq_matmul2$(EXE): tests/test_gq_matmul2.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The grid types' and Q2_K's row kernels (AVX-512's on a VNNI build, AVX2's otherwise) against
 # the unpack + gq_dot_i8 path, to the bit, one to eight activation rows
@@ -2728,6 +2785,10 @@ tests/test_olmoe_load_diagnostic$(EXE): tests/test_olmoe_load_diagnostic.c olmoe
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# The GGUF CPU MoE against the PILOT worker's loads: it computes from held slots.
+tests/test_qwen36_gguf_hold$(EXE): tests/test_qwen36_gguf_hold.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # The qwen36 embedding read in place (qwen36_embedding.h): rows, errors and the
@@ -2884,6 +2945,10 @@ tests/test_xf16$(EXE): tests/test_xf16.c
 # the SSE2 i8 expert kernel (no AVX2+FMA) against xf_dot_i8_ref, bit for bit.
 tests/test_xf_sse2_int16$(EXE): tests/test_xf_sse2_int16.c
 	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+# the same source built for Sandy Bridge: the AVX i8 expert kernel (AVX, no AVX2+FMA) against
+# xf_dot_i8_ref, and its fmaf emulation in four lanes and by the short way against fmaf (#2882).
+tests/test_xf_avx_i8$(EXE): tests/test_xf_sse2_int16.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=sandybridge -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
 # coli_fmaf_exact (fma_compat.h) against fmaf, bit for bit, built without FMA where it is the
 # emulation the kernels take there (#2882).
 tests/test_fmaf_exact$(EXE): tests/test_fmaf_exact.c
@@ -3043,6 +3108,10 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 
 # CPU-only state-policy regression; independent of model files and GPU flags.
 tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
+
+# glm53's serve request framing, frozen on synthetic frames (no model)
+tests/test_glm53_serve_framing$(EXE): tests/test_glm53_serve_framing.c glm53.c
 	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
 # Exact sampler order, cumulative mass, selected token and RNG-use regression.
@@ -3461,6 +3530,9 @@ tests/test_qwen36_tier_mxfp4_gpu$(EXE): tests/test_qwen36_tier_mxfp4_gpu.c qwen3
 	@case "$(CUDA_OBJ)" in *backend_*) ;; *) echo "tests/test_qwen36_tier_mxfp4_gpu needs CUDA=1, CUDA_DLL=1 or HIP=1" >&2; exit 1 ;; esac
 	$(CC) $(CFLAGS) $< $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
+# QT_ARENA=1 exact-size slab slots for FP8/int4 experts + copy-mode coldest cache.
+tests/test_qwen36_tier_arena$(EXE): tests/test_qwen36_tier_arena.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 # Same fake backend, qwen36 below full residency (#2090): cap < n_experts in copy
 # mode, the engine's planar int4 staged as the container's pairs, hits keeping
 # residents warm, the trunk-only cases, and cap == n_experts as before.
@@ -3515,6 +3587,9 @@ tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c q
 tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+tests/test_qwen36_cuda_profile$(EXE): tests/test_qwen36_cuda_profile.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 # The CUDA dense chain (COLI_CUDA_CHAIN=1, qwen36_cuda_chain.h): logits, state, verify
 # rollback and a lost device against the CPU path, on the fake backend's host-side table.
 tests/test_qwen36_cuda_chain$(EXE): tests/test_qwen36_cuda_chain.c qwen36.c qwen36_tier.c $(VK_OBJ)
@@ -3522,6 +3597,11 @@ tests/test_qwen36_cuda_chain$(EXE): tests/test_qwen36_cuda_chain.c qwen36.c qwen
 
 # dnout / attnproj / shexp offered, placed and served from VRAM (fake backend).
 tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# A GGUF's placed matrices give their host rows back and the CPU reads them back exactly
+# (the whole engine on the fake backend; tests/test_qwen36_gguf_hostdrop.py drives it).
+tests/test_qwen36_gguf_hostdrop$(EXE): tests/test_qwen36_gguf_hostdrop.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # #1391: il decode path deve offrire gli esperti int8 al tier, non solo il warmstart
@@ -3794,7 +3874,7 @@ test-c: $(TEST_BINS)
 # itself (the test ALSO skips loudly if the library is somehow still absent,
 # e.g. when invoked via unittest directly — but a green `make test` must mean
 # the pin was actually checked).
-test-python: $(RANSLIB) tests/test_ggml_quants$(EXE) tests/test_gguf_c$(EXE) tests/test_gq_dot$(EXE)
+test-python: $(RANSLIB) tests/test_ggml_quants$(EXE) tests/test_gguf_c$(EXE) tests/test_gq_dot$(EXE) tests/test_qwen36_gguf_hostdrop$(EXE)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 # One after the other, also under -j: the C binaries build in parallel, then run, and only
@@ -3909,7 +3989,7 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 	fi
 	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
 		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py \
-		image_engine.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
+		image_engine.py audio_dmel.py compaction.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
 		setup_download.py mcp_server.py power.py model_fit.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py tools/iq3xxs_grid.json $(DESTDIR)$(LIBEXECDIR)/tools/
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/ui

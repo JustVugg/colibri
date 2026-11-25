@@ -151,6 +151,9 @@ class GgufReader(unittest.TestCase):
         for name, (_, _, want) in list(a.items()) + list(b.items()):
             got = np.frombuffer(run(self.dir / "m-00001-of-00002.gguf", name).stdout, dtype=np.float32)
             self.assertTrue(np.array_equal(got.view(np.uint32), want.reshape(-1).view(np.uint32)), name)
+        for name in ("f32", "exps"):   # reads from several threads at once, both parts
+            p = run("--concurrent", self.dir / "m-00001-of-00002.gguf", name)
+            self.assertEqual(p.stdout.decode().strip(), "OK", p.stdout + p.stderr)
 
     def test_malformed_files_are_refused(self):
         rng = np.random.default_rng(8)

@@ -207,6 +207,8 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const uint16_t *gate, const float *bias,
                        const int *forced_indices, int experts, int dimension,
                        int topk, float route_scale);
+/* Re-read V4_ROUTE_FORCED_ONLY (the router reads it once; tests change it). */
+int coli_v4_route_forced_only_reload(void);
 
 int coli_v4_swiglu(float *output, const float *gate, const float *up,
                    int dimension, float limit);
@@ -783,6 +785,9 @@ int coli_v4_expert_store_lease_capacity(ColiExpertStore *store, int layer);
 int coli_v4_expert_store_lookup_uncounted(ColiExpertStore *store,
                                           ColiExpertKey key,
                                           ColiExpertView *view);
+/* V4_RAM_PROMPT_COLD (opt-in): while on, the bank's reads during a prompt go
+ * to the oldest end of the RAM cache's recency list (deepseek_v4.c). */
+void coli_v4_expert_store_prompt_sweep(ColiExpertStore *store, int on);
 void coli_v4_expert_store_touch_union(ColiExpertStore *store, int layer,
                                       const int *ids, int count);
 void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
@@ -1060,6 +1065,12 @@ extern unsigned long long g_v4_dec_calls, g_v4_dec_uploads;
 extern double g_v4_dec_total_s, g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s;
 extern unsigned long long g_v4_gpu_first_hits, g_v4_dec_store_fetches;
 
+/* DSV4_CUDA_REQUIRE: nonzero turns every CPU fallback of the GPU tier's open into an error */
+static inline int coli_v4_gpu_required(void) {
+    const char *s = getenv("DSV4_CUDA_REQUIRE");
+    return s && atoi(s) != 0;
+}
+
 #ifdef COLI_V4_GPU_TIER
 /* Provided by the COLI_V4_UNIT_GPU translation unit. Compiled in only on the
  * Windows CUDA build; every call site elsewhere is guarded by COLI_V4_GPU_TIER
@@ -1249,6 +1260,11 @@ int coli_v4_gpu_resident_first(void);
 /* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
  * unit, read by the serve unit's per-turn stderr line. */
 int coli_v4_hybrid_enabled(void);
+int coli_v4_hot_split_on(void);
+void coli_v4_hot_split_auto(int on);
+void coli_v4_gpu_hot_touch(int layer, const int *ids, int count);
+int coli_v4_gpu_hot_pick(int layer, const int *ids, const int *candidates, int count);
+int coli_v4_gpu_expert_admit_hot(ColiExpertStore *store, ColiExpertView *view);
 /* async attach (enqueue only; drain closes the pipeline before compute) */
 int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
                                     ColiExpertView *view);

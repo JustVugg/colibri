@@ -372,20 +372,9 @@ static void trace(const char *name, int layer, const float *v, int n) {
             name, layer, n, sum, v[0], n > 1 ? v[1] : 0.0f, n > 2 ? v[2] : 0.0f);
 }
 
-static double rss_gb(void) {
-    struct rusage usage;
-    getrusage(RUSAGE_SELF, &usage);
-#ifdef __APPLE__
-    return usage.ru_maxrss / 1e9;
-#else
-    return usage.ru_maxrss / 1e6;
-#endif
-}
+static double rss_gb(void) { return compat_rss_gb(); }
 
-static double now_s(void) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
+static double now_s(void) { return compat_now_s(); }
 
 static void *xmalloc(size_t bytes, const char *what) {
     void *p = malloc(bytes ? bytes : 1);
@@ -3298,6 +3287,7 @@ static int moe_block_rows(void) {
     }
     return rows;
 }
+static void prefetch_after_reads(Model *m, const char *kind, int layer, const float *xc, int rows);
 
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* ---- the Vulkan routed-expert tier (vk_tier.c) ---------------------------------
@@ -3364,7 +3354,7 @@ static void moe_vk_cpu(Model *m, LCache *cache, const char *kind, int layer, int
         tail[at] = d;
         count[at]++;
     }
-    if (!n_uniq) { free(uniq); return; }
+    if (!n_uniq) { free(uniq); prefetch_after_reads(m, kind, layer, xc, rows); return; }
     float *gathered = xmalloc((size_t)rows * dim * sizeof(float), "expert inputs");
     float *down = xmalloc((size_t)rows * dim * sizeof(float), "expert outputs");
     int step = cache->cap < MOE_ROW_CHUNK ? cache->cap : MOE_ROW_CHUNK;
@@ -3372,6 +3362,7 @@ static void moe_vk_cpu(Model *m, LCache *cache, const char *kind, int layer, int
         int ne = n_uniq - u0 < step ? n_uniq - u0 : step;
         Slot *slot[MOE_ROW_CHUNK];
         expert_slots_at(m, cache, kind, layer, uniq + u0, ne, slot);
+        if (u0 + ne >= n_uniq) prefetch_after_reads(m, kind, layer, xc, rows);
         for (int u = 0; u < ne; u++) {
             int cnt = count[u0 + u], at = 0;
             for (int d = head[u0 + u]; d >= 0; d = next[d], at++)
@@ -3721,10 +3712,146 @@ static int cluster_worker_run(const char *snap, int port) {
  * slots genuinely cannot all be live at once. */
 /* with_shared 0: the routed experts only (the dense chain runs the shared expert on the
  * device and adds it there, in the same place of the sum). */
+/* V41_PREFETCH (on by default, 0 turns it off): during a decode step, read the experts layer
+ * L+1 will probably route to on a worker thread, so the reads overlap layer L's matmuls and
+ * layer L+1's attention. The guess runs layer L's FFN input through layer L+1's ffn_norm and
+ * gate once layer L's own reads are done; a guess the cache or the device already holds is
+ * not read. A rank of the guess is read only while its running hit rate is at least
+ * V41_PREFETCH_MIN percent (default 40): on unsloth's V4.1-Flash GGUF the ranks hit about
+ * 91/81/68/55/41/28%, and a rank under ~40% wastes more reads than it hides.
+ *
+ * The slots are reserved here, on the main thread, as expert_slots_at reserves them; the
+ * worker only reads into them. The main thread waits for the worker before any expert cache
+ * is used again (moe_run_at, the end of forward_full), so a cache is never shared. The bytes
+ * land in ordinary slots and the routing and the matmuls are the ones that would have run,
+ * so the output does not move. */
+#define V41_PREFETCH_MIN_DEFAULT 40
+#define V41_PREFETCH_WINDOW 1024   /* a rank's tally is halved every this many guesses */
+typedef struct {
+    pthread_mutex_t mx; pthread_cond_t cv;
+    pthread_t th; int started, busy;
+    Model *m; int layer, n; int eid[MOE_TOPK_MAX]; Slot *slot[MOE_TOPK_MAX];
+    uint64_t read, used, guessed;
+    int have[V41_MAX_LAYERS], guess[V41_MAX_LAYERS][MOE_TOPK_MAX];
+    uint8_t held[V41_MAX_LAYERS][MOE_TOPK_MAX];
+    int fetched[V41_MAX_LAYERS][MOE_TOPK_MAX], n_fetched[V41_MAX_LAYERS];
+    uint32_t hit[MOE_TOPK_MAX], tried[MOE_TOPK_MAX];
+} Prefetch;
+static Prefetch g_pf = { .mx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+static int g_pf_on = -1, g_pf_min;
+static int prefetch_on(void) {
+    if (g_pf_on < 0) {
+        const char *e = getenv("V41_PREFETCH"), *mn = getenv("V41_PREFETCH_MIN");
+        g_pf_on = !e || !*e || *e != '0';
+        g_pf_min = mn && *mn ? atoi(mn) : V41_PREFETCH_MIN_DEFAULT;
+    }
+    return g_pf_on;
+}
+static void *prefetch_main(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_pf.mx);
+    for (;;) {
+        while (!g_pf.busy) pthread_cond_wait(&g_pf.cv, &g_pf.mx);
+        pthread_mutex_unlock(&g_pf.mx);
+        expert_fetch(g_pf.m, "layers", g_pf.layer, g_pf.slot, g_pf.eid, g_pf.n);
+        pthread_mutex_lock(&g_pf.mx);
+        g_pf.busy = 0;
+        pthread_cond_broadcast(&g_pf.cv);
+    }
+    return NULL;
+}
+static void prefetch_wait(void) {
+    if (g_pf_on != 1) return;
+    pthread_mutex_lock(&g_pf.mx);
+    while (g_pf.busy) pthread_cond_wait(&g_pf.cv, &g_pf.mx);
+    pthread_mutex_unlock(&g_pf.mx);
+}
+static int prefetch_held(Model *m, int layer, int e) {
+    LCache *cache = &m->cache[layer];
+    for (int i = 0; i < cache->n; i++) if (cache->slot[i].eid == e) return 1;
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    if (XT(ready)() && XT(resident)(v41_tier_layer(m, "layers", layer), e)) return 1;
+#endif
+    return 0;
+}
+/* Until a rank has a few dozen guesses behind it, it is read. */
+static int prefetch_rank_ok(int r) {
+    if (g_pf_min <= 0 || g_pf.tried[r] < 64) return 1;
+    return (uint64_t)g_pf.hit[r] * 100 >= (uint64_t)g_pf_min * g_pf.tried[r];
+}
+/* inside a decode step's MoE, once its own reads are done: guess layer L+1 and start reading */
+static void prefetch_after_reads(Model *m, const char *kind, int layer, const float *xc, int rows) {
+    Cfg *c = &m->c;
+    int next = layer + 1;
+    if (rows != 1 || strcmp(kind, "layers") || next >= c->n_layers || next >= V41_MAX_LAYERS) return;
+    if (!prefetch_on() || c->n_activated > MOE_TOPK_MAX) return;
+    static float *in, *scores, *w;
+    if (!in) {
+        in = xmalloc((size_t)c->dim * sizeof(float), "prefetch input");
+        scores = xmalloc((size_t)c->n_routed * sizeof(float), "prefetch scores");
+        w = xmalloc((size_t)MOE_TOPK_MAX * sizeof(float), "prefetch weights");
+    }
+    Layer *l = &m->L[next];
+    rms_into(in, xc, l->ffn_norm.w, c->dim, c->norm_eps);
+    mvb_rows(scores, c->n_routed, &l->gate_w, in, c->dim, 1);
+    moe_gate(m, l, c->n_routed, c->n_activated, scores, g_pf.guess[next], w);
+    for (int k = 0; k < c->n_activated; k++) g_pf.held[next][k] = (uint8_t)prefetch_held(m, next, g_pf.guess[next][k]);
+    g_pf.have[next] = 1;
+    g_pf.n_fetched[next] = 0;
+
+    LCache *cache = &m->cache[next];
+    if (cache->cap < c->n_activated + 1) return;   /* the step's own experts need every slot */
+    int want[MOE_TOPK_MAX], n = 0;
+    for (int k = 0; k < c->n_activated; k++)
+        if (!g_pf.held[next][k] && prefetch_rank_ok(k)) want[n++] = g_pf.guess[next][k];
+    g_pf.guessed += (uint64_t)n;
+    if (n > cache->cap - 1) n = cache->cap - 1;
+    if (!n) return;
+    prefetch_wait();
+    Slot *slot[MOE_TOPK_MAX];
+    for (int i = 0; i < n; i++) {   /* reserved as expert_slots_at reserves a miss */
+        Slot *victim = cache->n < cache->cap ? &cache->slot[cache->n++]
+                                              : &cache->slot[v41_victim(m, cache, "layers", next)];
+        victim->used = ++m->clock;
+        victim->eid = -1;
+        slot[i] = victim;
+    }
+    pthread_mutex_lock(&g_pf.mx);
+    if (!g_pf.started) {
+        if (pthread_create(&g_pf.th, NULL, prefetch_main, NULL) == 0) g_pf.started = 1;
+        else { pthread_mutex_unlock(&g_pf.mx); g_pf_on = 0; expert_fetch(m, "layers", next, slot, want, n); return; }
+    }
+    g_pf.m = m; g_pf.layer = next; g_pf.n = n;
+    memcpy(g_pf.eid, want, (size_t)n * sizeof(int));
+    memcpy(g_pf.slot, slot, (size_t)n * sizeof(Slot *));
+    memcpy(g_pf.fetched[next], want, (size_t)n * sizeof(int));
+    g_pf.n_fetched[next] = n;
+    g_pf.read += (uint64_t)n;
+    g_pf.busy = 1;
+    pthread_cond_broadcast(&g_pf.cv);
+    pthread_mutex_unlock(&g_pf.mx);
+}
+/* once layer L+1 routes: score each rank of its guess, and count the reads it used */
+static void prefetch_score(int layer, const int *chosen, int topk) {
+    if (layer >= V41_MAX_LAYERS || !g_pf.have[layer]) return;
+    for (int r = 0; r < topk; r++) {
+        if (g_pf.held[layer][r]) continue;
+        int hit = 0;
+        for (int k = 0; k < topk; k++) if (chosen[k] == g_pf.guess[layer][r]) { hit = 1; break; }
+        if (++g_pf.tried[r] >= V41_PREFETCH_WINDOW) { g_pf.tried[r] /= 2; g_pf.hit[r] /= 2; }
+        g_pf.hit[r] += (uint32_t)hit;
+    }
+    for (int i = 0; i < g_pf.n_fetched[layer]; i++)
+        for (int k = 0; k < topk; k++) if (chosen[k] == g_pf.fetched[layer][i]) { g_pf.used++; break; }
+    g_pf.have[layer] = 0;
+    g_pf.n_fetched[layer] = 0;
+}
+
 static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int layer,
                        int E, int topk, const float *x, int n, float *out, int with_shared) {
     Cfg *c = &m->c;
     int dim = c->dim;
+    prefetch_wait();
     if (topk > MOE_TOPK_MAX) {
         fprintf(stderr, "[moe] n_activated %d exceeds the scratch\n", topk); exit(1); }
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
@@ -3758,6 +3885,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
             moe_gate(m, l, E, topk, scores + (size_t)r * E,
                      chosen + r * topk, weights + r * topk);
         free(scores);
+        if (g_pf_on == 1 && n == 1 && !strcmp(kind, "layers")) prefetch_score(layer, chosen, topk);
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
         if (XT(ready)() && v41_tier_layer(m, kind, layer) < XT(layers)()) {   /* the backbone, a stage the tier took */
             /* in MOE_ROW_CHUNK pieces, as before: the tier's buffers are sized for that many */
@@ -3844,6 +3972,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
             int ne = n_uniq - u0 < step ? n_uniq - u0 : step;
             Slot *slot[MOE_ROW_CHUNK];
             expert_slots_at(m, cache, kind, layer, uniq + u0, ne, slot);
+            if (u0 + ne >= n_uniq) prefetch_after_reads(m, kind, layer, xc, rows);
             for (int u = 0; u < ne; u++) {
                 int cnt = count[u0 + u], at = 0;
                 for (int d = head[u0 + u]; d >= 0; d = next[d], at++)
@@ -4971,6 +5100,7 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
             v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
     }
 
+    prefetch_wait();   /* a STOP between layers can leave the next layer's read in flight */
     if (stopped) {
         free(collapsed); free(comb); free(post); free(pre);
         free(residual); free(branch_out); free(branch_in); free(pre_mix); free(h);
@@ -5262,23 +5392,8 @@ static int sample_desc(const void *a, const void *b) {
     return (pb > pa) - (pa > pb);
 }
 
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes
- * them (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V) {
-    static int dump = -1;
-    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
-    if (!dump) return;
-    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
-    for (int t = 0; t < V; t++) {
-        const float x = lo[t];
-        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
-    }
-    fprintf(stderr, "[LOGITS]");
-    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
-    fprintf(stderr, "\n");
-}
 static int serve_sample(const float *logits, int vocab, float temperature, float top_p) {
-    serve_logit_dump(logits, vocab);
+    coli_logit_dump(logits, vocab);
     if (temperature <= 0.0f) return argmax(logits, vocab);
     SampleProb *rank = xmalloc((size_t)vocab * sizeof(SampleProb), "sampling");
     float top = logits[0];
@@ -6382,6 +6497,11 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
              * that was registered but never read from would look like a win in
              * every number except the one that matters. */
             if (turn_bytes) mirror_report(mir_bytes0, mir_reads0);
+            if (g_pf_on == 1 && g_pf.read)
+                fprintf(stderr, "[v41] prefetch: %llu experts guessed off the caches, %llu read ahead, "
+                                "%llu of them routed (%.1f%%)\n",
+                        (unsigned long long)g_pf.guessed, (unsigned long long)g_pf.read,
+                        (unsigned long long)g_pf.used, 100.0 * g_pf.used / g_pf.read);
         }
         if (stats && m->spec.active && m->spec.written > written0) {
             fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn (%llu written)\n",
@@ -6805,6 +6925,35 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[CUDA] deepseek_v41: a build with Vulkan runs on it, the same card, its dense chain and expert tier "
                             "(COLI_VULKAN=0 keeps the CUDA tier)\n");
         }
+    }
+#endif
+#if defined(_OPENMP) && defined(__linux__)
+    /* Bind the team, one thread to a core packed from the first (OMP_PROC_BIND=close,
+     * OMP_PLACES=cores), as colibri and inkling do. Unbound, the scheduler moves the team's
+     * threads onto a hybrid CPU's efficiency cores, and the team waits at every barrier for the
+     * slowest of them. libgomp reads these when it loads, so the process runs itself again
+     * once with them set. An OMP_PROC_BIND or OMP_PLACES the user set wins (setenv's 0);
+     * COLI_NO_OMP_TUNE=1 leaves the team unbound. Not OMP_WAIT_POLICY=active: a spinning team
+     * measured slower here, beside the GPU's threads. */
+    if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") && argv && argv[0]) {
+        setenv("OMP_PROC_BIND", "close", 0);
+        setenv("OMP_PLACES", "cores", 0);
+        setenv("COLI_OMP_TUNED", "1", 1);
+#ifdef CPU_SETSIZE
+        {   /* #471: a user's OMP_PROC_BIND already bound this thread to one place; the new image
+             * would inherit that mask and put its whole team there */
+            cpu_set_t all; CPU_ZERO(&all);
+            long n = sysconf(_SC_NPROCESSORS_ONLN);
+            if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+            for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
+            if (sched_setaffinity(0, sizeof all, &all) != 0) perror("[OMP] deepseek_v41: sched_setaffinity before the re-exec (continuing)");
+        }
+#endif
+        char self[4096];   /* the binary's own path, so the process keeps its name */
+        ssize_t k = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (k > 0) { self[k] = 0; execv(self, argv); }
+        execv("/proc/self/exe", argv);
+        perror("[OMP] deepseek_v41: execv self-reexec failed, the team runs unbound");
     }
 #endif
     coli_env_check(CE_DSV41, "deepseek-v41");
