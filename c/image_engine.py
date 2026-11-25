@@ -121,6 +121,21 @@ def supports_image_edits(info):
     return info.get("supports_image_edits") is True
 
 
+EDIT_DECODER_REQUIRED = "Image editing requires Pillow (pip install pillow)."
+
+
+def _edit_decoder():
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    return Image
+
+
+def edit_decoder_available():
+    return _edit_decoder() is not None
+
+
 def edit_image_bytes(body):
     """Read one inline image. This route never resolves paths or URLs."""
     for param in ("mask", "strength"):
@@ -144,12 +159,11 @@ def edit_image_bytes(body):
 
 def prepare_edit_reference(data):
     """Return (width, height, RGBA bytes) for both Qwen-Image-2.1 encoders."""
+    image_decoder = _edit_decoder()
+    if image_decoder is None:
+        raise ImageRequestError(EDIT_DECODER_REQUIRED, "image")
     try:
-        from PIL import Image
-    except ImportError as error:
-        raise ImageRequestError("Image editing requires Pillow (pip install pillow).", "image") from error
-    try:
-        with Image.open(io.BytesIO(data), formats=("PNG", "JPEG", "WEBP")) as image:
+        with image_decoder.open(io.BytesIO(data), formats=("PNG", "JPEG", "WEBP")) as image:
             width, height = image.size
             if width * height > REFERENCE_MAX_PIXELS:
                 raise ImageRequestError("The reference image has more than 16,777,216 pixels.", "image")
@@ -163,8 +177,9 @@ def prepare_edit_reference(data):
             height = round(target_width / ratio / 32) * 32
             if not (32 <= width <= REFERENCE_MAX_SIDE and 32 <= height <= REFERENCE_MAX_SIDE):
                 raise ImageRequestError("The reference aspect ratio is outside the supported range.", "image")
-            rgba = image.convert("RGBA").resize((width, height), Image.Resampling.LANCZOS).tobytes()
-    except (OSError, Image.DecompressionBombError) as error:
+            filters = getattr(image_decoder, "Resampling", image_decoder)
+            rgba = image.convert("RGBA").resize((width, height), filters.LANCZOS).tobytes()
+    except (OSError, image_decoder.DecompressionBombError) as error:
         raise ImageRequestError("`image` must contain a readable PNG, JPEG, or WebP image.", "image") from error
     return width, height, rgba
 

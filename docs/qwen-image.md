@@ -347,11 +347,13 @@ coli run --model ~/Models/Qwen-Image-2.1 --image fox.png --size 1024x576 \
   --seed 42 --out edited.png "Give the fox a blue scarf"
 ```
 
-Check `GET /v1/models` for the `image_editing` capability. Send the
+Check `GET /v1/models` for `image_editing`. The server advertises it when
+the model supports edits and the server can import Pillow. Send the
 generation fields to `POST /v1/images/edits` as JSON, plus one `image`
 string containing the file bytes as base64 or an image data URL such as
-`data:image/png;base64,...`. The body limit is 4 MiB. Leave `mask` and
-`strength` out of the request.
+`data:image/png;base64,...`. The default body limit is 4 MiB. Set
+`COLI_MAX_BODY` in bytes to change it. Leave `mask` and `strength` out of
+the request.
 
 ```sh
 python3 -c 'import base64, json; print(json.dumps({

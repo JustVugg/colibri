@@ -1586,14 +1586,7 @@ static int engine_edit_supported(Engine *e){
 #ifdef QI_HAVE_VAE
     if (!te_image_supported(&e->te, e->model)) return 0;
     char dir[2100]; qi_part(e->model, "vae", dir, sizeof dir);
-    struct stat sb;
-    if (stat(dir, &sb) || !S_ISDIR(sb.st_mode)) return 0;
-    /* Inspect the checkpoint index to distinguish an encoder/decoder from
-     * a decoder-only export. Do not load the encoder before it is needed. */
-    shards s; st_init(&s, dir);
-    int supported = st_has(&s, "encoder.conv_in.weight") && st_has(&s, "quant_conv.weight");
-    st_destroy(&s);
-    return supported;
+    return qie_supported(dir, e->dit.in_ch);
 #else
     (void)e;
     return 0;

@@ -8693,7 +8693,7 @@ class APIServer(ThreadingHTTPServer):
         if is_image_engine(self.engine):
             info = getattr(self.engine, "info", None) or {}
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
-            if image_engine.supports_image_edits(info):
+            if "image_editing" in entry["capabilities"]:
                 entry["image"]["supports_image_edits"] = True
         return entry
 
@@ -8708,12 +8708,16 @@ class APIServer(ThreadingHTTPServer):
                 self._states_seen.popitem(last=False)
         return seen
 
+    def image_edits_available(self):
+        return (image_engine.supports_image_edits(self.engine.info)
+                and image_engine.edit_decoder_available())
+
     def capabilities(self):
         """What the served model does, for /v1/models and /health: an image model
         draws (image_generation); every text engine answers POST /v1/systemone
         (systemone), and a decision engine does only that (decision)."""
         if is_image_engine(self.engine):
-            if image_engine.supports_image_edits(self.engine.info):
+            if self.image_edits_available():
                 return ["image_generation", "image_editing"]
             return ["image_generation"]
         if engine_decides(self.engine) and not engine_chats(self.engine):
@@ -8741,7 +8745,7 @@ class APIServer(ThreadingHTTPServer):
         rather than promising a picture nobody checked."""
         modalities = ["text"]
         if is_image_engine(self.engine):
-            if image_engine.supports_image_edits(self.engine.info):
+            if self.image_edits_available():
                 modalities.append("image")
         elif family_by_id(ARCH).capabilities.image and getattr(self.engine, "vision", None) is True:
             modalities.append("image")
@@ -9863,9 +9867,13 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
                                 "chat model (POST /v1/chat/completions).",
                            "model", "unsupported_endpoint")
-        if edit and not image_engine.supports_image_edits(engine.info):
-            raise APIError(400, f"`{self.server.model_id}` does not support reference-image edits.",
-                           "model", "unsupported_endpoint")
+        if edit:
+            if not image_engine.supports_image_edits(engine.info):
+                raise APIError(400, f"`{self.server.model_id}` does not support reference-image edits.",
+                               "model", "unsupported_endpoint")
+            if not image_engine.edit_decoder_available():
+                raise APIError(503, image_engine.EDIT_DECODER_REQUIRED, None,
+                               "image_decoder_unavailable", "server_error")
         try:
             request = image_engine.image_request(body, engine.info)
             uploaded = image_engine.edit_image_bytes(body) if edit else None

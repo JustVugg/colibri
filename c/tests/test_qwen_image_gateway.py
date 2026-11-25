@@ -8,9 +8,10 @@ determinism, the size actually drawn and the PNG framing.
 """
 import base64
 import http.client
-import importlib.util
 import json
+import math
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -19,12 +20,15 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from qwen_image_fixture import STUB, make_fake_pipeline, stub_env  # noqa: E402
+import safetensors_edit  # noqa: E402
 
 import image_engine  # noqa: E402
 from openai_server import APIServer  # noqa: E402
@@ -371,6 +375,7 @@ class ImagesFailureTest(unittest.TestCase):
             gw.close()
 
 
+@unittest.skipUnless(image_engine.edit_decoder_available(), "image editing requires Pillow")
 class EditsEndpointTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -408,7 +413,6 @@ class EditsEndpointTest(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(json.loads(raw)["error"]["param"], param)
 
-    @unittest.skipUnless(importlib.util.find_spec("PIL"), "image editing requires Pillow")
     def test_inline_bytes_reach_protocol_in_both_response_modes(self):
         def sample(color):
             pixels = bytes([color, 0, 255, 255]) * 8
@@ -428,11 +432,44 @@ class EditsEndpointTest(unittest.TestCase):
         self.assertNotEqual(json.loads(raw)["data"][0]["b64_json"], image)
         self.assertIsNone(self.gw.engine._reference_dir)
 
-    @unittest.skipUnless(importlib.util.find_spec("PIL"), "image editing requires Pillow")
     def test_valid_base64_but_invalid_image_is_a_client_error(self):
         status, _h, raw = self.edit("YWJjZA==")
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(raw)["error"]["param"], "image")
+
+    def test_legacy_pillow_resize_filter(self):
+        decoder = image_engine._edit_decoder()
+        legacy = SimpleNamespace(open=decoder.open, LANCZOS=3,
+                                 DecompressionBombError=decoder.DecompressionBombError)
+        pixel = bytes((20, 40, 80, 255))
+        png = image_engine.encode_png(2, 2, pixel * 4, 4)
+        with patch.object(image_engine, "_edit_decoder", return_value=legacy):
+            width, height, rgba = image_engine.prepare_edit_reference(png)
+        self.assertEqual((width, height), (1024, 1024))
+        self.assertEqual(rgba[:4], pixel)
+
+
+class EditsWithoutDecoderTest(unittest.TestCase):
+    def test_missing_pillow_hides_editing_and_returns_503(self):
+        with patch.dict(sys.modules, {"PIL": None}):
+            gw = GatewayHarness(QWENIMAGE_STUB_EDITS="1")
+            try:
+                self.assertIs(gw.engine.info.get("supports_image_edits"), True)
+                status, _h, raw = gw.request("/v1/models")
+                self.assertEqual(status, 200)
+                entry = json.loads(raw)["data"][0]
+                self.assertEqual(entry["capabilities"], ["image_generation"])
+                self.assertEqual(entry["input_modalities"], ["text"])
+                self.assertNotIn("supports_image_edits", entry["image"])
+                status, _h, raw = gw.request("/v1/images/edits", {
+                    "model": MODEL_ID, "prompt": "x", "image": "eA==",
+                })
+                self.assertEqual(status, 503, raw)
+                self.assertIn("Pillow", json.loads(raw)["error"]["message"])
+                status, _h, raw = gw.generate(prompt="x", size="256x256", steps=2)
+                self.assertEqual(status, 200, raw)
+            finally:
+                gw.close()
 
 
 class TextModelImagesTest(unittest.TestCase):
@@ -467,11 +504,13 @@ class TextModelImagesTest(unittest.TestCase):
 
 @unittest.skipUnless(EDIT_TINY, "needs QWENIMAGE_EDIT_TINY")
 class RealEngineEditsTest(unittest.TestCase):
-    def test_cli_and_http_edit_the_same_reference(self):
+    def setUp(self):
         self.assertTrue(EDIT_ENGINE.is_file(), "build qwenimage before setting QWENIMAGE_EDIT_TINY")
-        env = dict(os.environ, COLI_ENGINE=str(EDIT_ENGINE), COLI_IMG_BITS="8",
-                   COLI_IMG_ACT8="0", COLI_VULKAN="0", OMP_NUM_THREADS="2")
-        gw = GatewayHarness(engine_path=EDIT_ENGINE, model=EDIT_TINY, env=env)
+        self.env = dict(os.environ, COLI_ENGINE=str(EDIT_ENGINE), COLI_IMG_BITS="8",
+                        COLI_IMG_ACT8="0", COLI_VULKAN="0", OMP_NUM_THREADS="2")
+
+    def test_cli_and_http_edit_the_same_reference(self):
+        gw = GatewayHarness(engine_path=EDIT_ENGINE, model=EDIT_TINY, env=self.env)
         self.addCleanup(gw.close)
         self.assertIs(gw.engine.info.get("supports_image_edits"), True)
         root = Path(gw.tmp.name)
@@ -484,7 +523,7 @@ class RealEngineEditsTest(unittest.TestCase):
             [sys.executable, str(C_DIR / "coli"), "run", "--model", EDIT_TINY,
              "--image", str(reference), "--size", "256x256", "--seed", "13",
              "--steps", "2", "--out", str(output), prompt],
-            env=env, capture_output=True, text=True, timeout=180,
+            env=self.env, capture_output=True, text=True, timeout=180,
         )
         self.assertEqual(cli.returncode, 0, cli.stderr)
         cli_image = image_engine.decode_png(output.read_bytes())
@@ -501,6 +540,67 @@ class RealEngineEditsTest(unittest.TestCase):
         self.assertEqual(edit(first), cli_image)
         self.assertNotEqual(edit(second)[3], cli_image[3],
                             "changing only the reference left the real engine output unchanged")
+
+    def check_edits_disabled(self, model, *, check_generation=False):
+        gw = GatewayHarness(engine_path=EDIT_ENGINE, model=model, env=self.env)
+        try:
+            self.assertNotIn("supports_image_edits", gw.engine.info)
+            status, _headers, raw = gw.request("/v1/models")
+            self.assertEqual(status, 200, raw)
+            self.assertEqual(json.loads(raw)["data"][0]["capabilities"], ["image_generation"])
+            status, _headers, raw = gw.request("/v1/images/edits", {
+                "model": MODEL_ID, "prompt": "x", "image": "unused",
+            })
+            self.assertEqual(status, 400, raw)
+            self.assertIn("does not support reference-image edits", json.loads(raw)["error"]["message"])
+            if check_generation:
+                status, _headers, raw = gw.generate(prompt="a red fox", size="256x256", steps=2, seed=13)
+                self.assertEqual(status, 200, raw)
+                self.assertEqual(png_pixels(json.loads(raw)["data"][0]["b64_json"])[:3], (256, 256, 4))
+        finally:
+            gw.close()
+
+    def test_invalid_vision_markers_disable_edits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model"
+            shutil.copytree(EDIT_TINY, model)
+            tokenizer_path = model / "processor" / "tokenizer.json"
+            original = tokenizer_path.read_text(encoding="utf-8")
+            config = json.loads((model / "text_encoder" / "config.json").read_text(encoding="utf-8"))
+            for kind in ("missing", "out of range", "vision collision", "chat collision",
+                         "text collision", "template collision"):
+                with self.subTest(kind=kind):
+                    tokenizer = json.loads(original)
+                    added = tokenizer["added_tokens"]
+                    markers = {token["content"]: token for token in added}
+                    end = markers["<|vision_end|>"]
+                    if kind == "missing":
+                        added.remove(end)
+                    elif kind == "out of range":
+                        end["id"] = config["text_config"]["vocab_size"]
+                    elif kind == "vision collision":
+                        end["id"] = markers["<|vision_start|>"]["id"]
+                    elif kind == "chat collision":
+                        end["id"] = markers["<|im_end|>"]["id"]
+                    elif kind == "text collision":
+                        end["id"] = tokenizer["model"]["vocab"]["A"]
+                    else:
+                        new_id = 1 + max(token["id"] for token in added)
+                        self.assertLess(new_id, config["text_config"]["vocab_size"])
+                        added.append(dict(end, id=new_id,
+                                          content="<|vision_start|><|image_pad|><|vision_end|>"))
+                    tokenizer_path.write_text(json.dumps(tokenizer), encoding="utf-8")
+                    self.check_edits_disabled(model)
+
+    def test_unreadable_vae_encoder_tensor_disables_edits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model"
+            shutil.copytree(EDIT_TINY, model)
+            # This encoder-only tensor is indexable as I32 but cannot be read as F32.
+            tensor = "encoder.norm_out.gamma"
+            shape = safetensors_edit.shape_of(model / "vae", tensor)
+            safetensors_edit.put(model / "vae", tensor, "I32", shape, bytes(4 * math.prod(shape)))
+            self.check_edits_disabled(model, check_generation=True)
 
 
 if __name__ == "__main__":
