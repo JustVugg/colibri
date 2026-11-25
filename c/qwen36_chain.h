@@ -145,7 +145,6 @@ static int g_q36c_fit2_on;
 static Q36Chain *q36c_of(Model *m, int d) { return (Q36Chain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *q36c_name(const Q36Chain *ch) { return ch && ch->d ? "qwen36 dev2" : "qwen36"; }
 /* COLI_VK_CHAIN_DEV2=0: the second device keeps routed experts only */
-static int q36c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 static void q36c_fatal(const char *what) {
     fprintf(stderr, "[VK] qwen36 chain: %s -- stopping (COLI_VK_CHAIN=0 keeps the state on the CPU)\n", what);
@@ -538,7 +537,7 @@ static void q36c_start(Model *m) {
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n, with that device's free memory (the tier there sizes itself after the placement) */
     int n2 = 0;
-    if (n > 0 && n < L && q36c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+    if (n > 0 && n < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
         vkc_device(1);
         size_t fixed2 = vkc_fit_buf((size_t)D * sizeof(float)) + vkc_fit_buf(4);
         g_q36c_fitsum = &fixed2;

@@ -2021,6 +2021,21 @@ jobs:
           /tmp/tg512
           gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_grid512.c -o /tmp/tg512v3 -lm
           /tmp/tg512v3
+          # grouped GQA attention in qwen36.c against the per-head loop, to the bit: the same two ISAs
+          gcc -O3 -march=native -fopenmp -pthread -I. tests/test_qwen36_attn_grouped.c -o /tmp/tq36ag -lm
+          /tmp/tq36ag
+          gcc -O3 -march=x86-64-v3 -fopenmp -pthread -I. tests/test_qwen36_attn_grouped.c -o /tmp/tq36agv3 -lm
+          /tmp/tq36agv3
+          # fused F32/F16/BF16 gq_matmul_f32 and vectorized gq_dequant_row: the same two ISAs
+          gcc -O3 -march=native -fopenmp -I. tests/test_gq_f32_fused.c -o /tmp/tgf32 -lm
+          /tmp/tgf32
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_f32_fused.c -o /tmp/tgf32v3 -lm
+          /tmp/tgf32v3
+          # single-region gq_matmul2_act (R16, TILE16_BIAS, F8) against two gq_matmul_act calls
+          gcc -O3 -march=native -fopenmp -I. tests/test_gq_matmul2.c -o /tmp/tgm2 -lm
+          /tmp/tgm2
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_matmul2.c -o /tmp/tgm2v3 -lm
+          /tmp/tgm2v3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)

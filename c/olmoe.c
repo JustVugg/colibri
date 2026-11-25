@@ -367,7 +367,7 @@ static double mem_available_gb(void) {
     }
     return avail;
 }
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 
 /* chat mode only (main()'s CHAT=1 path): sampling temperature/top-p and the
  * tokenizer + stop-set machinery. g_temp<=0 -> greedy (sample.h's pick_tok).
@@ -3515,25 +3515,7 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
 /* qwen38.c's: a file that is not an oracle's (no such array, a value that is no token id)
  * is refused with a line, where it read through a null pointer */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    if ((uint64_t)a->len > SIZE_MAX / sizeof(int)) {
-        fprintf(stderr, "ref.json: invalid array length for \"%s\"\n", key); exit(1);
-    }
-    /* lengths and id ranges are ref_fits()'s, once the vocabulary is known: here only
-     * what the cast to int needs */
-    int *r = malloc((size_t)(a->len ? a->len : 1) * sizeof(int));
-    if (!r) { fprintf(stderr, "ref.json: OOM reading \"%s\"\n", key); exit(1); }
-    for (int i = 0; i < a->len; i++) {
-        jval *v = a->kids[i];
-        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < INT_MIN ||
-            v->num > INT_MAX || floor(v->num) != v->num) {
-            fprintf(stderr, "ref.json: %s[%d] is not an integer\n", key, i);
-            exit(1);
-        }
-        r[i] = (int)v->num;
-    }
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 1, 0, INT_MIN);
 }
 
 /* The reference is input, and the run indexes with it: generate() and tf_nll()
