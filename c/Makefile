@@ -2471,7 +2471,7 @@ tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_cache_grow_floor$(EXE): tests/test_qwen38_cache_grow_floor.c qwen38.c qwen38_core.h $(VK_OBJ)
+tests/test_qwen38_cache_grow_floor$(EXE): tests/test_qwen38_cache_grow_floor.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)
@@ -3120,7 +3120,7 @@ tests/test_glm53_serve_framing$(EXE): tests/test_glm53_serve_framing.c glm53.c
 	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
 # glm53 native FP8 e4m3 load dequant + tiny end-to-end exactness (CPU-only, self-contained)
-tests/test_glm53_fp8_load$(EXE): tests/test_glm53_fp8_load.c glm53.c fp8_format.h
+tests/test_glm53_fp8_load$(EXE): tests/test_glm53_fp8_load.c glm53.c
 	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
 # Exact sampler order, cumulative mass, selected token and RNG-use regression.
@@ -3585,7 +3585,7 @@ tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c qwen36.c qwen36_tier.
 tests/test_qwen36_cuda_profile$(EXE): tests/test_qwen36_cuda_profile.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen36_ckpt_same_file_win$(EXE): tests/test_qwen36_ckpt_same_file_win.c qwen36_cuda_checkpoint.h
+tests/test_qwen36_ckpt_same_file_win$(EXE): tests/test_qwen36_ckpt_same_file_win.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 # The CUDA dense chain (COLI_CUDA_CHAIN=1, qwen36_cuda_chain.h): logits, state, verify
