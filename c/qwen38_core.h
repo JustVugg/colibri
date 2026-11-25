@@ -3617,7 +3617,16 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
  * next token. Only native FP8 slots are reported: gate.data at the slab start
  * is what q38_bind_fp8_slot() produces, an expanded slot points elsewhere. */
 static int g_q38_gguf_tier;   /* the tier holds a GGUF's experts as the file has them (q38_tier_start) */
+static int g_q38_mx4_tier;    /* the tier holds the experts-mxfp4/ records' matrices, fmt 7 (q38_tier_start) */
 static void q38_tier_note(int layer,int eid,const Slot *ex) {
+    if(g_q38_mx4_tier){
+        /* the record's codes and ue8m0 bytes, where the slot points into it (the tier copies them
+         * before qt_note returns); the bytes ride the float* parameters, as fmt 7 uploads take them */
+        if(!qt_ready()||ex->gate.kind!=Q38_WEIGHT_MXFP4)return;
+        qt_note(layer,eid,(const uint8_t*)ex->gate.data,(const uint8_t*)ex->up.data,(const uint8_t*)ex->down.data,
+                (const float*)ex->gate.x2q,(const float*)ex->up.x2q,(const float*)ex->down.x2q);
+        return;
+    }
     if(g_q38_gguf_tier){
         /* the file's rows: as the slot holds them, or back from its interleaved copy into a
          * buffer of this thread's (the tier copies before qt_note returns) */
@@ -4149,10 +4158,11 @@ static void q38_trunk_place_all(Model *m) {
  * tier reads that itself); it needs every layer's experts in native FP8 with
  * the block-scale bank resident, because the GPU kernels consume exactly the
  * checkpoint layout (e4m3 bytes + [ceil(O/128), ceil(I/128)] scales). */
-/* The CUDA tier's warm start for a GGUF's experts: the history's most used (.coli_usage,
- * qt_heat_order) until the budget is full, read by layer and expert as the file has them
- * (the three matrices' rows) in parallel and handed over (the tier copies them). Before,
- * the tier started empty and filled as the CPU's experts passed, converting each. */
+/* The CUDA tier's warm start for a GGUF's experts and for the experts-mxfp4/ records: the
+ * history's most used (.coli_usage, qt_heat_order) until the budget is full, read by layer and
+ * expert as the files have them (the three matrices' rows, or one record) in parallel and handed
+ * over (the tier copies them). Before, the tier started empty and filled as the CPU's experts
+ * passed, converting each. */
 static void q38_tier_warm(Model *m,int hist) {
     Cfg *c=&m->c; const int L=c->layers,E=c->experts,all=L*E;
     const char *w=getenv("COLI_CUDA_TIER_WARM");   /* 0: the tier fills as experts pass */
@@ -4179,6 +4189,16 @@ static void q38_tier_warm(Model *m,int hist) {
         uint8_t *buf=NULL; size_t cap=0;
         #pragma omp for schedule(dynamic,4)
         for(int i=0;i<n;i++){
+            if(g_q38_mx4_tier){   /* one record: its scales and codes where q38_mx4_offsets puts them */
+                const size_t rb=(size_t)m->x4->record_bytes;
+                if(rb>cap){uint8_t *nb=(uint8_t*)realloc(buf,rb);if(nb){buf=nb;cap=rb;}}
+                if(rb>cap||!q38_layer_int4(m,pl[i])){qt_note_planned(pl[i],pe[i],NULL,NULL,NULL,NULL,NULL,NULL);continue;}
+                q38_x4_read(m,pl[i],pe[i],buf,(int64_t)rb,"pread Qwen3.8 mxfp4 expert (tier warm start)");
+                int64_t co[3],so[3]; q38_mx4_offsets(m->x4,co,so);
+                qt_note_planned(pl[i],pe[i],buf+co[0],buf+co[1],buf+co[2],
+                                (const float*)(buf+so[0]),(const float*)(buf+so[1]),(const float*)(buf+so[2]));
+                continue;
+            }
             const gguf_tensor *t[3]; q38_gg_expert_tensors(m,pl[i],t);
             int64_t eb[3]; size_t tot=0;
             for(int k=0;k<3;k++){eb[k]=t[k]->nbytes/E;tot+=(size_t)eb[k];}
@@ -4189,8 +4209,8 @@ static void q38_tier_warm(Model *m,int hist) {
         free(buf);
     }
     qt_fill_wait();
-    fprintf(stderr,"[qtier] qwen38: warm start, %d of the GGUF's experts in VRAM, the history's most used first (%s) -- %.1f s\n",
-            n,hist?".coli_usage":"no history: expert by expert across the layers",now_s()-t0);
+    fprintf(stderr,"[qtier] qwen38: warm start, %d of the %s experts in VRAM, the history's most used first (%s) -- %.1f s\n",
+            n,g_q38_mx4_tier?"mxfp4":"GGUF's",hist?".coli_usage":"no history: expert by expert across the layers",now_s()-t0);
     free(pl);free(pe);
 }
 #ifdef COLI_CUDA
@@ -4209,7 +4229,9 @@ static int q38_tier_offer_chain(Model *m) {
     return 1;
 }
 #endif
+static void q38_tier_up(Model *m);
 static void q38_tier_start(Model *m,int cap) {
+    g_q38_mx4_tier=0;   /* per load: a process may open another model (the tests do) */
     const char *on=getenv("COLI_CUDA");
     if(!on||on[0]!='1'||on[1])return;
     Cfg *c=&m->c;
@@ -4252,8 +4274,18 @@ static void q38_tier_start(Model *m,int cap) {
         return;
     }
     if(m->x4&&m->x4->lb&&m->x4->lb->mx){
-        fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the mxfp4 experts stay "
-                       "on the CPU and the tier stays off (its fmt 7 copy mode is not wired yet)\n");
+        /* AMD Quark's MXFP4 records (experts-mxfp4/): the tier streams them as fmt 7 in copy mode,
+         * fed as the FP8 tier is (q38_tier_note), and warmed from the records (q38_tier_warm) */
+        q38_trunk_offer_all(m);
+#ifdef COLI_CUDA
+        q38_tier_offer_chain(m);
+#endif
+        if(qt_init_mxfp4(c->layers,c->experts,c->hidden,c->inter,cap,c->topk)){
+            g_q38_mx4_tier=1;
+            fprintf(stderr,"[qtier] qwen38: mxfp4 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
+            q38_tier_up(m);
+        } else
+            fprintf(stderr,"[qtier] qwen38: the CUDA expert tier did not start; the mxfp4 experts stay on the CPU\n");
         return;
     }
     if(m->x4){
@@ -4291,8 +4323,16 @@ static void q38_tier_start(Model *m,int cap) {
     q38_tier_offer_chain(m);                       /* as on a GGUF: the promotions would fill the chain's room */
 #endif
     if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
-        atexit(qt_shutdown);
         fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
+        q38_tier_up(m);
+    }
+}
+/* the FP8 or MXFP4 expert tier is up: the trunk the placer accepted goes to the card, and
+ * Q38_DN_GPU's per-layer DeltaNet step */
+static void q38_tier_up(Model *m) {
+    Cfg *c=&m->c;
+    {
+        atexit(qt_shutdown);
         q38_trunk_place_all(m);
         /* Q38_DN_GPU=1: where dnqkv, dnz and dnout of a DeltaNet layer all sit
          * on one card, the conv ring, the recurrence and the gated norm go there

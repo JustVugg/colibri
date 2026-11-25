@@ -1990,6 +1990,7 @@ def qwen38_int4_sidecar(info):
     2.01 MB at 3, 1.32 MB vq2, 0.82 MB vq1 on the release), priced the same way: by the
     record its index states, whatever the name, so a format this list does not know yet is
     never priced with the FP8 bytes (a 188-expert cap where RAM held 512, 2026-10-14).
+    The copy names the sidecar (`qwen38_lowbit`): the CUDA tier streams mxfp4's records.
     A checkpoint whose shards carry no routed experts, the sidecar being their only copy,
     takes its sparse layers from the index (which states the config's): priced by the
     shards' layers it had none, a cap of 0 slots, or with the MTP head on one made of the
@@ -2023,7 +2024,8 @@ def qwen38_int4_sidecar(info):
                 expert_bytes=record * want["experts"] * len(per_layer),
                 typical_expert_bytes=record, max_expert_bytes=record,
                 expert_bytes_by_layer=per_layer, per_cap_bytes=record * len(per_layer),
-                expert_fixed_bytes=0, qwen38_int4_experts=True)
+                expert_fixed_bytes=0, qwen38_int4_experts=True,
+                qwen38_lowbit=lowbit or "int4g64")
 
 
 def _q38_mtp_igpu_defaults(env, vulkan):
@@ -3744,12 +3746,16 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
-    if info.get("qwen38_int4_experts"):
-        # qwen38's CUDA tier streams FP8 experts only and stays off when the
-        # int4-g64 sidecar is in use (trunk included): plan the CPU.
+    # qwen38's CUDA tier streams the FP8 experts and the mxfp4 sidecar's records (fmt 7);
+    # with another sidecar it stays off (trunk included), and the Vulkan tier takes no
+    # mxfp4 record: plan the CPU.
+    lowbit = info.get("qwen38_lowbit")
+    vulkan_tier = _vk_flag(env_now, "COLI_VULKAN") and not _vk_flag(env_now, "COLI_CUDA")
+    if info.get("qwen38_int4_experts") and (lowbit != "mxfp4" or vulkan_tier):
         if gpu_indices or vram_gb > 0:
+            name = "int4-g64" if lowbit == "int4g64" else lowbit
             raise ValueError(
-                "Qwen3.8 int4-g64 experts (experts-int4g64/) run on the CPU; "
+                f"Qwen3.8 {name} experts (experts-{lowbit}/) run on the CPU; "
                 "Q38_EXPERT_INT4=0 gives the GPU tier the FP8 experts")
         gpus = []
     if not resolved.descriptor.supports_accelerator:

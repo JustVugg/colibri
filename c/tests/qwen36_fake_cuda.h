@@ -16,7 +16,14 @@
  *   fake_upload_hook  - called at the start of every tensor upload, on the
  *                       uploader thread, with the tensor's fmt. A test that
  *                       needs an upload to take TIME (a real cudaMemcpy does)
- *                       sleeps here; NULL (the default) uploads instantly. */
+ *                       sleeps here; NULL (the default) uploads instantly.
+ *   fake_group_hook   - called by coli_cuda_expert_group_issue with the group's
+ *                       tensors, the row count and the input rows; its return
+ *                       value is what issue returns, and coli_cuda_expert_group_take
+ *                       then hands back fake_group_out. With fake_own_mx4 set, an
+ *                       fmt 7 upload keeps its own copy of the nibbles and scale
+ *                       bytes (the tier frees its staging after the call), so the
+ *                       hook can compute the experts. NULL: fake_issue_hook's. */
 #ifndef QWEN36_FAKE_CUDA_H
 #define QWEN36_FAKE_CUDA_H
 #include <math.h>
@@ -29,7 +36,7 @@
 
 #include "../backend_cuda.h"
 
-struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; const float *sc; };
+struct ColiCudaTensor { int fmt, I, O, device, gs, owned; const void *w; const float *sc; };
 
 static int fake_uploads;
 static int fake_overwrites;      /* coli_cuda_tensor_overwrite calls (in-place swaps) */
@@ -38,6 +45,13 @@ static int last_fmt = -1;
 static size_t last_bytes;
 static unsigned char captured[4096];
 static size_t captured_len;
+/* fmt=7: the ue8m0 scale bytes of the first three uploads (gate, up, down) */
+static unsigned char captured_e8[3][4096];
+static size_t captured_e8_len[3];
+static int fake_own_mx4;
+static int (*fake_group_hook)(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                              int count, const float *x) = NULL;
+static const float *fake_group_out;
 
 static int fake_ndev = 1;
 static size_t fake_free_bytes = 2ull << 30;    /* what coli_cuda_mem_info reports as free */
@@ -59,6 +73,12 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int
         if (q && s) { memcpy(q, w, (size_t)I * O); memcpy(s, sc, (size_t)O * sizeof(float)); n->w = q; n->sc = s; }
         else { free(q); free(s); n->w = NULL; n->sc = NULL; }
     }
+    if (fake_own_mx4 && fmt == 7 && w && sc) {   /* [O, I/2] nibbles and [O, I/32] scale bytes */
+        size_t wb = (size_t)O * ((I + 1) / 2), sb = (size_t)O * ((I + 31) / 32);
+        void *q = malloc(wb), *e = malloc(sb);
+        if (q && e) { memcpy(q, w, wb); memcpy(e, sc, sb); n->w = q; n->sc = (const float *)e; n->owned = 1; }
+        else { free(q); free(e); n->w = NULL; n->sc = NULL; }
+    }
     if (fake_dense_compute && fmt == 0 && w) {   /* f32 rows (the chain's b|a, gate rows): the caller frees its copy */
         float *f = (float *)malloc((size_t)I * O * sizeof(float));
         if (f) { memcpy(f, w, (size_t)I * O * sizeof(float)); n->w = f; n->sc = NULL; } else n->w = NULL;
@@ -70,6 +90,11 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int
     if (fake_uploads == 1) {
         captured_len = last_bytes < sizeof captured ? last_bytes : sizeof captured;
         memcpy(captured, w, captured_len);
+    }
+    if (fmt == 7 && sc && fake_uploads <= 3) {
+        size_t nb = (size_t)O * ((I + 31) / 32);
+        captured_e8_len[fake_uploads - 1] = nb < sizeof captured_e8[0] ? nb : sizeof captured_e8[0];
+        memcpy(captured_e8[fake_uploads - 1], sc, captured_e8_len[fake_uploads - 1]);
     }
     return 1;
 }
@@ -83,7 +108,7 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
 }
 static int fake_tensor_frees;   /* tensors freed (a tier giving memory back) */
 void coli_cuda_tensor_free(ColiCudaTensor *t) {
-    if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
+    if (t && ((fake_dense_compute && t->fmt == 1) || t->owned)) { free((void *)t->w); free((void *)t->sc); }
     fake_tensor_frees += t != NULL;
     free(t);
 }
@@ -121,6 +146,8 @@ int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *w, const float *sc
     if (fake_upload_hook) fake_upload_hook(t->fmt);
     if (fake_dense_compute && t->fmt == 1 && t->w && t->sc) {
         memcpy((void *)t->w, w, (size_t)t->I * t->O); memcpy((void *)t->sc, sc, (size_t)t->O * sizeof(float));
+    } else if (t->owned) {
+        memcpy((void *)t->w, w, (size_t)t->O * ((t->I + 1) / 2)); memcpy((void *)t->sc, sc, (size_t)t->O * ((t->I + 31) / 32));
     } else { t->w = w; t->sc = sc; }
     fake_overwrites++;
     return 1;
@@ -139,11 +166,12 @@ int coli_cuda_mem_info(int device, size_t *freeb, size_t *total) {
 int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const *u,
                                  ColiCudaTensor *const *d, const int *rows,
                                  int count, const float *x) {
-    (void)u; (void)d; (void)rows;
+    (void)rows;
+    if (fake_group_hook) return fake_group_hook(g, u, d, count, x);
     if (fake_issue_hook) return fake_issue_hook(count > 0 ? g[0]->device : -1, count, x);
     return 0;
 }
-const float *coli_cuda_expert_group_take(int device) { (void)device; return NULL; }
+const float *coli_cuda_expert_group_take(int device) { (void)device; return fake_group_hook ? fake_group_out : NULL; }
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d, double *kernel, double *d2h) {
     if (calls) *calls = 0; if (experts) *experts = 0; if (rows) *rows = 0;
