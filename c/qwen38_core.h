@@ -232,8 +232,13 @@ typedef enum {
  * here, and q38_seq_swap trades the two sets of pointers. A multiplexed decode
  * step (q38_forward_rows) parks every conversation here and reads each row's
  * from its Q38Row. */
+/* Q38_QSA_PK: one attention layer's pooled index keys (q38_qsa_pk_sync), block
+ * b = rows b*R..b*R+R-1 of the IK rows `ik` pooled, normed and roped exactly
+ * as the ranking pools them. len blocks valid, cap allocated. */
+typedef struct { const float *ik; float *pk; int len, cap; } Q38PkCache;
 typedef struct Q38Seq {
     float **K, **V, **IK, **DN_rec, **DN_conv;
+    Q38PkCache *qsa_pk;   /* Q38_QSA_PK: c.layers+1 entries, allocated at first use; NULL = none yet */
     int kv_len;
     kv_prefix kvp;
     int64_t *ple_history;
@@ -265,6 +270,7 @@ typedef struct {
      * says the card advanced past the host copy (pull before any CPU use). */
     uint8_t *dn_dev_fresh, *dn_host_stale; int dn_dev;
     float **K, **V, **IK;
+    Q38PkCache *qsa_pk;   /* Q38_QSA_PK: the pooled index keys of IK, c.layers+1 entries (q38_qsa_pk_sync) */
     int kv_len, kv_cap, max_t;
     kv_prefix kvp; /* token identity of the live attention rows, not a snapshot */
     st_tensor *ple_parts[Q38_MAX_PLE_PARTS];
@@ -3430,6 +3436,118 @@ static int q38_block_desc(const void *aa,const void *bb){
     if(a->score>b->score)return -1;if(a->score<b->score)return 1;return a->block-b->block;
 }
 
+/* ---- QSA pooled index keys ---------------------------------------------------
+ * The ranking scores every complete block of R index-key rows by its pooled
+ * key: the R raw rows averaged, normed (idx_kn) and roped at the block's first
+ * position. One place computes it, so the cache below and the re-pooling path
+ * do the same arithmetic in the same order and give the same bits. */
+static void q38_qsa_pool_block(float *pool,const float *IKl,int b,int R,int ID,
+                               const float *kn,float eps,int rotary_dim,float theta) {
+    memset(pool,0,(size_t)ID*sizeof(float));
+    for(int r=0;r<R;r++){const float *raw=IKl+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
+    q38_rms0(pool,pool,kn,ID,eps);q38_rope(pool,ID,rotary_dim,b*R,theta);
+}
+
+/* Q38_QSA_PK (default 0): 0 = re-pool every block from IK at every step (the
+ * reference); 1 = keep each layer's pooled keys (Q38PkCache) as blocks
+ * complete and rank from them; 2 = keep them, but also re-pool every block,
+ * rank from the re-pooled key and count any block whose cached bits differ
+ * (g_q38_qsa_pk_mism): a check of the cache that cannot change the output.
+ * Read once; a test sets g_q38_qsa_pk directly. */
+static int g_q38_qsa_pk=-1;
+static unsigned long long g_q38_qsa_pk_mism,g_q38_qsa_pk_resets,g_q38_qsa_pk_built;
+static int q38_qsa_pk_mode(void) {
+    if(g_q38_qsa_pk<0){
+        const char *e=getenv("Q38_QSA_PK");
+        int v=e&&*e?atoi(e):0;
+        g_q38_qsa_pk=v==1||v==2?v:0;
+        if(e&&*e&&v!=0&&v!=1&&v!=2)fprintf(stderr,"qwen38: Q38_QSA_PK=%s ignored (0, 1 or 2)\n",e);
+    }
+    return g_q38_qsa_pk;
+}
+
+/* The pooled keys of IKl's complete blocks below `visible`, for a step whose
+ * own rows [first, visible) were just written into IKl (first <= visible).
+ *
+ * What stays valid. A block is kept only if all its rows are below `first`
+ * (rows from `first` on are this step's). Rows below `first` may have been
+ * rewritten since the cache was last brought up to date, without the host
+ * attention seeing it: a speculative rollback re-run by the CUDA chain, which
+ * copies its rows back (qwen38_cuda_chain.h), a prefix-store, park or segment
+ * restore, a bank read back from the card. Every such write is either a whole
+ * replacement of the rows or a rollback-and-run-forward, and kv_len only moves
+ * forward by writing rows, so the rows they changed form one suffix ending at
+ * row first-1. A suffix that reaches any kept block reaches the last one: so
+ * the last kept block is pooled again from IKl and compared bit for bit, and
+ * on any difference the whole cache is rebuilt from IKl (the cost of one
+ * re-pooling step, what Q38_QSA_PK=0 pays at every step). A different IK
+ * buffer (q38_seq_swap, a segment swapped in, ensure_kv) starts from empty.
+ * Q38_QSA_PK=2 checks every block on top of this.
+ *
+ * The limit. The suffix is of rows written; the check sees rows whose bits
+ * changed. They are the same set when a rewrite changes every row it writes,
+ * which holds for a different conversation (an attention layer's index keys
+ * depend on every earlier token through the layers below it). It need not
+ * hold when the same tokens are written again by another route (a row the
+ * card ran where the host had run it, a store checkpoint made by the chain):
+ * if such a rewrite leaves the last kept block's bits as they were but not an
+ * older block's, that block keeps its old key. A writer that knows the first
+ * row it writes says so with q38_qsa_pk_drop_from, which is exact. */
+static void q38_qsa_pk_sync(Q38PkCache *e,const float *IKl,int first,int visible,int R,int ID,
+                            const float *kn,float eps,int rotary_dim,float theta) {
+    int need=visible/R,keep=first/R;
+    if(e->ik!=IKl){e->ik=IKl;e->len=0;}
+    if(e->len>keep)e->len=keep;
+    if(e->len>0){
+        float *chk=falloc(ID);
+        q38_qsa_pool_block(chk,IKl,e->len-1,R,ID,kn,eps,rotary_dim,theta);
+        if(memcmp(chk,e->pk+(int64_t)(e->len-1)*ID,(size_t)ID*sizeof(float))){e->len=0;g_q38_qsa_pk_resets++;}
+        free(chk);
+    }
+    if(need>e->cap){
+        int cap=e->cap>0?e->cap:64;
+        while(cap<need)cap=cap>INT_MAX/2?need:cap*2;
+        float *pk=(float*)realloc(e->pk,(size_t)cap*ID*sizeof(float));
+        if(!pk){fprintf(stderr,"OOM QSA pooled keys\n");exit(1);}
+        e->pk=pk;e->cap=cap;
+    }
+    int from=e->len;
+    /* blocks are independent and each is computed whole by one thread: bit-identical to serial */
+    #pragma omp parallel for schedule(static) if(need-from>16)
+    for(int b=from;b<need;b++)
+        q38_qsa_pool_block(e->pk+(int64_t)b*ID,IKl,b,R,ID,kn,eps,rotary_dim,theta);
+    if(need>from){e->len=need;g_q38_qsa_pk_built+=(unsigned long long)(need-from);}
+}
+
+/* the per-layer caches of a Model or a Q38Seq: allocated at first use */
+static Q38PkCache *q38_qsa_pk_table(Q38PkCache **slot,int layers) {
+    if(!*slot){
+        *slot=(Q38PkCache*)calloc((size_t)layers+1,sizeof(Q38PkCache));
+        if(!*slot){fprintf(stderr,"OOM QSA pooled-key table\n");exit(1);}
+    }
+    return *slot;
+}
+static void q38_qsa_pk_free(Q38PkCache **slot,int layers) {
+    if(!*slot)return;
+    for(int i=0;i<=layers;i++)free((*slot)[i].pk);
+    free(*slot);*slot=NULL;
+}
+/* Every layer's pooled keys forgotten (they are rebuilt from IK at the next
+ * step). For a writer that replaces IK rows in place: the check in
+ * q38_qsa_pk_sync already catches it, this makes it certain. */
+static void q38_qsa_pk_invalidate(Q38PkCache *t,int layers) {
+    if(!t)return;
+    for(int i=0;i<=layers;i++){t[i].len=0;t[i].ik=NULL;}
+}
+/* Rows from `row` on are about to be rewritten in place (every layer's IK, as
+ * a rollback copy-back or a restore writes them): only the blocks wholly below
+ * `row` stay. R is the indexer's block size (c.idx_ratio). */
+static void q38_qsa_pk_drop_from(Q38PkCache *t,int layers,int row,int R) {
+    if(!t)return;
+    int keep=row>0&&R>0?row/R:0;
+    for(int i=0;i<=layers;i++)if(t[i].len>keep)t[i].len=keep;
+}
+
 /* K and V rounded to float16 where they are made (kv16.h): the CPU's rows here, the CUDA and
  * Vulkan chains' (CC_EW_F16, VKC_EW_F16), so every backend holds the same values; the host's
  * caches keep them as floats and the CUDA chain's mirrors as halves (cc_attn_h: half the device
@@ -3482,6 +3600,27 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
      *   B  each row's ranking and selection;
      *   C  attention by (row, head). */
     double qsa_started=now_s();
+    /* Q38_QSA_PK: bring each conversation's pooled keys up to its last row,
+     * now that every IK row of this step is written; Phase A below reads
+     * them instead of re-pooling. Serial over conversations (one, unless
+     * multiplexed), parallel over new blocks inside q38_qsa_pk_sync. */
+    const int pk_mode=q38_qsa_pk_mode();
+    if(pk_mode){
+        for(int s=0;s<S;s++){
+            Q38Seq *sq=mr?mr[s].seq:NULL;
+            int dup=0;
+            for(int t=0;t<s&&!dup;t++)dup=(mr?mr[t].seq:NULL)==sq;
+            if(dup)continue;   /* this conversation's rows were taken with its first one */
+            int first=mr?mr[s].pos:pos_base,last=mr?mr[s].pos:pos_base+S-1;
+            if(mr)for(int t=s+1;t<S;t++)if(mr[t].seq==sq){
+                if(mr[t].pos<first)first=mr[t].pos;
+                if(mr[t].pos>last)last=mr[t].pos;
+            }
+            Q38PkCache *tab=q38_qsa_pk_table(sq?&sq->qsa_pk:&m->qsa_pk,c->layers);
+            q38_qsa_pk_sync(&tab[layer],sq?sq->IK[layer]:m->IK[layer],first,last+1,R,ID,
+                            l->idx_kn,c->eps,c->rotary_dim,theta);
+        }
+    }
     int maxblocks=0;
     int *nblk=(int*)malloc((size_t)S*sizeof(int)),*nsel=(int*)calloc((size_t)S,sizeof(int));
     float *qidx=falloc((int64_t)S*IQ*ID);
@@ -3504,12 +3643,20 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
             const int b=shared_ik?it:it%maxblocks,s0=shared_ik?0:it/maxblocks,s1=shared_ik?S:s0+1;
             if(!shared_ik&&b>=nblk[s0])continue;
             const float *IKl=mr?mr[s0].seq->IK[layer]:m->IK[layer];
-            memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=IKl+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
-            q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,theta);
+            const float *PKl=pk_mode?(mr?mr[s0].seq->qsa_pk:m->qsa_pk)[layer].pk:NULL;
+            const float *pk=pool;
+            if(pk_mode==1)pk=PKl+(int64_t)b*ID;
+            else {
+                q38_qsa_pool_block(pool,IKl,b,R,ID,l->idx_kn,c->eps,c->rotary_dim,theta);
+                if(pk_mode==2&&memcmp(pool,PKl+(int64_t)b*ID,(size_t)ID*sizeof(float))){
+                    #pragma omp atomic
+                    g_q38_qsa_pk_mism++;
+                }
+            }
             for(int s=s0;s<s1;s++){
                 if(b>=nblk[s])continue;
                 const float *qs=qidx+(int64_t)s*IQ*ID;
-                float score=0.f;for(int h=0;h<IQ;h++){float a=q38_dot8(qs+(int64_t)h*ID,pool,ID);if(a>0.f)score+=a;}
+                float score=0.f;for(int h=0;h<IQ;h++){float a=q38_dot8(qs+(int64_t)h*ID,pk,ID);if(a>0.f)score+=a;}
                 rank[(int64_t)s*maxblocks+b]=(Q38Block){score/sqrtf((float)ID),b};
             }
         }
@@ -5409,6 +5556,7 @@ static void ensure_kv(Model *m) {
     Cfg *c=&m->c;if(m->max_t<=m->kv_cap&&m->K)return;
     int rows=q38_layer_rows(m);
     if(m->K){for(int i=0;i<rows;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);}free(m->K);free(m->V);free(m->IK);}
+    q38_qsa_pk_invalidate(m->qsa_pk,c->layers);   /* new IK rows: the pooled keys start again */
     /* +1: the MTP head's attention rows at index c.layers */
     m->K=(float**)calloc((size_t)c->layers+1,sizeof(float*));m->V=(float**)calloc((size_t)c->layers+1,sizeof(float*));m->IK=(float**)calloc((size_t)c->layers+1,sizeof(float*));
     for(int i=0;i<rows;i++)if(i==c->layers||c->is_attn[i]){
@@ -5623,6 +5771,7 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
 static void q38_seq_swap(Model *m,Q38Seq *q) {
 #define Q38_SEQ_SWAP(T,a,b) do{T t_=(a);(a)=(b);(b)=t_;}while(0)
     Q38_SEQ_SWAP(float**,m->K,q->K); Q38_SEQ_SWAP(float**,m->V,q->V); Q38_SEQ_SWAP(float**,m->IK,q->IK);
+    Q38_SEQ_SWAP(Q38PkCache*,m->qsa_pk,q->qsa_pk);   /* the pooled keys travel with their IK rows */
     Q38_SEQ_SWAP(float**,m->DN_rec,q->DN_rec); Q38_SEQ_SWAP(float**,m->DN_conv,q->DN_conv);
     Q38_SEQ_SWAP(int,m->kv_len,q->kv_len); Q38_SEQ_SWAP(kv_prefix,m->kvp,q->kvp);
     Q38_SEQ_SWAP(int64_t*,m->ple_history,q->ple_history);
@@ -5666,6 +5815,7 @@ static void q38_seq_free(Model *m,Q38Seq *q) {
         if(q->DN_rec)free(q->DN_rec[i]); if(q->DN_conv)free(q->DN_conv[i]);
     }
     free(q->K);free(q->V);free(q->IK);free(q->DN_rec);free(q->DN_conv);
+    q38_qsa_pk_free(&q->qsa_pk,m->c.layers);
     kv_prefix_free(&q->kvp); free(q->ple_history); free(q->PLE_conv_state);
     memset(q,0,sizeof *q);
 }
@@ -6133,6 +6283,7 @@ static void q38_spec_rollback(Model *m,int len,int keep) {
     }
     m->kv_len=len;
     if(m->kvp.len>len)m->kvp.len=len;
+    q38_qsa_pk_drop_from(m->qsa_pk,c->layers,len,c->idx_ratio);
 }
 
 /* The verify's first `keep` rows stand (rejected: the next one did not): undo
@@ -6638,6 +6789,10 @@ static void q38_model_free(Model *m) {
     q38_weight_free(&m->mtp_fc_emb); q38_weight_free(&m->mtp_fc_hid);
     free(m->mtp_mixer.norm); q38_weight_free(&m->mtp_mixer.down); q38_weight_free(&m->mtp_mixer.up);
     if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4);}
+    if(g_q38_qsa_pk>0)
+        fprintf(stderr,"qwen38: Q38_QSA_PK=%d pooled blocks built %llu, cache rebuilds %llu, checked blocks that differed %llu\n",
+                g_q38_qsa_pk,g_q38_qsa_pk_built,g_q38_qsa_pk_resets,g_q38_qsa_pk_mism);
+    q38_qsa_pk_free(&m->qsa_pk,m->c.layers);
     free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->dn_dev_fresh); free(m->dn_host_stale); free(m->K); free(m->V); free(m->IK);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
     free(m->draft_codes);free(m->draft_sc);m->draft_codes=NULL;m->draft_sc=NULL;

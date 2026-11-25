@@ -1220,6 +1220,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     reset_recurrent(m);
     ensure_kv(m);
     m->kv_len = 0;
+    q38_qsa_pk_drop_from(m->qsa_pk, c->layers, 0, c->idx_ratio);
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
     q38_tm_snapshot_prefill(m);        /* COLI_TIMERS: decode bank starts here */
@@ -1266,6 +1267,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     reset_recurrent(m);
     ensure_kv(m);
     m->kv_len = 0;
+    q38_qsa_pk_drop_from(m->qsa_pk, c->layers, 0, c->idx_ratio);
     double nll = 0; int scored = 0;
     float *logit = step(m, full, np, 0);
     for (int i = np; i < nfull; i++) {
@@ -1856,7 +1858,9 @@ static int q38_prefix_restore(Model *m,const int *ids,int len){
        memcmp(g_q38_prefix.ids,ids,(size_t)g_q38_prefix.len*sizeof(int))||
        !kv_prefix_holds(&m->kvp,g_q38_prefix.ids,g_q38_prefix.len))return 0;
     q38_prefix_copy_state(m,0);m->kv_len=g_q38_prefix.len;
-    m->kvp.len=g_q38_prefix.len;return g_q38_prefix.len;
+    m->kvp.len=g_q38_prefix.len;
+    q38_qsa_pk_drop_from(m->qsa_pk,m->c.layers,m->kv_len,m->c.idx_ratio);
+    return g_q38_prefix.len;
 }
 
 static const float *q38_prefix_cached_logits(Model *m){
@@ -2214,6 +2218,7 @@ static void q38_unpark(Model *m){
         q38_prefix_cache_invalidate();q38_park_free_rows();return;
     }
     for(int i=0;i<g_q38_park.nl;i++)if(m->K[i]&&g_q38_park.K[i])q38_park_rows(m,i,g_q38_park.rows,0);
+    q38_qsa_pk_drop_from(m->qsa_pk,m->c.layers,0,m->c.idx_ratio);
     q38_pin_state_copy(m,&g_q38_park.st,0);
     memcpy(m->kvp.fed,g_q38_park.fed,(size_t)g_q38_park.len*sizeof(int));
     m->kvp.len=g_q38_park.len;m->kvp.tainted=0;m->kv_len=g_q38_park.kv_len;
@@ -2353,6 +2358,7 @@ static int q38_ps_take_ram(Model *m,const int *ids,int np,int held,int floor){
     if(m->mtp&&keep>common-1)keep=common-1;
     coli_ps_load_from(&g_q38_ps,&h,parts,nparts,keep);
     keep=coli_ps_kept(&g_q38_ps,&h,keep);
+    q38_qsa_pk_drop_from(m->qsa_pk,m->c.layers,keep,m->c.idx_ratio);
     free(parts);
     q38_pin_state_copy(m,&st,0);
     m->kv_len=P;
@@ -2792,6 +2798,7 @@ static int q38_psd_restore(Model *m,const char *path,const int *ids,int P,int np
 #undef Q38_PSD_GET
     if(ok)q38_pin_state_copy(m,&st,0);   /* the state on the host, the devices told to take it up */
     m->kv_len=ok?P:0;
+    q38_qsa_pk_drop_from(m->qsa_pk,m->c.layers,0,m->c.idx_ratio);
     kv_prefix_clear(&m->kvp);
     if(ok)kv_prefix_record(&m->kvp,ids,0,P);
 #ifdef COLI_VULKAN
@@ -3053,6 +3060,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
             if(st && kv_prefix_holds(&m->kvp,k->ids,k->len) &&
                q38_pin_state_copy(m,&st,0)){
                 m->kv_len=k->len; m->kvp.len=k->len;
+                q38_qsa_pk_drop_from(m->qsa_pk,m->c.layers,k->len,m->c.idx_ratio);
                 reuse=k->len; pin_lo=k->logit;
                 coli_pin_touch(&g_q38_pins,ps);
                 break;
@@ -3095,6 +3103,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         const float *cached=q38_prefix_cached_logits(m);
         if(!cached){
             q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
+            q38_qsa_pk_drop_from(m->qsa_pk,m->c.layers,0,m->c.idx_ratio);
             lo=q38_serve_prefill(m,ids,0,np,pc);reuse=0;
         }else{
             lo=falloc(m->c.vocab);
@@ -3107,6 +3116,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         /* A miss invalidates the snapshot before reset so no later request can
          * pair its recurrent state with the old token record. */
         q38_prefix_cache_invalidate();reset_recurrent(m);m->kv_len=0;
+        q38_qsa_pk_drop_from(m->qsa_pk,m->c.layers,0,m->c.idx_ratio);
         lo=q38_serve_prefill_at(m,ids,0,np,pc,snap_ok,&snapped);
     }
     g_echo_k=0; g_echo_id=NULL; g_echo_pin_logit=NULL;   /* la lettura e finita col prefill */
@@ -4823,6 +4833,9 @@ static int qwen38_segment_session_restore(void *impl,ColiSegmentReadFn rf,void *
     int rc=coli_segment_spans_restore_checked(
         sp,n,h.payload_hash,rf,rd,qwen38_segment_payload_valid,s,error,es);
     free(sp);if(rc)return rc;
+    pthread_mutex_lock(&s->engine->run_lock);
+    q38_qsa_pk_drop_from(s->engine->model.qsa_pk,s->engine->model.c.layers,0,s->engine->model.c.idx_ratio);
+    pthread_mutex_unlock(&s->engine->run_lock);
     s->position=h.position;return 0;
 }
 

@@ -2517,6 +2517,10 @@ qwen38-vision-serve-check: qwen38$(EXE)
 tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# Q38_QSA_PK: the host QSA's pooled-key cache against re-pooling, bit for bit (synthetic keys, no fixture)
+tests/test_qwen38_qsa_pk$(EXE): tests/test_qwen38_qsa_pk.c qwen38.c qwen38_core.h $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
