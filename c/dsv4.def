@@ -56,6 +56,8 @@ EXPORTS
     dsv4_cuda_attn_decode_chain
     dsv4_cuda_proj_batch
     dsv4_cuda_proj_batch_release
+    dsv4_cuda_host_alloc
+    dsv4_cuda_host_free
     dsv4_cuda_wo_decode
     dsv4_cuda_upload_fp8_ref
     dsv4_cuda_fp8_ref_matmul_resident

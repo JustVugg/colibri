@@ -1,5 +1,6 @@
 #ifndef COLIBRI_BACKEND_CUDA_DSV4_H
 #define COLIBRI_BACKEND_CUDA_DSV4_H
+#include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
@@ -71,6 +72,10 @@ int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const float *q,
  * sum(rows) floats, output i at the sum of rows[0..i-1]. Bit-identical to dsv4_cuda_matvec. */
 int dsv4_cuda_proj_batch(int n,Dsv4CudaTensor *const *t,const int *rows,const float *x,float *stage);
 void dsv4_cuda_proj_batch_release(void);
+/* Optional (V4_MHC_CHAIN; older DLLs lack them: alloc returns NULL, free is a
+ * no-op): page-locked, portable host memory for small activation round trips. */
+void *dsv4_cuda_host_alloc(size_t bytes);
+void dsv4_cuda_host_free(void *p);
 /* Batched indexer scoring: scores[t][c] = sum_h relu(q_th . k_c) * w_th for
  * c < counts[t] (else 0), sequential fp32 order identical to the CPU loop. */
 int dsv4_cuda_indexer_score_batch(int device,const float *queries,const float *keys,

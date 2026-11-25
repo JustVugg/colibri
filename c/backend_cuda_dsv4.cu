@@ -4475,6 +4475,16 @@ extern "C" void dsv4_cuda_proj_batch_release(void){
         pj_out[i]=nullptr;pj_cap[i]=0;
     }
 }
+/* V4_MHC_CHAIN (optional exports, newer DLLs): page-locked host buffers for the
+ * small decode activation round trips (x, post/comb), so their downloads are
+ * truly asynchronous and one stream sync covers them. Portable: usable with any
+ * device's stream. NULL on failure; the caller then keeps ordinary (pageable) memory. */
+extern "C" void *dsv4_cuda_host_alloc(size_t bytes){
+    void*p=nullptr;if(!bytes)return nullptr;
+    if(cudaHostAlloc(&p,bytes,cudaHostAllocPortable)!=cudaSuccess){cudaGetLastError();return nullptr;}
+    return p;
+}
+extern "C" void dsv4_cuda_host_free(void *p){if(p)cudaFreeHost(p);}
 extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*input,int tokens,Dsv4CudaActivation*output){
     Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||
        input->elements<(long long)tokens*t->I||output->elements<(long long)tokens*t->O||!ok(cudaSetDevice(t->device),"select batched dense device"))return 0;

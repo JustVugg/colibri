@@ -1232,6 +1232,39 @@ int coli_v4_gpu_mhc_post_batch(
     const ColiDeepSeekV4LayerWeights *weights, float *outputs_hc,
     const float *branch, const float *residual_hc, const float *posts,
     const float *combs, int hc, int hidden, int batch);
+/* V4_MHC_CHAIN=1 (opt-in, default off; needs V4_DECODE_GPU_MHC=1 and
+ * COLI_CUDA_ATTN_BATCH=1): inside target_token's layer loop (the scope) the
+ * decode token's four hc streams stay on the device between mHC calls. A post
+ * leaves its output in a device mirror without downloading it (the host buffer
+ * is then STALE) and the next pre reads it there instead of re-uploading;
+ * each pre downloads only x and post/comb, into pinned buffers, with one sync.
+ * Same kernels, same inputs: bit-identical to the V4_DECODE_GPU_MHC path.
+ * Host readers of a stale buffer call materialize first; any CPU fallback
+ * calls flush. V4_MHC_CHAIN_VERIFY=1 (implies the chain) also runs the old
+ * path on shadow mirrors and byte-compares streams, x, post and comb.
+ * begin opens the scope on the calling thread (1 = chained, 0 = off); end
+ * downloads what is still stale and closes it (0, or -1 when a download
+ * failed). active: the scope is open on this thread. */
+int coli_v4_gpu_mhc_chain_begin(void);
+int coli_v4_gpu_mhc_chain_end(void);
+int coli_v4_gpu_mhc_chain_active(void);
+/* host: a buffer whose bytes may live only on the device; downloads them when
+ * they do (the device copy stays valid). 0 ok/nothing to do, -1 failure. */
+int coli_v4_gpu_mhc_chain_materialize(const float *host);
+/* Downloads whatever is stale and forgets every device residency: the host
+ * buffers are authoritative again (CPU fallbacks). 0 ok, -1 failure. */
+int coli_v4_gpu_mhc_chain_flush(void);
+/* site 0 = attn (hc_attn_*, attn_norm), 1 = ffn (hc_ffn_*, ffn_norm); batch 1.
+ * Same contract as coli_v4_gpu_mhc_pre_norm_batch / _post_batch (non-zero =
+ * refused, the caller flushes and runs the CPU step), except that the post
+ * leaves outputs_hc stale. */
+int coli_v4_gpu_mhc_chain_pre(
+    const ColiDeepSeekV4LayerWeights *weights, int site, float *posts,
+    float *combs, float *normalized, const float *inputs_hc, int hc, int hidden);
+int coli_v4_gpu_mhc_chain_post(
+    const ColiDeepSeekV4LayerWeights *weights, int site, float *outputs_hc,
+    const float *branch, const float *residual_hc, const float *posts,
+    const float *combs, int hc, int hidden);
 /* MoE router offload: mirrors the bf16 route contract of coli_v4_route_bf16.
  * Uses the resident layer's uploaded f32 gate/bias mirrors through
  * dsv4_cuda_route (which hardcodes 256 experts / top-k 6); any shape or
