@@ -14,6 +14,7 @@
 
 __global__ static void ccf_dfconv_k(const float *__restrict__ x, const float *__restrict__ kp,
                                     const float *__restrict__ w, float *__restrict__ y, CcDfConv p) {
+    COLI_PDL_WAIT();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)p.n * p.C) return;
     const int r = (int)(i / (size_t)p.C), c = (int)(i % (size_t)p.C), G = p.C / p.gs;
@@ -75,11 +76,13 @@ __device__ static void ccf_topk_block(const float *v, int vs, const int *ci, int
     }
 }
 __global__ static void __launch_bounds__(256) ccf_dftopk1_k(const float *__restrict__ x, float *__restrict__ sc, CcDfTopk p) {
+    COLI_PDL_WAIT();
     const int r = blockIdx.x, g = blockIdx.y, per = (p.V + p.splits - 1) / p.splits, lo = g * per;
     const int n = lo >= p.V ? 0 : (p.V - lo < per ? p.V - lo : per);
     ccf_topk_block<256>(x + p.x_off + (size_t)r * p.x_row + lo, 1, NULL, 0, lo, n, p.K, sc + ((size_t)r * p.splits + g) * 2 * p.K);
 }
 __global__ static void __launch_bounds__(256) ccf_dftopk2_k(const float *__restrict__ sc, float *__restrict__ out, CcDfTopk p) {
+    COLI_PDL_WAIT();
     const int r = blockIdx.x, K = p.K;
     const float *row = sc + (size_t)r * p.splits * 2 * K;   /* slice g's values at g 2K .., its columns at g 2K + K .. */
     /* candidate i: slice i / K, place i % K */
@@ -109,6 +112,7 @@ static int cc_dftopk(CcBuf *x, CcBuf *sc, CcBuf *out, const CcDfTopk *p) {
  * x[x_off + r*x_row + b*D + c] (C 1: a copy; Qwen3.8-Flash-Next's four hyper-connection streams: their
  * sum, which the drafter's hidden_norm makes their mean). The streams added in order, rounded apart. */
 __global__ static void ccf_dftap_k(const float *__restrict__ x, float *__restrict__ y, CcDfTap p) {
+    COLI_PDL_WAIT();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)p.n * p.D) return;
     const int r = (int)(i / (size_t)p.D), c = (int)(i % (size_t)p.D);
