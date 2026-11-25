@@ -2796,12 +2796,30 @@ static int q38_victim(const LCache *lc,int layer,const uint8_t *protect){
     if(dev>=0){vkt_ram_gave();return dev;}
     return lru;
 }
+/* Whether a layer cache may take one more slab. Under the free-RAM floor the
+ * layer stops growing where it stands (cap = max(n, 1)) and recycles its slots,
+ * so misses stream from disk instead of pushing new slabs into the pagefile. */
+static double g_q38_ram_floor_gb = 1.0;   /* tests raise it to take this path */
+static int q38_cache_grow_ok(LCache *lc) {
+    if(lc->n>=lc->cap)return 0;
+    if(lc->n==0&&lc->cap<=1)return 1;
+    double avail=compat_mem_available_gb();
+    if(avail<=0||avail>=g_q38_ram_floor_gb)return 1;
+    static int said;
+    if(!said){
+        said=1;
+        fprintf(stderr,"[qwen38] RAM: %.2f GB available, under %.1f GB: the expert RAM caches stop growing "
+                       "(each layer keeps the slots it has) and misses stream from disk\n",avail,g_q38_ram_floor_gb);
+    }
+    lc->cap=lc->n>0?lc->n:1;
+    return lc->n<lc->cap;
+}
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
     q38_ehit_mark(m,layer,eid);
     LCache *lc=&m->cache[layer]; int si=lc->by_expert[eid];
     if(si>=0){m->hits++;lc->slots[si].used=++m->clock;return &lc->slots[si];}
     m->miss++; Slot *s;
-    if(lc->n<lc->cap){s=&lc->slots[lc->n++];s->eid=-1;}
+    if(q38_cache_grow_ok(lc)){s=&lc->slots[lc->n++];s->eid=-1;}
     else {
         int victim=q38_victim(lc,layer,NULL);
         s=&lc->slots[victim];if(s->eid>=0)lc->by_expert[s->eid]=-1;
@@ -2852,6 +2870,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     if(!m->expert_parallel_reads)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_DISABLED,layer,0,0);
     LCache *cache=&m->cache[layer];
+    q38_cache_grow_ok(cache);   /* low RAM freezes the cap before the demand set is sized against it */
     if(count>cache->cap)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY,
                                          layer,cache->cap,count);

@@ -2465,6 +2465,9 @@ tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_qwen38_cache_grow_floor$(EXE): tests/test_qwen38_cache_grow_floor.c qwen38.c qwen38_core.h $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
