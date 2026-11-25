@@ -1062,9 +1062,10 @@ int main(int argc, char **argv) {
     {   /* the four positions written, per head (the rows past them are malloc's: not zero on Windows) */
         int kv_ok = 1;
         for (int h = 0; h < KV; h++) {
-            size_t off = (size_t)h * CAP * HD;
-            if (maxdiff((const float *)m.K[1] + off, (const float *)ref.K[1] + off, (size_t)4 * HD) > 1e-4 ||
-                maxdiff((const float *)m.V[1] + off, (const float *)ref.V[1] + off, (size_t)4 * HD) > 1e-4) kv_ok = 0;
+            /* the row stride is the cache's (ensure_kv grows it to 1024 rows at least), not CAP */
+            const size_t om = (size_t)q36_kv_at(&m, 1, h, 0), orf = (size_t)q36_kv_at(&ref, 1, h, 0);
+            if (maxdiff((const float *)m.K[1] + om, (const float *)ref.K[1] + orf, (size_t)4 * HD) > 1e-4 ||
+                maxdiff((const float *)m.V[1] + om, (const float *)ref.V[1] + orf, (size_t)4 * HD) > 1e-4) kv_ok = 0;
         }
         ck(kv_ok, "the K/V rows reached the host cache as the CPU path wrote them");
     }

@@ -89,6 +89,7 @@ def size_of(types, consts, t):
     return total, spec
 
 
+@unittest.skipUnless(any(SHADERS.glob("*.spv")), "no compiled shaders (build with VK=1)")
 class SharedMemoryTest(unittest.TestCase):
     def test_no_shader_needs_more_than_any_device_has(self):
         modules = sorted(SHADERS.glob("*.spv"))
