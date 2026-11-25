@@ -12,6 +12,8 @@ EXPORTS
     dsv4_cuda_decode_state_set
     dsv4_cuda_profiler_start
     dsv4_cuda_profiler_stop
+    dsv4_cuda_ledger_label
+    dsv4_cuda_ledger_step
     dsv4_cuda_graph_begin
     dsv4_cuda_graph_end
     dsv4_cuda_graph_end_pair

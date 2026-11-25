@@ -313,12 +313,19 @@ def _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref, ref
             out_ids = model.generate(input_ids, max_new_tokens=max_new, do_sample=False,
                                      use_cache=True)
         full = out_ids[0].tolist()
-        payload = {"prompt_ids": prompt_ids, "full_ids": full,
+        # teacher forcing (make_glm_oracle.py's tf_pred): one forward over the whole
+        # sequence, no cache, the argmax at every position. For the greedy tokens
+        # tf_pred[i] == full[i+1] from i = len(prompt)-1 on; the prompt's own positions
+        # are what only `TF=1` on the engine checks (its prefill apart from its decode).
+        with torch.no_grad():
+            tf_pred = model(out_ids, use_cache=False).logits[0].argmax(-1).tolist()
+        payload = {"prompt_ids": prompt_ids, "full_ids": full, "tf_pred": tf_pred,
                    "mode": ref_mode, "model": label}
         Path(emit_ref).write_text(json.dumps(payload, indent=2))
         print(f"ref.json -> {emit_ref}")
         print(f"  prompt_ids={prompt_ids}")
         print(f"  full_ids ={full}")
+        print(f"  tf_pred  ={tf_pred}")
     if fused_experts or mtp:
         # after the reference: generate() ran on the in-memory model, the
         # rewrite only changes what is on disk
