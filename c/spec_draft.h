@@ -72,6 +72,8 @@ typedef struct {
     double t_w[SPEC_MAX_DRAFTS + 2];
     double rho, rho_w;                        /* a row's extra cost relative to one row */
     double d[SPEC_NSRC], d_w[SPEC_NSRC];      /* seconds a source spends per draft past its first */
+    double pre[SPEC_NSRC], pre_w[SPEC_NSRC];  /* seconds it spends before any draft that a plain step does not
+                                               * (a drafter's block; pre_w 0 = none told, the cost left out) */
     int picks[SPEC_NSRC];                     /* picks so far (the probe's clock) */
     int since_plain;                          /* forwards since the last plain step */
     int off;                                  /* 1: every proposal drafted in full (tests, fixed depths) */
@@ -97,6 +99,22 @@ static inline void spec_gate_init(SpecGate *g, int off) {
         for (int b = 0; b < SPEC_PBINS; b++) { g->pb[src][b] = (b + 0.5) / SPEC_PBINS; g->pb_w[src][b] = 2.0; }
 }
 
+/* A new generation's gate from the one the generation before left (same process, same model): the
+ * acceptance, rho and the draft costs as they were. The forward times were another context's: T(1)
+ * is measured again (the first pick takes a plain step, since_plain), the row counts' times count
+ * as one old measurement each. The report counts start over. */
+static inline void spec_gate_carry(SpecGate *g, const SpecGate *from) {
+    int off = g->off;
+    *g = *from;
+    g->off = off;
+    g->t_w[1] = 0.0;
+    for (int n = 2; n < SPEC_MAX_DRAFTS + 2; n++) if (g->t_w[n] > 1.0) g->t_w[n] = 1.0;
+    g->since_plain = SPEC_REFRESH;
+    memset(g->prop, 0, sizeof g->prop); memset(g->hit, 0, sizeof g->hit);
+    memset(g->verifies, 0, sizeof g->verifies); memset(g->probes, 0, sizeof g->probes);
+    memset(g->declined, 0, sizeof g->declined);
+}
+
 static inline void spec_ema(double *x, double *w, double v, double memory) {
     if (*w < memory) *w += 1.0;
     *x += (v - *x) / *w;
@@ -120,6 +138,13 @@ static inline void spec_gate_forward(SpecGate *g, int rows, double seconds) {
 static inline void spec_gate_draft_cost(SpecGate *g, int src, double seconds) {
     if (src < 0 || src >= SPEC_NSRC || !(seconds >= 0.0)) return;
     spec_ema(&g->d[src], &g->d_w[src], seconds, SPEC_T_W);
+}
+
+/* A source spent `seconds` to have drafts at all, which a plain step would not have spent (a drafter's
+ * block): from then on a verify of that source costs that much more, at any depth. */
+static inline void spec_gate_pre_cost(SpecGate *g, int src, double seconds) {
+    if (src < 0 || src >= SPEC_NSRC || !(seconds >= 0.0)) return;
+    spec_ema(&g->pre[src], &g->pre_w[src], seconds, SPEC_T_W);
 }
 
 /* A verify's drafts from `src` were judged: the first `accepted` stood, and `judged` of
@@ -172,6 +197,7 @@ static inline double spec_gate_value(const SpecGate *g, int src, int k, double *
     for (int j = 0; j < k && j < SPEC_MAX_DRAFTS; j++) { p *= g->acc[src][j]; e += p; }
     double cost = spec_gate_rows_cost(g, k + 1);
     if (k > 1 && g->d_w[src] > 0.0 && g->t_w[1] > 0.0 && g->t[1] > 0.0) cost += (k - 1) * g->d[src] / g->t[1];
+    if (g->pre_w[src] > 0.0 && g->t_w[1] > 0.0 && g->t[1] > 0.0) cost += g->pre[src] / g->t[1];
     if (expect) *expect = e;
     return k > 0 ? e / cost : 1.0;
 }
