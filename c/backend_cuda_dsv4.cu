@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <vector>
+#include <atomic>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -112,8 +113,14 @@ static void cuda_lost(const char*s,cudaError_t e){if(g_cuda_lost)return;g_cuda_l
     fprintf(stderr,"[DSV4 CUDA] %s: %s is a sticky fault: CUDA is lost for this process, on every device; the GPU paths "
                    "stay off and the engine runs on the host until the server restarts\n",s,cudaGetErrorString(e));}
 extern "C" int dsv4_cuda_lost(void){return g_cuda_lost;}
+/* DSV4_CUDA_FAULT_AFTER=n, debug only (read by dsv4_cuda_init, never set by a
+ * profile): the n-th checked call after init reads as cudaErrorLaunchFailure,
+ * once, so the latch and the host fallbacks run without a real fault. */
+static std::atomic<long> g_fault_after{0};
+static cudaError_t fault_inject(cudaError_t e,const char*s){if(g_fault_after.fetch_sub(1)!=1)return e;
+    fprintf(stderr,"[DSV4 CUDA] DSV4_CUDA_FAULT_AFTER: \"%s\" reads as a launch failure\n",s);return cudaErrorLaunchFailure;}
 static Dev *ctx(int d){if(g_cuda_lost)return nullptr;for(int i=0;i<ng;i++)if(g[i].id==d)return g+i;return nullptr;}
-static int ok(cudaError_t e,const char *s){if(e==cudaSuccess)return 1;fprintf(stderr,"[DSV4 CUDA] %s: %s\n",s,cudaGetErrorString(e));if(sticky(e))cuda_lost(s,e);return 0;}
+static int ok(cudaError_t e,const char *s){if(g_fault_after.load(std::memory_order_relaxed)>0)e=fault_inject(e,s);if(e==cudaSuccess)return 1;fprintf(stderr,"[DSV4 CUDA] %s: %s\n",s,cudaGetErrorString(e));if(sticky(e))cuda_lost(s,e);return 0;}
 #if COLI_DSV4_TC
 static int bok(cublasStatus_t e,const char*s){if(e==CUBLAS_STATUS_SUCCESS)return 1;fprintf(stderr,"[DSV4 CUDA] %s: cuBLAS status %d\n",s,(int)e);return 0;}
 #endif
@@ -3710,6 +3717,8 @@ extern "C" int dsv4_cuda_init(const int *dev,int n){if(!dev||n<1||n>16||g_cuda_l
 #ifdef COLI_DSV4_NCCL
     if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))return init_fail(dev,n,n,-1,-1);g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
 #endif
+    {const char*f=getenv("DSV4_CUDA_FAULT_AFTER");long at=f?atol(f):0;if(at>0){g_fault_after=at;
+        fprintf(stderr,"[DSV4 CUDA] DSV4_CUDA_FAULT_AFTER=%ld (debug): checked call %ld will read as a sticky fault\n",at,at);}}
     return 1;}
 extern "C" void dsv4_cuda_shutdown(void){
     for(int layer=0;layer<DSV4_KV_CACHE_LAYERS;layer++){

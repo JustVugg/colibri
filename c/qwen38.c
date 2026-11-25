@@ -1255,6 +1255,27 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     q38_spec_end(m, sp);
 }
 
+/* Q38_TF_TOPK=<file> (default off): per row tf_nll() scores, the top-K (id, log-prob), the target's log-prob
+ * (the very term the TF-NLL sums) and log Z, for a paired KL / top-1 check of two arms with
+ * tools/q38_tf_kl.py, which documents the little-endian layout. The printed TF-NLL does not change. */
+enum { Q38_TF_K = 32 };
+static void q38_tf_topk_row(FILE *f, const float *logit, int vocab, int pos, int target, float mx, double Z) {
+    int k = vocab < Q38_TF_K ? vocab : Q38_TF_K, n = 0;
+    int32_t id[Q38_TF_K];
+    for (int v = 0; v < vocab; v++) {   /* descending; a tie keeps the lower id first, like generate()'s argmax */
+        if (n == k && !(logit[v] > logit[id[k - 1]])) continue;
+        int j = n < k ? n++ : k - 1;
+        while (j > 0 && logit[v] > logit[id[j - 1]]) { id[j] = id[j - 1]; j--; }
+        id[j] = v;
+    }
+    double lz = log(Z), lp[Q38_TF_K];
+    for (int j = 0; j < k; j++) lp[j] = (double)logit[id[j]] - mx - lz;
+    int32_t head[2] = {pos, target};
+    double tl[2] = {(double)logit[target] - mx - lz, mx + lz};   /* target log-prob as tf_nll() sums it; log Z */
+    fwrite(head, sizeof head, 1, f); fwrite(tl, sizeof tl, 1, f);
+    fwrite(id, sizeof id[0], (size_t)k, f); fwrite(lp, sizeof lp[0], (size_t)k, f);
+}
+
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
     Cfg *c = &m->c;
     if (nfull <= np) {
@@ -1263,6 +1284,18 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     }
     m->max_t = q38_context_total(c, np, nfull - np, "PPL");
     q38_validate_ids(c, full, nfull, "full_ids");
+    const char *tk = getenv("Q38_TF_TOPK");
+    FILE *tf = tk && *tk ? fopen(tk, "wb") : NULL;
+    if (tk && *tk && !tf) { perror(tk); exit(1); }
+    if (tf) {
+        int32_t h[4] = {c->vocab < Q38_TF_K ? c->vocab : Q38_TF_K, c->vocab, np, nfull};
+        fwrite("Q38TFTK1", 8, 1, tf); fwrite(h, sizeof h, 1, tf);
+    }
+    /* Q38_LOGITS_DUMP=<file>: a line per scored position, teacher forced: position, the
+     * forced token's NLL, log Z, then the top 32 as id:logit (tools/q38_logit_cmp.py) */
+    const char *dp = getenv("Q38_LOGITS_DUMP");
+    FILE *df = dp && *dp ? fopen(dp, "w") : NULL;
+    if (dp && *dp && !df) { perror(dp); exit(1); }
     reset_recurrent(m);
     ensure_kv(m);
     m->kv_len = 0;
@@ -1272,12 +1305,31 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
         float mx = logit[0]; for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) mx = logit[v];
         double Z = 0; for (int v = 0; v < c->vocab; v++) Z += exp((double)logit[v] - mx);
         nll += -((double)logit[full[i]] - mx - log(Z));
+        if (tf) q38_tf_topk_row(tf, logit, c->vocab, i, full[i], mx, Z);
+        if (df) {
+            int top[32]; int nt = 0;   /* insertion into a sorted top 32: fine for a test */
+            for (int v = 0; v < c->vocab; v++) {
+                if (nt == 32 && logit[v] <= logit[top[31]]) continue;
+                int j = nt < 32 ? nt++ : 31;
+                while (j > 0 && logit[top[j - 1]] < logit[v]) { top[j] = top[j - 1]; j--; }
+                top[j] = v;
+            }
+            fprintf(df, "%d %.6f %.6f", i, -((double)logit[full[i]] - mx - log(Z)), mx + log(Z));
+            for (int j = 0; j < nt; j++) fprintf(df, " %d:%.6f", top[j], logit[top[j]]);
+            fputc('\n', df);
+        }
         scored++;
         free(logit); logit = NULL;
         if (i == nfull - 1) break;
         logit = step(m, &full[i], 1, i);
     }
     if (logit) free(logit);
+    if (df) fclose(df);
+    if (tf) {
+        int bad = ferror(tf);
+        if (fclose(tf) != 0 || bad) { fprintf(stderr, "Q38_TF_TOPK: writing %s failed\n", tk); exit(1); }
+        fprintf(stderr, "[tf-topk] %d rows x top-%d -> %s\n", scored, c->vocab < Q38_TF_K ? c->vocab : Q38_TF_K, tk);
+    }
     *nll_out = nll / scored;
     return scored;
 }
@@ -2916,7 +2968,9 @@ static float *q38_serve_prefill_at(Model *m,const int *ids,int from,int np,ColiP
         q38_head_pin(m,ids,h,lo);
         free(lo);
         from=h;
+        double t0=now_s();
         if(q38_ps_save(m,ids,from))q38_psd_mark(m,ids,from);
+        Q38_PFP("store save at %d: %.1f ms\n",from,(now_s()-t0)*1e3);
     }
     if(snap_ok){   /* in pieces where its messages start, the state there kept for later requests (q38_ps_save) */
         int marks[2],nm=q38_ps_marks(m,ids,np,from,marks);
@@ -2926,7 +2980,9 @@ static float *q38_serve_prefill_at(Model *m,const int *ids,int from,int np,ColiP
             if(!lo)return NULL;
             free(lo);
             from=marks[k];
+            double t0=now_s();
             if(q38_ps_save(m,ids,from))q38_psd_mark(m,ids,from);
+            Q38_PFP("store save at %d: %.1f ms\n",from,(now_s()-t0)*1e3);
         }
     }
     const int a=snap_ok?q38_answer_start(ids,np):-1;
@@ -2981,7 +3037,9 @@ static void q38_prefix_miss_log(Model *m,const int *ids,int np){
 static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
                            Q38ReqClock *clk, int lone){
     int *ids=NULL, np=0;
+    double pf_e=now_s();
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
+    if(np>8)Q38_PFP("encode %d tokens: %.1f ms\n",np,(now_s()-pf_e)*1e3);
     if(g_pending_image.present){
         /* Le patch arrivano gia' float32 dal gateway: qui si controlla solo che
          * ce ne sia un numero intero e che la griglia le giustifichi, perche' un
@@ -3015,6 +3073,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         q->max_tok = budget;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
+    double pf_a=now_s();
     if(lone)q38_park_decide(m,ids,np,q->max_tok);   /* a conversation parked by the last request: back, kept or dropped */
     clk->started=now_s(); clk->hits=m->hits; clk->misses=m->miss; clk->timers=m->timers; qt_counters(&clk->qt);
     /* Prima gli scatti CHIESTI, e il piu profondo: sono punti di ritorno che
@@ -3110,6 +3169,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         lo=q38_serve_prefill_at(m,ids,0,np,pc,snap_ok,&snapped);
     }
     g_echo_k=0; g_echo_id=NULL; g_echo_pin_logit=NULL;   /* la lettura e finita col prefill */
+    double pf_b=now_s();
     if(ctl.control){
         /* stopped while reading: what was read stays the live state; a STOP ends the turn
          * with no token, a CANCEL with the error the gateway waits for */
@@ -3143,6 +3203,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         fprintf(stderr,"[qwen38 prefix] cache disabled for request %s (state snapshot unavailable)\n",q->id);
     if(getenv("Q38_PREFIX_LOG"))
         fprintf(stderr,"[qwen38 prefix] request=%s reused=%d/%d\n",q->id,reuse,np);
+    Q38_PFP("request %d tokens (reuse %d): accept->prefill done %.1f ms, snapshot save %.1f ms\n",np,reuse,(pf_b-pf_a)*1e3,(now_s()-pf_b)*1e3);
     if(m->draft_vocab)draft_vocab_begin(m->draft_vocab,ids,np,reuse);
     /* the prompt has been read: what follows is the decode's share of the request */
     clk->prefill_hits=m->hits; clk->prefill_misses=m->miss; clk->prefill_timers=m->timers;

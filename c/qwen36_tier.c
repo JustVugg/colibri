@@ -792,6 +792,10 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
 static int G_fp8_stream;
 static const float *G_fp8_lut;
 static int G_upload_sync;             /* QT_UPLOAD_SYNC=1: qt_issue waits for in-flight uploads first (tests) */
+/* QT_FREEZE=1 (A/B and test knob, default off): after the warm start the tier moves no expert --
+ * no note promotes or swaps, the tick plans no swap and drains no replan -- so two runs that differ
+ * only in how they group rows see the same residents and must give the same bits. */
+static int G_freeze;
 
 int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e4m3_lut){
     if(G.on) return 0;
@@ -889,6 +893,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         fprintf(stderr,"[qtier] RAM holds %d of %d experts a layer: the tier copies each expert it takes as it passes\n",cap,ne);
     memset(&G,0,sizeof G);
     { const char *e=getenv("QT_UPLOAD_SYNC"); G_upload_sync=e&&*e&&*e!='0'; }
+    { const char *e=getenv("QT_FREEZE"); G_freeze=e&&*e&&*e!='0'; }
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
     /* Placement state is re-derived per init: the device fold-in below reads
      * COLI_PLACE before the automatic placement has decided anything, and a
@@ -2060,7 +2065,7 @@ static void stream_promote_locked(int layer,int eid){
 void qt_note(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4 || G_trunk_only || G_chain_own) return;
+    if(!G.on || !g4 || G_trunk_only || G_chain_own || G_freeze) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
     if(G_stream){
@@ -2093,7 +2098,7 @@ void qt_heat_order(uint32_t *const *counts, int nl, int ne){
  * and room on its device or a resident colder than it, as of the last tick), so an engine
  * converts the bytes only then; qt_note_heat counts a pass of one it does not hand over. */
 int qt_note_wanted(int layer,int eid){
-    if(!G.on || G_trunk_only || G_chain_own || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+    if(!G.on || G_trunk_only || G_chain_own || G_freeze || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
     if(!G_stream) return 1;
     QSlot *s=qs(layer,eid);
     if(s->resident || s->queued) return 0;
@@ -2385,6 +2390,7 @@ static void qt_lfru_tick_locked(int skip_full_scan){
         for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
     if(!(G.tick%QT_CONV_DECAY))
         for(size_t i=0;i<n;i++) G.slot[i].conv>>=1;
+    if(G_freeze) return;   /* QT_FREEZE: no swap planned or drained */
     replan_drain_locked(QT_REPLAN_PER_TICK);              /* pending re-plan pairs, a few per token */
     if(G.tick%16 || (skip_full_scan && (size_t)G.nres >= n)) return;
     for(int di=0;di<G.ndev;di++){

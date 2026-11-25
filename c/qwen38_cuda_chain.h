@@ -3179,7 +3179,7 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n);
                 double t0 = now_s();
                 ok = ok && cc_submit(1);
-                m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
+                m->timers.seconds[Q38_TM_DEV_WAIT] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
                 if (!ok) { free(cs_all); return -1; }
                 q38cc_kv_down(ch, m, i, n, pb);
                 if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
@@ -3208,7 +3208,7 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 }
                 double t0 = now_s();
                 ok = ok && cc_submit(1);   /* the frame's stream: the next staged layer's copy goes on beside the next frames */
-                m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
+                m->timers.seconds[Q38_TM_DEV_WAIT] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
                 if (!ok) { free(cs_all); return -1; }
                 if (want_streams && i == L - 1) memcpy(hyper_h + (size_t)c0 * W, cc_ptr(ch->hypd), (size_t)n * W * 4);   /* the frame is done */
                 /* layer i's books for these rows (q38cc_dm_books' for one layer; its K/V rows went down after the first pass) */
@@ -3615,6 +3615,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
     for (int c0 = 0; c0 < S; c0 += rows) {
         if (coli_prompt_break()) { q38cc_pd_end(ch, S, pd, 0); q38cc_dm_end(ch); return 0; }   /* a served prompt's stop, between two chunks */
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
+        double pp0 = now_s(), pp1 = pp0, pp2 = pp0, pw0 = ch->wait_ms;
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
         if (ns < 0) ns = 0;
         if (ns) snapped = c0 + ns;
@@ -3660,6 +3661,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         if (!q38cc_frame_begin(ch) || !q38cc_hyper_in(ch, hyper_h + (size_t)c0 * W, n, W) ||
             !q38cc_push_state(ch, m, pb)) goto lost;
         if (dm && q38cc_dm_tab(ch, n) == ch->dm_tabb && !q38cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
+        pp1 = now_s();
         int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
         CcBuf *routed = ch->routed;              /* where the layer before left its routed sum */
@@ -3692,7 +3694,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             if (ok && pend_v) { ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v); pend_v = 0; }   /* before a wait for the frame */
             double t0 = now_s();
             ok = ok && cc_submit(1);   /* A1 */
-            m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
+            m->timers.seconds[Q38_TM_DEV_WAIT] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
             if (!ok) break;
             q38cc_kv_down(ch, m, i, n, pb);
             ok = q38cc_frame_begin(ch) && q38cc_shared(ch, m, l, i, n) && cc_submit(0);   /* A2 */
@@ -3715,6 +3717,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             ok = cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)lo0 * H, greedy ? ch->outdev : ch->outd, (size_t)dst * V, lo_n);
             if (ok && greedy) ok = cc_pick_rows(ch->outdev, (size_t)dst * V, ch->gpick, V, lo_n);   /* one chunk: dst 0 */
         }
+        pp2 = now_s();
         double t0 = now_s();
         ok = ok && cc_submit(0);
         if (ok && pend_v) ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v);   /* the last hybrid layer's, the tail recorded */
@@ -3723,9 +3726,11 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
          * chunk's, everything (its stagings) */
         ok = ok && (n > Q38CC_DM_ROWS ? cc_finish() : cc_submit(1));
         if (sv) { ok = q38cc_srv_close(sv, ok, ch->dm_seq) && ok; q38cc_srv_books(ch); sv = NULL; }
-        m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
+        m->timers.seconds[Q38_TM_DEV_WAIT] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
         if (!ok || (dm && cc_host_wait_gave_up(ch->dm_hfl, "qwen38"))) goto lost;
         if (dm) q38cc_dm_books(ch, m, n, pb);
+        if (n > 8) Q38_PFP("chain chunk %d rows at %d: prep %.1f ms, record %.1f ms, out+books %.1f ms (dev-wait %.1f), staged table %d\n",
+                           n, pb, (pp1 - pp0) * 1e3, (pp2 - pp1) * 1e3, (now_s() - pp2) * 1e3, ch->wait_ms - pw0, dm && q38cc_dm_tab(ch, n) == ch->dm_tabb);
         if (want_streams) memcpy(hyper_h + (size_t)c0 * W, cc_ptr(ch->hypd), (size_t)n * W * 4);
         if (mixed_h) memcpy(mixed_h + (size_t)c0 * H, cc_ptr(ch->find), (size_t)n * H * 4);
         for (int i = 0; i < L; i++) if (c->is_attn[i]) ch->kv_valid[i] = pb + n;

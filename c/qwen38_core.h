@@ -156,6 +156,8 @@ typedef enum {
     Q38_TM_DN_RECUR,               /* inside deltanet: conv, recurrence, gated norm (no weights) */
     Q38_TM_DN_SNAP,                /* inside deltanet: a verify's per-row state copies */
     Q38_TM_LM_DRAFT,               /* the MTP head's lm-head (its drafts), apart from lm-head */
+    Q38_TM_DEV_WAIT,               /* the CUDA or Vulkan chain waiting for its device frames (not a CPU matmul) */
+    Q38_TM_TIER_IO,                /* the VRAM tier from the host: qt_issue, qt_take (waits for its experts), qt_note */
     Q38_TM_COUNT
 } Q38Timer;
 
@@ -351,6 +353,10 @@ static int g_capture_last_logit;
 static int g_q38_rowwise;
 
 static double now_s(void) { return compat_now_s(); }
+
+/* Q38_PF_PROF=1: where a prompt's wall time goes, a line per piece on stderr */
+static int q38_pfprof(void) { static int on = -1; if (on < 0) { const char *e = getenv("Q38_PF_PROF"); on = e && *e == '1'; } return on; }
+#define Q38_PFP(...) do { if (q38_pfprof()) { fprintf(stderr, "[pfprof] " __VA_ARGS__); } } while (0)
 
 static inline void q38_tm_add(Model *m,Q38Timer timer,double started) {
     m->timers.seconds[timer] += now_s() - started;
@@ -4791,7 +4797,9 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     }
     /* the CUDA tier's residents of the row run on the device from here on (qt_take adds them
      * after the CPU's, as the loop does); the rest are this function's */
+    double tier_started=now_s();
     uint32_t qmask=cuda&&!idx_in?qt_issue(layer,idx,K,x):0;
+    if(cuda&&!idx_in)q38_tm_add(m,Q38_TM_TIER_IO,tier_started);
     for(int i=0;i<np;i++)ondev[i]=idx_in?dev_in[i]:(uint8_t)((qmask>>i)&1u);
     /* the distinct experts in first-seen order and each one's assignments, grouped */
     int nu=0,nc=0;   /* nc: the assignments computed here */
@@ -4916,7 +4924,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     }
     /* the tier promotes what the CPU computed (it copies the rows before qt_note returns;
      * the next wave may recycle this one's slots) */
-    if(cuda&&loaded)for(int j=j0;j<j1;j++)q38_tier_note(layer,uniq[j],slot[j]);
+    if(cuda&&loaded){double tn=now_s();for(int j=j0;j<j1;j++)q38_tier_note(layer,uniq[j],slot[j]);q38_tm_add(m,Q38_TM_TIER_IO,tn);}
     }
     q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
     static int said;
@@ -4934,7 +4942,10 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
             const float g=gates[s*K+z];const float *e=eo+(int64_t)pos[s*K+z]*H;
             for(int d=0;d<H;d++)ys[d]+=g*e[d];
         }
-        if(cuda&&!idx_in&&!qt_take(qmask,gates+(int64_t)s*K,K,ys)){
+        tier_started=now_s();
+        int tier_took=!(cuda&&!idx_in)||qt_take(qmask,gates+(int64_t)s*K,K,ys);
+        if(cuda&&!idx_in)q38_tm_add(m,Q38_TM_TIER_IO,tier_started);
+        if(!tier_took){
             fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
             exit(1);
         }
@@ -4981,7 +4992,9 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         uint8_t taken[Q38_MAX_TOPK]={0};
         int ndev=vk?vkt_issue(layer,xs,1,K,idx,taken):0;
         for(int z=0;z<K;z++)if(taken[z])q38_ehit_mark(m,layer,idx[z]);   /* routed this turn, wherever it ran */
+        double tier_started=now_s();
         uint32_t qmask=tiered?qt_issue(layer,idx,K,xs):0;
+        if(tiered)q38_tm_add(m,Q38_TM_TIER_IO,tier_started);
         int cpu_idx[Q38_MAX_TOPK],cpu_rank[Q38_MAX_TOPK],cpu_n=0;
         for(int z=0;z<K;z++)if(!((qmask>>z)&1u)&&!taken[z]){cpu_idx[cpu_n]=idx[z];cpu_rank[cpu_n]=z;cpu_n++;}
         q38_prefetch_experts(m,layer,cpu_idx,cpu_n);
@@ -5008,7 +5021,7 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
             }
             else for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
-            if(tiered)q38_tier_note(layer,cpu_idx[i],ex);
+            if(tiered){double tn=now_s();q38_tier_note(layer,cpu_idx[i],ex);q38_tm_add(m,Q38_TM_TIER_IO,tn);}
         }
         if(vk){
             /* the device's experts, then every rank in order; a batch that failed is
@@ -5025,7 +5038,10 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         }
         /* GPU experts land after the CPU ones: same values, one more group in
          * the float sum (that is the only ordering difference to a CPU run). */
-        if(tiered&&!qt_take(qmask,route_gates,K,ys)){
+        tier_started=now_s();
+        int tier_took=!tiered||qt_take(qmask,route_gates,K,ys);
+        if(tiered)q38_tm_add(m,Q38_TM_TIER_IO,tier_started);
+        if(!tier_took){
             fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
             exit(1);
         }
@@ -5496,10 +5512,12 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
     float *hyper=falloc((int64_t)S*W);
+    double pf_t0=now_s();
     /* Le righe PLE partono ADESSO, non al layer 2 dove servono: sono note dagli
      * id dei token soltanto, e i due layer che le precedono danno il tempo di
      * farle arrivare dal disco. */
     q38_ple_prefetch(m,ids,S);
+    double pf_t1=now_s();
     for(int s=0;s<S;s++)
         if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
     /* a prompt's rows on the team: a 4180-token prompt's embedding rows and their copies into the
@@ -5510,6 +5528,7 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         q38_embed_row(m,ids[s],pos_base+s,e);
         for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
     }
+    if(S>8)Q38_PFP("forward rows %d: ple prefetch %.1f ms, embed %.1f ms\n",S,(pf_t1-pf_t0)*1e3,(now_s()-pf_t1)*1e3);
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
     int first=0;   /* the layers a partial dense chain ran on the device (COLI_VULKAN) */
     float *chain_logit=NULL;   /* the Vulkan or the CUDA chain ran the final mixer and lm_head */
@@ -5550,7 +5569,9 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         m->greedy_done=0;
         /* a greedy caller's rows picked on the card (q38cc_greedy_ok): no logits come down */
         chain_logit=falloc(!echo&&q38cc_greedy_ok(m,S,nlogits)?1:(int64_t)nlogits*c->vocab);
+        double pf_c=now_s();
         int took=q38cc_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
+        if(S>8)Q38_PFP("chain forward rows %d: %.1f ms (took %d)\n",S,(now_s()-pf_c)*1e3,took);
         if(took){
             free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
         } else {
@@ -6007,9 +6028,12 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
 
 static float *step(Model *m,const int *ids,int S,int pos_base) {
     float *streams=NULL;
+    double tf=now_s();
     float *logit=q38_forward(m,ids,S,pos_base,1,m->mtp?&streams:NULL);
+    double tm=now_s();
     if(!logit)return NULL;   /* g_q38_breaker stopped it */
     if(streams){q38_mtp_feed(m,ids,S,pos_base,streams);free(streams);}
+    if(S>8)Q38_PFP("step rows %d at %d: forward %.1f ms, mtp feed %.1f ms\n",S,pos_base,(tm-tf)*1e3,(now_s()-tm)*1e3);
     return logit;
 }
 
@@ -6541,7 +6565,7 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
     static const char *names[Q38_TM_COUNT]={
         "expert-read","fp8-expand","routed-expert","shared-expert",
         "resident-mm","deltanet","qsa-index","qsa-attn","ple","lm-head",
-        "dn-recur","dn-snap","lm-draft"
+        "dn-recur","dn-snap","lm-draft","dev-wait","vram-tier"
     };
     double per=timers->forwards?1000.0/timers->forwards:0.0;
     fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
@@ -6550,7 +6574,8 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
         fprintf(stderr,"[qwen38 timers]   %-14s %9.3f s  %9.3f ms/forward\n",
                 names[i],timers->seconds[i],timers->seconds[i]*per);
     fprintf(stderr,"[qwen38 timers] architecture phases overlap resident-mm; "
-                   "expert-read is disk service and fp8-expand is synchronous miss work\n");
+                   "expert-read is disk service and fp8-expand is synchronous miss work; dev-wait is the "
+                   "device chain (CUDA or Vulkan) waiting for its frames, vram-tier the tier's issue/take/note\n");
 }
 
 /* Snapshot of the timer bank taken when the prompt's forward has finished
