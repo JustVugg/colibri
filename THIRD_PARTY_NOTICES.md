@@ -94,3 +94,17 @@ not copy Swiftlet or huggingface_hub source code.
 emitted by Swiftlet's `scripts/verify_container.py`. They are new Python
 implementations with stricter path, transport, credential, resume, and digest
 validation; no Swiftlet source code is copied.
+
+## TensorFold FP8 tensor-core expert kernels (`c/cuda_f8_mma.cuh`, `c/f8_mma.h`)
+
+`c/cuda_f8_mma.cuh` and `c/f8_mma.h` are derived from TensorFold
+(https://github.com/ashhart/TensorFold, commit `9489c38`, 2026-11-17),
+specifically `zig/kernels/cuda/fp8_experts.cu`, `experts.cuh`,
+`common/fp_pairs.cuh`, `common/qmm_frag.cuh`, `common/cp_async.cuh`, and
+`zig/src/cuda/experts.zig` (`Fp8Experts.packOne`).
+
+TensorFold is licensed under Apache License 2.0 (Copyright 2026 TensorFold
+contributors; TensorFold's NOTICE is reproduced verbatim in `NOTICE`, and this
+repository's `LICENSE` contains the applicable Apache 2.0 text). Both files were
+modified for Colibri's `fmt=8` row-major layout, `GroupDesc` dispatch, and f32
+SwiGLU epilogue; each file header lists what was taken and what changed.
