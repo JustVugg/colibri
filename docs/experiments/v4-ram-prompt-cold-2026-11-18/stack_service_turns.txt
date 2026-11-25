@@ -1,0 +1,87 @@
+The deployed stack (upstream dev of 2026-11-16 + the local prompt and decode pieces, serve.sh enabling
+all of them) + this commit, built with a local trace instrumentation (V4_RAM_TRACE, not part of this
+change; inactive unless set). V4_RAM_PROMPT_COLD=0 (cold0_*) and =1 (cold1_*), one binary. The
+v4_ram_phase lines are that build's store counters (requests, hits, misses, bytes read) at each
+request's start, at the prompt bank's release and at the turn's end; the per-turn table below is their
+difference (tools: phase_sum.py, not in the tree).
+
+Five 3.3k-token turns per service: `coli serve --ram 80 --ctx 20000` (serve.sh in the record's command),
+prompt3k.txt prefixed with "Request N. ", max_tokens 36, temperature 0, a fresh service per line, the arms
+alternating (off on off on off on). Each service line: the five requests' wall times in seconds (curl
+time_total: prompt and 36 generated tokens), the engine's decode seconds and RAM-cache hit rate per turn
+(v4_serve_turn, V4_SERVE_STATS_LOG=1; the hit rate covers the whole turn, prompt included) and the md5 of
+each reply's content. Below the lines, each service's v4_serve_turn lines as the engine printed them.
+
+cold0_21499: 31.232056 26.755054 25.152185 24.015478 23.076266 decode_s: 9.62 7.94 7.46 7.01 6.49  hit: 58.5 57.0 57.3 57.2 57.4  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+cold0_30960: 31.225740 26.890716 25.114723 24.106393 23.095366 decode_s: 9.83 8.01 7.37 7.11 6.49  hit: 58.6 57.0 57.3 57.2 57.3  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+cold0_5659: 31.154411 26.833893 25.115492 24.296861 23.227633 decode_s: 9.73 7.99 7.41 7.16 6.59  hit: 58.6 57.1 57.3 57.2 57.4  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+cold1_8140: 29.436032 23.265909 22.783127 22.160703 22.353036 decode_s: 9.52 5.34 5.39 5.29 5.59  hit: 73.2 77.4 77.4 77.4 76.5  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+cold1_28070: 29.735143 23.304774 22.876928 22.231969 22.375625 decode_s: 9.77 5.36 5.43 5.28 5.62  hit: 73.3 77.4 77.4 77.4 76.6  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+cold1_7284: 29.566981 23.353822 22.858761 22.131384 22.372910 decode_s: 9.59 5.38 5.47 5.25 5.58  hit: 73.2 77.4 77.4 77.5 76.5  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+
+== cold0_21499
+  turn 1  prompt reads 10941 misses  8756 (117.1 GB)  decode reads 13984 misses 1579 (21.1 GB)  decode_s 9.62 tok_s 3.744
+  turn 2  prompt reads 10941 misses  9153 (122.4 GB)  decode reads 14016 misses 1567 (20.9 GB)  decode_s 7.94 tok_s 4.537
+  turn 3  prompt reads 10941 misses  9175 (122.7 GB)  decode reads 14167 misses 1538 (20.6 GB)  decode_s 7.46 tok_s 4.693
+  turn 4  prompt reads 10941 misses  9184 (122.8 GB)  decode reads 14183 misses 1571 (21.0 GB)  decode_s 7.01 tok_s 4.993
+  turn 5  prompt reads 10941 misses  9145 (122.3 GB)  decode reads 14085 misses 1524 (20.4 GB)  decode_s 6.49 tok_s 5.548
+v4_serve_turn prompt=3282 completion=36 decode_s=9.62 tok_s=3.744 hit=58.5% expert_disk_s=31.95 expert_wait_s=2.58 expert_matmul_s=0.00 attention_s=28.21 rss_gb=79.6 vram_first_hits_total=0 store_fetches_total=8700
+v4_serve_turn prompt=3282 completion=36 decode_s=7.94 tok_s=4.537 hit=57.0% expert_disk_s=29.89 expert_wait_s=2.26 expert_matmul_s=0.00 attention_s=24.22 rss_gb=79.7 vram_first_hits_total=0 store_fetches_total=17430
+v4_serve_turn prompt=3282 completion=35 decode_s=7.46 tok_s=4.693 hit=57.3% expert_disk_s=29.14 expert_wait_s=2.08 expert_matmul_s=0.00 attention_s=22.81 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=26196
+v4_serve_turn prompt=3282 completion=35 decode_s=7.01 tok_s=4.993 hit=57.2% expert_disk_s=29.02 expert_wait_s=1.96 expert_matmul_s=0.00 attention_s=21.77 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=34968
+v4_serve_turn prompt=3282 completion=36 decode_s=6.49 tok_s=5.548 hit=57.4% expert_disk_s=28.61 expert_wait_s=1.77 expert_matmul_s=0.00 attention_s=21.06 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=43794
+== cold1_8140
+  turn 1  prompt reads 10941 misses  5444 ( 72.8 GB)  decode reads 14074 misses 1248 (16.7 GB)  decode_s 9.52 tok_s 3.781
+  turn 2  prompt reads 10941 misses  5452 ( 72.9 GB)  decode reads 14138 misses  220 ( 2.9 GB)  decode_s 5.34 tok_s 6.738
+  turn 3  prompt reads 10941 misses  5452 ( 72.9 GB)  decode reads 14275 misses  244 ( 3.3 GB)  decode_s 5.39 tok_s 6.492
+  turn 4  prompt reads 10941 misses  5449 ( 72.8 GB)  decode reads 14292 misses  244 ( 3.3 GB)  decode_s 5.29 tok_s 6.611
+  turn 5  prompt reads 10941 misses  5452 ( 72.9 GB)  decode reads 14165 misses  436 ( 5.8 GB)  decode_s 5.59 tok_s 6.435
+v4_serve_turn prompt=3282 completion=36 decode_s=9.52 tok_s=3.781 hit=73.2% expert_disk_s=19.42 expert_wait_s=2.47 expert_matmul_s=0.00 attention_s=26.53 rss_gb=79.6 vram_first_hits_total=0 store_fetches_total=8760
+v4_serve_turn prompt=3282 completion=36 decode_s=5.34 tok_s=6.738 hit=77.4% expert_disk_s=13.07 expert_wait_s=0.76 expert_matmul_s=0.00 attention_s=22.22 rss_gb=79.7 vram_first_hits_total=0 store_fetches_total=17568
+v4_serve_turn prompt=3282 completion=35 decode_s=5.39 tok_s=6.492 hit=77.4% expert_disk_s=13.09 expert_wait_s=0.78 expert_matmul_s=0.00 attention_s=21.73 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=26394
+v4_serve_turn prompt=3282 completion=35 decode_s=5.29 tok_s=6.611 hit=77.4% expert_disk_s=13.09 expert_wait_s=0.75 expert_matmul_s=0.00 attention_s=21.13 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=35226
+v4_serve_turn prompt=3282 completion=36 decode_s=5.59 tok_s=6.435 hit=76.5% expert_disk_s=13.71 expert_wait_s=0.93 expert_matmul_s=0.00 attention_s=21.17 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=44088
+== cold0_30960
+  turn 1  prompt reads 10941 misses  8755 (117.0 GB)  decode reads 14006 misses 1581 (21.1 GB)  decode_s 9.83 tok_s 3.664
+  turn 2  prompt reads 10941 misses  9152 (122.4 GB)  decode reads 14007 misses 1564 (20.9 GB)  decode_s 8.01 tok_s 4.496
+  turn 3  prompt reads 10941 misses  9178 (122.7 GB)  decode reads 14169 misses 1535 (20.5 GB)  decode_s 7.37 tok_s 4.749
+  turn 4  prompt reads 10941 misses  9188 (122.8 GB)  decode reads 14189 misses 1568 (21.0 GB)  decode_s 7.11 tok_s 4.926
+  turn 5  prompt reads 10941 misses  9145 (122.3 GB)  decode reads 14068 misses 1525 (20.4 GB)  decode_s 6.49 tok_s 5.547
+v4_serve_turn prompt=3282 completion=36 decode_s=9.83 tok_s=3.664 hit=58.6% expert_disk_s=31.01 expert_wait_s=2.64 expert_matmul_s=0.00 attention_s=28.15 rss_gb=79.6 vram_first_hits_total=0 store_fetches_total=8718
+v4_serve_turn prompt=3282 completion=36 decode_s=8.01 tok_s=4.496 hit=57.0% expert_disk_s=29.90 expert_wait_s=2.32 expert_matmul_s=0.00 attention_s=24.29 rss_gb=79.7 vram_first_hits_total=0 store_fetches_total=17442
+v4_serve_turn prompt=3282 completion=35 decode_s=7.37 tok_s=4.749 hit=57.3% expert_disk_s=29.03 expert_wait_s=2.08 expert_matmul_s=0.00 attention_s=22.77 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=26208
+v4_serve_turn prompt=3282 completion=35 decode_s=7.11 tok_s=4.926 hit=57.2% expert_disk_s=29.18 expert_wait_s=1.99 expert_matmul_s=0.00 attention_s=21.84 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=34986
+v4_serve_turn prompt=3282 completion=36 decode_s=6.49 tok_s=5.547 hit=57.3% expert_disk_s=28.45 expert_wait_s=1.83 expert_matmul_s=0.00 attention_s=21.02 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=43794
+== cold1_28070
+  turn 1  prompt reads 10941 misses  5444 ( 72.8 GB)  decode reads 14075 misses 1247 (16.7 GB)  decode_s 9.77 tok_s 3.683
+  turn 2  prompt reads 10941 misses  5452 ( 72.9 GB)  decode reads 14144 misses  218 ( 2.9 GB)  decode_s 5.36 tok_s 6.714
+  turn 3  prompt reads 10941 misses  5452 ( 72.9 GB)  decode reads 14275 misses  243 ( 3.2 GB)  decode_s 5.43 tok_s 6.449
+  turn 4  prompt reads 10941 misses  5448 ( 72.8 GB)  decode reads 14294 misses  246 ( 3.3 GB)  decode_s 5.28 tok_s 6.626
+  turn 5  prompt reads 10941 misses  5451 ( 72.9 GB)  decode reads 14162 misses  435 ( 5.8 GB)  decode_s 5.62 tok_s 6.401
+v4_serve_turn prompt=3282 completion=36 decode_s=9.77 tok_s=3.683 hit=73.3% expert_disk_s=19.61 expert_wait_s=2.58 expert_matmul_s=0.00 attention_s=26.72 rss_gb=79.6 vram_first_hits_total=0 store_fetches_total=8760
+v4_serve_turn prompt=3282 completion=36 decode_s=5.36 tok_s=6.714 hit=77.4% expert_disk_s=13.16 expert_wait_s=0.77 expert_matmul_s=0.00 attention_s=22.26 rss_gb=79.7 vram_first_hits_total=0 store_fetches_total=17574
+v4_serve_turn prompt=3282 completion=35 decode_s=5.43 tok_s=6.449 hit=77.4% expert_disk_s=13.29 expert_wait_s=0.78 expert_matmul_s=0.00 attention_s=21.83 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=26400
+v4_serve_turn prompt=3282 completion=35 decode_s=5.28 tok_s=6.626 hit=77.4% expert_disk_s=13.01 expert_wait_s=0.74 expert_matmul_s=0.00 attention_s=21.22 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=35238
+v4_serve_turn prompt=3282 completion=36 decode_s=5.62 tok_s=6.401 hit=76.6% expert_disk_s=13.74 expert_wait_s=0.97 expert_matmul_s=0.00 attention_s=21.16 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=44100
+== cold0_5659
+  turn 1  prompt reads 10941 misses  8756 (117.1 GB)  decode reads 13998 misses 1580 (21.1 GB)  decode_s 9.73 tok_s 3.699
+  turn 2  prompt reads 10941 misses  9151 (122.3 GB)  decode reads 14017 misses 1566 (20.9 GB)  decode_s 7.99 tok_s 4.506
+  turn 3  prompt reads 10941 misses  9180 (122.7 GB)  decode reads 14147 misses 1533 (20.5 GB)  decode_s 7.41 tok_s 4.722
+  turn 4  prompt reads 10941 misses  9181 (122.7 GB)  decode reads 14180 misses 1572 (21.0 GB)  decode_s 7.16 tok_s 4.887
+  turn 5  prompt reads 10941 misses  9149 (122.3 GB)  decode reads 14091 misses 1526 (20.4 GB)  decode_s 6.59 tok_s 5.460
+v4_serve_turn prompt=3282 completion=36 decode_s=9.73 tok_s=3.699 hit=58.6% expert_disk_s=30.89 expert_wait_s=2.60 expert_matmul_s=0.00 attention_s=28.12 rss_gb=79.6 vram_first_hits_total=0 store_fetches_total=8712
+v4_serve_turn prompt=3282 completion=36 decode_s=7.99 tok_s=4.506 hit=57.1% expert_disk_s=29.90 expert_wait_s=2.23 expert_matmul_s=0.00 attention_s=24.32 rss_gb=79.7 vram_first_hits_total=0 store_fetches_total=17442
+v4_serve_turn prompt=3282 completion=35 decode_s=7.41 tok_s=4.722 hit=57.3% expert_disk_s=29.15 expert_wait_s=2.03 expert_matmul_s=0.00 attention_s=22.81 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=26190
+v4_serve_turn prompt=3282 completion=35 decode_s=7.16 tok_s=4.887 hit=57.2% expert_disk_s=29.39 expert_wait_s=1.96 expert_matmul_s=0.00 attention_s=22.05 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=34962
+v4_serve_turn prompt=3282 completion=36 decode_s=6.59 tok_s=5.460 hit=57.4% expert_disk_s=28.98 expert_wait_s=1.89 expert_matmul_s=0.00 attention_s=21.09 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=43794
+== cold1_7284
+  turn 1  prompt reads 10941 misses  5444 ( 72.8 GB)  decode reads 14072 misses 1248 (16.7 GB)  decode_s 9.59 tok_s 3.753
+  turn 2  prompt reads 10941 misses  5452 ( 72.9 GB)  decode reads 14137 misses  216 ( 2.9 GB)  decode_s 5.38 tok_s 6.697
+  turn 3  prompt reads 10941 misses  5451 ( 72.9 GB)  decode reads 14275 misses  241 ( 3.2 GB)  decode_s 5.47 tok_s 6.404
+  turn 4  prompt reads 10941 misses  5448 ( 72.8 GB)  decode reads 14288 misses  241 ( 3.2 GB)  decode_s 5.25 tok_s 6.665
+  turn 5  prompt reads 10941 misses  5452 ( 72.9 GB)  decode reads 14162 misses  437 ( 5.8 GB)  decode_s 5.58 tok_s 6.446
+v4_serve_turn prompt=3282 completion=36 decode_s=9.59 tok_s=3.753 hit=73.2% expert_disk_s=19.39 expert_wait_s=2.53 expert_matmul_s=0.00 attention_s=26.60 rss_gb=79.6 vram_first_hits_total=0 store_fetches_total=8760
+v4_serve_turn prompt=3282 completion=36 decode_s=5.38 tok_s=6.697 hit=77.4% expert_disk_s=13.23 expert_wait_s=0.74 expert_matmul_s=0.00 attention_s=22.33 rss_gb=79.7 vram_first_hits_total=0 store_fetches_total=17568
+v4_serve_turn prompt=3282 completion=35 decode_s=5.47 tok_s=6.404 hit=77.4% expert_disk_s=13.33 expert_wait_s=0.79 expert_matmul_s=0.00 attention_s=21.79 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=26394
+v4_serve_turn prompt=3282 completion=35 decode_s=5.25 tok_s=6.665 hit=77.5% expert_disk_s=13.14 expert_wait_s=0.75 expert_matmul_s=0.00 attention_s=21.11 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=35226
+v4_serve_turn prompt=3282 completion=36 decode_s=5.58 tok_s=6.446 hit=76.5% expert_disk_s=13.79 expert_wait_s=0.90 expert_matmul_s=0.00 attention_s=21.22 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=44088

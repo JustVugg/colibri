@@ -17,7 +17,7 @@ with neither it answers 404 and the page says the feature is not available.
 Streams (chat in SSE) are passed through chunk by chunk. A confirmed client reset
 or failed response write closes upstream. A client that only closes its request
 write side can still read its response."""
-import argparse, json, os, sys, time, urllib.parse
+import argparse, ipaddress, json, os, sys, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -48,6 +48,7 @@ class Handler(BaseHTTPRequestHandler):
     port = 8790
     bind_host = "127.0.0.1"  # what this server listens on (--host)
     allowed_hosts = ()       # more Host names the API paths accept (--allowed-host)
+    allow_remote = False     # let a peer on another machine use the page-only routes (--allow-remote-ui)
 
     def _json(self, code, obj):
         b = json.dumps(obj).encode()
@@ -58,10 +59,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _peer_local(self):
+        """the caller is on this machine: its address, which a client cannot choose, and not a header"""
+        try:
+            ip = ipaddress.ip_address(str(self.client_address[0]).split("%")[0])
+            if ip.version == 6 and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            return ip.is_loopback
+        except (ValueError, IndexError, TypeError):
+            return False
+
     def _local_ok(self, post):
         """/agents only for this page: its own Host and Origin (no DNS rebinding, no other site),
         and on a POST a header of its own, which a page elsewhere cannot send without a CORS
-        preflight this server never grants"""
+        preflight this server never grants. The caller must also be on this machine: those
+        headers are the caller's to write, so once the server listens beyond loopback a remote
+        client sends them too (--allow-remote-ui lifts this, for a UI reached through Docker's
+        port mapping or a reverse proxy, where the peer is not loopback)"""
+        if not (self.allow_remote or self._peer_local()):
+            self.log_error("page-only route refused for %s: this server answers only a caller on this machine "
+                           "(--allow-remote-ui, or COLI_UI_ALLOW_REMOTE=1, lifts it)", self.client_address[0])
+            return False
         hosts = {"127.0.0.1:%d" % self.port, "localhost:%d" % self.port}
         if self.headers.get("Host") not in hosts:
             return False
@@ -83,6 +101,26 @@ class Handler(BaseHTTPRequestHandler):
             return True
         name = host_name(self.headers.get("Host"))
         return name in LOOPBACK or name in self.allowed_hosts or "*" in self.allowed_hosts
+
+    def _origin_ok(self):
+        """A page on another site can POST to the API paths without a preflight, and this proxy drops
+        the Origin before the gateway could look at it. So a request that names an Origin runs only
+        for this machine's names, this request's own Host or one added with --allowed-host."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        try:
+            name = (urllib.parse.urlparse(origin).hostname or "").lower()
+        except ValueError:
+            return False
+        return bool(name) and (name == host_name(self.headers.get("Host")) or name in LOOPBACK
+                               or name in self.allowed_hosts or "*" in self.allowed_hosts)
+
+    def _origin_refused(self):
+        origin = self.headers.get("Origin")
+        self.close_connection = True   # a body may be unread
+        self._json(403, {"error": "Origin %r not allowed. Add its host with --allowed-host (or COLI_ALLOWED_HOSTS) "
+                                  "if a page there should call this server." % origin})
 
     def _host_refused(self):
         name = host_name(self.headers.get("Host"))
@@ -239,6 +277,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if (path.startswith(PROXIED) or path == "/v1/responses") and not self._api_host_ok():
             return self._host_refused()
+        if ((path.startswith(PROXIED) or path == "/v1/responses") and self.command not in ("GET", "HEAD")
+                and not self._origin_ok()):
+            return self._origin_refused()
         if path == "/doc/extract" and self.command == "POST":
             self._doc()
         elif path.startswith("/web/") and self.command == "GET":
@@ -294,6 +335,11 @@ def main():
                     default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS", "").split(",") if h.strip()],
                     help="a Host name the gateway's API paths accept besides loopback, for a UI reached through a "
                          "reverse proxy or a tunnel name (repeatable; or COLI_ALLOWED_HOSTS; '*' accepts any)")
+    ap.add_argument("--allow-remote-ui", action="store_true",
+                    default=os.environ.get("COLI_UI_ALLOW_REMOTE") == "1",
+                    help="let a caller on another machine use the page-only routes (/agents, /models, /web, "
+                         "/doc/extract): they download and switch models and open agents, and are answered "
+                         "only to this machine unless this is set (or COLI_UI_ALLOW_REMOTE=1)")
     ap.add_argument("--exit-with-stdin", action="store_true",
                     help="exit when stdin closes: `coli web` holds it open, so the UI ends with the launcher "
                          "however that ends (coli stop, Ctrl-C, a crash)")
@@ -324,6 +370,10 @@ def main():
     Handler.allowed_hosts = tuple(h.strip().lower() for h in a.allowed_host if h and h.strip())
     if "*" in Handler.allowed_hosts:
         print("WARNING: --allowed-host '*' accepts ANY Host header (DNS-rebinding guard disabled)", file=sys.stderr)
+    Handler.allow_remote = a.allow_remote_ui
+    if a.allow_remote_ui and a.host.strip("[]").lower() not in LOOPBACK:
+        print("WARNING: --allow-remote-ui: any machine that can reach %s:%d can download and switch models and "
+              "open agents here, with no key" % (a.host, a.port), file=sys.stderr)
     if not a.models_backend and Handler.backend.hostname in ("127.0.0.1", "localhost", "::1"):
         try:   # the gateway is on this machine: the Models page is served from here
             import models

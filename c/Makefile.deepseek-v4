@@ -253,7 +253,14 @@ ROCM_HOME ?= /opt/rocm
 HIP_ARCH ?= native
 NVCC = hipcc
 NO_TC = 1
-V4_NVCCFLAGS = -O3 -std=c++20 --offload-arch=$(HIP_ARCH) -DCOLI_DSV4_NO_TC -D_GNU_SOURCE -fPIC
+# HIP_WAVE64=1: the kernels as 64-lane waves (RDNA cards default to 32). On
+# gfx1102 the decode's FP4 expert group runs 37-39 % faster so, with the same
+# results. The kernels' warps are 32 threads either way: a lane reads only
+# lanes of its own 32 (xor and down shuffles of at most 16, the reductions'
+# sums taken at each 32's first lane, broadcasts of width 32). On for gfx11
+# (measured there); HIP_ARCH=native leaves it off.
+HIP_WAVE64 ?= $(if $(filter gfx11%,$(HIP_ARCH)),1,0)
+V4_NVCCFLAGS = -O3 -std=c++20 --offload-arch=$(HIP_ARCH) $(if $(filter 1,$(HIP_WAVE64)),-mwavefrontsize64) -DCOLI_DSV4_NO_TC -D_GNU_SOURCE -fPIC
 CFLAGS += -DCOLI_V4_GPU_TIER -DCOLI_V4_HIP
 V4_WIN_EXTRA_OBJS += backend_cuda_dsv4.o
 LDFLAGS += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
@@ -447,7 +454,7 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAM
 	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -c backend_loader_dsv4.c -o $@
 
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh $(V4_DEEPGEMM_DEP) \
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh ledger_map.h $(V4_DEEPGEMM_DEP) \
 	$(V4_CUDA_FLAGS_STAMP)
 ifneq ($(NO_TC),1)
 	@release=$$("$(NVCC)" --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p'); \

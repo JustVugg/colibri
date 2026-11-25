@@ -64,6 +64,10 @@ static int qwen36_max_ctx(void) {
 }
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>   /* the preload workers' own priority (q36_preload_worker) */
+#endif
 #include <unistd.h>
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
@@ -87,6 +91,7 @@ static int qwen36_max_ctx(void) {
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept only while the tier is on */
 #include "draft_vocab.h"   /* the tokens the MTP head scores for a draft (Q36_MTP_VOCAB) */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
+#include "expert_store.h"  /* leases on the GGUF experts the CPU MoE reads */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
 #include "lfm3_vision.h"   /* LFM3-VL's tower and projector */
@@ -1142,11 +1147,14 @@ static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidde
  * get the file's 16-bit rows back from w (q36_wf16_rows, exact) as block format 100 + wf16. */
 /* vk_name, vk_tag, vk_quant: what load_tq read it with, to read it back from disk
  * (q36_dho_reload); vk_fmt, vk_gone: with the dense weights on the device only
- * (COLI_VK_DENSE_HOST), the device copy's format and 1 while no host copy is kept. */
+ * (COLI_VK_DENSE_HOST), the device copy's format and 1 while no host copy is kept.
+ * gq_gone: 1 while the CUDA tier holds this GGUF matrix alone (q36_gq_drop), 2 while the loader
+ * has read its header only (load_tq_noted under the CUDA tier, q36_gq_settle): no gq, gq_type
+ * what load_tq gives it; matmul_d reads the rows from the file first (q36_gq_reload). */
 typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
-                 uint8_t *gq; int gq_type; float gs; int wf16;
+                 uint8_t *gq; int gq_type; float gs; int wf16; int gq_gone;
                  int mapped; /* q/sc are canonical.qc's pages (qwen_dense_mapped), or gq the GGUF's
                               * (the Metal graph, qwen_gguf_map): never freed */
                  int q8r16, q4r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave);
@@ -1155,8 +1163,9 @@ static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
     if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
     w->vk = NULL; w->vk_off = 0; w->vk_imported = 0;
-    free(w->vk_name); w->vk_name = NULL; w->vk_gone = 0;
+    w->vk_gone = 0;
 #endif
+    free(w->vk_name); w->vk_name = NULL; w->gq_gone = 0;
     if (!w->mapped) { q36_wfree(w->q); free(w->sc); free(w->gq); }
     free((void*)w->w); free(w->q4); free(w->sg); q36_wfree(w->h);
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->h = NULL; w->gq = NULL; w->mapped = 0;
@@ -1299,6 +1308,8 @@ typedef struct {
     kv_prefix kvp;
     float *attn_sc;            /* [attn_sc_thr * kv_cap] score rows, one per thread */
     int attn_sc_thr;
+    float *attn_sc_grp;        /* reusable grouped-GQA score scratch [threads * gq * len] */
+    size_t attn_sc_grp_cap;
     double dense_load_s;
     uint32_t *freq;
     int freq_token_count, hot_pinned, hot_n, warmup_tokens, token_count;
@@ -1416,6 +1427,15 @@ static struct { int l, e; } pilot_q[4096];
 static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
+static _Thread_local int tl_loader_thread = 0;   /* set on PILOT pool threads: their loads stay single-threaded */
+
+/* PAR_LOAD=0 turns off the parallel expert loads added for small-RAM streaming (default on):
+ * a token's / a prefill chunk's missed experts are read from disk concurrently instead of
+ * one pread at a time, so the drive sees a queue depth of up to PF_CHUNK (default 8). The
+ * maths and the token ids are unchanged: only the order in which misses are served differs. */
+static int par_load_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("PAR_LOAD"); on = !(e && *e == '0'); } return on; }
+static int pf_chunk(void) { static int n = -1; if (n < 0) { const char *e = getenv("PF_CHUNK"); n = e ? atoi(e) : 8; if (n < 1) n = 1; if (n > 64) n = 64; } return n; }
+static int pilot_threads(void) { static int n = -1; if (n < 0) { const char *e = getenv("PILOT_THREADS"); n = e ? atoi(e) : 1; if (n < 1) n = 1; if (n > 16) n = 16; } return n; }
 static int g_wide  = 1;
 /* CACHE_ROUTE family, same names and defaults as the GLM engine (docs/CACHE_ROUTE.md). */
 static int   g_cache_route = 0;
@@ -1426,6 +1446,8 @@ static float g_route_alpha = 1.f;
 static int   g_route_agree = 0;
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
+static int pilot_enqueue(Model *m, int layer, int eid);
+static int pf_ahead_on(void);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
@@ -1524,22 +1546,21 @@ static int slot_victim(const LCache *lc, int layer, int allow_pinned) {
 static void ensure_pilot_worker_started(Model *m) {
     if (!pilot_m) {
         pilot_m = m;
-        pthread_t t;
-        if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
-            fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
-            exit(1);
+        const int nw = pilot_threads();
+        for (int i = 0; i < nw; i++) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
+                fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
+                exit(1);
+            }
+            pthread_detach(t);
         }
-        pthread_detach(t);
     }
 }
 
 /* ---------- utility ---------- */
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
-#endif
+static double now_s(void) { return compat_now_s(); }
+static double rss_gb(void) { return compat_rss_gb(); }
 /* same wrapper convention as colibri.c/olmoe.c/inkling.c/kimi_k3.c/deepseek_v4.c */
 static double mem_available_gb(void) { return compat_mem_available_gb(); }
 
@@ -1591,7 +1612,7 @@ static void tm_report(void){
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
 }
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 #include "kv16.h"
@@ -2234,10 +2255,13 @@ static int g_q36_cap_arg;              /* the cache size asked for (argv[1], 0 =
 static long long g_q36_exp_codes;
 static double g_q36_exp_bytes __attribute__((unused));   /* read only where GQ_R16_ON (AVX2, AVX-512) */
 static void q36_codes_now(QW *w);
+static void q36_gq_reload(QW *w);
+static void q36_gq_drop(QW *w);
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
+    if (__atomic_load_n(&w->gq_gone, __ATOMIC_ACQUIRE)) q36_gq_reload((QW *)w);
     if (w->gq) {
         if (gq_r16_of_grown(w->gq_type) >= 0 && __atomic_load_n(&g_q36_codes, __ATOMIC_ACQUIRE) != 0) q36_codes_now((QW *)w);
         if (gq_matmul(y, x, w->gq, w->gq_type, S, I, O)) {
@@ -2389,14 +2413,26 @@ static inline int qtd(int hp1, float *y, const float *x, int I, int O){
  * backend does not take the type or the tensor carries a scale the kernels lack. */
 #ifdef COLI_CUDA
 int coli_cuda_block_elems(int fmt);
+struct ColiCudaTensor;
+int coli_cuda_tensor_upload_rows(struct ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int row0, int n);
+int coli_cuda_host_register(void *p, size_t bytes);
+void coli_cuda_host_unregister(void *p);
+void coli_cuda_ledger_step(void);
+/* Ledger (ledger_map.h): one generated token; inert without LEDGER_OUT */
+static void q36_ledger_token(void) { coli_cuda_ledger_step(); }
+#else
+static void q36_ledger_token(void) {}
 #endif
+/* a GGUF matrix the loader left in the file (gq_gone 2), read as the tier uploads it (q36_gq_stream) */
+typedef struct { QtRows r; const QW *w[2]; int O0; } Q36Rows;   /* rows [0, O0) of w[0], then w[1]'s */
+static const QtRows *q36_gq_stream(Q36Rows *s, const QW *a, const QW *b, int fmt);
 static int qdw_gq_fmt(const QW *w) {
 #ifdef COLI_CUDA
     if (g_gguf && !w->gq && w->wf16 && w->w) {   /* F16, BF16: blocks of 32 of their 16 bits (q36_wf16_rows) */
         const int be = coli_cuda_block_elems(100 + w->wf16);
         return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + w->wf16 : 0;
     }
-    if (!g_gguf || !w->gq || w->gs != 1.f) return 0;
+    if (!g_gguf || !(w->gq || w->gq_gone) || w->gs != 1.f) return 0;
     const int r = gq_r16_base(w->gq_type), t = r >= 0 ? r : w->gq_type, be = coli_cuda_block_elems(100 + t);
     return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + t : 0;
 #else
@@ -2411,6 +2447,7 @@ static size_t qdw_gq_bytes(const QW *w) {
  * *rows (free it after the upload); NULL when out of memory */
 static const void *qdw_gq_rows(const QW *w, int fmt, uint8_t **rows) {
     *rows = NULL;
+    if (__atomic_load_n(&w->gq_gone, __ATOMIC_ACQUIRE)) q36_gq_reload((QW *)w);
     if (!w->gq) return *rows = (uint8_t *)q36_wf16_rows(w);   /* F16, BF16 */
     if (gq_r16_base(w->gq_type) < 0) return w->gq;
     if (!(*rows = malloc((size_t)gq_row_bytes(fmt - 100, w->I) * w->O))) return NULL;
@@ -2425,9 +2462,11 @@ static int qdw_place(const QW *w, int dev){
     if (dev == QT_PLACE_CPU) return 0;
     if (!w->q) {
         const int fmt = qdw_gq_fmt(w);
-        uint8_t *rows; const void *src = fmt ? qdw_gq_rows(w, fmt, &rows) : NULL;
-        int h = src ? qt_dense_init_fmt(src, NULL, fmt, w->I, w->O, dev) : -1;
-        if (src) free(rows);
+        Q36Rows s; const QtRows *r = fmt ? q36_gq_stream(&s, w, NULL, fmt) : NULL;
+        uint8_t *rows = NULL; const void *src = fmt && !r ? qdw_gq_rows(w, fmt, &rows) : NULL;
+        int h = src || r ? qt_dense_init_fmt(src, r, NULL, fmt, w->I, w->O, dev) : -1;
+        free(rows);
+        if (h >= 0) q36_gq_drop((QW *)w);   /* the device's copy is the one read from here on */
         return h >= 0 ? h + 1 : 0;
     }
     int h = qt_dense_init(w->q, w->sc, w->I, w->O, dev);
@@ -3386,6 +3425,9 @@ static int qwen_dense_mapped(Model *m, const char *name, int I, int O, QW *out) 
  * load (rows are whole blocks: a byte copy), every kernel then rotates the halves as for every
  * other model. q36_gguf_rope_perm: 1 for such a file (muse-spark, Q36_GGUF_ROPE_PERM=0/1 sets it). */
 static int g_q36_rope_perm = 0;
+/* g_q36_gq_defer: main's GGUF run under the CUDA tier, whose loader reads a matrix's header only
+ * (load_tq_noted: g_q36_gq_defer_one, gq_gone 2) and the tier's upload its rows (q36_gq_settle) */
+static int g_q36_gq_defer, g_q36_gq_defer_one;
 static int q36_rope_heads(const Model *m, const char *name) {
     if (!g_q36_rope_perm || !name) return 0;
     size_t L = strlen(name);
@@ -3428,6 +3470,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
         if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
         if (g_gguf_dry) { out->gq_type = t->type; return; }
+        if (g_q36_gq_defer_one) { out->gq_type = q36_gq_held(t->type, O, I); out->gq_gone = 2; return; }   /* q36_gq_settle */
 #ifdef QWEN36_METAL_GRAPH
         if (QWEN_GRAPH(m) && g_gg_map) {   /* the Metal graph reads the file's blocks in place (qg_dense) */
             out->gq = (uint8_t *)g_gg_map[t->file] + t->off; out->gq_type = t->type; out->mapped = 1;
@@ -3467,15 +3510,136 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     qw_quantize(p, I, O, tag, out);
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
 }
-/* load_tq, and under COLI_VULKAN a note of what it read (name, tag, whether it was
- * quantized) for q36_dho_reload. Every resident dense matrix of the model loads here. */
+/* load_tq, and under COLI_VULKAN or COLI_CUDA a note of what it read (name, tag, whether it was
+ * quantized) for q36_dho_reload and q36_gq_reload. Every resident dense matrix of the model loads here.
+ * With g_q36_gq_defer, a GGUF matrix's header only: g_q36_gq_left lists it for q36_gq_settle. */
+static QW **g_q36_gq_left;
+static int g_q36_gq_nleft;
 static void load_tq_noted(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
+    g_q36_gq_defer_one = g_q36_gq_defer;
     load_tq(m, name, I, O, quantize, tag, out);
-#ifdef COLI_VULKAN
+    g_q36_gq_defer_one = 0;
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
     out->vk_name = strdup(name); out->vk_tag = tag; out->vk_quant = quantize;
     out->vk_fmt = 0; out->vk_gone = 0;
     if (!out->vk_name) { fprintf(stderr, "OOM dense matrix name\n"); exit(1); }
 #endif
+    if (out->gq_gone == 2) {
+        QW **l = realloc(g_q36_gq_left, (size_t)(g_q36_gq_nleft + 1) * sizeof *l);
+        if (!l) { fprintf(stderr, "OOM dense matrix list\n"); exit(1); }
+        (g_q36_gq_left = l)[g_q36_gq_nleft++] = out;
+    }
+}
+/* ---- GGUF matrices the CUDA tier holds alone --------------------------------------
+ * A GGUF matrix the CUDA tier took (qdw_place, the DeltaNet projections, lm_head) gives its
+ * host rows back right after its upload: the device's copy is the one read from then on. The
+ * CPU multiplies by it again only after a lost device or a handle the tier turned off, and
+ * matmul_d first reads it back here, through load_tq with what it was loaded with (the same
+ * bytes: the file's rows, un-permuted and interleaved as at load). Before, every placed matrix
+ * kept its host rows: Qwen3.8-27B Q4_K_M, the trunk on a 32 GB card, gave back 14.0 GB of RAM
+ * it held beside its VRAM copy for the whole run. g_q36_gq_model: set by main where the CUDA tier
+ * places the trunk; NULL (every other path) keeps the host rows.
+ * Nor does the loader read them first: under the CUDA tier it reads a GGUF matrix's header only
+ * (gq_gone 2), the tier's upload reads its rows from the file a range at a time through one
+ * staging buffer (q36_gq_stream: Q36_GGUF_STAGE_KB, 64 MiB, pinned where the backend gives it),
+ * and q36_gq_settle reads the matrices the tier did not take, as load_tq would have at load.
+ * Before, the loader read all of them into RAM first: that model passed 19 GB of RAM during the
+ * load and a 32 GB PC with 22 GB free ran out of memory; streamed, it runs in about 8 GB. */
+static Model *g_q36_gq_model;
+static pthread_mutex_t g_q36_gq_mx = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_q36_gq_dropped;
+static int g_q36_gq_ndrop, g_q36_gq_nreload;
+static void q36_gq_drop(QW *w) {
+    if (!g_q36_gq_model || !(w->gq || w->gq_gone == 2) || w->mapped || !w->vk_name) return;   /* not noted (an MTP head's): its rows stay */
+    g_q36_gq_dropped += (size_t)gq_row_bytes(w->gq_type, w->I) * w->O; g_q36_gq_ndrop++;
+    free(w->gq); w->gq = NULL;
+    __atomic_store_n(&w->gq_gone, 1, __ATOMIC_RELEASE);
+}
+/* load_tq with what w was noted with: the same bytes, the file's rows un-permuted and interleaved as at load */
+static void q36_gq_read(QW *w) {
+    QW t; memset(&t, 0, sizeof t);
+    load_tq(g_q36_gq_model, w->vk_name, w->I, w->O, w->vk_quant, w->vk_tag, &t);
+    w->gq_type = t.gq_type; w->gq = t.gq;
+    __atomic_store_n(&w->gq_gone, 0, __ATOMIC_RELEASE);
+}
+static void q36_gq_reload(QW *w) {
+    pthread_mutex_lock(&g_q36_gq_mx);
+    if (w->gq_gone) {
+        const int back = w->gq_gone == 1;   /* 2: the first read of a matrix the loader left in the file */
+        q36_gq_read(w);
+        if (back && !g_q36_gq_nreload++)
+            fprintf(stderr, "[gguf] the CPU multiplies by a matrix the CUDA tier held alone (%s): its rows read back from the file\n", w->vk_name);
+    }
+    pthread_mutex_unlock(&g_q36_gq_mx);
+}
+static uint8_t *g_q36_stage;
+static size_t g_q36_stage_cap;
+static int g_q36_stage_pinned;
+/* QtRows.read: rows [row0, row0 + n) of s's matrices from the file, un-permuted as load_tq reads
+ * them before it interleaves them for the CPU: the rows qdw_gq_rows gives the device, byte for byte */
+static int q36_gq_file_rows(void *ctx, int row0, int n, void *buf) {
+    const Q36Rows *s = ctx; uint8_t *dst = buf;
+    while (n > 0) {
+        const int k = row0 >= s->O0, r = row0 - (k ? s->O0 : 0), c = k || row0 + n <= s->O0 ? n : s->O0 - row0;
+        const QW *w = s->w[k];
+        const gguf_tensor *t = gg_tensor(w->vk_name);
+        const size_t rb = (size_t)gq_row_bytes(t->type, w->I);
+        const int rh = q36_rope_heads(g_q36_gq_model, w->vk_name);
+        if (gguf_read(gg_ctx_of(t), t, dst, (int64_t)r * rb, (int64_t)c * rb)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
+        if (rh) q36_rope_unpermute(dst, rb, c / (w->O / rh), w->O / rh);   /* whole heads: QtRows.align */
+        dst += (size_t)c * rb; row0 += c; n -= c;
+    }
+    return 1;
+}
+/* What the tier's upload of a (then b: a DeltaNet's qkv ++ z) reads, when the loader left both
+ * in the file and the backend takes a range of rows; NULL: the caller hands the rows whole */
+static const QtRows *q36_gq_stream(Q36Rows *s, const QW *a, const QW *b, int fmt) {
+#ifdef COLI_CUDA
+    if (a->gq_gone != 2 || (b && b->gq_gone != 2) || !coli_cuda_tensor_upload_rows(NULL, NULL, 0, 0, 0, 0, 0, 0)) return NULL;
+    const gguf_tensor *ta = gg_tensor(a->vk_name), *tb = b ? gg_tensor(b->vk_name) : NULL;
+    if (!ta || ta->type != fmt - 100 || (b && (!tb || tb->type != fmt - 100 || b->I != a->I))) return NULL;
+    const int rh = b ? 0 : q36_rope_heads(g_q36_gq_model, a->vk_name), align = rh ? a->O / rh : 1;
+    const size_t rb = (size_t)gq_row_bytes(fmt - 100, a->I);
+    if (!g_q36_stage) {
+        const char *e = getenv("Q36_GGUF_STAGE_KB");
+        g_q36_stage_cap = (size_t)(e && atol(e) > 0 ? atol(e) : 65536) << 10;
+        if (!(g_q36_stage = malloc(g_q36_stage_cap))) return NULL;
+        g_q36_stage_pinned = coli_cuda_host_register(g_q36_stage, g_q36_stage_cap);   /* the copies DMA */
+    }
+    if (rb * (size_t)align > g_q36_stage_cap) return NULL;   /* not one range fits */
+    s->w[0] = a; s->w[1] = b; s->O0 = a->O;
+    s->r = (QtRows){ q36_gq_file_rows, s, g_q36_stage, g_q36_stage_cap, rb, align };
+    return &s->r;
+#else
+    (void)s; (void)a; (void)b; (void)fmt;
+    return NULL;
+#endif
+}
+/* After the tier's placement, or where none came: the matrices it did not take read now, as
+ * load_tq would have at load; the staging buffer goes */
+static void q36_gq_settle(void) {
+    if (!g_q36_gq_defer) return;
+    int n = 0; double bytes = 0;
+    pthread_mutex_lock(&g_q36_gq_mx);
+    for (int i = 0; i < g_q36_gq_nleft; i++) {
+        QW *w = g_q36_gq_left[i];
+        if (w->gq_gone != 2) continue;
+        q36_gq_read(w);
+        n++; bytes += (double)gq_row_bytes(w->gq_type, w->I) * w->O;
+    }
+    pthread_mutex_unlock(&g_q36_gq_mx);
+    if (g_q36_stage)
+        fprintf(stderr, "[gguf] the CUDA tier's matrices went from the file to the device through a %zu MiB staging buffer (%s); "
+                        "%d for the CPU read after them (%.2f GB)\n", g_q36_stage_cap >> 20, g_q36_stage_pinned ? "pinned" : "pageable",
+                n, bytes / 1073741824.0);
+    else if (n) fprintf(stderr, "[gguf] %d matrices for the CPU read after the placement (%.2f GB)\n", n, bytes / 1073741824.0);
+#ifdef COLI_CUDA
+    if (g_q36_stage_pinned) coli_cuda_host_unregister(g_q36_stage);
+#endif
+    free(g_q36_stage);
+    g_q36_stage = NULL; g_q36_stage_pinned = 0;
+    free(g_q36_gq_left); g_q36_gq_left = NULL; g_q36_gq_nleft = 0;
+    g_q36_gq_defer = 0;
 }
 #ifdef COLI_VULKAN
 /* ---- dense weights on the device only (COLI_VK_DENSE_HOST) ------------------------
@@ -4753,6 +4917,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
          * pre-existing, unrelated bug if this process ever builds two models
          * with different container formats (out of scope here). */
         double resident = rss_gb();
+        for (int i = 0; i < g_q36_gq_nleft; i++)   /* left in the file (q36_gq_settle): counted as read, as before */
+            resident += (double)gq_row_bytes(g_q36_gq_left[i]->gq_type, g_q36_gq_left[i]->I) * g_q36_gq_left[i]->O / 1073741824.0;
         double avail = mem_available_gb();
         const char *ram_env = getenv("RAM_GB");
         double ram_override = ram_env ? atof(ram_env) : 0.0;
@@ -5180,7 +5346,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
                 ng[k] = ht[k] != ft[k] ? rows[k] / 16 : 0;
                 if (!ng[k]) memcpy(dst + ho[k], b + fo[k], (size_t)fb[k]);
             }
-            #pragma omp parallel for schedule(static) if (!omp_in_parallel())
+            #pragma omp parallel for schedule(static) if (!omp_in_parallel() && !tl_loader_thread)
             for (int j = 0; j < ng[0] + ng[1] + ng[2]; j++) {
                 const int k = j < ng[0] ? 0 : j < ng[0] + ng[1] ? 1 : 2, g = j - (k > 0 ? ng[0] : 0) - (k > 1 ? ng[1] : 0);
                 const int64_t fr = gq_row_bytes(ft[k], cols[k]), hr = gq_row_bytes(ht[k], cols[k]);
@@ -5809,10 +5975,34 @@ static void ehit_mark(Model *m, int layer, int eid){
 }
 /* hold=1 marks the slot busy before the lock drops, so nothing can evict it
  * between this lookup and the caller's slot_release. */
+/* ---- Background preload (Q36_PRELOAD=1) -----------------------------------
+ * A cache with a slot for every expert still fills on demand: an expert's
+ * first use reads and unpacks it on the engine's thread, in the middle of a
+ * token. Measured on 2x Xeon E5-2670 with every expert in the page cache:
+ * the routed-expert phase fell from 455 to 57 ms/token over the first ~700
+ * tokens of a fresh server and was still falling. With Q36_PRELOAD=1, loader
+ * threads fill the free slots of every layer at startup, in file order, at
+ * low priority, while the server already answers. They only take free slots
+ * (never evict), and an expert is loaded once: the engine waits for a preload
+ * of the expert it wants (g_pl_busy), and the loaders skip the one the engine
+ * is reading (g_pl_engine). Placement only: the bytes a slot holds are
+ * load_expert_merged's either way. q36_preload_start says where it runs. */
+#define Q36_PL_MAX 16
+static int g_pl_on = 0, g_pl_threads = 0;
+static struct { int layer, eid; } g_pl_busy[Q36_PL_MAX], g_pl_engine = { -1, -1 };   /* under g_pilot_mx */
+static int pl_busy_locked(int layer, int eid) {
+    for (int i = 0; i < g_pl_threads; i++) if (g_pl_busy[i].layer == layer && g_pl_busy[i].eid == eid) return 1;
+    return 0;
+}
 static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
+    while (g_pl_on && pl_busy_locked(layer, eid)) {   /* a loader is reading this very expert: take its copy */
+        pthread_mutex_unlock(&g_pilot_mx);
+        usleep(100);
+        pthread_mutex_lock(&g_pilot_mx);
+    }
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
@@ -5856,6 +6046,7 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
         if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
+    g_pl_engine.layer = layer; g_pl_engine.eid = eid;
     pthread_mutex_unlock(&g_pilot_mx);
     double t_read0 = now_s();
     load_expert_merged(m, layer, eid, s);
@@ -5863,13 +6054,133 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     pthread_mutex_lock(&g_pilot_mx);
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
+    g_pl_engine.layer = -1; g_pl_engine.eid = -1;
     if (hold) slot_hold(s);
     *out = s; pthread_mutex_unlock(&g_pilot_mx);
+}
+static Model *g_pl_m; static int g_pl_next = 0, g_pl_done = 0, g_pl_loaded = 0; static double g_pl_t0;
+static void *q36_preload_worker(void *arg) {
+    int me = (int)(intptr_t)arg; Model *m = g_pl_m; Cfg *c = &m->c;
+#if defined(__linux__) && defined(CPU_SETSIZE)   /* as omp_tune.h: only where the including source asked for the GNU names */
+    {   /* the engine's thread is bound to one core (OMP_PROC_BIND): do not inherit that, and stay out of its way */
+        cpu_set_t all; CPU_ZERO(&all);
+        long n = sysconf(_SC_NPROCESSORS_ONLN); if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+        for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
+        sched_setaffinity(0, sizeof all, &all);
+#ifdef SYS_gettid
+        setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+#endif
+    }
+#endif
+#ifdef _OPENMP
+    omp_set_num_threads(1);   /* load_expert_merged's parallel loops: no second team beside the engine's */
+#endif
+    const int total = c->n_layers * c->n_experts;
+    for (;;) {
+        int w = __atomic_fetch_add(&g_pl_next, 1, __ATOMIC_ACQ_REL);
+        if (w >= total) break;
+        int layer = w / c->n_experts, eid = w % c->n_experts;
+        if (c->dense_layer && c->dense_layer[layer]) continue;
+        LCache *lc = &m->cache[layer];
+        pthread_mutex_lock(&g_pilot_mx);
+        if (lc->n >= lc->cap || slot_indexed(m, layer, eid) || pl_busy_locked(layer, eid) ||
+            (g_pl_engine.layer == layer && g_pl_engine.eid == eid)) { pthread_mutex_unlock(&g_pilot_mx); continue; }
+        Slot *s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s);
+        cache_hide(m, layer, s); s->used = 0;          /* never used yet: the first to go if the cache must evict */
+        g_pl_busy[me].layer = layer; g_pl_busy[me].eid = eid;
+        pthread_mutex_unlock(&g_pilot_mx);
+        load_expert_merged(m, layer, eid, s);
+        pthread_mutex_lock(&g_pilot_mx);
+        cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid];
+        g_pl_busy[me].layer = -1; g_pl_busy[me].eid = -1; g_pl_loaded++;
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
+    if (__atomic_add_fetch(&g_pl_done, 1, __ATOMIC_ACQ_REL) == g_pl_threads)
+        fprintf(stderr, "[qwen36] preload: %d experts loaded in %.1f s, RSS %.2f GB\n", g_pl_loaded, now_s() - g_pl_t0, rss_gb());
+    return NULL;
+}
+static void q36_preload_start(Model *m) {
+    const char *e = getenv("Q36_PRELOAD");
+    if (!e || *e != '1' || m->c.n_experts == 0) return;
+    {   /* the CPU's cache of a safetensors container only: what was measured. A device tier keeps
+         * pointers into the slots or copies of them, the Metal graph reads its own records, PILOT's
+         * worker loads experts itself, and a GGUF's slots take another path through the loader. */
+        int dev = qt_ready();
+#ifdef COLI_VULKAN
+        dev = dev || g_vk_ready;
+#endif
+        if (dev || QWEN_GRAPH(m) || g_pilot || g_gguf) {
+            fprintf(stderr, "[qwen36] preload: Q36_PRELOAD=1 is for the CPU expert cache of a safetensors container (no device tier, no PILOT): off\n");
+            return;
+        }
+    }
+    int nt = getenv("Q36_PRELOAD_THREADS") ? atoi(getenv("Q36_PRELOAD_THREADS")) : 4;
+    if (nt < 1) nt = 1; if (nt > Q36_PL_MAX) nt = Q36_PL_MAX;
+    for (int i = 0; i < Q36_PL_MAX; i++) { g_pl_busy[i].layer = -1; g_pl_busy[i].eid = -1; }
+    /* The slots' buffers are allocated here, on the engine's thread, and the loaders only fill
+     * them. A loader that allocates takes the buffer from its own thread's malloc arena, and with
+     * four loaders that cost the routed experts 5 ms a token for as long as the server ran (41.3
+     * against 36.3 ms, three runs each on 2x Xeon E5-2670; one or two loaders, or one arena, did
+     * not show it, and neither page migration nor the buffers' alignment explains it). Untouched
+     * memory is address space only: a slot the loaders never reach costs nothing. */
+    for (int l = 0; l < m->c.n_layers; l++) {
+        if (m->c.dense_layer && m->c.dense_layer[l]) continue;
+        LCache *lc = &m->cache[l];
+        for (int i = lc->n; i < lc->cap; i++) slot_ensure_allocated(m, &lc->slots[i]);
+    }
+    g_pl_m = m; g_pl_t0 = now_s();
+    pthread_mutex_lock(&g_pilot_mx); g_pl_threads = nt; g_pl_on = 1; pthread_mutex_unlock(&g_pilot_mx);
+    fprintf(stderr, "[qwen36] preload: filling the expert cache in the background (%d threads, Q36_PRELOAD=0 to skip)\n", nt);
+    for (int i = 0; i < nt; i++) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, q36_preload_worker, (void *)(intptr_t)i) != 0) { __atomic_add_fetch(&g_pl_done, 1, __ATOMIC_ACQ_REL); continue; }
+        pthread_detach(t);
+    }
 }
 static void expert_get(Model *m, int layer, int eid, Slot **out) { expert_fetch(m, layer, eid, out, 0); }
 /* expert_get for a caller that computes from the slot after the lock drops:
  * it stays resident until slot_release. */
 static Slot *expert_hold(Model *m, int layer, int eid) { Slot *s; expert_fetch(m, layer, eid, &s, 1); return s; }
+
+/* Borrowed ExpertStore facade over a GGUF model's expert cache: the Model owns the cache and
+ * outlives every facade and lease. A lookup is expert_hold and a release slot_release, so the
+ * PILOT worker cannot evict an expert a view still reads; allocation, the PILOT policy and the
+ * GPU tiers stay with the engine. The views are the three matrices as the slot holds them
+ * (hg/hu/hd, GQ_*_R16 where the rows are interleaved). */
+static ColiTensorView q36_gq_tensor(const uint8_t *data, int type, int rows, int cols) {
+    return (ColiTensorView){ .format = COLI_TENSOR_GGML, .data = data, .rows = rows, .columns = cols,
+                             .block_columns = (uint32_t)type,
+                             .data_bytes = (size_t)rows * (size_t)gq_row_bytes(type, cols) };
+}
+static int q36_gq_store_lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *view) {
+    Model *m = store->state;
+    if (!view) return -1;
+    memset(view, 0, sizeof(*view));
+    if (!m || !m->cache || !m->gqx || key.layer < 0 || key.layer >= m->c.n_layers ||
+        key.expert < 0 || key.expert >= m->c.n_experts) return -1;
+    const GqExp *gx = &m->gqx[key.layer]; const int D = q36_eh(&m->c), I = m->c.inter;
+    Slot *s = expert_hold(m, key.layer, key.expert);
+    view->key = key;
+    view->lease = s;
+    view->gate = q36_gq_tensor(s->gqe, gx->hg, I, D);
+    view->up = q36_gq_tensor(s->gqe + gx->hb_g, gx->hu, I, D);
+    view->down = q36_gq_tensor(s->gqe + gx->hb_g + gx->hb_u, gx->hd, D, I);
+    return 0;
+}
+static void q36_gq_store_release(ColiExpertStore *store, ColiExpertView *view) {
+    (void)store;
+    if (view && view->lease) slot_release(view->lease);
+    if (view) memset(view, 0, sizeof(*view));
+}
+static ColiExpertStore q36_gq_expert_store(Model *m) {
+    static const ColiExpertStoreOps ops = { .lookup = q36_gq_store_lookup, .release = q36_gq_store_release };
+    return (ColiExpertStore){ .ops = &ops, .state = m };
+}
+static void q36_gq_expert_acquire(ColiExpertStore *store, int layer, int expert, ColiExpertView *view) {
+    if (coli_expert_lookup(store, (ColiExpertKey){ layer, expert }, view)) {
+        fprintf(stderr, "qwen36: invalid expert key %d/%d\n", layer, expert); exit(1);
+    }
+}
 
 static void pin_hot_experts(Model *m) {
     Cfg *c = &m->c;
@@ -6006,6 +6317,216 @@ static inline void mrope_at(const Model *m, int p, int pos3[3]) {
     } else pos3[0] = pos3[1] = pos3[2] = p + m->rope_delta;
 }
 
+/* Grouped GQA attention core: share each K/V row read and float16 conversion
+ * across a group of gq query heads that map to the same KV head. Every head
+ * runs the exact same lane dot-products, softmax, and FMA axpy order as the
+ * per-head loop, so every output bit is unchanged. */
+static inline void attention_task(const Model *m, const Layer *l, int layer,
+                                  const float *query, const float *k, const float *vv,
+                                  int S, int pos_base, int win, int ring,
+                                  int gq, int nsub, int kv16, int sc_stride,
+                                  float *sc, float *ctx, int it) {
+    const Cfg *c = &m->c;
+    const int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, kvd = c->k_head_dim;
+    const int q_per_kv = H / KV;
+    const float scale = 1.f / sqrtf((float)hd);
+    const Q36Row *mr = m->mux_rows;
+    const int s = (S - 1) - it / (KV * nsub);
+    const int r = it % (KV * nsub);
+    const int kvh = r / nsub;
+    const int h0 = kvh * q_per_kv + (r % nsub) * gq;
+    const int qpos = mr ? mr[s].pos : pos_base + s;
+    const void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+    /* a sliding-window layer (Flint) sees the window's rows, its own included */
+    const int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+    const int len = qpos + 1 - t0;
+    /* from tb on, the step's own rows (a ring's, from the scratch): a multiplexed
+     * row's is itself, the others' from pos_base */
+    const int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
+    const int tc = tb < qpos + 1 ? tb : qpos + 1;
+    const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
+    const float *qbase = query + ((int64_t)s*H + h0)*hd;
+    float *cbase = ctx + ((int64_t)s*H + h0)*hd;
+    const int64_t ss = sc_stride;
+
+    /* 1. QK scores: cache rows [t0, tc) then scratch rows [tc, qpos] */
+    if (kv16) {
+        if (gq == 1) {
+            for (int t = t0; t < tc; t++)
+                sc[t - t0] = kv16_dot_lanes(qbase, (const uint16_t *)Kl + q36_kv_at(m, layer, kvh, t), kvd) * scale;
+        } else {
+            for (int t = t0; t < tc; t++) {
+                const int j = t - t0;
+                const uint16_t *krow16 = (const uint16_t *)Kl + q36_kv_at(m, layer, kvh, t);
+                int g = 0;
+                for (; g + 1 < gq; g += 2) {
+                    float d2[2];
+                    kv16_dot_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow16, kvd);
+                    sc[(int64_t)g*ss + j]       = d2[0] * scale;
+                    sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+                }
+                if (g < gq) sc[(int64_t)g*ss + j] = kv16_dot_lanes(qbase + (int64_t)g*hd, krow16, kvd) * scale;
+            }
+        }
+    } else {
+        for (int t = t0; t < tc; t++) {
+            const int j = t - t0;
+            const float *krow = (const float *)Kl + q36_kv_at(m, layer, kvh, t);
+            int g = 0;
+            for (; g + 1 < gq; g += 2) {
+                float d2[2];
+                dot_f32_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow, kvd);
+                sc[(int64_t)g*ss + j]       = d2[0] * scale;
+                sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+            }
+            if (g < gq) sc[(int64_t)g*ss + j] = dot_f32_lanes(qbase + (int64_t)g*hd, krow, kvd) * scale;
+        }
+    }
+    for (int t = tc; t <= qpos; t++) {
+        const int j = t - t0;
+        const float *krow = Kb + (int64_t)(t - sp0)*KV*kvd;
+        int g = 0;
+        for (; g + 1 < gq; g += 2) {
+            float d2[2];
+            dot_f32_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow, kvd);
+            sc[(int64_t)g*ss + j]       = d2[0] * scale;
+            sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+        }
+        if (g < gq) sc[(int64_t)g*ss + j] = dot_f32_lanes(qbase + (int64_t)g*hd, krow, kvd) * scale;
+    }
+
+    /* 2. Softmax (+ optional Flint sinks) and zero output accumulators */
+    for (int g = 0; g < gq; g++) {
+        float *scg = sc + (int64_t)g*ss;
+        if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
+            float mx = l->sinks[h0 + g];
+            for (int j = 0; j < len; j++) if (scg[j] > mx) mx = scg[j];
+            float sum = expf(l->sinks[h0 + g] - mx);
+            for (int j = 0; j < len; j++) { scg[j] = expf(scg[j] - mx); sum += scg[j]; }
+            float inv = 1.f / sum;
+            for (int j = 0; j < len; j++) scg[j] *= inv;
+        } else softmax_row(scg, len);
+        float *cx = cbase + (int64_t)g*hd;
+        for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+    }
+
+    /* 3. PV accumulation: cache rows [t0, tc) then scratch rows [tc, qpos] */
+    if (kv16) {
+        if (gq == 1) {
+            for (int t = t0; t < tc; t++)
+                kv16_axpy(cbase, sc[t - t0], (const uint16_t *)Vl + q36_kv_at(m, layer, kvh, t), kvd);
+        } else {
+            for (int t = t0; t < tc; t++) {
+                const int j = t - t0;
+                const uint16_t *vrow16 = (const uint16_t *)Vl + q36_kv_at(m, layer, kvh, t);
+                int g = 0;
+                for (; g + 3 < gq; g += 4)
+                    kv16_axpy_x4(cbase + (int64_t)g*hd, cbase + (int64_t)(g + 1)*hd,
+                                 cbase + (int64_t)(g + 2)*hd, cbase + (int64_t)(g + 3)*hd,
+                                 sc[(int64_t)g*ss + j], sc[(int64_t)(g + 1)*ss + j],
+                                 sc[(int64_t)(g + 2)*ss + j], sc[(int64_t)(g + 3)*ss + j], vrow16, kvd);
+                for (; g + 1 < gq; g += 2)
+                    kv16_axpy_x2(cbase + (int64_t)g*hd, cbase + (int64_t)(g + 1)*hd,
+                                 sc[(int64_t)g*ss + j], sc[(int64_t)(g + 1)*ss + j], vrow16, kvd);
+                if (g < gq) kv16_axpy(cbase + (int64_t)g*hd, sc[(int64_t)g*ss + j], vrow16, kvd);
+            }
+        }
+    } else {
+        for (int t = t0; t < tc; t++) {
+            const int j = t - t0;
+            const float *vrow = (const float *)Vl + q36_kv_at(m, layer, kvh, t);
+            for (int g = 0; g < gq; g++) {
+                float a = sc[(int64_t)g*ss + j];
+                float *cx = cbase + (int64_t)g*hd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+            }
+        }
+    }
+    for (int t = tc; t <= qpos; t++) {
+        const int j = t - t0;
+        const float *vrow = Vb + (int64_t)(t - sp0)*KV*kvd;
+        for (int g = 0; g < gq; g++) {
+            float a = sc[(int64_t)g*ss + j];
+            float *cx = cbase + (int64_t)g*hd;
+            for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+        }
+    }
+}
+
+static void attention_scores_ctx(Model *m, Layer *l, int layer,
+                                 const float *query, const float *k, const float *vv,
+                                 int S, int pos_base, int win, int ring, float *ctx) {
+    Cfg *c = &m->c;
+    const int H = c->q_heads, KV = c->kv_heads;
+    const int q_per_kv = H / KV;
+    const Q36Row *mr = m->mux_rows;
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+    if (threads < 1) threads = 1;
+#endif
+    int gq = q_per_kv;
+    {
+        int64_t want = S == 1 ? (int64_t)threads : (int64_t)4 * threads;
+        while (gq > 1 && (int64_t)S * KV * (q_per_kv / gq) < want) {
+            int d = gq - 1;
+            while (d > 1 && q_per_kv % d) d--;
+            gq = d;
+        }
+        /* For single-token decode, grouping fewer than 4 heads does not beat
+         * the single-head static loop's contiguous score stream. */
+        if (S == 1 && gq < 4) gq = 1;
+    }
+    const int nsub = q_per_kv / gq;
+    const int kv16 = q36_kv16();
+    int max_len = 0;
+    for (int s = 0; s < S; s++) {
+        int qpos = mr ? mr[s].pos : pos_base + s;
+        int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+        int len = qpos + 1 - t0;
+        if (len > max_len) max_len = len;
+    }
+    /* Pad row stride away from 4 KB multiples to prevent L1 set-aliasing across heads. */
+    int sc_stride = (max_len + 15) & ~15;
+    if (sc_stride < 16) sc_stride = 16;
+    if ((sc_stride & 1023) == 0) sc_stride += 16;
+    size_t per_thr = (size_t)gq * (size_t)sc_stride;
+    if (gq > 1) {
+        size_t need = (size_t)threads * per_thr;
+        if (need > m->attn_sc_grp_cap) {
+            free(m->attn_sc_grp);
+            m->attn_sc_grp = falloc((int64_t)need);
+            m->attn_sc_grp_cap = need;
+        }
+    }
+    const int nitems = S * KV * nsub;
+    if (S == 1) {
+        #pragma omp parallel for schedule(static)
+        for (int it = 0; it < nitems; it++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *sc = gq == 1 ? m->attn_sc + (int64_t)tid * m->kv_cap
+                                : m->attn_sc_grp + (size_t)tid * per_thr;
+            attention_task(m, l, layer, query, k, vv, S, pos_base, win, ring,
+                           gq, nsub, kv16, sc_stride, sc, ctx, it);
+        }
+    } else {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int it = 0; it < nitems; it++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *sc = gq == 1 ? m->attn_sc + (int64_t)tid * m->kv_cap
+                                : m->attn_sc_grp + (size_t)tid * per_thr;
+            attention_task(m, l, layer, query, k, vv, S, pos_base, win, ring,
+                           gq, nsub, kv16, sc_stride, sc, ctx, it);
+        }
+    }
+}
+
 /* Gated Attention (GQA) matching HF Qwen3_5MoeAttention:
  *  - q_proj outputs query(head_dim) ++ attn_output_gate(head_dim); k/v are head_dim.
  *  - per-head q/k RMSNorm (weight [head_dim], 1.0+weight).
@@ -6019,7 +6540,6 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int qdim = c->q_head_dim;                  /* per-head q total (query+gate) */
     int q_out = H * qdim;                      /* q_proj output dim */
     int kv_out = KV * kvd;                     /* k/v_proj output dim */
-    int q_per_kv = H / KV;
     int rotary = c->rotary_dim;
     /* HF always chunks q_proj output into query(head_dim) ++ gate(head_dim),
      * regardless of the attn_output_gate config flag -- so split whenever the
@@ -6076,7 +6596,6 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* the step's K and V as the cache keeps them (float16, q36_kv16), before anything reads them:
      * a row reads the same numbers from here as from the cache */
     if (q36_kv16()) { kv16_round(k, (int64_t)S*KV*kvd); kv16_round(vv, (int64_t)S*KV*kvd); }
-    float scale = 1.f / sqrtf((float)hd);
     const int win = c->win_layer && c->win_layer[layer] ? c->window : 0;
     /* A sliding layer's ring (q36_kv_rows): the step's own rows are read from k/vv, where
      * the cache would have them, and go into the ring after the scores; written first, the
@@ -6104,47 +6623,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     float *ctx = falloc((int64_t)S*H*hd);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int hh = 0; hh < H; hh++) {
-        for (int s = 0; s < S; s++) {
-            int kvh = hh / q_per_kv;
-            int qpos = mr ? mr[s].pos : pos_base + s;
-            const void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
-            const float *qv = query + ((int64_t)s*H + hh)*hd;
-            int tid = 0;
-#ifdef _OPENMP
-            tid = omp_get_thread_num();
-#endif
-            float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
-            /* a sliding-window layer (Flint) sees the window's rows, its own included */
-            int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
-            /* from tb on, the step's own rows (a ring's, from the scratch): a multiplexed
-             * row's is itself, the others' from pos_base */
-            int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
-            const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
-            for (int t = t0; t <= qpos; t++) {
-                float acc = t < tb ? q36_kv_dot(qv, Kl, q36_kv_at(m, layer, kvh, t), kvd)
-                                   : dot_f32_lanes(qv, Kb + (int64_t)(t - sp0)*KV*kvd, kvd);
-                sc[t] = acc * scale;
-            }
-            if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
-                float mx = l->sinks[hh];
-                for (int t = t0; t <= qpos; t++) if (sc[t] > mx) mx = sc[t];
-                float sum = expf(l->sinks[hh] - mx);
-                for (int t = t0; t <= qpos; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
-                float inv = 1.f / sum;
-                for (int t = t0; t <= qpos; t++) sc[t] *= inv;
-            } else softmax_row(sc + t0, qpos + 1 - t0);
-            float *cx = ctx + ((int64_t)s*H + hh)*hd;
-            for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
-            for (int t = t0; t <= qpos; t++) {
-                float a = sc[t];
-                if (t < tb) { q36_kv_axpy(cx, a, Vl, q36_kv_at(m, layer, kvh, t), kvd); continue; }
-                const float *vrow = Vb + (int64_t)(t - sp0)*KV*kvd;
-                for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
-            }
-        }
-    }
+    attention_scores_ctx(m, l, layer, query, k, vv, S, pos_base, win, ring, ctx);
     if (ring)   /* the step's rows into the ring: its last `ring` (an earlier one would be overwritten here) */
         for (int s = !mr && S > ring ? S - ring : 0; s < S; s++) {
             int t = mr ? mr[s].pos : pos_base + s;
@@ -6712,14 +7191,9 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
     const int u = moe_gq_unit(gx, D, I);
     if (u == 16 && (I % 16 || D % 16)) return -1;
-    Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
+    ColiExpertStore store = q36_gq_expert_store(m);
+    ColiExpertView ev[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
-    for (int k = 0; k < n; k++) expert_get(m, layer, ids[k], &sl[k]);
-    for (int k = 0; k < n; k++) if (sl[k]->eid != ids[k]) {   /* evicted while fetching the others */
-        for (int j = 0; j < n; j++) expert_get(m, layer, ids[j], &sl[j]);
-        for (int j = 0; j < n; j++) if (sl[j]->eid != ids[j]) return -1;
-        break;
-    }
     /* moe() runs on the engine's thread; the worker threads get these through
      * the local pointers below (thread-local storage here would hand each
      * worker its own empty copy) */
@@ -6733,12 +7207,17 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (gq_act_set(pax, x, 1, D)) return -1;
     const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D), rbd = gq_row_bytes(gx->hd, I);
     const int gI = I / u, gD = D / u;
+    /* the token's misses read concurrently (expert_fetch loads outside its lock, as the PILOT worker
+     * does), each leased until the step is done: a PILOT load (the lookahead's or the next layer's)
+     * picks its victim among the slots nobody computes from, so it cannot take one of these */
+    #pragma omp parallel for schedule(dynamic, 1) if (par_load_on() && n > 1)
+    for (int k = 0; k < n; k++) q36_gq_expert_acquire(&store, layer, ids[k], &ev[k]);
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * 2 * gI; r++) {
         int k = r / (2 * gI), rr = (r % (2 * gI)) * u;
-        const uint8_t *base = sl[k]->gqe;
-        if (rr < I) gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + (int64_t)rr * rbg, gx->hg, D);
-        else        gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + gx->hb_g + (int64_t)(rr - I) * rbu, gx->hu, D);
+        const uint8_t *wg = ev[k].gate.data, *wu = ev[k].up.data;
+        if (rr < I) gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, wg + (int64_t)rr * rbg, gx->hg, D);
+        else        gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, wu + (int64_t)(rr - I) * rbu, gx->hu, D);
     }
     for (int k = 0; k < n; k++) {
         float *g = GU + (int64_t)k * 2 * I, *u = g + I; float *h = H + (int64_t)k * I;
@@ -6746,15 +7225,21 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         if (gx->su) for (int i = 0; i < I; i++) u[i] *= gx->su[ids[k]];
         for (int i = 0; i < I; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     }
-    if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
+    if (gq_act_set(pah, H, n, I)) { for (int k = 0; k < n; k++) coli_expert_release(&store, &ev[k]); return -1; }   /* row k of ah is expert k's hidden */
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * gD; r++) {
         int k = r / gD, o = (r % gD) * u;
         gq_act one = *pah; one.S = 1; one.q = pah->q + (int64_t)k * I; one.d = pah->d + (int64_t)k * (I / 32); one.s = pah->s + (int64_t)k * (I / 16);
         one.l4 = pah->l4 ? pah->l4 + (int64_t)k * (I / 4) : NULL;
-        gq_rows_u(Y + (int64_t)k * D + o, u, &one, sl[k]->gqe + gx->hb_g + gx->hb_u + (int64_t)o * rbd, gx->hd, I);
+        gq_rows_u(Y + (int64_t)k * D + o, u, &one, (const uint8_t *)ev[k].down.data + (int64_t)o * rbd, gx->hd, I);
     }
-    /* accumulate in expert-id order, as the general path does: same sums, same bits */
+    for (int k = 0; k < n; k++) coli_expert_release(&store, &ev[k]);
+    /* accumulate in expert-id order, as moe_gq_run's row path below does (it walks the experts
+     * e = 0..E-1): the same sums in the same order, so a decode step's logits are those of the
+     * row path bit for bit (measured: 64 tokens of Qwen3.6 UD-Q4_K_M, GQ_NODECODE=0 against 1,
+     * identical dumps). The planar-int4 and int8 paths (expert_ffn.h's xf_moe_run, moe_ex) and
+     * the device chains sum a token's experts in RANK order instead; a GGUF container and an
+     * int4 container therefore round the MoE sum differently, each consistently. */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
     for (int a = 1; a < n; a++) { int v = ord[a], b = a; while (b > 0 && ids[ord[b - 1]] > ids[v]) { ord[b] = ord[b - 1]; b--; } ord[b] = v; }
     for (int j = 0; j < n; j++) {
@@ -6783,14 +7268,31 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     /* a speculative verify's rows (S <= GQ_EXACT_ROWS) read the experts as a decode step does, the
      * file's rows by eight where moe_gq_decode does: a row's bits are then a plain step's (#2874) */
     const int f8 = S <= GQ_EXACT_ROWS && moe_gq_unit(gx, D, I) == 8;
-    for (int e = 0; e < E; e++) {
+    ColiExpertStore store = q36_gq_expert_store(m);
+    /* the experts this chunk needs, in order; misses of the next PF_CHUNK of them are read
+     * concurrently before their compute (bounded well below cap so nothing prefetched is
+     * evicted before it is used: prefetched slots carry the newest LRU clocks) */
+    int *need = malloc(sizeof(int) * (size_t)E), nn = 0;
+    for (int e = 0; e < E; e++) if (cnt[e + 1] - cnt[e]) need[nn++] = e;
+    int pf = pf_chunk(); { int capl = m->cache[layer].cap; if (pf > capl / 2) pf = capl / 2 > 0 ? capl / 2 : 1; }
+    const int ahead = pf_ahead_on() && m->is_queued != NULL;
+    if (ahead) ensure_pilot_worker_started(m);
+    for (int i0 = 0; i0 < nn; i0 += pf) {
+        const int i1 = i0 + pf < nn ? i0 + pf : nn;
+        if (par_load_on() && i1 - i0 > 1) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int i = i0; i < i1; i++) { Slot *t; expert_get(m, layer, need[i], &t); }
+        }
+        if (ahead) { const int j1 = i1 + pf < nn ? i1 + pf : nn; for (int j = i1; j < j1; j++) pilot_enqueue(m, layer, need[j]); }
+    for (int ii = i0; ii < i1; ii++) {
+        const int e = need[ii];
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
-        Slot *sl; expert_get(m, layer, e, &sl);
+        ColiExpertView ev; q36_gq_expert_acquire(&store, layer, e, &ev);   /* leased: the lookahead's PILOT loads may not evict it mid-matmul */
+        const uint8_t *wg = ev.gate.data, *wu = ev.up.data, *wd = ev.down.data;
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
         const int ex = f8 && !gq_act_set(&act, X, n, D);
         if (ex) {
-            const uint8_t *wg = sl->gqe, *wu = sl->gqe + gx->hb_g;
             const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D);
             #pragma omp parallel for schedule(static)
             for (int r = 0; r < 2 * (I / 8); r++) {
@@ -6798,20 +7300,21 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
                 else gq_rows_f8(U + 8 * (r - I / 8), I, &act, wu + (int64_t)8 * (r - I / 8) * rbu, rbu, gx->hu, D, 8);
             }
         } else if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
-            gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
+            gq_matmul2_act(G, wg, gx->hg, U, wu, gx->hu, &act, I);   /* x quantized once */
         else {
-            gq_matmul(G, X, sl->gqe, gx->hg, n, D, I);
-            gq_matmul(U, X, sl->gqe + gx->hb_g, gx->hu, n, D, I);
+            gq_matmul(G, X, wg, gx->hg, n, D, I);
+            gq_matmul(U, X, wu, gx->hu, n, D, I);
         }
         if (gx->sg) for (int64_t q = 0; q < (int64_t)n * I; q++) G[q] *= gx->sg[e];
         if (gx->su) for (int64_t q = 0; q < (int64_t)n * I; q++) U[q] *= gx->su[e];
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
         if (ex && !gq_act_set(&ah, G, n, I)) {
-            const uint8_t *wd = sl->gqe + gx->hb_g + gx->hb_u; const int64_t rbd = gq_row_bytes(gx->hd, I);
+            const int64_t rbd = gq_row_bytes(gx->hd, I);
             #pragma omp parallel for schedule(static)
             for (int r = 0; r < D / 8; r++) gq_rows_f8(Y + 8 * r, D, &ah, wd + (int64_t)8 * r * rbd, rbd, gx->hd, I, 8);
         } else
-        gq_matmul(Y, G, sl->gqe + gx->hb_g + gx->hb_u, gx->hd, n, I, D);
+        gq_matmul(Y, G, wd, gx->hd, n, I, D);
+        coli_expert_release(&store, &ev);
         if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
         if (m->L[layer].post_en)   /* Muse Spark: every expert's output scaled, then normalised */
             for (int r = 0; r < n; r++) rmsnorm_scaled(Y + (int64_t)r * D, Y + (int64_t)r * D, m->L[layer].post_en, D, c->post_eps);
@@ -6820,6 +7323,8 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
         }
     }
+    }
+    free(need);
     gq_act_free(&act); gq_act_free(&ah);
     free(cnt); free(tok); free(wt); free(fill); free(X); free(G); free(U); free(Y);
 }
@@ -6829,6 +7334,9 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
  * so `out` gets the routed experts' rank-order sum alone (the Vulkan dense chain runs
  * the router and the shared expert on the device and adds them there). moe() is
  * moe_ex(..., NULL, 0): the same operations in the same order as before. */
+#ifdef COLI_CUDA
+static int q36cc_skip_tier_scan(Model *m);
+#endif
 static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                    const float *logits_in, int routed_only) {
     /* D: the experts' width, the rows of x and out (Muse Spark's latent, hidden otherwise) */
@@ -7063,7 +7571,11 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
              * read into RAM for it: below full residency the RAM cache and the
              * VRAM tier then add up instead of holding the same experts. */
             double _q0 = tm_now();
-            uint32_t qmask = qt_issue(layer, idx, K, xs);
+            int skip_full_scan = 0;
+#ifdef COLI_CUDA
+            skip_full_scan = q36cc_skip_tier_scan(m);
+#endif
+            uint32_t qmask = qt_issue_mode(layer, idx, K, xs, skip_full_scan);
             double _q1 = tm_now();
             qt_cpu_misses(m, layer, xs, idx, val, qmask, out + (int64_t)s*D, g, u, hh);
             /* Compute the shared expert NOW so it overlaps with the GPU
@@ -7884,6 +8396,10 @@ static int qwen_embedding_row(Model *m, int id, float *row) {
 #include "dflash_cuda.h"        /* COLI_DFLASH: DFlash2's drafter on the CUDA chain's device */
 static DfDrafter g_q36_df;
 #include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
+static int q36cc_skip_tier_scan(Model *m) {
+    Q36CChain *ch = q36cc_of(m);
+    return g_cuda_chain && q36cc_permits(ch, Q36_ASYNC_COPIES);
+}
 /* The CUDA chain's prompt staging (q36cc_gguf_stage_bytes), out of the tier's expert budget when
  * the card holds fewer than every routed expert of a GGUF (qt_reserve_short): taken from the
  * mirrors' room instead, a 16K prompt on Flint (RTX PRO 4000) found no memory for the routed
@@ -8146,7 +8662,14 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
 }
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
-    return step_ex(m, ids, S, pos_base, 1);
+#ifdef COLI_CUDA
+    Q36CChain *owned = q36cc_begin_if_idle(m, pos_base, S);
+#endif
+    float *logit = step_ex(m, ids, S, pos_base, 1);
+#ifdef COLI_CUDA
+    if (owned) q36cc_end_request(owned);
+#endif
+    return logit;
 }
 
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) --------------------
@@ -8286,6 +8809,22 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S,
     return logit;
 }
 
+/* queue (layer, eid) for the prefetch pool unless resident or already queued; returns 1 if queued */
+static int pilot_enqueue(Model *m, int layer, int eid) {
+    Cfg *c = &m->c; const int gidx = layer * c->n_experts + eid;
+    pthread_mutex_lock(&g_pilot_mx);
+    if (slot_indexed(m, layer, eid) || m->is_queued[gidx]) { pthread_mutex_unlock(&g_pilot_mx); return 0; }
+    m->is_queued[gidx] = 1;
+    pthread_mutex_unlock(&g_pilot_mx);
+    unsigned w2 = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
+    unsigned r2 = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+    if (w2 - r2 < 4096) { pilot_q[w2 & 4095].l = layer; pilot_q[w2 & 4095].e = eid; __atomic_store_n(&pilot_w, w2 + 1, __ATOMIC_RELEASE); return 1; }
+    pthread_mutex_lock(&g_pilot_mx); m->is_queued[gidx] = 0; pthread_mutex_unlock(&g_pilot_mx);
+    return 0;
+}
+/* PF_AHEAD=0 turns off the prefill lookahead: while a chunk of experts computes, the pool reads the next chunk */
+static int pf_ahead_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("PF_AHEAD"); on = !(e && *e == '0'); } return on; }
+
 static void pilot_realload(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
     pthread_mutex_lock(&g_pilot_mx);
@@ -8312,13 +8851,15 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
 static void *pilot_worker(void *arg) {
     (void)arg;
+    tl_loader_thread = 1;
     while (1) {
         unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
         unsigned w = __atomic_load_n(&pilot_w, __ATOMIC_ACQUIRE);
         if (r == w) { sleep_ms(1); continue; }
+        /* several workers (PILOT_THREADS) share the ring: claim the entry before reading it */
+        if (!__atomic_compare_exchange_n(&pilot_r, &r, r + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
         int layer = pilot_q[r & 4095].l, eid = pilot_q[r & 4095].e;
         pilot_realload(pilot_m, layer, eid);
-        __atomic_store_n(&pilot_r, r + 1, __ATOMIC_RELEASE);
     }
     return NULL;
 }
@@ -8395,10 +8936,23 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
     free(logits);
 }
 
-/* When DUMP=<path> is set, generate() copies the last-token logits here so main()
- * can write them to <path> (raw float32, length = vocab). Lets a torch-free
- * cosine comparison against tools/_ref_dn.py's numpy logits validate the port. */
-static float *g_last_logit = NULL;
+/* DUMP=<path>: every logits row a token is sampled from, appended to <path> as raw float32
+ * (vocab floats a row), as colibri.c's dump_logits writes them: generate()'s rows (the
+ * prompt's last position first, then each step's) and serve's (each request's rows in
+ * turn). It used to hold the last row only, which left a torch-free comparison one
+ * position to look at and nothing of the path there (#I4 of the audit). The file is
+ * opened at the first row and closed at exit, with a line saying how many rows it got. */
+static FILE *g_dump = NULL; static int g_dump_init = 0; static long g_dump_rows = 0;
+static void dump_logits(const float *lo, int n) {
+    if (!g_dump_init) { g_dump_init = 1; const char *p = getenv("DUMP"); if (p && *p) g_dump = fopen(p, "wb"); }
+    if (g_dump) { fwrite(lo, sizeof(float), (size_t)n, g_dump); fflush(g_dump); g_dump_rows++; }
+}
+/* At the end of an argv run: close the file and say how many rows it got (or that it never opened). */
+static void dump_close(int vocab) {
+    if (g_dump) { fclose(g_dump); g_dump = NULL;
+                  fprintf(stderr, "[dump] wrote %ld rows of %d logits -> %s\n", g_dump_rows, vocab, getenv("DUMP")); }
+    else if (getenv("DUMP") && *getenv("DUMP") && g_dump_init) fprintf(stderr, "[dump] cannot open %s\n", getenv("DUMP"));
+}
 
 /* Zero the DeltaNet recurrent state so a new request doesn't inherit the
  * previous conversation's hidden state. Must be called at the start of every
@@ -9041,6 +9595,16 @@ static void ensure_kv(Model *m){
         m->max_t = m->kv_cap;
         return;
     }
+#ifdef COLI_CUDA
+    Q36CChain *ch = q36cc_of(m);
+    if (ch && ch->pend_books) {
+        /* The completed chunk still belongs to the old buffers and their head stride. */
+        int want = m->max_t;
+        m->max_t = m->kv_cap;
+        q36cc_dm_flush_books(ch, m);
+        m->max_t = want;
+    }
+#endif
     /* Growth COPIES the rows instead of discarding them. A chat resends a
      * longer transcript every turn, so this reallocation lands on exactly the
      * turn that wants to reuse the previous one's state: freeing the rows here
@@ -9055,6 +9619,9 @@ static void ensure_kv(Model *m){
      * new length paid the reallocation, the rows' copy and (a GPU chain) its KV mirrors' again
      * on every turn (LFM3-VL-2B on CUDA: a prompt of a new length 48 ms instead of 35). The
      * RAM plan reserves the whole context's cache already. */
+#ifdef COLI_CUDA
+    if (!(g_cuda_chain && q36cc_prompt_cache_enabled(ch)))
+#endif
     {
         const int top = qwen36_max_ctx();
         int want = m->max_t;
@@ -9083,6 +9650,11 @@ static void ensure_kv(Model *m){
     if (!ring) { free(m->ring_pos); m->ring_pos = NULL; }
     m->K = calloc((size_t)c->n_layers, sizeof(void *)); m->V = calloc((size_t)c->n_layers, sizeof(void *));
     const size_t es = q36_kv_es();
+#ifdef COLI_CUDA
+    const int parallel_copy = g_cuda_chain && q36cc_prompt_cache_enabled(ch);
+#else
+    const int parallel_copy = 0;
+#endif
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
             int64_t kvd = c->k_head_dim;
@@ -9091,18 +9663,36 @@ static void ensure_kv(Model *m){
                 m->K[i] = oldK[i]; m->V[i] = oldV[i]; oldK[i] = oldV[i] = NULL;
                 continue;
             }
-            int rows = win ? ring : m->max_t, ostride = old_ring && c->win_layer && c->win_layer[i] ? old_ring : old_stride;
+            int rows = win ? ring : m->max_t;
             m->K[i] = malloc((size_t)c->kv_heads * rows * kvd * es);
             m->V[i] = malloc((size_t)c->kv_heads * rows * kvd * es);
             if (!m->K[i] || !m->V[i]) { fprintf(stderr, "OOM KV cache, layer %d\n", i); exit(1); }
-            if (keep > 0 && oldK && oldK[i] && oldV[i])
-                for (int h = 0; h < c->kv_heads; h++){
+            if (!parallel_copy && keep > 0 && oldK && oldK[i] && oldV[i]) {
+                int ostride = old_ring && c->win_layer && c->win_layer[i] ? old_ring : old_stride;
+                for (int h = 0; h < c->kv_heads; h++) {
                     memcpy(q36_kv_ptr(m->K[i], (int64_t)h*rows*kvd),
                            q36_kv_ptr(oldK[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
                     memcpy(q36_kv_ptr(m->V[i], (int64_t)h*rows*kvd),
                            q36_kv_ptr(oldV[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
                 }
+            }
         } else { m->K[i] = NULL; m->V[i] = NULL; }
+    }
+    if (parallel_copy && keep > 0 && oldK && oldV) {
+        #pragma omp parallel for collapse(2)
+        for (int i = 0; i < c->n_layers; i++) {
+            for (int h = 0; h < c->kv_heads; h++) {
+                if (!c->is_attn[i] || !oldK[i] || !oldV[i]) continue;
+                int64_t kvd = c->k_head_dim;
+                int win = ring && c->win_layer && c->win_layer[i];
+                int rows = win ? ring : m->max_t;
+                int ostride = old_ring && c->win_layer && c->win_layer[i] ? old_ring : old_stride;
+                memcpy(q36_kv_ptr(m->K[i], (int64_t)h*rows*kvd),
+                       q36_kv_ptr(oldK[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
+                memcpy(q36_kv_ptr(m->V[i], (int64_t)h*rows*kvd),
+                       q36_kv_ptr(oldV[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
+            }
+        }
     }
     if (ring && ring != old_ring) {
         int nw = 0;
@@ -9438,6 +10028,13 @@ static int q36_mtp_depth(Q36Spec *sp, int room, double *value) {
  * them; `more` is how many tokens the caller may still want after `tok`. The
  * returned buffer is the caller's (it may hold more rows past the first vocab). */
 static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
+#ifdef COLI_CUDA
+    Q36CChain *request_chain = g_cuda_chain ? q36cc_of(m) : NULL;
+    if (request_chain && request_chain->device_profile && !request_chain->failed && request_chain->request_phase == Q36CC_REQUEST_PREFILL) {
+        request_chain->request_phase = Q36CC_REQUEST_DECODE;
+        q36cc_set_permissions(request_chain, request_chain->decode_permissions);
+    }
+#endif
     Cfg *c = &m->c; int V = c->vocab;
     sp->tokens++;
     q36_spec_hist_push(sp, tok, pos);
@@ -9649,29 +10246,30 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     ensure_kv(m);
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
+#ifdef COLI_CUDA
+    Q36CChain *owned = q36cc_begin_if_idle(m, 0, np);
+#endif
     float *logit = step(m, prompt, np, 0);
     qt_stats_mark();   /* [qtier] stats also report the hit rate from here on */
     int len = np;
     Q36Spec *sp = &g_q36_run_spec;
     q36_spec_begin(m, sp, prompt, np);   /* COLI_LOOKUP=1: drafts, every token still the argmax below */
     for (int s = 0; s < n_new; s++) {
+        dump_logits(logit, c->vocab);
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         if (s == 0 && g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* record TTFT */
         if (g_stream) { stream_token(best); fflush(stdout); }
-        if (s == n_new - 1) {
-            if (getenv("DUMP")) {
-                g_last_logit = malloc((size_t)c->vocab * sizeof(float));
-                memcpy(g_last_logit, logit, (size_t)c->vocab * sizeof(float));
-            }
-            free(logit); out[len++] = best; break;
-        }
+        if (s == n_new - 1) { free(logit); out[len++] = best; break; }
         free(logit); out[len++] = best;
         { extern double g_tm_step; double _s0 = tm_now();
           logit = q36_spec_step(m, sp, best, len - 1, n_new - 1 - s);
           if (tm_on()) g_tm_step += tm_now()-_s0; }
     }
     q36_spec_end(m, sp);
+#ifdef COLI_CUDA
+    if (owned) q36cc_end_request(owned);
+#endif
 }
 
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
@@ -9686,6 +10284,9 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     ensure_kv(m);
     m->kv_len = 0;
     double nll = 0; int scored = 0;
+#ifdef COLI_CUDA
+    Q36CChain *owned = q36cc_begin_if_idle(m, 0, np);
+#endif
     float *logit = step(m, full, np, 0);
     for (int i = np; i < nfull; i++) {
         float mx = logit[0]; for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) mx = logit[v];
@@ -9697,16 +10298,112 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
         logit = step(m, &full[i], 1, i);
     }
     if (logit) free(logit);
+#ifdef COLI_CUDA
+    if (owned) q36cc_end_request(owned);
+#endif
     *nll_out = nll / scored;
     return scored;
 }
 
+#include "argmax_first.h"
+/* DEBUG_LOGITS=1 under TF: a mismatched position's top five logits and its top1-top2 gap
+ * (colibri.c's dump_top5_logits), so a near tie shows as the small gap it is and not as a
+ * bare token mismatch. */
+static void tf_top5(int pos, const float *lo, int V, int expected, int got) {
+    int idx[5]; float val[5];
+    for (int k = 0; k < 5; k++) { idx[k] = -1; val[k] = -INFINITY; }
+    for (int i = 0; i < V; i++) { float v = lo[i];
+        for (int k = 0; k < 5; k++) if (v > val[k]) {
+            for (int j = 4; j > k; j--) { val[j] = val[j-1]; idx[j] = idx[j-1]; }
+            val[k] = v; idx[k] = i; break; } }
+    double gap = idx[1] >= 0 ? (double)(val[0] - val[1]) : 0.0;
+    fprintf(stderr, "[LOGITS] pos=%d top1-top2 gap=%.3e | expected=%d (%.5f)  got=%d (%.5f) | top5:",
+            pos, gap, expected, (expected >= 0 && expected < V) ? (double)lo[expected] : 0.0,
+            got, (got >= 0 && got < V) ? (double)lo[got] : 0.0);
+    for (int k = 0; k < 5 && idx[k] >= 0; k++) fprintf(stderr, " %d:%.5f", idx[k], (double)val[k]);
+    fprintf(stderr, "\n");
+}
+
+#define Q36_TF_ROWS 256   /* rows of logits held at once (256 x vocab floats) */
+
+/* TF=1 on a .json reference: teacher forcing, colibri.c's forward_all for this engine. The
+ * reference's full_ids go through the model as a prompt, Q36_TF_ROWS rows at a time, every
+ * row's logits read out (step_ex's nlogits): the argmax at position s is the engine's
+ * prediction for full_ids[s+1], the prompt's positions included, which the greedy oracle
+ * never looks at. Each position is compared with the reference's tf_pred (the torch model's
+ * argmax over one forward of the whole sequence; tools/make_qwen36_tiny.py --emit-ref and
+ * tools/make_qwen36_oracle.py write it): a mismatch fails the run, ORACLE_TF_MAX_MISMATCHES
+ * of them allowed. A reference without tf_pred gets its predictions printed and fails too,
+ * as colibri's does: nothing was validated. DUMP takes every row as it is read; DEBUG_LOGITS=1
+ * prints a mismatched position's top five. Returns the exit status. */
+static int tf_run(Model *m, const int *full, int nfull, const int *tf, int ntf) {
+    Cfg *c = &m->c; int V = c->vocab;
+    if (nfull > QWEN36_ATTN_MAX_CTX) {
+        fprintf(stderr, "[ctx] %d tokens exceed the %d-token ceiling\n", nfull, QWEN36_ATTN_MAX_CTX);
+        exit(1);
+    }
+    if (tf && ntf != nfull) {
+        fprintf(stderr, "[tf] tf_pred has %d entries, full_ids %d: not the same sequence\n", ntf, nfull);
+        return 1;
+    }
+    int allowed = 0;
+    { const char *a = getenv("ORACLE_TF_MAX_MISMATCHES");
+      if (a && *a) {
+          char *end = NULL; long v = strtol(a, &end, 10);
+          if (end == a || *end || v < 0 || v >= nfull) {
+              fprintf(stderr, "[tf] ORACLE_TF_MAX_MISMATCHES must be an integer in [0,%d)\n", nfull);
+              return 1;
+          }
+          allowed = (int)v;
+      } }
+    int dbg = tf && getenv("DEBUG_LOGITS") && *getenv("DEBUG_LOGITS");
+    m->max_t = nfull;
+    reset_recurrent(m);
+    ensure_kv(m);
+    m->kv_len = 0;
+    int *pred = malloc((size_t)nfull * sizeof(int));
+    if (!pred) { fprintf(stderr, "[tf] out of memory\n"); return 1; }
+    int finite = 1, mism = 0;
+    double t0 = now_s();
+    for (int at = 0; at < nfull; at += Q36_TF_ROWS) {
+        int S = nfull - at < Q36_TF_ROWS ? nfull - at : Q36_TF_ROWS;
+        float *lo = step_ex(m, full + at, S, at, S);
+        for (int r = 0; r < S; r++) {
+            const float *row = lo + (int64_t)r * V; int s = at + r;
+            dump_logits(row, V);
+            int ok = 1; for (int v = 0; v < V; v++) if (!isfinite(row[v])) { ok = 0; break; }
+            if (!ok) {
+                fprintf(stderr, "[tf] non-finite logits at position %d\n", s);
+                finite = 0; pred[s] = -1; continue;
+            }
+            pred[s] = argmax_first(row, V);
+            if (tf && pred[s] != tf[s]) {
+                mism++;
+                fprintf(stderr, "[tf] mismatch pos=%d expected=%d got=%d\n", s, tf[s], pred[s]);
+                if (dbg) tf_top5(s, row, V, tf[s], pred[s]);
+            }
+        }
+        free(lo);
+    }
+    double dt = now_s() - t0;
+    int rc;
+    if (!tf) {
+        printf("TF pred  : "); for (int s = 0; s < nfull; s++) printf("%d ", pred[s]); printf("\n");
+        fprintf(stderr, "[tf] the reference has no tf_pred: %d predictions and nothing to compare them with "
+                        "(tools/make_qwen36_tiny.py --emit-ref and tools/make_qwen36_oracle.py write it)\n", nfull);
+        rc = 1;
+    } else {
+        printf("TEACHER-FORCING: %d/%d positions match the reference | %.1f pos/s\n", nfull - mism, nfull, nfull / dt);
+        if (mism) fprintf(stderr, "[tf] %d/%d mismatches, %d allowed%s\n", mism, nfull, allowed,
+                          dbg ? "" : " (DEBUG_LOGITS=1 for the top five logits of each)");
+        rc = (!finite || mism > allowed) ? 1 : 0;
+    }
+    free(pred);
+    return rc;
+}
+
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 1, 0, INT_MIN);
 }
 
 #ifndef QWEN36_NO_MAIN
@@ -10095,6 +10792,35 @@ static void q36_rewind(Model *m, int len) {
     if (m->kvp.len > len) m->kvp.len = len;
 }
 
+#ifdef COLI_CUDA
+static void q36cc_reserve_prompt_cache(Model *m, int need, int max_ctx) {
+    Q36CChain *ch = g_cuda_chain ? q36cc_of(m) : NULL;
+    m->max_t = need;
+    if (q36cc_prompt_cache_enabled(ch) && need > m->kv_cap) {
+        int step = m->kv_cap / 8 > 1024 ? m->kv_cap / 8 : 1024;
+        int cap = m->kv_cap ? ((m->kv_cap + step + 1023) / 1024) * 1024 : 2048;
+        if (cap < need) cap = ((need + (need / 8 > 1024 ? need / 8 : 1024) + 1023) / 1024) * 1024;
+        m->max_t = cap > max_ctx ? max_ctx : cap;
+    }
+    ensure_kv(m);
+}
+
+static int q36cc_reuses_live_prefix(Model *m, const int *ids, int np) {
+    if (!q36_3090_uses_exact_cache(m->kv_len, np - m->kv_len)) return 0;
+    int held = kv_prefix_reuse(&m->kvp, ids, np);
+    if (held != m->kv_len || !q36_ring_holds(m->ring_pos, m->kv_ring, held - m->c.window + 1, held) ||
+        coli_pin_best(&g_pins, ids, np) >= 0) return 0;
+    if (q36_ps_on(m)) {
+        for (int i = 0; i < g_q36_ps.nck; i++) {
+            const ColiPsCkpt *ck = &g_q36_ps.ck[i];
+            int len = ck->depth * g_q36_ps.B + ck->tail;
+            if (ck->live && len > held + coli_ps_min_gain(&g_q36_ps) && len < np) return 0;
+        }
+    }
+    return 1;
+}
+#endif
+
 /* A request's prompt into the conversation the Model holds: its tokens and image,
  * the budget, ACCEPT, the prefix reuse and the pins, the prefill and its read-out.
  * 1 with the prompt's ids and the logits after it; 0 when the request ended here,
@@ -10147,11 +10873,26 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         q->max_tok = budget;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
+#ifdef COLI_CUDA
+    q36cc_dm_flush_books(q36cc_of(m), m);   /* park, rewind and prefix restores may read or overwrite the host KV */
+#endif
     q36_park_decide(m, ids, np, q->max_tok);   /* a conversation parked by the last request: back, kept or dropped */
-    m->max_t = np + q->max_tok;
-    /* Grow the cache BEFORE deciding, so the decision sees the state that will
-     * actually be there: ensure_kv preserves both the rows and the record. */
+    int need = np + q->max_tok;
+    m->max_t = need;
+#ifdef COLI_CUDA
+    Q36CChain *request_chain = g_cuda_chain ? q36cc_of(m) : NULL;
+    const int select_live_cache = request_chain && request_chain->device_profile == Q36_GPU_3090 && !q->pin && !q->logprobs &&
+                             !m->vis_rows_n && !kv_prefix_off();
+    const int defer_cache_growth = request_chain && q36_has_request_rules(request_chain->device_profile) && !request_chain->failed && m->K != NULL;
+    if (defer_cache_growth) m->max_t = m->kv_cap;
+    else {
+        int direct = select_live_cache && q36cc_reuses_live_prefix(m, ids, np) ? m->kv_len : 0;
+        q36cc_begin_request(request_chain, direct, np - direct, direct != 0);
+        q36cc_reserve_prompt_cache(m, need, max_ctx);
+    }
+#else
     ensure_kv(m);
+#endif
     /* A chat client resends the whole transcript every turn. If this prompt
      * begins with the ids the current state was built from, that state already
      * IS the state at those positions: prefill only the tail. Either the reused
@@ -10245,6 +10986,17 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * The pin path above is untouched -- a photograph carries the logits for the position
      * that follows it, so it still resumes. */
     if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
+#ifdef COLI_CUDA
+    int reused_tokens = !reuse && !g_pin_use_logit ? rewind : reuse;
+    q36cc_begin_request(request_chain, reused_tokens, np - reused_tokens, select_live_cache);
+    if (defer_cache_growth) {
+        q36cc_reserve_prompt_cache(m, need, max_ctx);
+        if (reused_tokens > m->kvp.len) {
+            reuse = rewind = g_pin_use_logit = 0; pes_logit = NULL;
+            q36cc_begin_request(request_chain, 0, np, 0);
+        }
+    }
+#endif
     if (!reuse) {
         q36_park(m, np, q->max_tok);   /* a short request keeps the conversation (q36_unpark) */
         if (rewind > 0 && !g_pin_use_logit) {
@@ -10329,6 +11081,9 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         if(prefill_control == Q36_CONTROL_CANCEL) printf("ERROR %s CANCELLED\n",q->id);
         else printf("DONE %s STAT 0 0.000 0.0 %.2f %d 0\n",q->id,rss_gb(),np);
         fflush(stdout);
+#ifdef COLI_CUDA
+        q36cc_end_request(request_chain);
+#endif
         free(ids);
         return 0;
     }
@@ -10359,6 +11114,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
     unsigned char sbuf[16]; int sbn=0;
     Q36Spec spec; q36_spec_begin(m, &spec, ids, np);   /* COLI_LOOKUP=1: drafts, every token still sampled from the exact logits */
     for(int s=0;s<q->max_tok;s++){
+        dump_logits(lo, m->c.vocab);
         int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
         /* La coda si calcola PRIMA della free: dopo, lo non c'e piu. */
         char lptail[1024]; lptail[0]=0;
@@ -10373,7 +11129,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
             unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
             if(cn>0) serve_data(q->id,(char*)chunk,cn);
         }
-        gen++;
+        gen++; q36_ledger_token();
         if(s == 0) q36_pes_commit(m);   /* the first token is out; the state is still the prompt's end */
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -10382,7 +11138,11 @@ static void serve_one_turn(Model *m, ServeReq *q){
         if(control == Q36_CONTROL_STOP){ limited=0; break; }
         if(control == Q36_CONTROL_CANCEL){
             free(lo); lo=NULL;
-            q36_spec_end(m, &spec); q36_spec_free(&spec);   /* the state of the tokens fed, drafts undone */
+            q36_spec_end(m, &spec);
+#ifdef COLI_CUDA
+            q36cc_end_request(q36cc_of(m));
+#endif
+            q36_spec_free(&spec);   /* the state of the tokens fed, drafts undone */
             if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);
             printf("ERROR %s CANCELLED\n",q->id); fflush(stdout);
             free(ids);
@@ -10396,6 +11156,9 @@ static void serve_one_turn(Model *m, ServeReq *q){
     }
     q36_pes_commit(m);   /* a turn that ended on its first token (an EOS) */
     q36_spec_end(m, &spec);
+#ifdef COLI_CUDA
+    q36cc_end_request(q36cc_of(m));
+#endif
     forwards += (int)spec.forwards;
     if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);   /* flush trailing partial UTF-8 */
     free(lo); free(ids);
@@ -10858,6 +11621,7 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
 static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, int *tk_out){
     if (r->stop) r->limited = 0;
     if (r->cancel || r->stop || r->gen >= r->q.max_tok) { q36_mux_finish(m, r); return 0; }
+    dump_logits(r->lo, m->c.vocab);
     int tk = serve_sample(r->lo, m->c.vocab, r->q.temp, r->q.top_p);
     char lptail[1024]; lptail[0] = 0;
     if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, m->c.vocab, tk, r->q.logprobs);
@@ -10869,7 +11633,7 @@ static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, i
         unsigned char chunk[256]; int cn = 0; utf8_drain(r->sbuf, &r->sbn, tmp, tn, chunk, &cn);
         if (cn > 0) serve_data(r->q.id, (char *)chunk, cn);
     }
-    r->gen++;
+    r->gen++; q36_ledger_token();
 #ifdef COLI_CUDA
     if (g_q36_mcv) q36_mtp_vocab_step(tk);   /* the draft vocabulary counts it, as a lone request's */
 #endif
@@ -10890,6 +11654,7 @@ static void q36_mux_settle(Model *m, Q36MuxReq *r, int slot, const float *hid, c
     if (r->dn) {
         const float *row = r->lo;
         while (acc < r->dn && !r->stop && !r->cancel && r->gen + acc + 1 < r->q.max_tok) {
+            dump_logits(row, V);
             const int t = serve_sample(row, V, r->q.temp, r->q.top_p);
             int end = t != r->d[acc];
             for (int e = 0; e < n_eos && !end; e++) end = t == eos_ids[e];
@@ -11519,7 +12284,8 @@ int main(int argc, char **argv) {
     { const char *seed = getenv("SEED");
       srand(seed && *seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)(time(NULL) ^ (unsigned)getpid())); }
     const char *snap = getenv("SNAP");
-    if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
+    if (!snap || !*snap) snap = getenv("COLI_MODEL");   /* the launcher's name for it, as colibri.c takes it */
+    if (!snap || !*snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
     static char gguf_path[4096], mmproj_path[4096], mtp_path[4096]; int gguf_dir = 0;
     {   /* a model directory made by tools/gguf_import.py: gguf.json names the file */
         char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
@@ -11664,6 +12430,7 @@ int main(int argc, char **argv) {
 
 
     int is_ref = 0;
+    jval *ref_root = NULL;       /* the parsed reference (TF reads its tf_pred) */
     jval *ref_image = NULL;      /* {"grid_h", "grid_w", "patches": [...]}: one image for the oracle */
     int rplen = (int)strlen(refpath);
     if (rplen>=5 && strcmp(refpath+rplen-5, ".json")==0) is_ref = 1;
@@ -11707,6 +12474,7 @@ int main(int argc, char **argv) {
         fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
         buf=malloc(n+1); if (fread(buf,1,n,f)!=(size_t)n) {} buf[n]=0; fclose(f);
         jval *ref = json_parse(buf, &arena);
+        ref_root = ref;
         ref_image = ref ? json_get(ref, "image") : NULL;
         prompt = read_int_array(ref,"prompt_ids",&np);
         full   = read_int_array(ref,"full_ids",&nfull);
@@ -11735,7 +12503,16 @@ int main(int argc, char **argv) {
      * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
-    static Model m; model_init(&m, snap, cap, bits);
+    static Model m;
+#ifdef COLI_CUDA
+    /* a GGUF under the CUDA tier: the loader reads each matrix's header, the tier's upload its rows
+     * (Q36_GGUF_STAGE_KB=0: every matrix read at load, as before; the placed ones still give theirs back) */
+    const char *stage_kb = getenv("Q36_GGUF_STAGE_KB");
+    if (g_gguf && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1' && !(stage_kb && !strcmp(stage_kb, "0"))) {
+        g_q36_gq_defer = 1; g_q36_gq_model = &m;
+    }
+#endif
+    model_init(&m, snap, cap, bits);
     if (g_tok_exact) q36_clef_load(&m, snap);
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
@@ -11964,13 +12741,16 @@ int main(int argc, char **argv) {
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * QW struct on m.lm_head holds the int8 rows + per-row scales the
          * CPU path uses; the GPU applies the identical semantics. */
+        if (g_gguf) g_q36_gq_model = &m;   /* a GGUF matrix placed from here on gives its host rows back (q36_gq_drop) */
         if (m.lm_head.q)
             qt_lmhead_init(m.lm_head.q, m.lm_head.sc, m.lm_head.I, m.lm_head.O);
         else if (qdw_gq_fmt(&m.lm_head)) {   /* a GGUF's blocks */
             const int fmt = qdw_gq_fmt(&m.lm_head);
-            uint8_t *rows; const void *src = qdw_gq_rows(&m.lm_head, fmt, &rows);
-            if (src) qt_lmhead_init_fmt(src, NULL, fmt, m.lm_head.I, m.lm_head.O);
+            Q36Rows s; const QtRows *r = q36_gq_stream(&s, &m.lm_head, NULL, fmt);
+            uint8_t *rows = NULL; const void *src = r ? NULL : qdw_gq_rows(&m.lm_head, fmt, &rows);
+            const int up = (src || r) && qt_lmhead_init_fmt(src, r, NULL, fmt, m.lm_head.I, m.lm_head.O);
             free(rows);
+            if (up) q36_gq_drop(&m.lm_head);
         }
         /* R4 step 2: DeltaNet input projections, per layer, wherever
          * COLI_PLACE puts them. qkv and z are both [O_x, hidden] int8 with
@@ -11990,22 +12770,29 @@ int main(int argc, char **argv) {
                 const int gf = qdw_gq_fmt(&m.L[i].dn_qkv), gz = qdw_gq_fmt(&m.L[i].dn_z);
                 if (!q1 && gf && gf == gz) {   /* a GGUF's blocks: qkv's rows, then z's */
                     const size_t rb = (size_t)gq_row_bytes(gf - 100, Hd);
-                    uint8_t *ra, *rz, *cat = malloc(rb * Of);
-                    const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
-                    if (cat && a && z) {
-                        memcpy(cat, a, rb * O_qkv); memcpy(cat + rb * O_qkv, z, rb * O_z);
-                        if (qt_dnproj_init_fmt(i, cat, NULL, gf, Hd, Of, dev)) { placed++; vram += (double)rb * Of; }
+                    Q36Rows s; const QtRows *r = q36_gq_stream(&s, &m.L[i].dn_qkv, &m.L[i].dn_z, gf);
+                    uint8_t *ra = NULL, *rz = NULL, *cat = r ? NULL : malloc(rb * Of);
+                    const void *a = r ? NULL : qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = r ? NULL : qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
+                    int up = 0;
+                    if (r || (cat && a && z)) {
+                        if (!r) { memcpy(cat, a, rb * O_qkv); memcpy(cat + rb * O_qkv, z, rb * O_z); }
+                        if ((up = qt_dnproj_init_fmt(i, cat, r, NULL, gf, Hd, Of, dev))) { placed++; vram += (double)rb * Of; }
                     }
                     free(ra); free(rz); free(cat);
+                    if (up) { q36_gq_drop(&m.L[i].dn_qkv); q36_gq_drop(&m.L[i].dn_z); }
                     continue;
                 }
                 if (!q1 && gf && gz) {   /* two types (unsloth's mixes): two tensors, each the file's blocks */
                     const size_t rq = (size_t)gq_row_bytes(gf - 100, Hd), rzb = (size_t)gq_row_bytes(gz - 100, Hd);
-                    uint8_t *ra, *rz;
-                    const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gz, &rz);
-                    if (a && z && qt_dnproj_init_fmt(i, a, NULL, gf, Hd, O_qkv, dev) &&
-                        qt_dnproj_z_init_fmt(i, z, gz, Hd, O_z, dev)) { placed++; split++; vram += (double)rq * O_qkv + (double)rzb * O_z; }
+                    Q36Rows s, sz;
+                    const QtRows *r = q36_gq_stream(&s, &m.L[i].dn_qkv, NULL, gf), *rzs = q36_gq_stream(&sz, &m.L[i].dn_z, NULL, gz);
+                    uint8_t *ra = NULL, *rz = NULL;
+                    const void *a = r ? NULL : qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = rzs ? NULL : qdw_gq_rows(&m.L[i].dn_z, gz, &rz);
+                    const int up = (a || r) && (z || rzs) && qt_dnproj_init_fmt(i, a, r, NULL, gf, Hd, O_qkv, dev) &&
+                                   qt_dnproj_z_init_fmt(i, z, rzs, gz, Hd, O_z, dev);
+                    if (up) { placed++; split++; vram += (double)rq * O_qkv + (double)rzb * O_z; }
                     free(ra); free(rz);
+                    if (up) { q36_gq_drop(&m.L[i].dn_qkv); q36_gq_drop(&m.L[i].dn_z); }
                     continue;
                 }
                 if (!q1 || !q2) continue;      /* dense-i8 off: CPU path stands */
@@ -12036,6 +12823,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[dense] %d trunk matrices on GPU (%d dnout, %d attnproj, %d shexp; %.2f GB VRAM)\n",
                         placed, kinds[0], kinds[1], kinds[2], vram / 1073741824.0);
         }
+        if (g_q36_gq_ndrop)
+            fprintf(stderr, "[gguf] %d matrices on the CUDA tier gave their host rows back: %.2f GB of RAM "
+                            "(the CPU reads one back from the file only if it needs it)\n",
+                    g_q36_gq_ndrop, g_q36_gq_dropped / 1073741824.0);
+        q36_gq_settle();   /* what the tier did not take, before the chain and the rest read it */
         /* Q36_DN_GPU=1: where the in_proj and the out_proj of a DeltaNet layer
          * both sit on one card, the conv ring, the recurrence and the gated
          * norm go there too, and a decode token runs the layer end to end on
@@ -12047,7 +12839,8 @@ int main(int argc, char **argv) {
          * per-layer step below is not set up beside it. */
         int chain_up = 0;
 #ifdef COLI_CUDA
-        if (q36cc_env_on() && q36cc_setup(&m, g_q36_mux_slots)) { g_cuda_chain = 1; chain_up = 1; atexit(cc_shutdown); }
+        const Q36Checkpoint profile_checkpoint = q36_qualified_checkpoint(snap);
+        if (q36cc_env_on() && q36cc_setup(&m, g_q36_mux_slots, &profile_checkpoint)) { g_cuda_chain = 1; chain_up = 1; atexit(cc_shutdown); }
 #endif
         if (!chain_up && dn_gpu_env_on()) {
             int n = 0; double vram = 0;
@@ -12072,7 +12865,11 @@ int main(int argc, char **argv) {
          * loading all RAM slots along the way. */
         const char *nws = getenv("QT_NO_WARMSTART");
         if (!(nws && *nws=='1') && qt_experts_on()) tier_warmstart(&m, expert_is_int4);
+#ifdef COLI_CUDA
+        if (chain_up) q36cc_warmstart(&m);
+#endif
     }
+    q36_gq_settle();   /* no tier: every matrix the loader left in the file */
 
 #ifdef COLI_VULKAN
     q36c_start(&m);      /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */
@@ -12116,8 +12913,31 @@ int main(int argc, char **argv) {
     }
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
         if (!g_tok) { fprintf(stderr, "[serve] tokenizer.json required (put in SNAP or set TOK)\n"); return 1; }
+        q36_preload_start(&m);
         serve_loop(&m);
         return 0;
+    }
+
+    if (is_ref && getenv("TF") && *getenv("TF")) {
+        /* teacher forcing: every position's argmax against the reference's tf_pred */
+        int ntf = 0; int *tf = NULL;
+        if (ref_root && json_get(ref_root, "tf_pred")) tf = read_int_array(ref_root, "tf_pred", &ntf);
+        int rc = tf_run(&m, full, nfull, tf, ntf);
+        dump_close(m.c.vocab);
+        double tot = m.hits + m.miss;
+        printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
+               (unsigned long long)m.hits, (unsigned long long)m.miss);
+        route_footer(stdout, &m);
+        printf("PEAK RSS: %.2f GB\n", rss_gb());
+#ifdef COLI_CUDA
+        q36cc_report(&m);
+#endif
+#ifdef COLI_VULKAN
+        vk_report();
+        q36c_report(&m);
+        vk_tier_turn(&m, "run");
+#endif
+        free(tf); free(buf); free(arena); return rc;
     }
 
     if (is_ref && getenv("PPL") && atoi(getenv("PPL")) == 1) {
@@ -12167,15 +12987,8 @@ int main(int argc, char **argv) {
     generate(&m, prompt, np, n_new, out);
     double dt = now_s() - t;
 
-    /* DUMP=<path>: write last-token logits (raw float32, vocab) for a torch-free
-     * cosine comparison against tools/_ref_dn.py --dump. */
-    if (g_last_logit) {
-        const char *dp = getenv("DUMP");
-        FILE *df = fopen(dp && *dp ? dp : "qwen36_logits.f32", "wb");
-        if (df) { fwrite(g_last_logit, sizeof(float), (size_t)m.c.vocab, df); fclose(df);
-                  fprintf(stderr, "[dump] wrote %d logits -> %s\n", m.c.vocab, dp && *dp ? dp : "qwen36_logits.f32"); }
-        else fprintf(stderr, "[dump] cannot open %s\n", dp ? dp : "qwen36_logits.f32");
-    }
+    /* DUMP=<path>: the rows went out as they were sampled (dump_logits); say how many */
+    dump_close(m.c.vocab);
 
     int ref_match = 0;
     if (is_ref) {
@@ -12289,6 +13102,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
         free(cache->slot_by_expert); free(cache->slots);
     }
     free(model->attn_sc);
+    free(model->attn_sc_grp); model->attn_sc_grp = NULL; model->attn_sc_grp_cap = 0;
     free(model->seen); free(model->is_queued); free(model->is_pinned);
     free(model->momentum_logits); free(model->freq);
     free(model->DN_conv); free(model->DN_rec); free(model->dn_dev_fresh); free(model->dn_host_stale);

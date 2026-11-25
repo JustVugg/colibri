@@ -219,3 +219,27 @@ class LiteralHTTPTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonFiniteArgumentTest(unittest.TestCase):
+    """NaN and Infinity read as Python numbers but are not JSON: a call never carries them in
+    `arguments` (dumped with allow_nan=False, #3051), and a reply that has them never fails."""
+
+    def test_glm_form_keeps_the_text(self):
+        for raw, declared in (("NaN", "number"), ("-Infinity", "number"), ("[Infinity]", "array"),
+                              ('{"a": NaN}', "object")):
+            with self.subTest(raw=raw):
+                _, calls = gw.parse_tool_calls(glm_reply(raw), tools(declared))
+                self.assertEqual(args_of(calls), [{"q": "x", "v": raw}])
+
+    def test_glm_salvaged_payload_keeps_the_text(self):
+        reply = "<tool_call>f (NaN)</tool_call>"
+        with patch.object(gw, "_SALVAGE", True):
+            _, calls = gw.parse_tool_calls(reply, tools("number"))
+        self.assertEqual(args_of(calls), [{"q": "NaN"}])
+
+    def test_mistral_form_is_not_a_call(self):
+        reply = "ok" + gw.ML4_CALLS + "f" + gw.ML4_ARGS + '{"q": "x", "v": NaN}'
+        content, calls = gw.parse_mistral_tool_calls(reply, tools("number"))
+        self.assertEqual(calls, [])
+        self.assertEqual(content, reply)

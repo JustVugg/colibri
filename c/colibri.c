@@ -862,6 +862,16 @@ static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x,
 }
 #endif
 #ifdef COLI_CUDA
+/* Ledger (ledger_map.h; inert without LEDGER_OUT): one generated token, and the name of
+ * the device buffers the next uploads allocate (NULL: the backend's own) */
+static void ledger_token(void){ coli_cuda_ledger_step(); }
+static void ledger_expert(int layer,int eid){
+    char n[64]; snprintf(n,sizeof n,"layers.%d.experts.%d",layer,eid); coli_cuda_ledger_label("weight",n);
+}
+#else
+static void ledger_token(void){}
+#endif
+#ifdef COLI_CUDA
 static int qt_cuda_upload(QT *t){
     if(t->fmt==QT_GGML) return 0;   /* a GGUF matrix: ggml_quants.h on the CPU */
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
@@ -1158,11 +1168,7 @@ static void cluster_stat_suffix(const ProfBase *b, double dt, int ntok){
            g, g>t?g-t:0.0, t, (double)tx/1e3/n, (double)rx/1e3/n);
 }
 
-static float *falloc(int64_t n){
-    /* guardia anti-wrap (report PR #25): n assurdo da file modello ostili non deve
-     * diventare una malloc piccola. Niente calloc: il memset nel percorso caldo costa. */
-    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld is out of range\n",(long long)n); exit(1); }
-    float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
+static inline float *falloc(int64_t n){ return coli_falloc(n); }
 
 /* Come falloc, per i buffer non-float del percorso caldo. moe() e' la funzione piu'
  * chiamata del motore e girare al soffitto di RAM e' la premessa del progetto: e'
@@ -5095,8 +5101,11 @@ static int kv_dev_sync(Model *m, Layer *l, int layer, int upto){
     Cfg *c=&m->c; int kvl=c->kv_lora, R=c->qk_rope, dev=l->kv_b.cuda_device;
     if(upto>m->max_t) return 0;
     if(!m->kv_dev_L[layer]){
+        char n[64]; snprintf(n,sizeof n,"layers.%d.kv.latent",layer); coli_cuda_ledger_label("cache",n);
         m->kv_dev_L[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*kvl*4);
+        snprintf(n,sizeof n,"layers.%d.kv.rope",layer); coli_cuda_ledger_label("cache",n);
         m->kv_dev_R[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*R*4);
+        coli_cuda_ledger_label(NULL,NULL);
         m->kv_dev_valid[layer]=0;
         if(!m->kv_dev_L[layer]||!m->kv_dev_R[layer]) return 0;
     }
@@ -9327,7 +9336,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1;
         if((eos>=0 && next==eos) || is_stop(next)){ free(logit); logit=NULL; break; }
-        emit(next,logit,ud); free(logit); logit=NULL; all[kv]=next; emitted++; m->n_emit++;
+        emit(next,logit,ud); free(logit); logit=NULL; all[kv]=next; emitted++; m->n_emit++; ledger_token();
         gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
         /* One-shot generation does not need logits or KV for the last token.
          * Stateful callers do: their kv_out becomes chat history, feeds MORE,
@@ -9427,7 +9436,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                    accept = (rndu() < g_pbuf[draft[k]]); }
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
-            emit(draft[k],lo+(int64_t)k*V,ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
+            emit(draft[k],lo+(int64_t)k*V,ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++; ledger_token();
             gr_feed(&g_grd,draft[k]); k++;
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
@@ -11123,7 +11132,10 @@ static void repin_pass_limit(Model *m,int limit){
         const char *tier="RAM";
 #ifdef COLI_CUDA
         if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
-            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+            ledger_expert(cd[b].l,cd[b].eid);
+            int up=qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d);
+            coli_cuda_ledger_label(NULL,NULL);
+            if(up){
                 int64_t now_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
@@ -11867,7 +11879,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     int next=pick_tok(logit,m->c.vocab,-1);
     if(r->maximum<=0){ free(logit); r->length_limited=1; mux_done(m,sc,r); return 1; }   /* no room at all */
     if(next==eos || is_stop(next)){ free(logit); mux_done(m,sc,r); return 1; }
-    r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
+    r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++; ledger_token();
     if(grd[sub.slot].on){ grammar_reset(&grd[sub.slot]); gr_feed(&grd[sub.slot],next); }
     mux_data(T,r->id,next,logit,m->c.vocab,r->logprobs);
     free(logit);
@@ -12006,7 +12018,7 @@ static void run_serve_mux(Model *m, const char *snap){
                     int next=pick_tok(lo+(int64_t)j*m->c.vocab,m->c.vocab,-1);
                     sc->len++;                       /* seq[j] joins the committed history */
                     if(next==eos || is_stop(next)){ mux_done(m,sc,r); done=1; break; }
-                    r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+                    r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++; ledger_token();
                     if(gd->on) gr_feed(gd,next);
                     mux_data(&T,r->id,next,lo+(int64_t)j*m->c.vocab,m->c.vocab,r->logprobs);
                     if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); done=1; break; }
@@ -12030,7 +12042,7 @@ static void run_serve_mux(Model *m, const char *snap){
             sc->len++; g_temp=r->temp; g_nuc=r->top_p;
             int next=pick_tok(lo+(int64_t)s*m->c.vocab,m->c.vocab,-1);
             if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
-            r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+            r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++; ledger_token();
             if(grd[i].on) gr_feed(&grd[i],next);   /* walker stays in sync when not drafting */
             mux_data(&T,r->id,next,lo+(int64_t)s*m->c.vocab,m->c.vocab,r->logprobs);
             if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
@@ -13252,12 +13264,14 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                     tried[best]=1;
                     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
                     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+                    ledger_expert(li,s->eid);
                     int uploaded=
 #ifdef COLI_ANS
                         compress ? (qt_cuda_upload_compressed(&s->g)&&qt_cuda_upload_compressed(&s->u)&&
                                     qt_cuda_upload_compressed(&s->d)) :
 #endif
                         (qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d));
+                    coli_cuda_ledger_label(NULL,NULL);
 #ifdef COLI_ANS
                     if(compress&&!uploaded){
                         fprintf(stderr,"[ANS] sidecar load failed; refusing partial VRAM placement\n");

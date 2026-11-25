@@ -186,6 +186,12 @@ make deepseek-v4 HIP=1 HIP_ARCH=gfx1102   # ROCM_HOME=/usr when ROCm is not in /
 The same `backend_cuda_dsv4.cu`, compiled by `hipcc` (ROCm 6.3 or newer: the
 OCP fp8 type in `<hip/hip_fp8.h>`) and linked into the engine like `CUDA=1`.
 The cooperative fused-MoE kernel is CUDA-only and compiled out on HIP.
+For an RDNA3 card (`HIP_ARCH=gfx11…`) the kernels are built as 64-lane waves
+(`-mwavefrontsize64`, `HIP_WAVE64=1`): on a gfx1102 the decode's FP4 expert
+group runs 37-39 % faster so, with the same results, and the GPU tier's
+decode with `--vram 5` from 1.67 to 1.88 tok/s (+12.6 %, three runs per arm,
+the same text; `docs/experiments/v4-hip-wave64-2026-11-19/`). `HIP_WAVE64=0`
+builds 32-lane waves, the RDNA default; `HIP_ARCH=native` leaves it off.
 
 ### Linux CUDA tier
 
@@ -726,6 +732,77 @@ token-layers (`calls`), their wall time from routing on, the wait for store
 fetches, the VRAM attach time and the mirror `uploads` it caused, and the
 fused GPU compute.
 
+### Hot experts on the card, the rest on the CPU (`V4_HOT_SPLIT`, on below 10 GiB on HIP)
+
+On a card that holds few experts the GPU tier can decode slower than the CPU
+alone. With `--vram 5` on an 8 GB RX 7600M XT (PCIe 4.0 x8) about four in five
+routed experts miss VRAM, and uploading one (1.0 ms for its 12.75 MiB) costs
+more than computing it on a 16-core CPU (about 0.8 ms): the card mostly waits
+for the bus. `V4_HOT_SPLIT` uses the card for the experts decode picks most
+and the CPU for the rest, at the same time:
+
+- as soon as a layer has routed, the token's experts mirrored in VRAM start on
+  the GPU on a helper thread and are not read from the store; the CPU computes
+  the shared expert and the other experts meanwhile, then the sums are added;
+- a miss is never uploaded to be used now. After the layer at most one of the
+  experts the CPU computed joins the cache: the most used one, into free room,
+  or over the least used mirror of another layer when it was used at least
+  twice as often. Use counts are halved about every 64 tokens, so a change of
+  subject can change what VRAM holds;
+- on HIP the mirror count is fixed from `--vram` (minus the exact head and 256
+  MiB for the runtime) rather than from the free VRAM of the moment: which
+  experts run where decides the low bits of the sums, and the same prompt then
+  gives the same text from run to run, within `--vram`;
+- the hyper-connection team stays whole (`V4_HC_TEAM` unset acts as `0`): the
+  CPU works through every layer.
+
+It needs the shared experts in RAM, as the GPU tier keeps them below 10 GiB of
+`--vram`; with them on the card the switch does nothing. On a HIP build with
+one card the placement turns it on there by itself (`v4_gpu hot-split=on` on
+stderr), not for a GGUF, whose experts are not mirrored; `V4_HOT_SPLIT=0`
+keeps the plain GPU tier, and `1` asks for the split on a CUDA build, where it
+was not measured. Like
+`V4_GPU_RESIDENT_FIRST` it acts on the one-token decode MoE. The GPU and CPU
+expert arithmetic are not bit-identical (see above), so a text can differ from
+a CPU run's in its later tokens.
+
+Measured on a Ryzen 9 7945HX (16 cores) with 62 GB RAM and an RX 7600M XT
+8 GB (gfx1102, PCIe 4.0 x8), DeepSeek V4 Flash REAP 150B, `--vram 5`, 200
+greedy tokens of a counting prompt, one binary (hipcc's default 32-lane
+waves), three alternating runs per row
+(`docs/experiments/v4-hot-split-2026-11-19/`):
+
+| configuration | decode tok/s |
+|---|---|
+| GPU tier, `V4_HOT_SPLIT=0` | 1.66 |
+| CPU only, `COLI_CUDA=0` | 3.14 |
+| GPU tier, `V4_HOT_SPLIT=1` (302 mirrors) | **3.41** |
+
+The counting answer was the same text in all nine runs; about half the
+expert computations ran on the card. Built with 64-lane waves (`-mwavefrontsize64`)
+the split reached 3.65 tok/s. VRAM held at 5045 MiB under `--vram 5` (4013
+MiB at 4, 6065 at 6, 7043 at 7). On an essay prompt the split was 9-10 %
+faster than the CPU (64-lane waves), and its text, the same from run to run,
+differed from the CPU's in later tokens.
+
+With the switch unset (on by itself), the same machine and prompt, one binary,
+three alternating runs per arm (`docs/experiments/v4-hot-split-auto-2026-11-20/`;
+about 3 GiB less RAM free than the day before, so every row is a little
+lower):
+
+| `--vram` | `V4_HOT_SPLIT=0` | unset (split) | mirrors | VRAM peak, MiB |
+|---|---|---|---|---|
+| 4 | 1.51 | **3.35** | 221 | 4013 |
+| 5 | | 3.26 (one run) | 302 | 5045 |
+| 6 | 1.64 | **3.29** | 382 | 6065 |
+| 7 | does not fit | 3.25 | 462 | 7064 |
+| CPU only, `COLI_CUDA=0` | 3.09 | | | |
+
+At `--vram 7` the plain tier peaks about 180 MiB above `--vram`, more than the
+card had free beside the desktop (about 900 MiB). More mirrors move more of
+the experts to the card (43 % at 4, 62 % at 7) without a faster decode. The
+text was the same in all 22 runs.
+
 ### An expert record stays where its read landed (`V4_SLAB_SHIFT`, on)
 
 A direct read of an expert lands a 4 KiB-aligned window of the file in the
@@ -756,6 +833,95 @@ cell, medians; the text is the same in all twelve runs):
 The prompt gains too, a tenth of its time, because the bank refills read
 experts through the same path. Not measured: a CPU-only run, Linux, a contiguous (FLOCK-packed)
 checkpoint. The record is in `docs/experiments/v4-slab-shift-2026-11-13/`.
+
+### A prompt's expert reads at the cold end of the RAM cache (`V4_RAM_PROMPT_COLD`, opt-in)
+
+With `COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1` a prompt's expert bank reads
+every routed expert of every layer once (the second bank prefetches the whole
+next layer), in the same order on every prompt. The RAM expert cache keeps one
+recency list per layer, and a layer has fewer slots than experts (133 of 256 at
+`--ram 80` on a 94 GiB box). A sweep larger than the list, in a fixed order, is
+the case recency handles worst: each read evicts an expert the same sweep needs
+further on. Measured on the service below, one prompt read in six hit RAM (122
+GB from disk per 3.3k-token turn, though RAM held half the experts), and the
+sweep pushed out the experts decode had just used: decode then missed RAM about
+1,550 times per turn.
+
+With `V4_RAM_PROMPT_COLD=1`, a slot the bank reads into while a prompt is read
+(from the request's start until the bank is released for decode) is linked at
+the oldest end of its layer's list, so the next such read reuses it and the
+rest of the cache stays as it was. The prompt hits whatever RAM holds; decode
+finds what it used. Hits keep their recency touch; decode, the read-ahead
+lanes and the CPU union's lookups (counted lookups) are unchanged. The bank
+holds each view's lease until its upload, so a cold slot is never reused before
+the bank has its copy. Only which slot a read reuses changes, never what is
+read or computed: the replies are the same. Without the bank (a CPU build, or
+`COLI_CUDA_MOE_BATCH` unset) nothing changes.
+
+The policy was picked by replaying one service's RAM-cache events (every hit,
+miss, victim, touch and pin set, recorded by a local trace build) against
+candidates. The replay of plain recency reproduced the engine's misses within
+a few per turn. Over five turns an oracle that knows the future misses 26,121
+times on the prompts; this policy 26,400 (recency 45,425), with 2,175 decode
+misses against recency's 7,776.
+
+Measured on the RTX 5080 server (`coli serve --ram 80 --ctx 20000`, five
+3,282-token turns per service, `max_tokens` 36, three services per arm
+alternating, medians; the replies are the same in all twelve services). On
+upstream dev with the merged switches (`V4_LAYER_FUSED`, `V4_MIRROR_BLOCK`,
+`V4_BANK_MAKE_ROOM`, `V4_UPLOAD_THREAD`, `DSV4_CUDA_MOE_FUSED6`):
+
+| turn | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| request (s), unset | 52.11 | 56.68 | 55.63 | 55.21 | 54.31 |
+| request (s), `V4_RAM_PROMPT_COLD=1` | 50.77 | 53.17 | 53.46 | 52.94 | 53.33 |
+| decode (s), unset | 10.06 | 8.01 | 7.42 | 7.05 | 6.53 |
+| decode (s), `=1` | 9.77 | 5.12 | 5.24 | 5.00 | 5.35 |
+| RAM hit rate of the turn, unset / `=1` | 49.5 / 69.1 % | 46.6 / 72.3 % | 46.6 / 72.3 % | 46.5 / 72.4 % | 46.7 / 71.5 % |
+
+Decode on turns 2 to 5: 4.82 -> 6.87 tok/s (medians of twelve). The expert
+disk seconds the engine reports per turn fall from about 19.8 to 10.4. Turn 1
+starts from the cache the engine read before the first request, and gains least.
+With a faster prompt path in front (the local deployment, same box, same
+service), the requests take 31.23 26.83 25.12 24.11 23.10 s unset and 29.57
+23.30 22.86 22.16 22.37 s with the switch; a counting build there logged prompt
+reads from disk per turn falling from about 9,150 to 5,450 (122 to 73 GB) and
+decode misses from about 1,550 to 220-436.
+
+Not measured: a smaller `--ram` (fewer slots per layer, the same sweep),
+prompts longer than a segment (each segment sweeps again), Windows, HIP. The
+record is in `docs/experiments/v4-ram-prompt-cold-2026-11-18/`.
+
+### A hash layer's router computes only its experts' gate scores (`V4_ROUTE_FORCED_ONLY`, opt-in)
+
+The first three layers route by hash: a token's six experts come from the
+token table (`ffn.gate.tid2eid`), and the router needs only those six experts'
+gate scores for the weights. It computed all 256 gate dot products per token
+anyway, on the CPU (the prompt's GPU router serves only the score-routed
+layers): about 10 ms per 128-token prompt chunk on a hash layer, against about
+0.5 ms on the others. With `V4_ROUTE_FORCED_ONLY=1` the router computes the
+forced experts' dot products only. Each is the same serial loop as before, so
+the weights are the same bits. `V4_ROUTE_FORCED_ONLY=2` also computes the full
+set and compares the two bit for bit (`routeforced verify` lines, at every
+mismatch and every 4,096 checks). Device logits (Vulkan) and precomputed logits
+are unchanged; so is every score-routed layer.
+
+Measured on the RTX 5080 server (3,278-token prompt, 36 tokens, `--memory-gb
+16`, dev's merged switches, one binary, the arms alternated four times; the
+text is the same in all eleven runs):
+
+| | unset | `V4_ROUTE_FORCED_ONLY=1` |
+|---|---|---|
+| time to first token (s), median | 42.33 | 41.92 |
+| prompt tokens per second, median | 77.44 | 78.21 |
+| hash layers' routing per prompt (ms, `V4_MOE_BATCH_PROF=1`) | 802 | 33 |
+| 35 tokens after the first (s), median | 9.60 | 9.58 |
+
+Not all of the router's 0.77 s comes off the prompt: the expert bank's
+prefetch of the next layer runs under it. The verify run checked every
+hash-layer routing of one run: 0 mismatches. Not measured: Windows, HIP,
+Vulkan, a CPU-only build (the CPU union routes through the same function). The
+record is in `docs/experiments/v4-route-forced-only-2026-11-18/`.
 
 ## Prefill: segments, chunks, checkpoints
 
@@ -971,6 +1137,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 |---|---|
 | `DSV4_CUDA` (1) | master switch for the V4 GPU tier; `0` = CPU only |
 | `DSV4_CUDA_DEVICE` (0) | single CUDA device ordinal, used when `DSV4_CUDA_DEVICES` is unset |
+| `DSV4_CUDA_REQUIRE` (0) | `1` = the GPU tier must start: where it would fall back to the CPU (no backend DLL or a dependency of it, init failure, a device the build cannot run, `DSV4_CUDA=0`) the engine prints `v4_gpu error=gpu-required (<cause>)` and exits 1 instead of running the model on the CPU. A build without the tier refuses before reading any weight |
 | `DSV4_CUDA_DEVICES` (unset) | ordered comma-separated distinct CUDA ordinals; split contiguous layers across these devices |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL, by file name or relative path (engine's folder) or absolute path (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
@@ -1021,6 +1188,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_UPLOAD_THREAD` (0) | `1` = a decode step hands each mirror upload to an uploader thread and starts its lane's next read at once; the copies go on the device's second stream and the expert group is ordered after them by an event (see [The decode mirror uploads on an uploader thread](#the-decode-mirror-uploads-on-an-uploader-thread-v4_upload_thread-opt-in)) |
 | `V4_UPLOAD_FENCE` (1) | with `V4_UPLOAD_THREAD=1`: `0` = the uploader drains the second stream after each mirror instead of the event |
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
+| `V4_HOT_SPLIT` (on for one HIP card below 10 GiB of `--vram`, else 0) | `1` = decode computes the experts mirrored in VRAM on the GPU while the CPU computes the others, and at most one expert per layer is uploaded, after it, by use count (see [Hot experts on the card, the rest on the CPU](#hot-experts-on-the-card-the-rest-on-the-cpu-v4_hot_split-on-below-10-gib-on-hip)); needs the shared experts in RAM |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
 | `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU (both GPUs at the same SM version; `mode=` in the `peer-mirrors` line); `0` = read them in place over P2P; no effect with `DSV4_CUDA_BATCHED=0`, which reads them in place |
 | `DSV4_CUDA_PEER_FAULT` (unset, `.cu`) | tests: `n` = the n-th peer-compute pass fails at its join with an error the devices survive, and the peer is latched off (that call recomputes on the primary); `n:lost` = the peer also counts as lost (the call fails, decode takes host copies); `n:sticky` = the error is a kernel fault's, which latches CUDA off for the whole process (every later call refused, host paths), as a real fault does |
@@ -1048,6 +1216,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_LOADER_LANES` (9, max 16) | persistent expert-loader threads for decode. The default suits the CPU path (1.41× decode, #1097); **with the GPU tier set `3`**: mirrors/RAM absorb most decode misses (9 lanes ≈ +4 % decode) while the extra readers contend with the MoE bank refill for the NVMe queues (~10 % slower prefill; measured on the reference box, v1.7.0) |
 | `V4_EXPERT_UNION` (1) | per-chunk expert union batching on the CPU path |
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
+| `V4_RAM_PROMPT_COLD` (0) | `1` = while a prompt is read, the expert bank's reads go to the oldest end of the RAM cache's recency list, so the sweep over every expert keeps what RAM held and decode finds its experts (see [A prompt's expert reads at the cold end of the RAM cache](#a-prompts-expert-reads-at-the-cold-end-of-the-ram-cache-v4_ram_prompt_cold-opt-in)) |
+| `V4_ROUTE_FORCED_ONLY` (0) | `1` = a hash layer's router computes only the forced experts' gate dot products (same bits); `2` = also the full set, compared (`routeforced verify` lines) (see [A hash layer's router computes only its experts' gate scores](#a-hash-layers-router-computes-only-its-experts-gate-scores-v4_route_forced_only-opt-in)) |
 | `V4_SLAB_SHIFT` (1) | an expert record stays where its direct read landed and the views point there; `0` = moved to the slab's first byte after every read, as before (see [An expert record stays where its read landed](#an-expert-record-stays-where-its-read-landed-v4_slab_shift-on)) |
 | `COLI_V4_AUTOPIN`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
 | `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage`, before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |

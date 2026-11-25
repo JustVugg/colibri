@@ -19,6 +19,9 @@
  *   rows     20 rows (2000 with "full") for each of I = 64, 128, 512, 2048, 4096 under several scale and activation
  *            distributions; xf_dot_i8 and xf_dot_i8_rows (1..4 activation rows, strides) as the reference
  *   layer    xf_moe_run / xf_moe_add, K = 8, 2048/512, S = 1, 7, 40, holes, cuts, 1 and many threads
+ * Built for Sandy Bridge (tests/test_xf_avx_i8, AVX without AVX2+FMA) the dispatch is the AVX i8 kernel
+ * (XF_HAVE_AVX_I8): the same checks, and its fmaf in four lanes and by the short way against libm fmaf
+ * (the short way wherever the kernel would not redo the block).
  * On a build without XF_HAVE_SSE2_INT16 (AVX2+FMA, or not x86-64) only what the dispatch gives is checked. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,8 +98,27 @@ static void fma_case(int g, uint64_t *s, float *a, float *b, float *c) {
 static float fma_emulated(float a, float b, float c) {
     return (float)_mm_cvtsd_f64(xf_fmaf2_sse2(_mm_set1_pd((double)a * (double)b), _mm_set1_pd((double)c)));
 }
+#ifdef XF_HAVE_AVX_I8
+/* the AVX kernel's two forms, the operands in lane `lane` of four and other values around them */
+static float fma_emulated_avx(float a, float b, float c, int lane) {
+    double p[4] = {3.0, -0.5, 0x1p-140, 7e30}, cc[4] = {1.0, 0x1p-30, -0x1p-149, 1.0}, r[4];
+    p[lane] = (double)a * (double)b; cc[lane] = (double)c;
+    _mm256_storeu_pd(r, xf_fmaf4_avx(_mm256_loadu_pd(p), _mm256_loadu_pd(cc)));
+    return (float)r[lane];
+}
+/* the short way; *suspect is what the kernel reads for this lane (it then takes xf_fmaf4_avx) */
+static float fma_fast_avx(float a, float b, float c, int lane, int *suspect) {
+    double p[4] = {3.0, -0.5, 0x1p-140, 7e30}, cc[4] = {1.0, 0x1p-30, -0x1p-149, 1.0}, r[4];
+    p[lane] = (double)a * (double)b; cc[lane] = (double)c;
+    __m128i hit = _mm_setzero_si128();
+    _mm256_storeu_pd(r, xf_fmaf4_fast_avx(_mm256_loadu_pd(p), _mm256_loadu_pd(cc), &hit, lane >= 2));
+    *suspect = (_mm_movemask_ps(_mm_castsi128_ps(hit)) >> (2 * (lane & 1))) & 1;
+    return (float)r[lane];
+}
+#endif
 static void test_fmaf(long n) {
     long bad[FMA_GENS] = {0}, tot[FMA_GENS] = {0};
+    long bad4 = 0, badfast = 0, nfast = 0;   /* the AVX forms: the full one, and the short one where it is not suspect */
 #ifdef _OPENMP
     #pragma omp parallel num_threads(omp_get_max_threads() < 4 ? omp_get_max_threads() : 4)
 #endif
@@ -107,6 +129,7 @@ static void test_fmaf(long n) {
 #endif
         uint64_t s = 88172645463325252ULL + 7919ULL * (uint64_t)th;
         long lbad[FMA_GENS] = {0}, ltot[FMA_GENS] = {0};
+        long lbad4 = 0, lbadfast = 0, lfast = 0;
         for (long it = 0; it < n; it++) {
             int g = (int)(it % FMA_GENS); float a, b, c;
             fma_case(g, &s, &a, &b, &c);
@@ -115,15 +138,39 @@ static void test_fmaf(long n) {
             if (fbits(ref) != fbits(got) && !(isnan(ref) && isnan(got))) {
                 if (++lbad[g] <= 2) printf("  fmaf mismatch (gen %d) a=%a b=%a c=%a ref=%a got=%a\n", g, a, b, c, ref, got);
             }
+#ifdef XF_HAVE_AVX_I8
+            {
+                const int lane = (int)(it & 3); int suspect;
+                const float g4 = fma_emulated_avx(a, b, c, lane), gf = fma_fast_avx(a, b, c, lane, &suspect);
+                if (fbits(ref) != fbits(g4) && !(isnan(ref) && isnan(g4))) {
+                    if (++lbad4 <= 2) printf("  fmaf mismatch, AVX (gen %d) a=%a b=%a c=%a ref=%a got=%a\n", g, a, b, c, ref, g4);
+                }
+                if (!suspect) {
+                    lfast++;
+                    if (fbits(ref) != fbits(gf) && !(isnan(ref) && isnan(gf))) {
+                        if (++lbadfast <= 2) printf("  fmaf mismatch, AVX short way not flagged (gen %d) a=%a b=%a c=%a ref=%a got=%a\n", g, a, b, c, ref, gf);
+                    }
+                }
+            }
+#endif
         }
 #ifdef _OPENMP
         #pragma omp critical
 #endif
-        for (int g = 0; g < FMA_GENS; g++) { bad[g] += lbad[g]; tot[g] += ltot[g]; }
+        { for (int g = 0; g < FMA_GENS; g++) { bad[g] += lbad[g]; tot[g] += ltot[g]; }
+          bad4 += lbad4; badfast += lbadfast; nfast += lfast; }
     }
     long B = 0, T = 0;
     for (int g = 0; g < FMA_GENS; g++) { B += bad[g]; T += tot[g]; printf("fmaf gen %d (%s): %ld cases, %ld differ\n", g, fma_gen_name[g], tot[g], bad[g]); }
     CHECK(B == 0, "fmaf emulation: %ld of %ld cases differ from libm fmaf", B, T);
+#ifdef XF_HAVE_AVX_I8
+    CHECK(bad4 == 0, "fmaf emulation, AVX four lanes: %ld of %ld cases differ from libm fmaf", bad4, T);
+    CHECK(badfast == 0, "fmaf emulation, AVX short way: %ld of %ld cases it did not flag differ from libm fmaf", badfast, nfast);
+    CHECK(nfast > T / 4, "fmaf emulation, AVX short way: only %ld of %ld cases took it", nfast, T);
+    printf("fmaf AVX four lanes: %ld cases, %ld differ; short way: %ld cases not flagged, %ld differ\n", T, bad4, nfast, badfast);
+#else
+    (void)bad4; (void)badfast; (void)nfast;
+#endif
     /* non-finite operands: the class (NaN, +-Inf, finite) of the reference */
     const float sp[] = {INFINITY, -INFINITY, NAN, 0.f, 1.5f, -2.f, 3e38f};
     long ncls = 0, nbad = 0;
@@ -412,7 +459,11 @@ int main(int argc, char **argv) {
 #ifdef XF_HAVE_AVX2
     printf("path: AVX2 (the SSE2 kernel is not in this build; the dispatch is checked against the reference)\n");
 #elif defined(XF_HAVE_SSE2_INT16)
+#ifdef XF_HAVE_AVX_I8
+    printf("path: AVX i8 (PMADDUBSW, four lanes, two rows), exact fmaf emulation; build has SSE2"
+#else
     printf("path: SSE2 int16 (PMADDWD), exact fmaf emulation; build has SSE2"
+#endif
 #ifdef __SSSE3__
            " SSSE3"
 #endif

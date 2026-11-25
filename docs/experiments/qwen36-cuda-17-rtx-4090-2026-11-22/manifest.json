@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "hypothesis": "The selected full CUDA stack changes prompt throughput on NVIDIA GeForce RTX 4090 at 16,384 tokens while preserving dev logits.",
+  "commit": "05245ef45048b837fee5ed7b5b1ab2e59161fb80",
+  "commit_role": "Dev reference at the start of the measured campaign.",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64@c619aa594ad1e70af82168fb6b4878427896e21c",
+  "command": "COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=15 OMP_DISPLAY_AFFINITY=TRUE OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A /usr/bin/time -v ./qwen36-bench --model \"$MODEL_DIR\" --steps steps.tsv --text promessi_sposi.txt --lengths 2048,4096,8192,16384 --gen 128 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "vram_mib": 24564,
+    "cuda_arch": "sm_89",
+    "cpu": "AMD Ryzen Threadripper PRO 3955WX 16-Cores",
+    "threads": 15,
+    "ram": "85.3 GiB available to the workload",
+    "storage": "Model directory on overlay. Visible host disks: PCIe SSD nvme 1.8T",
+    "os": "Linux 5.15.0-198-generic x86_64, CUDA 12.4.131, NVIDIA driver 595.71.05"
+  },
+  "metric": "Prefill tok/s at 16,384 tokens, the fourth row of the 2,048 to 16,384 sequence.",
+  "warmup_runs": 1,
+  "warmup_policy": "One excluded warm-up per build and workload group.",
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "engine_build": "dev (source 05245ef45048b837fee5ed7b5b1ab2e59161fb80, compiled c/ tree 34355d8f798ffb5fdf6c1330d14f592cb5909205)"
+    },
+    "samples": {
+      "tok_s": [
+        6294.94,
+        6206.07,
+        6298.98
+      ],
+      "steady_decode_tok_s": [
+        162.399,
+        162.51,
+        162.619
+      ]
+    },
+    "median_tok_s": 6294.94,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-17-rtx-4090-2026-11-22/correctness.txt",
+      "sha256": "58cae7aaea520bf3b908f47924b6b297013d0ee3ee5a960d7e21075e47995504"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-17-rtx-4090-2026-11-22/base.md",
+      "sha256": "b819b56afaa997caf1c1e8dcdfec64cf7f92425d27b8d588a79f66032ae57d38"
+    }
+  },
+  "trial": {
+    "config": {
+      "engine_build": "full stack (source da49a1611a76bfdf840b07cd326c31c4733c0e18, compiled c/ tree e7cb67d79e678045d4f9aaeb9fa9f745e1d5443b)"
+    },
+    "samples": {
+      "tok_s": [
+        12310.86,
+        12299.14,
+        12311.63
+      ],
+      "steady_decode_tok_s": [
+        180.927,
+        180.892,
+        180.792
+      ]
+    },
+    "median_tok_s": 12310.86,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-17-rtx-4090-2026-11-22/correctness.txt",
+      "sha256": "58cae7aaea520bf3b908f47924b6b297013d0ee3ee5a960d7e21075e47995504"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-17-rtx-4090-2026-11-22/base.md",
+      "sha256": "b819b56afaa997caf1c1e8dcdfec64cf7f92425d27b8d588a79f66032ae57d38"
+    }
+  },
+  "outcome": "improvement",
+  "change_pct": 95.5675510807093,
+  "change_method": "Median of three paired percentage changes"
+}

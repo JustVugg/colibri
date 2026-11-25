@@ -137,7 +137,6 @@ static int g_inkc_ran;   /* the layers the last forward ran on the devices, from
 static int inkc_ran(void) { return g_inkc_ran; }
 static InkChain *inkc_of(Model *m, int d) { return (InkChain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *inkc_name(const InkChain *ch) { return ch && ch->d ? "inkling dev2" : "inkling"; }
-static int inkc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 /* The device copy of a resident matrix or of a view of one (wt_off_i: a shared expert
  * of the fused [ns][R][I] tensors): the per-matrix path's copy when it keeps a table
@@ -369,7 +368,7 @@ static void inkc_fit_start(Model *m) {
      * n0 with that device's free memory, its pipelines up now (inkc_place_init places its
      * layers; the head goes with the last one when there is room) */
     int n0 = g_inkc_fit.n;
-    if (vkc_fit_partial(&g_inkc_fit) && n0 > 0 && n0 < L && inkc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
+    if (vkc_fit_partial(&g_inkc_fit) && n0 > 0 && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
         coli_vk_dev2_open_env()) {
         vkc_device(1);
         int n2 = vkc_fit("inkling dev2", L - n0, per + n0, mat + n0, fixed, tail, &g_inkc_fit2);

@@ -249,11 +249,12 @@ static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logit
     Q36MtpCuda *g = &g_q36_mc; Q36Mtp *p = &g_q36_mtp; Cfg *c = &m->c;
     int D = c->hidden, H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim;
     int qo = H * qdim, half = c->rotary_dim / 2, gate_dim = qdim > hd ? qdim - hd : 0;
-    int E = p->E, K = p->K, I = p->I, Ish = p->ish, V = p->voc ? p->voc->list_n : p->nvoc ? p->nvoc : c->vocab;
+    int E = p->E, K = p->K, I = p->I, Ish = p->ish, use_voc = p->voc && p->voc->list_n > 0;
+    int V = use_voc ? p->voc->list_n : p->nvoc ? p->nvoc : c->vocab;
     double t0 = now_s();
     if (!q36_mc_bufs(m, 1) || !cc_begin()) return 0;
     int vok = 1;
-    if (p->voc) {   /* the device's copy of the list: all of it after a rebuild, else the ids appended since */
+    if (use_voc) {   /* the device's copy of the list: all of it after a rebuild, else the ids appended since */
         const int *l = p->voc->list;
         if (g->vids_gen != p->voc_gen) vok = cc_write(g->vids, 0, l, (size_t)V * sizeof(int));
         else if (V > g->vids_n)
@@ -286,13 +287,13 @@ static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logit
                   cc_ew(g->x, g->x, g->rt, g->sd, g->sg, &cb1)
                 : cc_ew(g->x, g->x, g->sd, NULL, NULL, &add)) &&
              q36_mc_norm(g->x, 0, D, g->o_head, g->fin, 0, D, 1, D, c->eps) && cc_copy(g->hid, 0, g->fin, 0, D) &&
-             (p->voc ? cc_matmul_rows(g->lm, g->vids, g->fin, g->outd, V) : cc_matmul(g->lm, g->fin, 0, g->outd, 0, 1)) &&
+             (use_voc ? cc_matmul_rows(g->lm, g->vids, g->fin, g->outd, V) : cc_matmul(g->lm, g->fin, 0, g->outd, 0, 1)) &&
              (!g->pick_dev || cc_pick(g->outd, g->pick, V)) && cc_submit(1);
     if (!ok) return 0;
     if (g->pick_dev) {   /* the vocabulary stays in VRAM; only the draft id and its probability cross */
         const void *pk = cc_ptr(g->pick);
         int b = ((const int *)pk)[0];
-        p->pick_id = p->voc ? p->voc->list[b] : b; p->last_p = ((const float *)pk)[1]; p->pick_ok = 1;
+        p->pick_id = use_voc ? p->voc->list[b] : b; p->last_p = ((const float *)pk)[1]; p->pick_ok = 1;
     } else if (p->vid) {   /* the listed ids' scores, every other id out (as the Vulkan head) */
         const float *o = cc_ptr(g->outd);
         if (getenv("Q36_MTP_DUMP")) {

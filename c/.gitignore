@@ -36,6 +36,8 @@ mxfp4_cuda_test
 mxfp4_expert_cuda_test
 absorb_determinism_test
 cuda_fmt_trap_test
+gemv_sk_part_test
+gemv_sk_part_o*.bin
 cuda_dsv4c_test
 cuda_dsv4c_test.exe
 cuda_glm53c_test

@@ -110,7 +110,6 @@ static int q38c_attn_at(const Cfg *c, int i) { return i >= c->layers || c->is_at
 /* the primary device's chain (d 0) or the second device's (d 1, after it) */
 static Q38Chain *q38c_of(Model *m, int d) { return (Q38Chain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *q38c_name(const Q38Chain *ch) { return ch && ch->d ? "qwen38 dev2" : "qwen38"; }
-static int q38c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 static int g_vk_chain = 0;
 static void q38c_fatal(const char *what) {
@@ -705,7 +704,7 @@ static void q38c_start(Model *m) {
     if (!vkc_init()) { g_vk_chain = 0; g_q38c_fitted = 0; free(lb); free(mb); return; }   /* the per-matrix path, as before */
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n0, with that device's free memory (the tier there sizes itself after the placement) */
-    if (partial && n0 < L && q38c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+    if (partial && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
         vkc_device(1);
         int n2 = vkc_fit("qwen38 dev2", L - n0, lb + n0, mb + n0, fixed, tail, &g_q38c_fit2);
         if (n2 > 0 && !vkc_init()) {

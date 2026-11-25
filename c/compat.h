@@ -537,7 +537,9 @@ static inline int coli_stdin_readable(void)
     DWORD avail = 0;
     if (ih == INVALID_HANDLE_VALUE) return 0;
     if (PeekNamedPipe(ih, NULL, 0, NULL, &avail, NULL)) return avail > 0;
-    return 0;   /* console/file: nessun poll non bloccante, meglio "niente" che bloccare */
+    /* A broken pipe (gateway closed stdin) fails PeekNamedPipe while POSIX select()
+     * reports readable so the caller observes EOF instead of stalling until end-of-turn. */
+    return GetLastError() == ERROR_BROKEN_PIPE ? 1 : 0;
 }
 #else
 static inline int coli_stdin_readable(void)
@@ -1041,6 +1043,63 @@ static inline double compat_mem_available_gb(void){
     double avail = 0;
     compat_meminfo_gb(NULL, &avail);
     return avail;
+}
+
+/* --- the monotonic clock and the peak resident set, one definition for the engines ---
+ * Each engine had its own copy, and the copies of rss_gb had come to disagree: GiB in most,
+ * GB in DeepSeek V4.1 and MiMo, and GLM-5.3 divided macOS's bytes as if they were KB (a
+ * resident set a thousand times too large). ru_maxrss is in bytes on macOS and in KB on
+ * Linux and in the Windows shim above; the answer is GiB, as `resident` is everywhere else. */
+#include <time.h>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+static inline double compat_now_s(void){
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+static inline double compat_rss_gb(void){
+    struct rusage r; getrusage(RUSAGE_SELF, &r);
+#ifdef __APPLE__
+    return r.ru_maxrss / (1024.0 * 1024.0 * 1024.0);
+#else
+    return r.ru_maxrss / (1024.0 * 1024.0);
+#endif
+}
+
+/* Overflow-checked float buffer allocator shared by the engines (PR #25):
+ * rejects negative counts and byte-count wrap on hostile model headers. */
+static inline float *coli_falloc(int64_t n){
+    if(n < 0 || (uint64_t)n > SIZE_MAX / sizeof(float)){
+        fprintf(stderr, "falloc: n=%lld is out of range\n", (long long)n);
+        exit(1);
+    }
+    float *p = (float *)malloc((size_t)n * sizeof(float));
+    if(!p && n){
+        fprintf(stderr, "OOM allocating %lld floats\n", (long long)n);
+        exit(1);
+    }
+    return p;
+}
+
+/* COLI_LOGIT_DUMP=1: print each step's top-5 id:logit to stderr for backend
+ * exactness and prefix-reuse triage. Shared across all engines. */
+static inline void coli_logit_dump(const float *lo, int V){
+    static int dump = -1;
+    if(dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
+    if(!dump) return;
+    int id[5] = {-1, -1, -1, -1, -1};
+    float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
+    for(int t = 0; t < V; t++){
+        const float x = lo[t];
+        for(int k = 0; k < 5; k++) if(x > v[k]){
+            for(int j = 4; j > k; j--){ v[j] = v[j - 1]; id[j] = id[j - 1]; }
+            v[k] = x; id[k] = t; break;
+        }
+    }
+    fprintf(stderr, "[LOGITS]");
+    for(int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
+    fprintf(stderr, "\n");
 }
 
 

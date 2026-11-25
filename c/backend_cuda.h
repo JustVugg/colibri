@@ -221,6 +221,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul_mxfp4(float *y, const float *x,
                                                const unsigned char *e8s,
                                                int S, int I, int O);
 
+/* coli_cuda_tensor_upload of a block-format matrix (fmt >= 100) a range of rows at a time, so
+ * the rows can pass through a bounded staging buffer: rows [row0, row0 + n) from n of the file's
+ * rows at weights. With *tensor NULL, row0 is 0 and the tensor's O rows are allocated first;
+ * later calls fill the tensor that call made. 0 on failure (the caller frees the tensor).
+ * tensor == NULL is the probe: 1 from a backend that has it. Optional in the DLL loader. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_rows(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O,
+                                                     int device, int row0, int n);
 /* Streaming Kimi expert: down(SiTU(gate(x), up(x))). Weights are MXFP4
  * host buffers; intermediate activations remain on device. No weight cache.
  * Returns 0 on failure; callers must accumulate y only after success. */
@@ -321,6 +328,12 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update(ColiCudaTensor *tensor,
 /* ---- resident-pipeline primitives (Inc.0): device-pointer entry points ---- */
 COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
 COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
+/* Ledger (ledger_map.h; no effect without LEDGER_OUT): what the engine calls its next
+ * allocations on this thread -- kind "weight", "cache" or "buffer", a NULL name for the
+ * backend's own -- and the end of a decode step (writes the map, opens and closes
+ * COLI_LEDGER_WINDOW=<skip>:<take>). */
+COLI_CUDA_DLLEXPORT void coli_cuda_ledger_label(const char *kind,const char *name);
+COLI_CUDA_DLLEXPORT void coli_cuda_ledger_step(void);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);

@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "hypothesis": "On x86 CPUs with AVX and SSSE3 but no AVX2 or FMA (Sandy Bridge, Ivy Bridge) the planar int4 expert dot runs the SSE2 int16 kernel; an AVX tier (PMADDUBSW + PMADDWD, the emulated fmaf in four double lanes with a short way where the double sum is not a float's midpoint, two weight rows interleaved) should cut the routed experts' time and raise decode speed with the same bits.",
+  "commit": "df45c4d429cfdfba4b37bff0d67be5b30d0bf3f1",
+  "model": "Qwen3.6-35B-A3B, Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (int4 gs=64 safetensors container from the one-step setup)",
+  "command": "make -C c qwen36 ARCH=native in a worktree of each commit; python3 docs/experiments/qwen36-avx-i8-2026-11-17/bench.py MODEL OUT dev:WT_DEV/c avx:WT_AVX/c, once per pair, three pairs (each run: coli serve --model MODEL --auto-tier --port 8011, one warm-up request, three timed requests, five others, the same three again; tok_s holds the second round)",
+  "prompt_hash": "sha256:a66be27c334df7f45cbfb7a831a8df906fb138200e3eeff1ced6d91a3ba85014",
+  "hardware": {
+    "cpu": "2x Intel Xeon E5-2670 (Sandy Bridge-EP: AVX, SSSE3, no AVX2, no FMA, no F16C), 16 cores / 32 threads, 2 NUMA nodes",
+    "ram": "94 GiB DDR3, 64 GB on node 0 and 32 GB on node 1",
+    "storage": "7200 rpm HDD, ext4 (rw,relatime); the model was in the page cache for every run",
+    "os": "Fedora 42, Linux 6.17.7, glibc 2.41, GCC 15.2.1"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "expert_ffn_x86_i8"
+  ],
+  "baseline": {
+    "config": {
+      "OMP_NUM_THREADS": "unset (16, the engine's choice)",
+      "COLI_TIMERS": "1",
+      "expert cache": "256 a layer (--auto-tier), page cache warm",
+      "BUILD": "make qwen36 ARCH=native, GCC 15.2.1",
+      "max_tokens": "96",
+      "temperature": "0",
+      "expert_ffn_x86_i8": "SSE2 int16 kernel (dev d7e4945e)"
+    },
+    "samples": {
+      "tok_s": [
+        10.0,
+        9.938,
+        10.004,
+        10.114,
+        9.994,
+        10.11,
+        9.943,
+        9.786,
+        10.251
+      ],
+      "fresh_tok_s": [
+        2.881,
+        4.976,
+        7.117,
+        2.842,
+        4.953,
+        7.112,
+        2.899,
+        4.985,
+        7.238
+      ],
+      "first_token_s_fresh": [
+        13.27,
+        5.78,
+        2.82,
+        13.63,
+        5.69,
+        2.87,
+        13.88,
+        5.73,
+        2.84
+      ],
+      "first_token_s_warm": [
+        1.93,
+        1.82,
+        1.67,
+        1.94,
+        1.84,
+        1.81,
+        1.94,
+        1.74,
+        1.68
+      ],
+      "moe_ms_per_token_by_run": [
+        52.1,
+        51.1,
+        51.7
+      ],
+      "binary_sha256": "5250299c729686cc50f43d7e4f0c51711387e43718a4ffb34eb58b1114c94936"
+    },
+    "median_tok_s": 10.0,
+    "quality": {
+      "method": "tests/test_xf_avx_i8 (the kernel through the dispatch against the reference loop, both fmaf forms against libm) and tests/test_expert_ffn pass on this CPU; the text of the six timed replies is byte-identical in all six runs (sha256 9ec0f3c7a6ffae4888f65424209f872fb43178efcb3d64132ef3cb1d007d58eb)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-avx-i8-2026-11-17/baseline.txt",
+      "sha256": "bb447700d08009d8fc78a99b44d6c21b6fdaf81120f28b31da54d57fc19b6ee0"
+    }
+  },
+  "trial": {
+    "config": {
+      "OMP_NUM_THREADS": "unset (16, the engine's choice)",
+      "COLI_TIMERS": "1",
+      "expert cache": "256 a layer (--auto-tier), page cache warm",
+      "BUILD": "make qwen36 ARCH=native, GCC 15.2.1",
+      "max_tokens": "96",
+      "temperature": "0",
+      "expert_ffn_x86_i8": "AVX kernel (df45c4d4)"
+    },
+    "samples": {
+      "tok_s": [
+        11.621,
+        11.581,
+        11.749,
+        11.584,
+        11.437,
+        11.606,
+        11.528,
+        11.706,
+        11.783
+      ],
+      "fresh_tok_s": [
+        2.962,
+        5.31,
+        7.964,
+        2.956,
+        5.284,
+        7.899,
+        2.973,
+        5.33,
+        8.004
+      ],
+      "first_token_s_fresh": [
+        13.02,
+        5.25,
+        2.45,
+        13.04,
+        5.27,
+        2.49,
+        13.0,
+        5.29,
+        2.48
+      ],
+      "first_token_s_warm": [
+        1.44,
+        1.36,
+        1.33,
+        1.47,
+        1.35,
+        1.28,
+        1.31,
+        1.32,
+        1.27
+      ],
+      "moe_ms_per_token_by_run": [
+        37.2,
+        37.4,
+        36.7
+      ],
+      "binary_sha256": "b08d297700c362aff2273f100c42164532d4ee882da6ffa8d20aa18cf784528f"
+    },
+    "median_tok_s": 11.606,
+    "quality": {
+      "method": "tests/test_xf_avx_i8 (the kernel through the dispatch against the reference loop, both fmaf forms against libm) and tests/test_expert_ffn pass on this CPU; the text of the six timed replies is byte-identical in all six runs (sha256 9ec0f3c7a6ffae4888f65424209f872fb43178efcb3d64132ef3cb1d007d58eb)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-avx-i8-2026-11-17/trial.txt",
+      "sha256": "a74cc989eeaece36d0dbcf34688015dd65f224d1756e0f85b8068bb357bacff8"
+    }
+  },
+  "outcome": "improvement"
+}

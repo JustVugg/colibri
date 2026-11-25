@@ -316,16 +316,20 @@ static void case_host_pool(void) {
         int kept, res, n = warm_pool(pairs, 2, 1, 0, &kept, &res);
         /* outcome: every_expert_pooled_when_the_card_holds_part */
         snprintf(w, sizeof w, "%s, the chain on, two of four on the card: every expert pooled, the residents too", kind);
+        ck(n == NE, "the chain on, two of four on the card: every expert pooled, the residents too");
         ck(n == NE && res == 2, w);
         snprintf(w, sizeof w, "%s: the follow keeps the residents in the pool", kind);
+        ck(kept, "the follow keeps the residents in the pool");
         ck(kept, w);
         n = warm_pool(pairs, 2, 0, 0, &kept, &res);
         /* outcome: only_the_experts_off_the_card_without_the_chain */
         snprintf(w, sizeof w, "%s, the chain off: only the two experts off the card pooled", kind);
+        ck(n == NE - 2, "the chain off: only the two experts off the card pooled");
         ck(n == NE - 2 && res == 0, w);
         n = warm_pool(pairs, NE, 1, 0, &kept, &res);
         /* outcome: no_pool_when_the_card_holds_every_expert */
         snprintf(w, sizeof w, "%s, every expert on the card: none pooled", kind);
+        ck(n == 0, "every expert on the card: none pooled");
         ck(n == 0, w);
         /* outcome: the_experts_off_the_card_first_when_the_page_locks_run_out */
         n = warm_pool(pairs, 2, 1, NE - 1, &kept, &res);

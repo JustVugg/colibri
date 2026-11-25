@@ -579,6 +579,77 @@ class MessagesHTTPTest(unittest.TestCase):
                 self.assertLess(thinking_stop, text_start)
                 self.assertNotIn(marker, raw)
 
+    # Flint, Muse Spark and Mistral-Large-4 open their reasoning themselves
+    SELF_OPENED = (("qwen36", "flint", ("<think>plan", " it</th", "ink>The answer.")),
+                   ("glm", "mistral_large4", ("<thi", "nk>plan it</think>", "The answer.")),
+                   ("qwen36", "muse", (" to=self<|message|>plan it<|eom|>",
+                                       "<|start|>assistant to=user<|message|>The answer.<|eot|>")))
+
+    def test_reasoning_a_model_opens_itself_is_split_off(self):
+        for arch, flavor, script in self.SELF_OPENED:
+            for thinking in ({"type": "enabled"}, None):
+                with self.subTest(flavor=flavor, thinking=bool(thinking)), \
+                        patch("openai_server.ARCH", arch), patch("openai_server.CHAT_FLAVOR", flavor):
+                    self.engine.script = script
+                    extra = {"thinking": thinking} if thinking else {}
+                    with self.post(self.base_body(**extra)) as response:
+                        content = json.load(response)["content"]
+                    self.assertEqual(content, ([{"type": "thinking", "thinking": "plan it",
+                                                 "signature": "colibri-local"}] if thinking else [])
+                                     + [{"type": "text", "text": "The answer."}])
+
+    def test_streamed_reasoning_a_model_opens_itself_is_split_off(self):
+        for arch, flavor, script in self.SELF_OPENED:
+            for thinking in ({"type": "enabled"}, None):
+                with self.subTest(flavor=flavor, thinking=bool(thinking)), \
+                        patch("openai_server.ARCH", arch), patch("openai_server.CHAT_FLAVOR", flavor):
+                    self.engine.script = script
+                    extra = {"thinking": thinking} if thinking else {}
+                    with self.post(self.base_body(stream=True, **extra)) as response:
+                        payloads = [payload for _name, payload in self.events(response.read().decode())]
+                    deltas = [p["delta"] for p in payloads if p["type"] == "content_block_delta"]
+                    self.assertEqual("".join(d.get("thinking", "") for d in deltas),
+                                     "plan it" if thinking else "")
+                    self.assertEqual("".join(d.get("text", "") for d in deltas), "The answer.")
+                    self.assert_blocks_in_order(payloads, ["thinking", "text"] if thinking else ["text"])
+
+    def test_streamed_thinking_block_closes_when_there_is_no_reasoning(self):
+        # an answer with no reasoning, and one that continues an assistant turn
+        prefill = [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "The answer is"}]
+        for arch, flavor, script, messages in (
+                ("qwen36", "flint", ("\n", "The answer."), None),
+                ("glm", "mistral_large4", ("The answer.",), None),
+                ("qwen36", "qwen38", (" 42.",), prefill)):
+            with self.subTest(flavor=flavor, prefill=bool(messages)), \
+                    patch("openai_server.ARCH", arch), patch("openai_server.CHAT_FLAVOR", flavor):
+                self.engine.script = script
+                body = self.base_body(stream=True, thinking={"type": "enabled"})
+                if messages:
+                    body["messages"] = messages
+                with self.post(body) as response:
+                    payloads = [payload for _name, payload in self.events(response.read().decode())]
+                deltas = [p["delta"] for p in payloads if p["type"] == "content_block_delta"]
+                self.assertEqual("".join(d.get("text", "") for d in deltas), "".join(script))
+                self.assert_blocks_in_order(payloads, ["thinking", "text"])
+
+    def assert_blocks_in_order(self, payloads, kinds):
+        """Every block starts, gets its deltas and stops before the next one starts."""
+        trace = [(p["type"], p["index"]) for p in payloads if p["type"].startswith("content_block_")]
+        expected = []
+        for index, _kind in enumerate(kinds):
+            expected += [("content_block_start", index), ("content_block_stop", index)]
+        self.assertEqual([step for step in trace if step[0] != "content_block_delta"], expected)
+        open_block = None
+        for kind, index in trace:
+            if kind == "content_block_start":
+                open_block = index
+            elif kind == "content_block_delta":
+                self.assertEqual(index, open_block)
+            else:
+                open_block = None
+        self.assertEqual([p["content_block"]["type"] for p in payloads
+                          if p["type"] == "content_block_start"], kinds)
+
     def test_thinking_budget_exhaustion_returns_thinking_only(self):
         self.engine.script = ("unfinished reasoning",)
         self.engine.length_limited = True

@@ -25,6 +25,13 @@
  * routed experts the CPU computed instead. A request's share is the difference of two reads. */
 typedef struct { uint64_t hits, miss, uploads, swaps, q_full_skips; } QtCounters;
 
+/* A block-format matrix's rows read as they upload, a range at a time through one bounded
+ * buffer (qwen36 reads a GGUF's straight from the file): read(ctx, row0, n, buf) puts rows
+ * [row0, row0 + n) in buf, n a multiple of align but for the last range, n * row_bytes <= cap.
+ * Handed to the qt_*_init_fmt calls instead of their w (NULL); the backend must take a range
+ * (coli_cuda_tensor_upload_rows). */
+typedef struct { int (*read)(void *ctx, int row0, int n, void *buf); void *ctx, *buf; size_t cap, row_bytes; int align; } QtRows;
+
 #ifdef COLI_CUDA
 
 /* Init after model load. Returns 1 when the tier is active.
@@ -136,15 +143,16 @@ int  qt_dn_gpu_step(int layer, const float *x, float *out, const float *egh, con
  * Returns the handle (>= 0) or -1 (stays on the CPU). */
 int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
 /* The same three with the tensor's format: 1 int8 rows (scales sc), 100 + ggml type a GGUF's
- * blocks as the file has them (sc NULL: the backend's block formats, coli_cuda_block_elems). */
-int  qt_dense_init_fmt(const void *w, const float *sc, int fmt, int I, int O, int device);
-int  qt_lmhead_init_fmt(const void *w, const float *sc, int fmt, int I, int O);
-int  qt_dnproj_init_fmt(int layer, const void *w, const float *sc, int fmt, int I, int O, int device);
+ * blocks as the file has them (sc NULL: the backend's block formats, coli_cuda_block_elems);
+ * a block format's rows from rows instead of w where rows is not NULL. */
+int  qt_dense_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int device);
+int  qt_lmhead_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O);
+int  qt_dnproj_init_fmt(int layer, const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int device);
 /* A GGUF whose qkv and z rows have different ggml types (unsloth's dynamic mixes, in about
  * half of a Qwen3.8-27B's DeltaNet layers): qt_dnproj_init_fmt takes qkv's rows alone and this
  * z's, each in its own type, on the same device; qt_dnproj_matmul_batch still answers qkv ++ z.
  * A failure takes the layer's qkv off the device too: one without the other is no projection. */
-int  qt_dnproj_z_init_fmt(int layer, const void *w, int fmt, int I, int O, int device);
+int  qt_dnproj_z_init_fmt(int layer, const void *w, const QtRows *rows, int fmt, int I, int O, int device);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
@@ -203,6 +211,7 @@ void qt_note(int layer, int eid,
  * (async, all devices in parallel). Returns a bitmask of the k handled by
  * the GPU. Compute the misses on the CPU, then call qt_take(). */
 uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
+uint32_t qt_issue_mode(int layer, const int *eids, int K, const float *x, int skip_full_scan);
 
 /* Collect all GPU results and accumulate val[k]*y_k into out[hidden].
  * Returns 0 on collection failure, leaving out unchanged. The caller must
@@ -271,6 +280,8 @@ unsigned qt_chain_epoch(void);
 int  qt_chain_resident(int layer, int eid, int device, struct ColiCudaTensor **g, struct ColiCudaTensor **u, struct ColiCudaTensor **d);
 void qt_chain_hold(int on);
 void qt_chain_count(int layer, const int *eids, int K);
+/* One lock for consecutive rows of the same layer, with the same per-row accounting. */
+void qt_chain_count_rows(int layer, const int *eids, int rows, int K);
 int  qt_chain_format(int *fmt, int *gs);
 int  qt_chain_layer_format(int layer, int *fmt, int *fmt_d);
 /* a GGUF's arena for a chain that moves the experts itself (qwen36_tier.c's comment) */
@@ -360,10 +371,10 @@ static inline int  qt_dn_gpu_set_state(int a,const float*b,const float*c){(void)
 static inline int  qt_dn_gpu_get_state(int a,float*b,float*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_dn_gpu_step(int a,const float*b,float*c,const float*d,const float*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
-static inline int  qt_dense_init_fmt(const void*a,const float*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return -1;}
-static inline int  qt_lmhead_init_fmt(const void*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
-static inline int  qt_dnproj_init_fmt(int a,const void*b,const float*c,int d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
-static inline int  qt_dnproj_z_init_fmt(int a,const void*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
+static inline int  qt_dense_init_fmt(const void*a,const QtRows*r,const float*b,int c,int d,int e,int f){(void)a;(void)r;(void)b;(void)c;(void)d;(void)e;(void)f;return -1;}
+static inline int  qt_lmhead_init_fmt(const void*a,const QtRows*r,const float*b,int c,int d,int e){(void)a;(void)r;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_dnproj_init_fmt(int a,const void*b,const QtRows*r,const float*c,int d,int e,int f,int g){(void)a;(void)b;(void)r;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_dnproj_z_init_fmt(int a,const void*b,const QtRows*r,int c,int d,int e,int f){(void)a;(void)b;(void)r;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_count(void){return 0;}
@@ -379,6 +390,7 @@ struct ColiCudaTensor;
 static inline int  qt_chain_resident(int a,int b,int c,struct ColiCudaTensor**g,struct ColiCudaTensor**u,struct ColiCudaTensor**d){(void)a;(void)b;(void)c;(void)g;(void)u;(void)d;return 0;}
 static inline void qt_chain_hold(int a){(void)a;}
 static inline void qt_chain_count(int a,const int*b,int c){(void)a;(void)b;(void)c;}
+static inline void qt_chain_count_rows(int a,const int*b,int r,int k){(void)a;(void)b;(void)r;(void)k;}
 static inline int  qt_chain_format(int*a,int*b){(void)a;(void)b;return 0;}
 static inline int  qt_chain_layer_format(int a,int*b,int*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_chain_arena(void**a,size_t*b,size_t*c,size_t*d,int*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
@@ -413,6 +425,7 @@ static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline uint32_t qt_issue_mode(int a,const int*b,int c,const float*d,int e){(void)e;return qt_issue(a,b,c,d);}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
 static inline int qt_take_scaled(uint32_t a,const float*b,int c,float*d,const float*s,float e){(void)b;(void)c;(void)d;(void)s;(void)e;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}

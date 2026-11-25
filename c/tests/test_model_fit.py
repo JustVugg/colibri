@@ -3,9 +3,10 @@
 setup` offers first on the machines people have.
 
 CALIBRATION are runs of `coli serve` (100 tokens of decode after a prompt of about 550): machine
-D is an i5-13500 with 62 GB (its RAM read at 33-44 GB/s, model_fit's probe) and an RTX PRO 4000
-Blackwell SFF (24 GB, 432 GB/s from the CUDA driver); ds a Ryzen 7 PRO 8700GE with 62 GB at
-61.9 GB/s. The geometry is the files' (ui/models.py's header reads). An estimate is held to the
+D is an i5-13500 with 62 GB (its RAM read at 33-44 GB/s, model_fit's probe; its cores' vector work
+at 977-1024 GB/s, measure_cpu_gbs) and an RTX PRO 4000 Blackwell SFF (24 GB, 432 GB/s from the
+CUDA driver); ds a Ryzen 7 PRO 8700GE with 62 GB at 61.9 GB/s (912 GB/s of vector work); L an
+i7-1355U laptop under WSL with 27 GB at 35 GB/s and 288-304 GB/s of vector work. The geometry is the files' (ui/models.py's header reads). An estimate is held to the
 measurement within its tier's error: a fifth on the card and in RAM, a quarter half on the card
 half in RAM, and a factor for the models that stream from the disk, whose misses depend on the
 engine's cache (the pick counts those at half, model_fit.sure_speed)."""
@@ -30,14 +31,15 @@ def entry(family, resident, experts, dense, expert_read, layers, cost=""):
                                  modality="text", rank=1, disk_gb=resident + experts)
 
 
-def machine(ram, gbs, cards=(), integrated=None, disk="nvme"):
-    return {"ram": ram * GB, "ram_avail": ram * GB * 0.8, "ram_gbs": gbs, "integrated": integrated,
+def machine(ram, gbs, cards=(), integrated=None, disk="nvme", cpu_gbs=None):
+    return {"ram": ram * GB, "ram_avail": ram * GB * 0.8, "ram_gbs": gbs, "cpu_gbs": cpu_gbs, "integrated": integrated,
             "disk": disk, "disk_gbs": model_fit.DISK_GBS[disk],
             "cards": [{"name": n, "vram": v * GB, "gbs": model_fit.card_gbs(n, v * GB)} for n, v in cards]}
 
 
-D = machine(67.19, 40.0, [("NVIDIA RTX PRO 4000 Blackwell SFF Edition", 25.66)])
-DS = machine(66.45, 61.9, integrated="AMD Radeon 780M Graphics")
+D = machine(67.19, 40.0, [("NVIDIA RTX PRO 4000 Blackwell SFF Edition", 25.66)], cpu_gbs=1000.0)
+DS = machine(66.45, 61.9, integrated="AMD Radeon 780M Graphics", cpu_gbs=912.0)
+L = machine(27.31, 35.2, integrated="Intel(R) Iris(R) Xe Graphics", cpu_gbs=296.0)
 Q36 = entry("qwen36", 2.96, 18.12, 1.94, 0.566, 40)
 INK_Q4 = entry("inkling", 1.82, 15.8, 1.328, 0.9875, 48, "inkling2")
 INK_IQ2 = entry("inkling", 1.22, 7.25, 0.977, 0.453, 48, "inkling2")
@@ -60,6 +62,8 @@ CALIBRATION = (
     ("Inkling-2-Mini UD-IQ2_XXS", INK_IQ2, D, "vulkan", "gpu", 46.1, 0.2),
     # IQ2_XXS's codebooks cost the CPU more than its bytes say: the one estimate past a fifth
     ("Inkling-2-Mini UD-IQ2_XXS", INK_IQ2, D, "cpu", "ram", 8.4, 0.35),
+    # a CPU short of vector work: paced by its cores, not by its RAM (11.1 tok/s from the RAM alone)
+    ("Inkling-2-Mini UD-IQ2_XXS on L", INK_IQ2, L, "cpu", "ram", 3.0, 0.2),
     ("Qwen3.8-Flash-Next UD-IQ2_XS", Q38_IQ2, D, "cuda", "hybrid", 56.2, 0.25),
     ("Qwen3.8-Flash-Next UD-IQ2_XS", Q38_IQ2, D, "vulkan", "hybrid", 36.5, 0.25),
     ("Qwen3.8-Flash-Next UD-IQ3_XXS", Q38_IQ3, D, "cuda", "hybrid", 41.55, 0.25),
@@ -78,6 +82,19 @@ class Calibration(unittest.TestCase):
                 est = model_fit.estimate(model, where, backend)
                 self.assertEqual(est["tier"], tier)
                 self.assertLess(abs(est["tok_s"] / measured - 1), error, est)
+
+    def test_a_cpu_short_of_vector_work_slows_the_cpu_share_only(self):
+        self.assertEqual(model_fit.cpu_slowdown(D), 1.0)
+        self.assertEqual(model_fit.cpu_slowdown(DS), 1.0)
+        self.assertEqual(model_fit.cpu_slowdown(machine(32, 40)), 1.0)   # not measured: as before
+        self.assertAlmostEqual(model_fit.cpu_slowdown(L), model_fit.CPU_PACE_GBS / 296.0)
+        # the card's share does not move: every weight on the card, the same estimate either way
+        slow_d = dict(D, cpu_gbs=100.0)
+        self.assertEqual(model_fit.estimate(INK_IQ2, slow_d, "cuda"), model_fit.estimate(INK_IQ2, D, "cuda"))
+        self.assertLess(model_fit.estimate(INK_IQ2, slow_d, "cpu")["tok_s"],
+                        model_fit.estimate(INK_IQ2, D, "cpu")["tok_s"] / 5)
+        self.assertIn("computes 3.0x slower", model_fit.describe(L))
+        self.assertNotIn("computes", model_fit.describe(D))
 
     def test_the_card_bandwidth_from_the_driver_and_from_the_name(self):
         # the RTX PRO 4000 SFF: 9001 MHz on a 192-bit bus, as cuDeviceGetAttribute 36 and 37 say
@@ -102,6 +119,25 @@ class Calibration(unittest.TestCase):
         m = model_fit.machine_from_hw(hw, 43.3, "nvme", None)
         self.assertEqual((m["cards"][0]["gbs"], m["cards"][0]["source"]), (432.0, "name"))
         self.assertEqual(m["disk_gbs"], model_fit.DISK_GBS["nvme"])
+
+    def test_a_block_devices_kind(self):
+        def device(root, name, rotational=None, model=None):
+            d = os.path.join(root, name)
+            os.makedirs(os.path.join(d, "queue")); os.makedirs(os.path.join(d, "device"))
+            for rel, text in (("queue/rotational", rotational), ("device/model", model)):
+                if text is not None:
+                    with open(os.path.join(d, rel), "w") as f:
+                        f.write(text + "\n")
+            return d
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(model_fit._block_kind(device(root, "nvme0n1", "0")), "nvme")
+            self.assertEqual(model_fit._block_kind(device(root, "sda", "0", "Samsung SSD 870")), "ssd")
+            self.assertEqual(model_fit._block_kind(device(root, "sdb", "1", "ST8000DM004-2CX1")), "hdd")
+            self.assertEqual(model_fit._block_kind(device(root, "sdc", "1")), "hdd")
+            self.assertIsNone(model_fit._block_kind(device(root, "sdd")))
+            # WSL2's disk: Hyper-V says rotational for a file on any drive
+            self.assertIsNone(model_fit._block_kind(device(root, "sde", "1", "Virtual Disk    ")))
+            self.assertEqual(model_fit._block_kind(device(root, "sdf", "0", "Virtual Disk")), "ssd")
 
 
 class TheMeasurements(unittest.TestCase):

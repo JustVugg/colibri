@@ -682,7 +682,7 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
             for (int i = 0; i < c->vocab; i++) logits[i] = -INFINITY;
             for (int j = 0; j < p->nvoc; j++) logits[p->vid[j]] = scores[j];
             free(scores);
-        } else if (p->voc) {
+        } else if (p->voc && p->voc->list_n > 0) {
             const int *ids = p->voc->list; int n = p->voc->list_n;
             float *scores = falloc(n);
             q36_mtp_lm_rows(m, last, ids, n, scores);
@@ -778,9 +778,18 @@ static void q36_mtp_pend_at(Model *m, int pos) {
 }
 /* The head's draft for the token after `tok` (about to be fed at pos): its row at pos;
  * `hidden` (D floats, may be NULL) gets the row's state for a deeper draft */
+static float *q36_mtp_scratch(float **buf, int *cap, int need) {
+    if (need > *cap) {
+        float *nb = (float *)realloc(*buf, (size_t)need * sizeof(float));
+        if (!nb) { fprintf(stderr, "[mtp] scratch OOM (%d floats)\n", need); exit(1); }
+        *buf = nb; *cap = need;
+    }
+    return *buf;
+}
 static int q36_mtp_draft(Model *m, int tok, int pos, float *hidden) {
     Q36Mtp *p = &g_q36_mtp; int V = m->c.vocab;
-    float *lg = falloc(V);
+    static float *lg_buf; static int lg_cap;
+    float *lg = q36_mtp_scratch(&lg_buf, &lg_cap, V);
     q36_mtp_pend_at(m, pos);
     q36_mtp_rows(m, &tok, p->pend, 1, pos, lg, hidden);
     const char *dump = getenv("Q36_MTP_DUMP");
@@ -800,7 +809,6 @@ static int q36_mtp_draft(Model *m, int tok, int pos, float *hidden) {
         for (int i = 0; i < V; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
         p->last_p = z > 0 ? (float)(1.0 / z) : 0.f;
     }
-    free(lg);
     return best;
 }
 
@@ -809,7 +817,9 @@ static int q36_mtp_draft(Model *m, int tok, int pos, float *hidden) {
  * fed row the verify's standing rows bring overwrites it. */
 static int q36_mtp_draft_more(Model *m, float *hidden, int tok, int pos) {
     Q36Mtp *p = &g_q36_mtp; int V = m->c.vocab;
-    float *lg = falloc(V), *h = falloc(m->c.hidden);
+    static float *lg_buf, *h_buf; static int lg_cap, h_cap;
+    float *lg = q36_mtp_scratch(&lg_buf, &lg_cap, V);
+    float *h = q36_mtp_scratch(&h_buf, &h_cap, m->c.hidden);
     memcpy(h, hidden, sizeof(float) * (size_t)m->c.hidden);
 #ifdef COLI_VULKAN
     if (g_q36_mg.on) q36_mtp_rows(m, &tok, NULL, 1, pos, lg, NULL);   /* the state before stays on the device */
@@ -830,7 +840,6 @@ static int q36_mtp_draft_more(Model *m, float *hidden, int tok, int pos) {
         for (int i = 0; i < V; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
         p->last_p = z > 0 ? (float)(1.0 / z) : 0.f;
     }
-    free(lg); free(h);
     return best;
 }
 

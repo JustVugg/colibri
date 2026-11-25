@@ -159,6 +159,102 @@ class DoctorTest(unittest.TestCase):
         report = self.report(gpu_indices=None, linkage={"linked": False, "missing": True, "vulkan": True})
         self.assertEqual(self.checks_by_id(report)["accelerator.gpu"]["status"], "fail")
 
+    def test_metal_engine_is_a_gpu_engine(self):
+        """#2921: a METAL=1 engine links Metal.framework and macOS has no ldd, so doctor
+        found no GPU runtime and called a working Metal build "GPU detected but the
+        engine is CPU-only". backend_metal.o's messages in the binary say what it is;
+        the plan shows the Apple GPU as unified memory, not CUDA's VRAM."""
+        self.engine.chmod(0o755)
+        qwen36 = {"linked": True, "missing": False, "metal": True, "metal_engine": "qwen36",
+                  "metal_default": True, "metal_switch": "COLI_METAL"}
+        glm = dict(qwen36, metal_engine="other", metal_default=False)
+        kimi = dict(glm, metal_engine="kimi_k3", metal_switch="K3_METAL")
+        inkling = dict(glm, metal_engine="inkling", inkling2_cpu_build=True)
+        with mock.patch("doctor._runtime_linkage", return_value={"linked": False, "missing": False}):
+            for image, want in (
+                    (b"\xcf\xfa\xed\xfe ... [metal] pipeline failed\n ... [qwen36-metal] kernel", qwen36),
+                    # coli_env.h's table puts the name K3_METAL in every engine
+                    (b"\xcf\xfa\xed\xfe ... [metal] shader compile failed: %s\n COLI_METAL K3_METAL", glm),
+                    (b"\xcf\xfa\xed\xfe ... [metal] pipeline failed\n ... [K3-METAL] init OK", kimi),
+                    (b"\xcf\xfa\xed\xfe ... [metal] pipeline failed\n ... [inkling2] Inkling-2 runs on "
+                     b"the CPU in this build\n", inkling),
+                    (b"\xcf\xfa\xed\xfe ... [metal] pipeline failed\n ... [inkling2] INK2_MTP\n",
+                     dict(inkling, inkling2_cpu_build=False)),
+                    # neither marker nor a Vulkan loader: a CPU build, as before
+                    (b"\xcf\xfa\xed\xfe ... [OMP] ...", {"linked": False, "missing": False})):
+                self.engine.write_bytes(image)
+                self.assertEqual(cuda_linkage(self.engine), want, image)
+        apple = {"index": 0, "name": "Apple M5", "total_bytes": 0, "free_bytes": None,
+                 "unified_memory": True, "backend": "metal"}
+        from resource_plan import format_plan
+
+        def gpu_check(linkage, env, **kw):
+            with mock.patch.dict(os.environ, env):
+                for name in ("COLI_METAL", "K3_METAL", "KV_SLOTS", "NOGPU", "INK2_METAL"):
+                    if name not in env:
+                        os.environ.pop(name, None)
+                report = self.report(**dict(dict(gpu_indices=None, gpus=[apple], linkage=linkage), **kw))
+            return self.checks_by_id(report)["accelerator.gpu"], report
+
+        # qwen36's Metal graph is on unless COLI_METAL=0
+        check, report = gpu_check(qwen36, {})
+        self.assertEqual(check["status"], "pass")
+        self.assertEqual(check["summary"], "Metal engine on the Apple GPU (unified memory)")
+        self.assertEqual(check["details"], {"devices": [0], "unified": True, "switch": "COLI_METAL"})
+        self.assertIn("Metal  0:Apple M5 · unified memory", format_plan(report["plan"]))
+        self.assertEqual(report["plan"]["tiers"]["vram"]["budget_bytes"], 0)
+        check, report = gpu_check(qwen36, {"COLI_METAL": "0"})
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("COLI_METAL=0 keeps it on the CPU", check["summary"])
+        self.assertEqual(report["plan"]["tiers"]["vram"]["devices"], [])
+        # the other engines run Metal only when asked: as the engines read it, atoi()
+        for env, on in (({}, False), ({"COLI_METAL": "0"}, False), ({"COLI_METAL": "1"}, True),
+                        ({"COLI_METAL": " 2"}, True), ({"COLI_METAL": "yes"}, False)):
+            check, report = gpu_check(glm, env)
+            self.assertEqual(check["status"], "pass" if on else "warn", env)
+            self.assertEqual(bool(report["plan"]["tiers"]["vram"]["devices"]), on, env)
+            if not on:
+                self.assertIn("COLI_METAL=1 runs it on the Apple GPU", check["summary"])
+        check, _ = gpu_check(kimi, {"COLI_METAL": "1"})
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("K3_METAL=1", check["summary"])
+        self.assertEqual(gpu_check(kimi, {"K3_METAL": "1"})[0]["status"], "pass")
+        # qwen36's graph and Kimi K3 keep one conversation's state on the GPU: KV_SLOTS > 1 is the CPU
+        for linkage, env, kw in ((qwen36, {"KV_SLOTS": "2"}, {}), (qwen36, {}, {"kv_slots": 3}),
+                                 (kimi, {"K3_METAL": "1", "KV_SLOTS": "2"}, {})):
+            check, report = gpu_check(linkage, env, **kw)
+            self.assertEqual(check["status"], "warn", (linkage["metal_engine"], env, kw))
+            self.assertIn("KV_SLOTS=", check["summary"])
+            self.assertEqual(report["plan"]["tiers"]["vram"]["devices"], [])
+        self.assertEqual(gpu_check(glm, {"COLI_METAL": "1", "KV_SLOTS": "2"})[0]["status"], "pass")
+        # Inkling reads COLI_METAL's first character, and NOGPU keeps it on the CPU
+        for env, on in (({"COLI_METAL": "1"}, True), ({"COLI_METAL": "2"}, False),
+                        ({"COLI_METAL": " 1"}, False), ({"COLI_METAL": "1", "NOGPU": "1"}, False)):
+            self.assertEqual(gpu_check(inkling, env)[0]["status"], "pass" if on else "warn", env)
+        # an Inkling-2 model: never Metal in a build without CUDA or Vulkan, else INK2_METAL=1 too
+        config = json.loads((self.model / "config.json").read_text())
+        (self.model / "config.json").write_text(json.dumps(dict(config, text_config={"model_type": "inkling2_loop"})))
+        check, _ = gpu_check(inkling, {"COLI_METAL": "1", "INK2_METAL": "1"})
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("Inkling-2 runs on the CPU", check["summary"])
+        gpu_build = dict(inkling, inkling2_cpu_build=False)
+        check, _ = gpu_check(gpu_build, {"COLI_METAL": "1"})
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("INK2_METAL=1", check["summary"])
+        self.assertEqual(gpu_check(gpu_build, {"COLI_METAL": "1", "INK2_METAL": "1"})[0]["status"], "pass")
+        (self.model / "config.json").write_text(json.dumps(config))
+        # --gpu none on a Metal build: no GPU, and a CPU plan
+        check, report = gpu_check(qwen36, {}, gpu_indices=[])
+        self.assertEqual(check["status"], "skip")
+        self.assertEqual(report["plan"]["tiers"]["vram"]["devices"], [])
+        # a Metal build where no Metal GPU was found says so rather than passing
+        check, _ = gpu_check(qwen36, {}, gpus=[])
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("no Metal GPU", check["summary"])
+        # a CPU build on the same Mac keeps its warning
+        check, _ = gpu_check({"linked": False, "missing": False}, {})
+        self.assertIn("CPU-only", check["summary"])
+
     def test_vulkan_engine_gpu_index_is_the_vulkan_device(self):
         """#2127: on a Vulkan build --gpu 1 is Vulkan device 1, the one COLI_VK_DEV=1
         opens. doctor checked it against the CUDA inventory and sized the plan from the

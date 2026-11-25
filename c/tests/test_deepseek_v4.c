@@ -2236,6 +2236,82 @@ static int test_expert_store_union_recency(void) {
          "reads, base store no-op)");
     return 0;
 }
+/* V4_RAM_PROMPT_COLD: while a prompt is read (prompt_sweep on), an uncounted
+ * miss goes to the oldest end of the LRU, so the next one reuses its slot and
+ * the rest of the cache stays; a counted miss, and every miss once the sweep is
+ * off, is inserted as the most recent as before. Another backend and NULL are
+ * no-ops. */
+static int test_expert_store_prompt_cold(void) {
+    char directory[] = "colibri-v4-cold-XXXXXX";
+    char path[256], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    setenv("V4_RAM_PROMPT_COLD", "1", 1);
+    if (!mkdtemp(directory)) { perror("mkdtemp cold"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    if (write_fixture_experts(path, RECENCY_EXPERTS)) {
+        perror("write cold fixture");
+        rmdir(directory);
+        return 1;
+    }
+    int failed = 0;
+    /* Six slots holding 0..5, 0 the oldest; no pins at this size. */
+    ColiExpertStore *store = recency_store(directory, 6);
+    if (!store) {
+        failed = 1;
+    } else {
+        coli_v4_expert_store_prompt_sweep(store, 1);
+        /* 6 evicts 0 and goes cold; 7 then evicts 6, not 1 */
+        int missed = recency_miss(store, 6) | recency_miss(store, 7);
+        int swept = !recency_resident(store, 0) && !recency_resident(store, 6) &&
+                    recency_resident(store, 1) && recency_resident(store, 5) &&
+                    recency_resident(store, 7);
+        /* a counted miss during the sweep is the most recent: 8 evicts the
+         * cold 7 and stays over 1 */
+        ColiExpertView view;
+        int counted = coli_expert_lookup(store, (ColiExpertKey){0, 8}, &view);
+        if (!counted) coli_expert_release(store, &view);
+        /* sweep off: plain LRU again, 9 evicts 1, 10 evicts 2 */
+        coli_v4_expert_store_prompt_sweep(store, 0);
+        missed |= recency_miss(store, 9) | recency_miss(store, 10);
+        int after = !recency_resident(store, 7) && !recency_resident(store, 1) &&
+                    !recency_resident(store, 2) && recency_resident(store, 3) &&
+                    recency_resident(store, 8) && recency_resident(store, 9) &&
+                    recency_resident(store, 10);
+        if (missed || counted || !swept || !after) {
+            fprintf(stderr, "prompt cold: missed=%d counted=%d swept=%d after=%d "
+                            "resident 0:%d 1:%d 2:%d 3:%d 6:%d 7:%d 8:%d 9:%d 10:%d\n",
+                    missed, counted, swept, after, recency_resident(store, 0),
+                    recency_resident(store, 1), recency_resident(store, 2),
+                    recency_resident(store, 3), recency_resident(store, 6),
+                    recency_resident(store, 7), recency_resident(store, 8),
+                    recency_resident(store, 9), recency_resident(store, 10));
+            failed = 1;
+        }
+        store->ops->destroy(store);
+    }
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, 1, RECENCY_EXPERTS, 6 * 51, -1, 0, 0, 0
+    };
+    ColiExpertStore *base = NULL;
+    if (coli_deepseek_v4_expert_store_open_base(&options, &base,
+                                                error, sizeof(error))) {
+        fprintf(stderr, "cold base store open failed: %s\n", error);
+        failed = 1;
+    } else {
+        coli_v4_expert_store_prompt_sweep(base, 1);
+        coli_v4_expert_store_prompt_sweep(NULL, 1);
+        base->ops->destroy(base);
+    }
+    unsetenv("V4_RAM_PROMPT_COLD");
+    failed |= scratch_remove(directory, path);
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore prompt cold: ok (a swept miss reuses the "
+         "cold slot, counted misses and misses after the sweep are recent, "
+         "base store no-op)");
+    return 0;
+}
 /* ==== end test_deepseek_v4_expert_store.c ==== */
 
 /* ==== begin test_deepseek_v4_kv_cache.c ==== */
@@ -2722,6 +2798,50 @@ static int test_route_bf16_parallel_order(void) {
     return 0;
 }
 
+/* V4_ROUTE_FORCED_ONLY: a hash layer's router computes only the forced
+ * experts' gate logits; the weights and ids are the same bits as the full
+ * computation, a bad forced id still fails, and unforced routing is untouched. */
+static int test_route_bf16_forced_only(void) {
+    enum { EXPERTS = 64, DIM = 256, TOPK = 6 };
+    static uint16_t packed[EXPERTS * DIM];
+    float hidden[DIM], bias[EXPERTS];
+    float full[2][TOPK], only[2][TOPK];
+    int full_ids[2][TOPK], only_ids[2][TOPK];
+    int forced[TOPK] = {41, 3, 17, 63, 0, 29};
+    int bad[TOPK] = {41, 3, 17, 64, 0, 29};
+    for (int i = 0; i < EXPERTS * DIM; i++) {
+        float value = (i * 37 % 53 - 26) * 0.0117f;
+        uint32_t bits; memcpy(&bits, &value, sizeof(bits));
+        packed[i] = (uint16_t)(bits >> 16);
+    }
+    for (int i = 0; i < DIM; i++) hidden[i] = (i % 19 - 9) * 0.0213f;
+    for (int i = 0; i < EXPERTS; i++) bias[i] = (i % 7) * 0.01f;
+    int failed = 0;
+    setenv("V4_ROUTE_FORCED_ONLY", "0", 1);
+    if (coli_v4_route_forced_only_reload() != 0) failed = 1;
+    for (int mode = 0; mode < 2 && !failed; mode++)
+        if (coli_v4_route_bf16(full[mode], full_ids[mode], hidden, packed, bias,
+                               mode ? forced : NULL, EXPERTS, DIM, TOPK, 2.5f))
+            failed = 1;
+    for (int setting = 1; setting <= 2 && !failed; setting++) {
+        setenv("V4_ROUTE_FORCED_ONLY", setting == 1 ? "1" : "2", 1);
+        if (coli_v4_route_forced_only_reload() != setting) { failed = 1; break; }
+        for (int mode = 0; mode < 2 && !failed; mode++)
+            if (coli_v4_route_bf16(only[mode], only_ids[mode], hidden, packed,
+                                   bias, mode ? forced : NULL, EXPERTS, DIM,
+                                   TOPK, 2.5f) ||
+                memcmp(only[mode], full[mode], sizeof(only[mode])) ||
+                memcmp(only_ids[mode], full_ids[mode], sizeof(only_ids[mode])))
+                failed = 1;
+        if (!failed && !coli_v4_route_bf16(only[1], only_ids[1], hidden, packed,
+                                           bias, bad, EXPERTS, DIM, TOPK, 2.5f))
+            failed = 1;
+    }
+    unsetenv("V4_ROUTE_FORCED_ONLY");
+    coli_v4_route_forced_only_reload();
+    return failed;
+}
+
 static int test_sparse_attention_parallel_order(void) {
     enum { HEADS = 7, DIM = 32, KV = 19, TOPK = 17 };
     float query[HEADS * DIM], kv[KV * DIM], sinks[HEADS];
@@ -2790,7 +2910,8 @@ static int test_fp8_decode_batch_order(void) {
 
 int main(int argc, char **argv) {
     if (test_fp8_decode_batch_order() || test_sparse_attention_parallel_order() ||
-        test_route_bf16_parallel_order() || test_fp8_grouped_projection()) return 1;
+        test_route_bf16_parallel_order() || test_route_bf16_forced_only() ||
+        test_fp8_grouped_projection()) return 1;
     if (test_attention_cache() != 0) {
         fprintf(stderr, "FAIL: test_attention_cache\n");
         return 1;
@@ -2849,6 +2970,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_union_recency() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_union_recency\n");
+        return 1;
+    }
+    if (test_expert_store_prompt_cold() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_prompt_cold\n");
         return 1;
     }
     if (test_kv_cache() != 0) {

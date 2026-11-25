@@ -43,6 +43,7 @@
 #define COLI_VK_CHAIN_H
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "backend_vulkan.h"
 
 #ifdef __cplusplus
@@ -102,6 +103,11 @@ int  vkc_finish(void);        /* wait for every submitted frame */
  * frame a forward, n sends every n layers. */
 int  vkc_split_layers(void);
 int  vkc_layer_recorded(int *layers);
+/* COLI_VK_CHAIN_DEV2=0 keeps the chain on the primary Vulkan device only. */
+static inline int vkc_dev2_wanted(void) {
+    const char *e = getenv("COLI_VK_CHAIN_DEV2");
+    return !(e && *e == '0');
+}
 
 /* transfers, recorded into the open frame (offsets and counts in floats) */
 int  vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n);

@@ -87,7 +87,7 @@ static struct {
     uint64_t mk_hits, mk_miss; int mk_on;
     /* the dense chain's routed experts (qt_chain_*): residency changes counted, and its
      * forwards in flight, which no swap may touch the tensors of */
-    unsigned epoch; int chain_hold;
+    unsigned epoch; int chain_hold, nres;
     /* the uploader is inside device calls (an allocation, a copy, a free): a chain that holds
      * the tier waits for them to end before its forward (qt_chain_hold) */
     int uploading;
@@ -110,7 +110,7 @@ static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; 
 /* G.mx held: every change of residency goes through here (qt_chain_epoch) */
 static void res_set(QSlot *s, int r){
     if(s->resident==r) return;
-    s->resident=(uint8_t)r; G.epoch++;
+    s->resident=(uint8_t)r; G.epoch++; G.nres += r ? 1 : -1;
     if(G.chg_on){ if(G.chg_n<QT_CHG_CAP) G.chg[G.chg_n++]=(int)(s-G.slot); else G.chg_over=1; }
 }
 /* Expert homes. Default: expert eid lives on device index eid % ndev in every
@@ -407,6 +407,10 @@ static void *uploader(void *arg){
         }
 
         if(!inplace){
+            char ln[64];   /* Ledger (ledger_map.h): an arena slot holds one expert, then another */
+            if(G.wfmt==QT_GGUF && G_arena_on) snprintf(ln,sizeof ln,"experts.dev%d.slot.%d",dv,aslot);
+            else snprintf(ln,sizeof ln,"layers.%d.experts.%d",layer,eid);
+            coli_cuda_ledger_label("weight",ln);
             if(G.wfmt==QT_GGUF && G_arena_on){
                 const size_t ou = G_exact ? G_lou[layer] : G_aoff_u, od = G_exact ? G_lod[layer] : G_aoff_d,
                              sl = G_exact ? G_lsl[layer] : G_aslot;
@@ -441,6 +445,7 @@ static void *uploader(void *arg){
                   && coli_cuda_tensor_upload(&tu, w+mb,   su, 2, G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&td, w+2*mb, sd, 2, G.Ih, G.D,  dv);
             }
+            coli_cuda_ledger_label(NULL,NULL);
         }
         free(w); free(sc);
         if(!ok){
@@ -1289,10 +1294,27 @@ int qt_experts_on(void){
     return 0;
 }
 
-int qt_lmhead_init_fmt(const void *w, const float *sc, int fmt, int I, int O){
-    if(!G_lmh.dev_ok||!G.on||!w||(fmt<100&&!sc)) return 0;
+/* coli_cuda_tensor_upload, or with rows (qwen36_tier.h) a block format a range of rows at a time
+ * through rows' buffer: the host never holds the whole matrix */
+static int qt_upload(ColiCudaTensor **t, const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int dev){
+    if(!rows) return coli_cuda_tensor_upload(t, w, sc, fmt, I, O, dev);
+    int step = rows->row_bytes ? (int)(rows->cap / rows->row_bytes) : 0;
+    if(rows->align > 1) step -= step % rows->align;
+    if(fmt < 100 || step < 1) return 0;
+    for(int r0 = 0; r0 < O; r0 += step){
+        const int n = O - r0 < step ? O - r0 : step;
+        if(!rows->read(rows->ctx, r0, n, rows->buf) || !coli_cuda_tensor_upload_rows(t, rows->buf, fmt, I, O, dev, r0, n)){
+            coli_cuda_tensor_free(*t); *t = NULL;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int qt_lmhead_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O){
+    if(!G_lmh.dev_ok||!G.on||!(w||rows)||(fmt<100&&!sc)) return 0;
     int dev=G_lmh.dev;
-    if(!coli_cuda_tensor_upload(&G_lmh.t,w,sc,fmt,I,O,dev)){
+    if(!qt_upload(&G_lmh.t,w,rows,sc,fmt,I,O,dev)){
         fprintf(stderr,"[lmh] lm_head upload failed -> stays on CPU\n");
         return 0;
     }
@@ -1301,24 +1323,24 @@ int qt_lmhead_init_fmt(const void *w, const float *sc, int fmt, int I, int O){
             O,I,fmt>=100?"the GGUF's blocks":"int8",dev,coli_cuda_tensor_bytes(G_lmh.t)/1073741824.0);
     return 1;
 }
-int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){ return qt_lmhead_init_fmt(q, sc, 1, I, O); }
+int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){ return qt_lmhead_init_fmt(q, NULL, sc, 1, I, O); }
 
-int qt_dnproj_init_fmt(int layer, const void *w, const float *sc, int fmt,
+int qt_dnproj_init_fmt(int layer, const void *w, const QtRows *rows, const float *sc, int fmt,
                        int I, int O, int device){
     if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return 0;
-    if(device == QT_PLACE_CPU || !w || (fmt < 100 && !sc)) return 0;
+    if(device == QT_PLACE_CPU || !(w || rows) || (fmt < 100 && !sc)) return 0;
     /* No G.on requirement: the projections are independent of the expert tier,
      * so they can be measured on a card that holds no experts at all. */
-    if(!coli_cuda_tensor_upload(&G_dnp[layer].t, w, sc, fmt, I, O, device)){
+    if(!qt_upload(&G_dnp[layer].t, w, rows, sc, fmt, I, O, device)){
         fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
         return 0;
     }
     G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = fmt; G_dnp[layer].O = O;
     return 1;
 }
-int qt_dnproj_z_init_fmt(int layer, const void *w, int fmt, int I, int O, int device){
-    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || G_dnp[layer].dev != device || !w || fmt < 100) return 0;
-    if(!coli_cuda_tensor_upload(&G_dnz[layer].t, w, NULL, fmt, I, O, device)){
+int qt_dnproj_z_init_fmt(int layer, const void *w, const QtRows *rows, int fmt, int I, int O, int device){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || G_dnp[layer].dev != device || !(w || rows) || fmt < 100) return 0;
+    if(!qt_upload(&G_dnz[layer].t, w, rows, NULL, fmt, I, O, device)){
         fprintf(stderr,"[dnp] layer %d: z's upload failed -> the in_proj stays on CPU\n", layer);
         coli_cuda_tensor_free(G_dnp[layer].t); G_dnp[layer].t = NULL; G_dnp[layer].on = 0;
         return 0;
@@ -1332,7 +1354,7 @@ ColiCudaTensor *qt_dnproj_z_tensor(int layer, int *dev){
     return G_dnz[layer].t;
 }
 int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
-                   int I, int O, int device){ return qt_dnproj_init_fmt(layer, q, sc, 1, I, O, device); }
+                   int I, int O, int device){ return qt_dnproj_init_fmt(layer, q, NULL, sc, 1, I, O, device); }
 
 /* ---- generic resident dense matrices (Qwen3.8 trunk) -----------------------
  * Same mechanism as lmhead/dnproj -- an int8 per-row tensor resident on one
@@ -1343,11 +1365,11 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
 #define QT_DENSE_MAX 1024
 static struct { ColiCudaTensor *t; int dev, on, fmt; size_t bytes; } G_dense[QT_DENSE_MAX];
 static int G_dense_n;
-int qt_dense_init_fmt(const void *w, const float *sc, int fmt, int I, int O, int device){
-    if(device == QT_PLACE_CPU || !w || (fmt < 100 && !sc) || I <= 0 || O <= 0) return -1;
+int qt_dense_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int device){
+    if(device == QT_PLACE_CPU || !(w || rows) || (fmt < 100 && !sc) || I <= 0 || O <= 0) return -1;
     if(G_dense_n >= QT_DENSE_MAX) return -1;
     int h = G_dense_n;
-    if(!coli_cuda_tensor_upload(&G_dense[h].t, w, sc, fmt, I, O, device)){
+    if(!qt_upload(&G_dense[h].t, w, rows, sc, fmt, I, O, device)){
         fprintf(stderr,"[dense] upload [%d x %d] to dev %d failed -> stays on CPU\n", O, I, device);
         return -1;
     }
@@ -1355,7 +1377,7 @@ int qt_dense_init_fmt(const void *w, const float *sc, int fmt, int I, int O, int
     G_dense_n++;
     return h;
 }
-int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){ return qt_dense_init_fmt(q, sc, 1, I, O, device); }
+int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){ return qt_dense_init_fmt(q, NULL, sc, 1, I, O, device); }
 int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
     if(h < 0 || h >= G_dense_n || !G_dense[h].on || S <= 0) return 0;
     if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, G_dense[h].fmt, S, I, O, G_dense[h].dev, 0)) return 1;
@@ -1486,7 +1508,7 @@ int qt_lmhead_matmul(float *y, const float *x, int I, int O){
  * resident's buffers while one is in flight (an eviction only clears the flag at once,
  * which moves the epoch; its buffers wait for the hold to drop). The books qt_issue keeps
  * for the experts it serves, qt_chain_count keeps for the chain's. */
-static void qt_lfru_tick_locked(void);
+static void qt_lfru_tick_locked(int skip_full_scan);
 /* ---- the host pool: the RAM cache the device copies a prompt chunk's experts from -------------
  * A prompt chunk routes nearly every expert of a layer, and the CPU's step costs per row while a
  * copy over the bus costs per expert: from a few dozen rows up, copying a layer's non-resident
@@ -1659,23 +1681,33 @@ void qt_chain_hold(int on){
     else if(G.chain_hold>0 && --G.chain_hold==0) pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
 }
-void qt_chain_count(int layer,const int *eids,int K){
-    if(!G.on || layer<0 || layer>=G.nl) return;
+static void qt_chain_count_rows_mode(int layer,const int *eids,int rows,int K,int skip_full_scan){
+    if(!G.on || layer<0 || layer>=G.nl || rows<1) return;
     pthread_mutex_lock(&G.mx);
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); return; }
-    if(layer==0) qt_lfru_tick_locked();
-    for(int k=0;k<K;k++){
-        if(eids[k]<0 || eids[k]>=G.ne) continue;
-        QSlot *s=qs(layer,eids[k]);
-        if(s->conv<0xFFFFFFFFu) s->conv++;
-        if(s->resident){ if(s->heat<0xFFFFFFFFu) s->heat++; G.hits[home2(layer,eids[k])]++; }
-        else {
-            G.miss++;
-            if(!G.pm){ G.pm=malloc(QT_PM_CAP*sizeof(int)); G.pm_cap=G.pm?QT_PM_CAP:0; }
-            if(G.pm_n<G.pm_cap && !s->queued && s->g4) G.pm[G.pm_n++]=(int)(s-G.slot);
+    for(int row=0;row<rows;row++){
+        /* Decay and pending moves precede this row's routes, as in a single-row call. */
+        if(layer==0) qt_lfru_tick_locked(skip_full_scan);
+        for(int k=0;k<K;k++){
+            int eid=eids[(size_t)row*K+k];
+            if(eid<0 || eid>=G.ne) continue;
+            QSlot *s=qs(layer,eid);
+            if(s->conv<0xFFFFFFFFu) s->conv++;
+            if(s->resident){ if(s->heat<0xFFFFFFFFu) s->heat++; G.hits[home2(layer,eid)]++; }
+            else {
+                G.miss++;
+                if(!G.pm){ G.pm=malloc(QT_PM_CAP*sizeof(int)); G.pm_cap=G.pm?QT_PM_CAP:0; }
+                if(G.pm_n<G.pm_cap && !s->queued && s->g4) G.pm[G.pm_n++]=(int)(s-G.slot);
+            }
         }
     }
     pthread_mutex_unlock(&G.mx);
+}
+void qt_chain_count_rows(int layer,const int *eids,int rows,int K){
+    qt_chain_count_rows_mode(layer,eids,rows,K,1);
+}
+void qt_chain_count(int layer,const int *eids,int K){
+    qt_chain_count_rows_mode(layer,eids,1,K,0);
 }
 /* The chain's promotions, after a decode-sized step: up to max of the step's misses, the most
  * worth the most first (pm_score: the heat, which carries the history and this conversation,
@@ -2343,7 +2375,7 @@ int qt_counters(QtCounters *out){
     return 1;
 }
 
-static void qt_lfru_tick_locked(void){
+static void qt_lfru_tick_locked(int skip_full_scan){
     if(G_chain_own) return;   /* the chain's to move */
     size_t n=(size_t)G.nl*G.ne;
     G.tick++;
@@ -2359,7 +2391,7 @@ static void qt_lfru_tick_locked(void){
     if(!(G.tick%QT_CONV_DECAY))
         for(size_t i=0;i<n;i++) G.slot[i].conv>>=1;
     replan_drain_locked(QT_REPLAN_PER_TICK);              /* pending re-plan pairs, a few per token */
-    if(G.tick%16) return;
+    if(G.tick%16 || (skip_full_scan && (size_t)G.nres >= n)) return;
     for(int di=0;di<G.ndev;di++){
         int cold=-1, hot=-1; uint32_t ch=0, hh=0;
         for(size_t i=0;i<n;i++){
@@ -2385,6 +2417,9 @@ static void qt_lfru_tick_locked(void){
 }
 
 uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
+    return qt_issue_mode(layer,eids,K,x,0);
+}
+uint32_t qt_issue_mode(int layer,const int *eids,int K,const float *x,int skip_full_scan){
     if(!G.on||K>QT_MAX_ROWS||G_chain_own) return 0;
     uint32_t mask=0;
     ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
@@ -2402,7 +2437,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
      * meet a swap parked on issue_open. */
     if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
-    if(layer==0) qt_lfru_tick_locked();
+    if(layer==0) qt_lfru_tick_locked(skip_full_scan);
     G.issue_open=1;
     for(int k=0;k<K;k++){
         QSlot *s=qs(layer,eids[k]);

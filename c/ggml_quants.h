@@ -602,8 +602,26 @@ static void gq_rows_i8(int t, const uint8_t *src, int rows, int cols, float mul,
 }
 static int gq_dequant_row(int t, const uint8_t *src, float *dst, int64_t n) {
     if (t == GQ_F32) { memcpy(dst, src, (size_t)n * 4); return 0; }
-    if (t == GQ_F16) { for (int64_t i = 0; i < n; i++) dst[i] = gq_f16(gq_rd16(src + 2 * i)); return 0; }
-    if (t == GQ_BF16) { for (int64_t i = 0; i < n; i++) dst[i] = gq_bf16(gq_rd16(src + 2 * i)); return 0; }
+    if (t == GQ_F16) {
+        int64_t i = 0;
+#if defined(__AVX2__) && defined(__F16C__)
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + 2 * i))));
+#endif
+        for (; i < n; i++) dst[i] = gq_f16(gq_rd16(src + 2 * i));
+        return 0;
+    }
+    if (t == GQ_BF16) {
+        int64_t i = 0;
+#if defined(__AVX2__)
+        for (; i + 8 <= n; i += 8) {
+            __m256i u = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(src + 2 * i))), 16);
+            _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(u));
+        }
+#endif
+        for (; i < n; i++) dst[i] = gq_bf16(gq_rd16(src + 2 * i));
+        return 0;
+    }
     gq_blk_fn f = gq_blk_decoder(t);
     if (!f || n % GQ_TYPES[t].blck) return -1;
     const int bl = GQ_TYPES[t].blck, by = GQ_TYPES[t].bytes;
@@ -636,20 +654,151 @@ static inline float gq_dot_f32(const float *a, const float *b, int64_t n) {
 #endif
 }
 
+/* Two activation rows against one float weight row: exact same s0/s1 FMA chains
+ * and horizontal reduction order as gq_dot_f32, bit-identical, halving weight loads. */
+static inline void gq_dot_f32_x2(float out[2], const float *a, const float *b0, const float *b1, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 s00 = _mm256_setzero_ps(), s01 = _mm256_setzero_ps();
+    __m256 s10 = _mm256_setzero_ps(), s11 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 w0 = _mm256_loadu_ps(a + i);
+        __m256 w1 = _mm256_loadu_ps(a + i + 8);
+        s00 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(b0 + i), s00);
+        s01 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(b0 + i + 8), s01);
+        s10 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(b1 + i), s10);
+        s11 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(b1 + i + 8), s11);
+    }
+    s00 = _mm256_add_ps(s00, s01);
+    __m128 h0 = _mm_add_ps(_mm256_castps256_ps128(s00), _mm256_extractf128_ps(s00, 1));
+    h0 = _mm_add_ps(h0, _mm_movehl_ps(h0, h0)); h0 = _mm_add_ss(h0, _mm_movehdup_ps(h0));
+    float r0 = _mm_cvtss_f32(h0);
+    s10 = _mm256_add_ps(s10, s11);
+    __m128 h1 = _mm_add_ps(_mm256_castps256_ps128(s10), _mm256_extractf128_ps(s10, 1));
+    h1 = _mm_add_ps(h1, _mm_movehl_ps(h1, h1)); h1 = _mm_add_ss(h1, _mm_movehdup_ps(h1));
+    float r1 = _mm_cvtss_f32(h1);
+    for (; i < n; i++) { float w = a[i]; r0 += w * b0[i]; r1 += w * b1[i]; }
+    out[0] = r0; out[1] = r1;
+#else
+    float r0 = 0.f, r1 = 0.f;
+    for (int64_t i = 0; i < n; i++) { float w = a[i]; r0 += w * b0[i]; r1 += w * b1[i]; }
+    out[0] = r0; out[1] = r1;
+#endif
+}
+
+/* Fused F16 / BF16 weight row dot float activation: identical FMA chains and
+ * reduction tree to gq_dequant_row + gq_dot_f32, without a staging buffer. */
+static inline float gq_dot_f16_f32(const uint8_t *w, const float *b, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 w0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + 2 * i)));
+        __m256 w1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + 2 * (i + 8))));
+        s0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(b + i + 8), s1);
+    }
+    s0 = _mm256_add_ps(s0, s1);
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    float r = _mm_cvtss_f32(h);
+    if (i < n) {
+        float tail[16];
+        int64_t m = n - i;
+        for (int64_t k = 0; k < m; k++) tail[k] = gq_f16(gq_rd16(w + 2 * (i + k)));
+        for (int64_t k = 0; k < m; k++) r += tail[k] * b[i + k];
+    }
+    return r;
+#else
+    float r = 0.f; for (int64_t i = 0; i < n; i++) r += gq_f16(gq_rd16(w + 2 * i)) * b[i]; return r;
+#endif
+}
+
+static inline float gq_dot_bf16_f32(const uint8_t *w, const float *b, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 w0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + 2 * i))), 16));
+        __m256 w1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + 2 * (i + 8)))), 16));
+        s0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(b + i + 8), s1);
+    }
+    s0 = _mm256_add_ps(s0, s1);
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    float r = _mm_cvtss_f32(h);
+    if (i < n) {
+        float tail[16];
+        int64_t m = n - i;
+        for (int64_t k = 0; k < m; k++) tail[k] = gq_bf16(gq_rd16(w + 2 * (i + k)));
+        for (int64_t k = 0; k < m; k++) r += tail[k] * b[i + k];
+    }
+    return r;
+#else
+    float r = 0.f; for (int64_t i = 0; i < n; i++) r += gq_bf16(gq_rd16(w + 2 * i)) * b[i]; return r;
+#endif
+}
+
 /* Returns 0, or -1 for an unsupported type / shape (nothing written). */
 static int gq_matmul_f32(float *y, const float *x, const uint8_t *W, int t, int S, int I, int O) {
     const int64_t rb = gq_row_bytes(t, I);
     if (rb < 0 || (t != GQ_F32 && t != GQ_F16 && t != GQ_BF16 && !gq_blk_decoder(t))) return -1;
+    /* Direct paths without per-thread malloc or staging copies for F32 (all S,
+     * when 4-byte aligned) and single-row F16/BF16 decode. */
+    if (t == GQ_F32 && ((uintptr_t)W & 3u) == 0) {
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const float *wr = (const float *)(W + (int64_t)o * rb);
+            int s = 0;
+            for (; s + 1 < S; s += 2) {
+                float d2[2];
+                gq_dot_f32_x2(d2, wr, x + (int64_t)s * I, x + (int64_t)(s + 1) * I, I);
+                y[(int64_t)s * O + o]       = d2[0];
+                y[(int64_t)(s + 1) * O + o] = d2[1];
+            }
+            if (s < S) y[(int64_t)s * O + o] = gq_dot_f32(wr, x + (int64_t)s * I, I);
+        }
+        return 0;
+    }
+    /* The fused 16-bit kernels keep gq_dot_f32's AVX2 FMA chains, so they give its bits only where it
+     * takes that path (and F16 needs F16C for the conversion); elsewhere the decoded row below is the
+     * reference itself. On macOS arm64 the scalar F16 kernel was not bit-identical (I=255). */
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    const int fused16 = S == 1 && (t == GQ_F16 || t == GQ_BF16);
+#elif defined(__AVX2__) && defined(__FMA__)
+    const int fused16 = S == 1 && t == GQ_BF16;
+#else
+    const int fused16 = 0;
+#endif
+    if (fused16) {
+        if (t == GQ_F16) {
+            #pragma omp parallel for schedule(static)
+            for (int o = 0; o < O; o++) y[o] = gq_dot_f16_f32(W + (int64_t)o * rb, x, I);
+        } else {
+            #pragma omp parallel for schedule(static)
+            for (int o = 0; o < O; o++) y[o] = gq_dot_bf16_f32(W + (int64_t)o * rb, x, I);
+        }
+        return 0;
+    }
     #pragma omp parallel
     {
-        float *row = (float *)malloc((size_t)I * sizeof(float));
+        float stack_row[8192];
+        float *row = I <= 8192 ? stack_row : (float *)malloc((size_t)I * sizeof(float));
         #pragma omp for schedule(static)
         for (int o = 0; o < O; o++) {
             if (!row) continue;
             gq_dequant_row(t, W + (int64_t)o * rb, row, I);
-            for (int s = 0; s < S; s++) y[(int64_t)s * O + o] = gq_dot_f32(row, x + (int64_t)s * I, I);
+            int s = 0;
+            for (; s + 1 < S; s += 2) {
+                float d2[2];
+                gq_dot_f32_x2(d2, row, x + (int64_t)s * I, x + (int64_t)(s + 1) * I, I);
+                y[(int64_t)s * O + o]       = d2[0];
+                y[(int64_t)(s + 1) * O + o] = d2[1];
+            }
+            if (s < S) y[(int64_t)s * O + o] = gq_dot_f32(row, x + (int64_t)s * I, I);
         }
-        free(row);
+        if (I > 8192) free(row);
     }
     return 0;
 }
@@ -4296,10 +4445,85 @@ static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, in
 static void gq_matmul2_act(float *y1, const uint8_t *W1, int t1, float *y2, const uint8_t *W2, int t2, const gq_act *a, int O) {
     const int I = a->I; const int64_t rb1 = gq_row_bytes(t1, I), rb2 = gq_row_bytes(t2, I);
 #ifdef GQ_R16_ON
+    if (gq_r16_base(t1) >= 0 && gq_r16_base(t2) >= 0) {
+        const int G = O / 16, tail = O % 16;
+        if (a->S > GQ_FUSED_ROWS) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int g = 0; g < 2 * G; g++) {
+                if (g < G) gq_r16_rows(t1, y1 + 16 * g, O, W1 + (int64_t)16 * g * rb1, a, I);
+                else       gq_r16_rows(t2, y2 + 16 * (g - G), O, W2 + (int64_t)16 * (g - G) * rb2, a, I);
+            }
+        } else {
+            #pragma omp parallel for schedule(static)
+            for (int g = 0; g < 2 * G; g++) {
+                if (g < G) gq_r16_rows(t1, y1 + 16 * g, O, W1 + (int64_t)16 * g * rb1, a, I);
+                else       gq_r16_rows(t2, y2 + 16 * (g - G), O, W2 + (int64_t)16 * (g - G) * rb2, a, I);
+            }
+        }
+        if (tail) {
+            float *y16 = (float *)malloc((size_t)a->S * 16 * sizeof(float));
+            if (!y16) abort();
+            gq_r16_rows(t1, y16, 16, W1 + (int64_t)16 * G * rb1, a, I);
+            for (int r = 0; r < a->S; r++) memcpy(y1 + (int64_t)r * O + 16 * G, y16 + 16 * r, (size_t)tail * sizeof(float));
+            gq_r16_rows(t2, y16, 16, W2 + (int64_t)16 * G * rb2, a, I);
+            for (int r = 0; r < a->S; r++) memcpy(y2 + (int64_t)r * O + 16 * G, y16 + 16 * r, (size_t)tail * sizeof(float));
+            free(y16);
+        }
+        return;
+    }
     if (gq_r16_base(t1) >= 0 || gq_r16_base(t2) >= 0) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
 #endif
+#ifdef GQ_TILE16_BIAS
+    if (a->S >= GQ_TILE16_MIN_S && O >= 16) {
+        const int ok1 = gq_tile16_ok(t1, I), ok2 = gq_tile16_ok(t2, I);
+        if (ok1 && ok2) {
+            const int G = O / 16;
+            #pragma omp parallel
+            {
+                uint8_t *tile = (uint8_t *)malloc(gq_tile16_bytes(I));
+                int8_t *w8 = (int8_t *)malloc((size_t)I);
+                float *sw = (float *)malloc((size_t)(I / 16) * 2 * sizeof(float)), *mw = sw ? sw + I / 16 : NULL;
+                if (!tile || !w8 || !sw) abort();
+                #pragma omp for schedule(dynamic, 1)
+                for (int g = 0; g < 2 * G; g++) {
+                    if (g < G) {
+                        gq_tile16_pack(tile, W1 + (int64_t)16 * g * rb1, rb1, t1, I, w8, sw, mw);
+                        gq_tile16_rows(y1 + 16 * g, O, tile, a, I);
+                    } else {
+                        int g2 = g - G;
+                        gq_tile16_pack(tile, W2 + (int64_t)16 * g2 * rb2, rb2, t2, I, w8, sw, mw);
+                        gq_tile16_rows(y2 + 16 * g2, O, tile, a, I);
+                    }
+                }
+                free(tile); free(w8); free(sw);
+            }
+            for (int o = 16 * G; o < O; o++) {
+                gq_row_all(y1 + o, O, a, W1 + (int64_t)o * rb1, t1, I);
+                gq_row_all(y2 + o, O, a, W2 + (int64_t)o * rb2, t2, I);
+            }
+            return;
+        }
+        if (ok1 || ok2) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
+    }
+#endif
 #ifdef GQ_F8_ON
-    if (a->S > GQ_EXACT_ROWS && (gq_f8_ok(t1, I) || gq_f8_ok(t2, I))) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
+    if (a->S > GQ_EXACT_ROWS) {
+        const int ok1 = gq_f8_ok(t1, I), ok2 = gq_f8_ok(t2, I);
+        if (ok1 && ok2) {
+            const int G8 = O / 8;
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int g = 0; g < 2 * G8; g++) {
+                if (g < G8) gq_rows_f8(y1 + 8 * g, O, a, W1 + (int64_t)8 * g * rb1, rb1, t1, I, 8);
+                else        gq_rows_f8(y2 + 8 * (g - G8), O, a, W2 + (int64_t)8 * (g - G8) * rb2, rb2, t2, I, 8);
+            }
+            for (int o = 8 * G8; o < O; o++) {
+                gq_row_all(y1 + o, O, a, W1 + (int64_t)o * rb1, t1, I);
+                gq_row_all(y2 + o, O, a, W2 + (int64_t)o * rb2, t2, I);
+            }
+            return;
+        }
+        if (ok1 || ok2) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
+    }
 #endif
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < 2 * O; r++) {
