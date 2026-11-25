@@ -74,6 +74,7 @@
 #include "st.h"
 #include "ggml_view.h"
 #include "quant.h"
+#include "fp8_format.h"
 #include "tok.h"
 #include "omp_tune.h"
 #ifdef COLI_METAL
@@ -983,6 +984,60 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
 #endif
 }
 
+/* --- FP8 e4m3 native checkpoint (Sage-S2.1-Flash-FP8, the GLM-5.2-FP8 layout) -----
+ * Weights are F8_E4M3 bytes and the block scales are F32 under `name_scale_inv`, one
+ * scale per FP8_BLOCK x FP8_BLOCK tile: the dequant is quant.h's, w[o,i] =
+ * e4m3_decode(byte) * scale[o/128][i/128]. This engine has no fmt=8 matmul yet
+ * (its Mat formats are f32, int8 row and int4 gs64), so the bytes are dequantized
+ * once at load into f32 and the existing GLM53_BITS path quantizes them: correctness
+ * first, and the f32 peak is one tensor, not the model. Returns a freshly malloc'd
+ * buffer of numel floats, or NULL after saying why. */
+static float *glm53_load_fp8_f32(GModel *m, const char *name, st_tensor *t) {
+    char sc[544];
+    st_tensor *s;
+    uint8_t *w;
+    float *scale, *out;
+    int64_t rows, cols, nr, ncol, r, i;
+    if (t->rank != 2) { fprintf(stderr, "%s: FP8 weight of rank %d\n", name, t->rank); return NULL; }
+    rows = t->shape[0]; cols = t->shape[1];
+    if (rows <= 0 || cols <= 0 || t->nbytes != rows * cols) {
+        fprintf(stderr, "%s: %lld bytes cannot hold %lld x %lld e4m3\n", name,
+                (long long)t->nbytes, (long long)rows, (long long)cols);
+        return NULL;
+    }
+    snprintf(sc, sizeof sc, "%s_scale_inv", name);
+    s = st_find(&m->S, sc);
+    if (!s || s->dtype != 2) {
+        fprintf(stderr, "%s: FP8 needs '%s' as F32 block scales\n", name, sc);
+        return NULL;
+    }
+    nr = (rows + FP8_BLOCK - 1) / FP8_BLOCK;
+    ncol = (cols + FP8_BLOCK - 1) / FP8_BLOCK;
+    if (s->numel != nr * ncol) {
+        fprintf(stderr, "%s: %lld scales, %lld x %lld needed for 128x128 blocks\n", name,
+                (long long)s->numel, (long long)nr, (long long)ncol);
+        return NULL;
+    }
+    w = (uint8_t *)malloc((size_t)t->nbytes);
+    scale = (float *)malloc((size_t)s->numel * sizeof(float));
+    out = (float *)malloc((size_t)rows * cols * sizeof(float));
+    if (!w || !scale || !out) {
+        free(w); free(scale); free(out);
+        fprintf(stderr, "OOM on %s\n", name);
+        return NULL;
+    }
+    st_read_raw(&m->S, name, w, 1);
+    st_read_f32_cap(&m->S, sc, scale, s->numel, 1);
+    for (r = 0; r < rows; r++) {
+        const float *row_scale = scale + (r / FP8_BLOCK) * ncol;
+        for (i = 0; i < cols; i++)
+            out[(size_t)r * cols + i] = e4m3_decode(w[(size_t)r * cols + i]) * row_scale[i / FP8_BLOCK];
+    }
+    free(w);
+    free(scale);
+    return out;
+}
+
 /* rows x columns e' la forma con cui il forward usa la matrice, contata dalla
  * config: mm() scrive w->rows valori per token e ne legge w->columns. Presa
  * dall'header senza confronto, una riga in piu' scriveva oltre il buffer
@@ -1078,6 +1133,25 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
         st_read_raw(&m->S, name, packed, 1);
         st_read_f32_cap(&m->S, scales, step, qs->numel, 1);
         mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64; mat.resident = 1;
+#ifdef COLI_VULKAN
+        if (!(mat.vk_name = strdup(name))) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+#endif
+        return mat;
+    }
+
+    if (t->dtype == 4) {                  /* F8_E4M3 native: dequant at load, then quantize */
+        if (t->rank != 2) { fprintf(stderr, "%s: rank %d, expected 2\n", name, t->rank); exit(1); }
+        if (t->shape[0] != rows || t->shape[1] != columns) {
+            fprintf(stderr, "%s: %lld x %lld, the config needs %lld x %lld\n", name,
+                    (long long)t->shape[0], (long long)t->shape[1],
+                    (long long)rows, (long long)columns);
+            exit(1);
+        }
+        float *buffer = glm53_load_fp8_f32(m, name, t);
+        if (!buffer) { fprintf(stderr, "cannot dequantize FP8 %s\n", name); exit(1); }
+        mat.rows = (int)rows;
+        mat.columns = (int)columns;
+        mat = quantize_loaded(buffer, mat.rows, mat.columns);
 #ifdef COLI_VULKAN
         if (!(mat.vk_name = strdup(name))) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
 #endif
