@@ -317,6 +317,7 @@ V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
 V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ) $(V4_VK_OBJ) $(V4_CUT_OBJS)
 REGISTRY_OBJ = expert_store_registry.o
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
+V4_PREFIX_DISK_TEST := tests/test_v4_prefix_disk$(if $(IS_WIN),.exe,)
 V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
 
 # Include every C object, even when its backend is disabled in this invocation.
@@ -437,10 +438,14 @@ $(V4_BATCH_TEST_OBJ): deepseek_v4.c coli_env.h deepseek_v4.h deepseek_v4_interna
 COLI_V4_UNIT_GPU_HOOK.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h compat.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS -DCOLI_V4_UNIT_GPU -c deepseek_v4.c -o $@
 
-COLI_V4_UNIT_GENERATE_STATS.o: serve_codec.h
+COLI_V4_UNIT_GENERATE_STATS.o: serve_codec.h evidence_digest.h
 
 $(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c coli_env.h deepseek_v4.h \
 		deepseek_v4_internal.h serve_codec.h $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
+
+$(V4_PREFIX_DISK_TEST): tests/test_v4_prefix_disk.c deepseek_v4.c coli_env.h deepseek_v4.h \
+		deepseek_v4_internal.h evidence_digest.h serve_codec.h $(V4_SERVE_TEST_OBJS)
 	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
 
 tools/bench_dsv4_head_batch: tools/bench_dsv4_head_batch.c deepseek_v4.c deepseek_v4.h \
@@ -543,7 +548,7 @@ deepseek-v4-clean:
 	rm -f deepseek_v4 deepseek_v4.exe $(V4_OBJS) $(V4_C_DEP_OBJS) $(V4_C_DEPS) $(V4_LINK_STAMP) \
 		$(V4_BATCH_TEST_OBJ) \
 		tools/bench_dsv4_head_batch \
-		$(V4_SERVE_TEST) tests/test_dsv4_multigpu_cuda \
+		$(V4_SERVE_TEST) $(V4_PREFIX_DISK_TEST) tests/test_dsv4_multigpu_cuda \
 		tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
 		tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_wo_decode_cuda tests/test_dsv4_head_cuda \
 		tests/test_dsv4_quant_cuda tests/test_dsv4_resident_route tests/test_dsv4_resident_indexer \
