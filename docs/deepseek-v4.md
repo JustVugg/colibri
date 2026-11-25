@@ -505,7 +505,11 @@ upload costs the thread that makes it far less to begin with. The Linux column
 was measured at this change; the Windows column on 2026-11-13 at a local merge
 of dev with this change, before it was rebased. On Linux with `--memory-gb 80`
 from a cold start, 13.96 s against 13.92 s: no difference. The verifier read
-4,231 mirrors back on Linux and 4,305 on Windows with no difference. The
+4,231 mirrors back on Linux and 4,305 on Windows with no difference.
+Re-checked on dev b1f53353 after the rebase, with dev's other merged switches
+on (`V4_LAYER_FUSED`, `DSV4_CUDA_MOE_FUSED6`, `V4_IDX_FAST`), four alternated
+runs per arm: 9.37 s unset, 9.23 s with two pieces (+1.6 % tok/s), the same
+text; the verifier read 4,066 piece-filled mirrors back, no difference. The
 record is in `docs/experiments/v4-upload-pieces-2026-11-16/`.
 
 ### Expert-pruned checkpoints (REAP) and the generic kernels
