@@ -15,7 +15,7 @@
 
 **小巧引擎，庞大模型。** colibri 在你现有的机器上运行超大规模的开放模型。一个拥有数千亿参数的专家混合（mixture-of-experts，MoE）模型，每个 token 只会用到自身的一小部分，因此 colibri 把这一部分放在内存中，其余部分，也就是各个专家，则在模型需要时从磁盘读取。纯 C 实现，每个模型家族一个文件，不需要 GPU。
 
-如今有十三个引擎在运行。其中十个用于语言模型：**GLM-5.2/5.3**（也运行 **Mistral-Large-4**）、**GLM-5.3-Flash**、**Inkling**、**Kimi K3**（以及 K3.1 Pro）、**DeepSeek V4 Flash**、**DeepSeek V4.1 Flash**、**MiMo-V2.6 Flash**（以及 Pro）、**Qwen3.8-Flash-Next**、**Qwen3.6**（也运行 Qwen3-Coder、稠密的 Qwen3.8-27B、**Flint**、**Muse Spark Open** 和 **LFM3-VL**）以及 **OLMoE**。一个用来画图：**Qwen-Image-2.1**。两个用来回答决策问题：**Laya** 和 **GLiNER2.5-Decide**，第三个决策模型 **Clef** 运行在 Qwen3.6 引擎上。语言模型也可以直接运行已发布的 GGUF 文件，按原样读取（[GGUF](docs/gguf.md)），可在 CPU 上运行，可通过 Vulkan 在任何 GPU 上运行，也可通过 CUDA 在 NVIDIA 显卡上运行。[哪一个适合我的机器](#which-model-for-my-machine)
+如今有十三个引擎在运行。其中十个用于语言模型：**GLM-5.2/5.3**（也运行 **Mistral-Large-4**）、**GLM-5.3-Flash**、**Inkling**、**Kimi K3**（以及 K3.1 Pro）、**DeepSeek V4 Flash**、**DeepSeek V4.1 Flash**、**MiMo-V2.6 Flash**, **Nemotron-3.5 Super VL**（以及 Pro）、**Qwen3.8-Flash-Next**、**Qwen3.6**（也运行 Qwen3-Coder、稠密的 Qwen3.8-27B、**Flint**、**Muse Spark Open** 和 **LFM3-VL**）以及 **OLMoE**。一个用来画图：**Qwen-Image-2.1**。两个用来回答决策问题：**Laya** 和 **GLiNER2.5-Decide**，第三个决策模型 **Clef** 运行在 Qwen3.6 引擎上。语言模型也可以直接运行已发布的 GGUF 文件，按原样读取（[GGUF](docs/gguf.md)），可在 CPU 上运行，可通过 Vulkan 在任何 GPU 上运行，也可通过 CUDA 在 NVIDIA 显卡上运行。[哪一个适合我的机器](#which-model-for-my-machine)
 
 ```
 $ ./coli chat

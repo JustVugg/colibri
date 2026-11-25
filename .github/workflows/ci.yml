@@ -630,7 +630,7 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide"
+          ENGINES="colibri glm53 inkling nemotron kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           # -j: deepseek-v4 is a dozen units, and the macOS and Windows runners have the cores
           # (one engine a call, so a failure still names its engine)

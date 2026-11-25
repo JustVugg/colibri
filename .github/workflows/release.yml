@@ -122,7 +122,7 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide; do
+          for t in colibri glm53 inkling nemotron kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide; do
             extra=""
             case " ${{ matrix.metal }} " in *" $t "*) extra="METAL=1" ;; esac
             make $t ${{ matrix.make_args }} $extra
@@ -197,6 +197,7 @@ jobs:
           cp c/mimo${{ matrix.ext }} dist/mimo${{ matrix.ext }}
           cp c/laya${{ matrix.ext }} dist/laya${{ matrix.ext }}
           cp c/gliner_decide${{ matrix.ext }} dist/gliner_decide${{ matrix.ext }}
+          cp c/nemotron${{ matrix.ext }} dist/nemotron${{ matrix.ext }}
           # the terminal interface, next to coli: `coli tui` looks for it there (tui_binary())
           cp c/colibri-tui${{ matrix.ext }} dist/colibri-tui${{ matrix.ext }}
           # the desktop window, next to coli: it finds coli and ui/ beside itself
@@ -401,7 +402,7 @@ jobs:
           for f in ../c/shaders/*.spv; do
             test -f "shaders/$(basename "$f")" || { echo "FAIL: shaders/$(basename "$f") missing from archive"; exit 1; }
           done
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide"
+          ENGINES="colibri glm53 inkling nemotron kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek_v4"; fi
           COLI_ENGINES="$ENGINES" python3 - <<'PYCHK'
           import os, sys

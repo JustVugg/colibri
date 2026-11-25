@@ -23,7 +23,7 @@ model, tanpa memerlukan GPU.
 Saat ini ada tiga belas engine yang berjalan. Sepuluh untuk model bahasa:
 **GLM-5.2/5.3** (yang juga menjalankan **Mistral-Large-4**), **GLM-5.3-Flash**,
 **Inkling**, **Kimi K3** (dan K3.1 Pro), **DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**,
-**MiMo-V2.6 Flash** (dan Pro), **Qwen3.8-Flash-Next**, **Qwen3.6** (yang juga
+**MiMo-V2.6 Flash**, **Nemotron-3.5 Super VL** (dan Pro), **Qwen3.8-Flash-Next**, **Qwen3.6** (yang juga
 menjalankan Qwen3-Coder, Qwen3.8-27B dense, **Flint**, **Muse Spark Open**, dan
 **LFM3-VL**), dan **OLMoE**. Satu menggambar: **Qwen-Image-2.1**. Dua menjawab
 keputusan: **Laya** dan **GLiNER2.5-Decide**, dengan model keputusan ketiga,

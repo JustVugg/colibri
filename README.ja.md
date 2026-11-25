@@ -15,7 +15,7 @@
 
 **小さなエンジン、巨大なモデル。** colibri は、とても大きなオープンモデルを、あなたがすでに持っているマシンで動かします。数千億パラメータの Mixture-of-Experts モデルは、1 トークンごとに自分自身のごく一部しか使いません。そこで colibri はその部分を RAM に置き、残りの部分、つまりエキスパートは、モデルが必要としたときにディスクから読み込みます。純粋な C で書かれ、モデルファミリーごとにファイルは 1 つ、GPU は不要です。
 
-現在、13 のエンジンが動きます。言語モデル用が 10：**GLM-5.2/5.3**（**Mistral-Large-4** も動かします）、**GLM-5.3-Flash**、**Inkling**、**Kimi K3**（と K3.1 Pro）、**DeepSeek V4 Flash**、**DeepSeek V4.1 Flash**、**MiMo-V2.6 Flash**（と Pro）、**Qwen3.8-Flash-Next**、**Qwen3.6**（Qwen3-Coder、密モデルの Qwen3.8-27B、**Flint**、**Muse Spark Open**、**LFM3-VL** も動かします）、**OLMoE**。画像を描くのが 1 つ：**Qwen-Image-2.1**。判定に答えるのが 2 つ：**Laya** と **GLiNER2.5-Decide** で、3 つ目の判定モデル **Clef** が Qwen3.6 エンジン上で動きます。言語モデルは公開済みの GGUF ファイルからもそのまま読み込んで動き（[GGUF](docs/gguf.md)）、CPU、Vulkan による任意の GPU、CUDA による NVIDIA カードで動きます。[自分のマシンにはどれか](#which-model-for-my-machine)
+現在、13 のエンジンが動きます。言語モデル用が 10：**GLM-5.2/5.3**（**Mistral-Large-4** も動かします）、**GLM-5.3-Flash**、**Inkling**、**Kimi K3**（と K3.1 Pro）、**DeepSeek V4 Flash**、**DeepSeek V4.1 Flash**、**MiMo-V2.6 Flash**, **Nemotron-3.5 Super VL**（と Pro）、**Qwen3.8-Flash-Next**、**Qwen3.6**（Qwen3-Coder、密モデルの Qwen3.8-27B、**Flint**、**Muse Spark Open**、**LFM3-VL** も動かします）、**OLMoE**。画像を描くのが 1 つ：**Qwen-Image-2.1**。判定に答えるのが 2 つ：**Laya** と **GLiNER2.5-Decide** で、3 つ目の判定モデル **Clef** が Qwen3.6 エンジン上で動きます。言語モデルは公開済みの GGUF ファイルからもそのまま読み込んで動き（[GGUF](docs/gguf.md)）、CPU、Vulkan による任意の GPU、CUDA による NVIDIA カードで動きます。[自分のマシンにはどれか](#which-model-for-my-machine)
 
 ```
 $ ./coli chat

@@ -21,7 +21,7 @@ wenn das Modell sie anfordert. Reines C, eine Datei pro Modellfamilie, keine GPU
 
 Heute laufen dreizehn Engines. Zehn sind für Sprachmodelle: **GLM-5.2/5.3** (die
 auch **Mistral-Large-4** ausführt), **GLM-5.3-Flash**, **Inkling**, **Kimi K3** (und
-K3.1 Pro), **DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (und
+K3.1 Pro), **DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash**, **Nemotron-3.5 Super VL** (und
 Pro), **Qwen3.8-Flash-Next**, **Qwen3.6** (die auch Qwen3-Coder, das dichte
 Qwen3.8-27B, **Flint**, **Muse Spark Open** und **LFM3-VL** ausführt) und **OLMoE**.
 Eine zeichnet Bilder: **Qwen-Image-2.1**. Zwei treffen Entscheidungen: **Laya** und
