@@ -506,10 +506,17 @@ static void nemo_cuda_forward_one(NemoCuda *cu, NemoModel *m, NemoState *st,
             }
             for (int k = 0; k < K; k++) top_w[k] *= c->routed_scale;
 
-            /* 2. Routed experts in VRAM (LRU tier) */
+            /* 2. Routed experts in VRAM (LRU tier + parallel NVMe/RAM prefetch for misses) */
             const float *d_ein = L->has_latent ? cu->d_lat_in : cu->d_xn;
             float *d_eout = L->has_latent ? cu->d_lat_out : cu->d_res;
             ops->memset_zero(d_eout, (size_t)exp_in * sizeof(float));
+            {
+                int miss_ids[NEMO_MAX_TOPK], n_miss = 0;
+                const NemoCuExpertCache *vc = &cu->layers[li].vcache;
+                for (int k = 0; k < K; k++)
+                    if (vc->lut[top_idx[k]] < 0) miss_ids[n_miss++] = top_idx[k];
+                if (n_miss > 1) nemo_prefetch_experts_ram(m, li, miss_ids, n_miss);
+            }
             for (int k = 0; k < K; k++) {
                 NemoCuExpertSlot *vsl = nemo_cuda_get_expert(cu, m, li, top_idx[k]);
                 ops->matvec(cu->d_exp_h, vsl->d_up_data, vsl->d_up_sc, vsl->up_scale2,

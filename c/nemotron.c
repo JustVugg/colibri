@@ -483,6 +483,52 @@ static void nemo_ecache_free(NemoExpertCache *ec) {
     memset(ec, 0, sizeof(*ec));
 }
 
+static void nemo_prefetch_experts_ram(NemoModel *m, int layer_idx, const int *exp_ids, int n_ids) {
+    NemoLayer *L = &m->layers[layer_idx];
+    NemoExpertCache *ec = &L->ecache;
+    int miss_e[NEMO_MAX_TOPK], miss_s[NEMO_MAX_TOPK], nm = 0;
+    for (int i = 0; i < n_ids; i++) {
+        int eid = exp_ids[i];
+        if (ec->lut[eid] >= 0) continue;
+        /* Avoid duplicates in batch */
+        int dup = 0;
+        for (int j = 0; j < nm; j++) if (miss_e[j] == eid) { dup = 1; break; }
+        if (dup) continue;
+        int victim = 0;
+        uint64_t best = UINT64_MAX;
+        for (int s = 0; s < ec->cap; s++) {
+            if (ec->slots[s].expert_id < 0) { victim = s; break; }
+            if (ec->slots[s].stamp < best) { best = ec->slots[s].stamp; victim = s; }
+        }
+        NemoExpertSlot *sl = &ec->slots[victim];
+        if (sl->expert_id >= 0) {
+            ec->lut[sl->expert_id] = -1;
+            nemo_mat_free(&sl->up);
+            nemo_mat_free(&sl->down);
+        }
+        sl->expert_id = eid;
+        sl->stamp = ++ec->clock;
+        ec->lut[eid] = victim;
+        miss_e[nm] = eid;
+        miss_s[nm] = victim;
+        nm++;
+    }
+    if (nm == 0) return;
+    m->expert_misses += (uint64_t)nm;
+    int exp_in = m->c.moe_latent > 0 ? m->c.moe_latent : m->c.hidden;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(nm < 8 ? nm : 8) if (nm > 1)
+    #endif
+    for (int i = 0; i < nm; i++) {
+        NemoExpertSlot *sl = &ec->slots[miss_s[i]];
+        char un[256], dn[256];
+        snprintf(un, sizeof(un), "%slayers.%d.mixer.experts.%d.up_proj.weight", m->prefix, layer_idx, miss_e[i]);
+        snprintf(dn, sizeof(dn), "%slayers.%d.mixer.experts.%d.down_proj.weight", m->prefix, layer_idx, miss_e[i]);
+        nemo_mat_load(&sl->up, &m->S, un, m->c.moe_inter, exp_in);
+        nemo_mat_load(&sl->down, &m->S, dn, exp_in, m->c.moe_inter);
+    }
+}
+
 static NemoExpertSlot *nemo_get_expert(NemoModel *m, int layer_idx, int exp_id) {
     NemoLayer *L = &m->layers[layer_idx];
     NemoExpertCache *ec = &L->ecache;
