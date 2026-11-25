@@ -264,7 +264,9 @@ jobs:
     # off inside the Python suite with no test failed, and showed as red.
     # 2026-10-24 it took 24 minutes, and on the next run the suite printed
     # OK at 25:00, the moment the job was cut off: 35 leaves the room again.
-    timeout-minutes: 35
+    # 2026-11-24 it took 31 minutes on #3042, and #3065 and #3066 were cut off at 35
+    # inside the Python suite, nothing failed: 50.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - name: install libomp

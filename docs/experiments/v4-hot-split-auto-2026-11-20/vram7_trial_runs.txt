@@ -1,0 +1,47 @@
+== H7T_1 vram=7 [] rc=0 abort=0 wall=73s kfd_peak=7064MiB over=-104MiB card_delta=7053MiB generated=200 time_to_first_token=7.630s after_first=61.144s reads=3411 md5=ccbc8dfc avail=54G
+   tok_s=(generated-1)/after_first=199/61.144=3.2546
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=54.18GiB dense=resident(6.23GiB) target_slots=78 target_cache=41.76GiB head=resident-bf16 projected=53.87GiB
+   [DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+   v4_gpu place device=0 budget=7168MiB dense=ram
+   v4_gpu hot-split=on (dense in RAM; V4_HOT_SPLIT=0 turns it off)
+   v4_gpu hot-split mirrors=462
+   v4_gpu tier=dense-matvec device=0
+   v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=22015 hits=18604 misses=3411 hit_rate=84.506 bytes=45602832384 target_only=1
+   timing time_to_first_token=7.630s after_first=61.144s
+   v4_gpu hot-split experts gpu=31046 cpu=18640 uploads=684 mirrors=462
+   v4_direct reads=3411 flock_reads=0 fallbacks=0 payload_bytes=43637538816
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 
+
+== H7T_2 vram=7 [] rc=0 abort=0 wall=73s kfd_peak=7064MiB over=-104MiB card_delta=7072MiB generated=200 time_to_first_token=7.823s after_first=61.346s reads=3408 md5=ccbc8dfc avail=54G
+   tok_s=(generated-1)/after_first=199/61.346=3.2439
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=54.20GiB dense=resident(6.23GiB) target_slots=78 target_cache=41.76GiB head=resident-bf16 projected=53.87GiB
+   [DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+   v4_gpu place device=0 budget=7168MiB dense=ram
+   v4_gpu hot-split=on (dense in RAM; V4_HOT_SPLIT=0 turns it off)
+   v4_gpu hot-split mirrors=462
+   v4_gpu tier=dense-matvec device=0
+   v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=22015 hits=18607 misses=3408 hit_rate=84.520 bytes=45562724352 target_only=1
+   timing time_to_first_token=7.823s after_first=61.346s
+   v4_gpu hot-split experts gpu=31046 cpu=18640 uploads=684 mirrors=462
+   v4_direct reads=3408 flock_reads=0 fallbacks=0 payload_bytes=43599790080
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 
+
+== H7T_3 vram=7 [] rc=0 abort=0 wall=73s kfd_peak=7043MiB over=-125MiB card_delta=7062MiB generated=200 time_to_first_token=7.948s after_first=61.316s reads=3412 md5=ccbc8dfc avail=54G
+   tok_s=(generated-1)/after_first=199/61.316=3.2455
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=54.17GiB dense=resident(6.23GiB) target_slots=78 target_cache=41.76GiB head=resident-bf16 projected=53.87GiB
+   [DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+   v4_gpu place device=0 budget=7168MiB dense=ram
+   v4_gpu hot-split=on (dense in RAM; V4_HOT_SPLIT=0 turns it off)
+   v4_gpu hot-split mirrors=462
+   v4_gpu tier=dense-matvec device=0
+   v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=22015 hits=18603 misses=3412 hit_rate=84.501 bytes=45616201728 target_only=1
+   timing time_to_first_token=7.948s after_first=61.316s
+   v4_gpu hot-split experts gpu=31046 cpu=18640 uploads=684 mirrors=462
+   v4_direct reads=3412 flock_reads=0 fallbacks=0 payload_bytes=43650121728
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 

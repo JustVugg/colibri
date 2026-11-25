@@ -64,6 +64,10 @@ static int qwen36_max_ctx(void) {
 }
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>   /* the preload workers' own priority (q36_preload_worker) */
+#endif
 #include <unistd.h>
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
@@ -1304,6 +1308,8 @@ typedef struct {
     kv_prefix kvp;
     float *attn_sc;            /* [attn_sc_thr * kv_cap] score rows, one per thread */
     int attn_sc_thr;
+    float *attn_sc_grp;        /* reusable grouped-GQA score scratch [threads * gq * len] */
+    size_t attn_sc_grp_cap;
     double dense_load_s;
     uint32_t *freq;
     int freq_token_count, hot_pinned, hot_n, warmup_tokens, token_count;
@@ -1606,7 +1612,7 @@ static void tm_report(void){
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
 }
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 #include "kv16.h"
@@ -5969,10 +5975,34 @@ static void ehit_mark(Model *m, int layer, int eid){
 }
 /* hold=1 marks the slot busy before the lock drops, so nothing can evict it
  * between this lookup and the caller's slot_release. */
+/* ---- Background preload (Q36_PRELOAD=1) -----------------------------------
+ * A cache with a slot for every expert still fills on demand: an expert's
+ * first use reads and unpacks it on the engine's thread, in the middle of a
+ * token. Measured on 2x Xeon E5-2670 with every expert in the page cache:
+ * the routed-expert phase fell from 455 to 57 ms/token over the first ~700
+ * tokens of a fresh server and was still falling. With Q36_PRELOAD=1, loader
+ * threads fill the free slots of every layer at startup, in file order, at
+ * low priority, while the server already answers. They only take free slots
+ * (never evict), and an expert is loaded once: the engine waits for a preload
+ * of the expert it wants (g_pl_busy), and the loaders skip the one the engine
+ * is reading (g_pl_engine). Placement only: the bytes a slot holds are
+ * load_expert_merged's either way. q36_preload_start says where it runs. */
+#define Q36_PL_MAX 16
+static int g_pl_on = 0, g_pl_threads = 0;
+static struct { int layer, eid; } g_pl_busy[Q36_PL_MAX], g_pl_engine = { -1, -1 };   /* under g_pilot_mx */
+static int pl_busy_locked(int layer, int eid) {
+    for (int i = 0; i < g_pl_threads; i++) if (g_pl_busy[i].layer == layer && g_pl_busy[i].eid == eid) return 1;
+    return 0;
+}
 static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
+    while (g_pl_on && pl_busy_locked(layer, eid)) {   /* a loader is reading this very expert: take its copy */
+        pthread_mutex_unlock(&g_pilot_mx);
+        usleep(100);
+        pthread_mutex_lock(&g_pilot_mx);
+    }
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
@@ -6016,6 +6046,7 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
         if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
+    g_pl_engine.layer = layer; g_pl_engine.eid = eid;
     pthread_mutex_unlock(&g_pilot_mx);
     double t_read0 = now_s();
     load_expert_merged(m, layer, eid, s);
@@ -6023,8 +6054,88 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     pthread_mutex_lock(&g_pilot_mx);
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
+    g_pl_engine.layer = -1; g_pl_engine.eid = -1;
     if (hold) slot_hold(s);
     *out = s; pthread_mutex_unlock(&g_pilot_mx);
+}
+static Model *g_pl_m; static int g_pl_next = 0, g_pl_done = 0, g_pl_loaded = 0; static double g_pl_t0;
+static void *q36_preload_worker(void *arg) {
+    int me = (int)(intptr_t)arg; Model *m = g_pl_m; Cfg *c = &m->c;
+#if defined(__linux__) && defined(CPU_SETSIZE)   /* as omp_tune.h: only where the including source asked for the GNU names */
+    {   /* the engine's thread is bound to one core (OMP_PROC_BIND): do not inherit that, and stay out of its way */
+        cpu_set_t all; CPU_ZERO(&all);
+        long n = sysconf(_SC_NPROCESSORS_ONLN); if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+        for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
+        sched_setaffinity(0, sizeof all, &all);
+#ifdef SYS_gettid
+        setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+#endif
+    }
+#endif
+#ifdef _OPENMP
+    omp_set_num_threads(1);   /* load_expert_merged's parallel loops: no second team beside the engine's */
+#endif
+    const int total = c->n_layers * c->n_experts;
+    for (;;) {
+        int w = __atomic_fetch_add(&g_pl_next, 1, __ATOMIC_ACQ_REL);
+        if (w >= total) break;
+        int layer = w / c->n_experts, eid = w % c->n_experts;
+        if (c->dense_layer && c->dense_layer[layer]) continue;
+        LCache *lc = &m->cache[layer];
+        pthread_mutex_lock(&g_pilot_mx);
+        if (lc->n >= lc->cap || slot_indexed(m, layer, eid) || pl_busy_locked(layer, eid) ||
+            (g_pl_engine.layer == layer && g_pl_engine.eid == eid)) { pthread_mutex_unlock(&g_pilot_mx); continue; }
+        Slot *s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s);
+        cache_hide(m, layer, s); s->used = 0;          /* never used yet: the first to go if the cache must evict */
+        g_pl_busy[me].layer = layer; g_pl_busy[me].eid = eid;
+        pthread_mutex_unlock(&g_pilot_mx);
+        load_expert_merged(m, layer, eid, s);
+        pthread_mutex_lock(&g_pilot_mx);
+        cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid];
+        g_pl_busy[me].layer = -1; g_pl_busy[me].eid = -1; g_pl_loaded++;
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
+    if (__atomic_add_fetch(&g_pl_done, 1, __ATOMIC_ACQ_REL) == g_pl_threads)
+        fprintf(stderr, "[qwen36] preload: %d experts loaded in %.1f s, RSS %.2f GB\n", g_pl_loaded, now_s() - g_pl_t0, rss_gb());
+    return NULL;
+}
+static void q36_preload_start(Model *m) {
+    const char *e = getenv("Q36_PRELOAD");
+    if (!e || *e != '1' || m->c.n_experts == 0) return;
+    {   /* the CPU's cache of a safetensors container only: what was measured. A device tier keeps
+         * pointers into the slots or copies of them, the Metal graph reads its own records, PILOT's
+         * worker loads experts itself, and a GGUF's slots take another path through the loader. */
+        int dev = qt_ready();
+#ifdef COLI_VULKAN
+        dev = dev || g_vk_ready;
+#endif
+        if (dev || QWEN_GRAPH(m) || g_pilot || g_gguf) {
+            fprintf(stderr, "[qwen36] preload: Q36_PRELOAD=1 is for the CPU expert cache of a safetensors container (no device tier, no PILOT): off\n");
+            return;
+        }
+    }
+    int nt = getenv("Q36_PRELOAD_THREADS") ? atoi(getenv("Q36_PRELOAD_THREADS")) : 4;
+    if (nt < 1) nt = 1; if (nt > Q36_PL_MAX) nt = Q36_PL_MAX;
+    for (int i = 0; i < Q36_PL_MAX; i++) { g_pl_busy[i].layer = -1; g_pl_busy[i].eid = -1; }
+    /* The slots' buffers are allocated here, on the engine's thread, and the loaders only fill
+     * them. A loader that allocates takes the buffer from its own thread's malloc arena, and with
+     * four loaders that cost the routed experts 5 ms a token for as long as the server ran (41.3
+     * against 36.3 ms, three runs each on 2x Xeon E5-2670; one or two loaders, or one arena, did
+     * not show it, and neither page migration nor the buffers' alignment explains it). Untouched
+     * memory is address space only: a slot the loaders never reach costs nothing. */
+    for (int l = 0; l < m->c.n_layers; l++) {
+        if (m->c.dense_layer && m->c.dense_layer[l]) continue;
+        LCache *lc = &m->cache[l];
+        for (int i = lc->n; i < lc->cap; i++) slot_ensure_allocated(m, &lc->slots[i]);
+    }
+    g_pl_m = m; g_pl_t0 = now_s();
+    pthread_mutex_lock(&g_pilot_mx); g_pl_threads = nt; g_pl_on = 1; pthread_mutex_unlock(&g_pilot_mx);
+    fprintf(stderr, "[qwen36] preload: filling the expert cache in the background (%d threads, Q36_PRELOAD=0 to skip)\n", nt);
+    for (int i = 0; i < nt; i++) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, q36_preload_worker, (void *)(intptr_t)i) != 0) { __atomic_add_fetch(&g_pl_done, 1, __ATOMIC_ACQ_REL); continue; }
+        pthread_detach(t);
+    }
 }
 static void expert_get(Model *m, int layer, int eid, Slot **out) { expert_fetch(m, layer, eid, out, 0); }
 /* expert_get for a caller that computes from the slot after the lock drops:
@@ -6206,6 +6317,216 @@ static inline void mrope_at(const Model *m, int p, int pos3[3]) {
     } else pos3[0] = pos3[1] = pos3[2] = p + m->rope_delta;
 }
 
+/* Grouped GQA attention core: share each K/V row read and float16 conversion
+ * across a group of gq query heads that map to the same KV head. Every head
+ * runs the exact same lane dot-products, softmax, and FMA axpy order as the
+ * per-head loop, so every output bit is unchanged. */
+static inline void attention_task(const Model *m, const Layer *l, int layer,
+                                  const float *query, const float *k, const float *vv,
+                                  int S, int pos_base, int win, int ring,
+                                  int gq, int nsub, int kv16, int sc_stride,
+                                  float *sc, float *ctx, int it) {
+    const Cfg *c = &m->c;
+    const int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, kvd = c->k_head_dim;
+    const int q_per_kv = H / KV;
+    const float scale = 1.f / sqrtf((float)hd);
+    const Q36Row *mr = m->mux_rows;
+    const int s = (S - 1) - it / (KV * nsub);
+    const int r = it % (KV * nsub);
+    const int kvh = r / nsub;
+    const int h0 = kvh * q_per_kv + (r % nsub) * gq;
+    const int qpos = mr ? mr[s].pos : pos_base + s;
+    const void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+    /* a sliding-window layer (Flint) sees the window's rows, its own included */
+    const int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+    const int len = qpos + 1 - t0;
+    /* from tb on, the step's own rows (a ring's, from the scratch): a multiplexed
+     * row's is itself, the others' from pos_base */
+    const int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
+    const int tc = tb < qpos + 1 ? tb : qpos + 1;
+    const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
+    const float *qbase = query + ((int64_t)s*H + h0)*hd;
+    float *cbase = ctx + ((int64_t)s*H + h0)*hd;
+    const int64_t ss = sc_stride;
+
+    /* 1. QK scores: cache rows [t0, tc) then scratch rows [tc, qpos] */
+    if (kv16) {
+        if (gq == 1) {
+            for (int t = t0; t < tc; t++)
+                sc[t - t0] = kv16_dot_lanes(qbase, (const uint16_t *)Kl + q36_kv_at(m, layer, kvh, t), kvd) * scale;
+        } else {
+            for (int t = t0; t < tc; t++) {
+                const int j = t - t0;
+                const uint16_t *krow16 = (const uint16_t *)Kl + q36_kv_at(m, layer, kvh, t);
+                int g = 0;
+                for (; g + 1 < gq; g += 2) {
+                    float d2[2];
+                    kv16_dot_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow16, kvd);
+                    sc[(int64_t)g*ss + j]       = d2[0] * scale;
+                    sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+                }
+                if (g < gq) sc[(int64_t)g*ss + j] = kv16_dot_lanes(qbase + (int64_t)g*hd, krow16, kvd) * scale;
+            }
+        }
+    } else {
+        for (int t = t0; t < tc; t++) {
+            const int j = t - t0;
+            const float *krow = (const float *)Kl + q36_kv_at(m, layer, kvh, t);
+            int g = 0;
+            for (; g + 1 < gq; g += 2) {
+                float d2[2];
+                dot_f32_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow, kvd);
+                sc[(int64_t)g*ss + j]       = d2[0] * scale;
+                sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+            }
+            if (g < gq) sc[(int64_t)g*ss + j] = dot_f32_lanes(qbase + (int64_t)g*hd, krow, kvd) * scale;
+        }
+    }
+    for (int t = tc; t <= qpos; t++) {
+        const int j = t - t0;
+        const float *krow = Kb + (int64_t)(t - sp0)*KV*kvd;
+        int g = 0;
+        for (; g + 1 < gq; g += 2) {
+            float d2[2];
+            dot_f32_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow, kvd);
+            sc[(int64_t)g*ss + j]       = d2[0] * scale;
+            sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+        }
+        if (g < gq) sc[(int64_t)g*ss + j] = dot_f32_lanes(qbase + (int64_t)g*hd, krow, kvd) * scale;
+    }
+
+    /* 2. Softmax (+ optional Flint sinks) and zero output accumulators */
+    for (int g = 0; g < gq; g++) {
+        float *scg = sc + (int64_t)g*ss;
+        if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
+            float mx = l->sinks[h0 + g];
+            for (int j = 0; j < len; j++) if (scg[j] > mx) mx = scg[j];
+            float sum = expf(l->sinks[h0 + g] - mx);
+            for (int j = 0; j < len; j++) { scg[j] = expf(scg[j] - mx); sum += scg[j]; }
+            float inv = 1.f / sum;
+            for (int j = 0; j < len; j++) scg[j] *= inv;
+        } else softmax_row(scg, len);
+        float *cx = cbase + (int64_t)g*hd;
+        for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+    }
+
+    /* 3. PV accumulation: cache rows [t0, tc) then scratch rows [tc, qpos] */
+    if (kv16) {
+        if (gq == 1) {
+            for (int t = t0; t < tc; t++)
+                kv16_axpy(cbase, sc[t - t0], (const uint16_t *)Vl + q36_kv_at(m, layer, kvh, t), kvd);
+        } else {
+            for (int t = t0; t < tc; t++) {
+                const int j = t - t0;
+                const uint16_t *vrow16 = (const uint16_t *)Vl + q36_kv_at(m, layer, kvh, t);
+                int g = 0;
+                for (; g + 3 < gq; g += 4)
+                    kv16_axpy_x4(cbase + (int64_t)g*hd, cbase + (int64_t)(g + 1)*hd,
+                                 cbase + (int64_t)(g + 2)*hd, cbase + (int64_t)(g + 3)*hd,
+                                 sc[(int64_t)g*ss + j], sc[(int64_t)(g + 1)*ss + j],
+                                 sc[(int64_t)(g + 2)*ss + j], sc[(int64_t)(g + 3)*ss + j], vrow16, kvd);
+                for (; g + 1 < gq; g += 2)
+                    kv16_axpy_x2(cbase + (int64_t)g*hd, cbase + (int64_t)(g + 1)*hd,
+                                 sc[(int64_t)g*ss + j], sc[(int64_t)(g + 1)*ss + j], vrow16, kvd);
+                if (g < gq) kv16_axpy(cbase + (int64_t)g*hd, sc[(int64_t)g*ss + j], vrow16, kvd);
+            }
+        }
+    } else {
+        for (int t = t0; t < tc; t++) {
+            const int j = t - t0;
+            const float *vrow = (const float *)Vl + q36_kv_at(m, layer, kvh, t);
+            for (int g = 0; g < gq; g++) {
+                float a = sc[(int64_t)g*ss + j];
+                float *cx = cbase + (int64_t)g*hd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+            }
+        }
+    }
+    for (int t = tc; t <= qpos; t++) {
+        const int j = t - t0;
+        const float *vrow = Vb + (int64_t)(t - sp0)*KV*kvd;
+        for (int g = 0; g < gq; g++) {
+            float a = sc[(int64_t)g*ss + j];
+            float *cx = cbase + (int64_t)g*hd;
+            for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+        }
+    }
+}
+
+static void attention_scores_ctx(Model *m, Layer *l, int layer,
+                                 const float *query, const float *k, const float *vv,
+                                 int S, int pos_base, int win, int ring, float *ctx) {
+    Cfg *c = &m->c;
+    const int H = c->q_heads, KV = c->kv_heads;
+    const int q_per_kv = H / KV;
+    const Q36Row *mr = m->mux_rows;
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+    if (threads < 1) threads = 1;
+#endif
+    int gq = q_per_kv;
+    {
+        int64_t want = S == 1 ? (int64_t)threads : (int64_t)4 * threads;
+        while (gq > 1 && (int64_t)S * KV * (q_per_kv / gq) < want) {
+            int d = gq - 1;
+            while (d > 1 && q_per_kv % d) d--;
+            gq = d;
+        }
+        /* For single-token decode, grouping fewer than 4 heads does not beat
+         * the single-head static loop's contiguous score stream. */
+        if (S == 1 && gq < 4) gq = 1;
+    }
+    const int nsub = q_per_kv / gq;
+    const int kv16 = q36_kv16();
+    int max_len = 0;
+    for (int s = 0; s < S; s++) {
+        int qpos = mr ? mr[s].pos : pos_base + s;
+        int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+        int len = qpos + 1 - t0;
+        if (len > max_len) max_len = len;
+    }
+    /* Pad row stride away from 4 KB multiples to prevent L1 set-aliasing across heads. */
+    int sc_stride = (max_len + 15) & ~15;
+    if (sc_stride < 16) sc_stride = 16;
+    if ((sc_stride & 1023) == 0) sc_stride += 16;
+    size_t per_thr = (size_t)gq * (size_t)sc_stride;
+    if (gq > 1) {
+        size_t need = (size_t)threads * per_thr;
+        if (need > m->attn_sc_grp_cap) {
+            free(m->attn_sc_grp);
+            m->attn_sc_grp = falloc((int64_t)need);
+            m->attn_sc_grp_cap = need;
+        }
+    }
+    const int nitems = S * KV * nsub;
+    if (S == 1) {
+        #pragma omp parallel for schedule(static)
+        for (int it = 0; it < nitems; it++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *sc = gq == 1 ? m->attn_sc + (int64_t)tid * m->kv_cap
+                                : m->attn_sc_grp + (size_t)tid * per_thr;
+            attention_task(m, l, layer, query, k, vv, S, pos_base, win, ring,
+                           gq, nsub, kv16, sc_stride, sc, ctx, it);
+        }
+    } else {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int it = 0; it < nitems; it++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *sc = gq == 1 ? m->attn_sc + (int64_t)tid * m->kv_cap
+                                : m->attn_sc_grp + (size_t)tid * per_thr;
+            attention_task(m, l, layer, query, k, vv, S, pos_base, win, ring,
+                           gq, nsub, kv16, sc_stride, sc, ctx, it);
+        }
+    }
+}
+
 /* Gated Attention (GQA) matching HF Qwen3_5MoeAttention:
  *  - q_proj outputs query(head_dim) ++ attn_output_gate(head_dim); k/v are head_dim.
  *  - per-head q/k RMSNorm (weight [head_dim], 1.0+weight).
@@ -6219,7 +6540,6 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int qdim = c->q_head_dim;                  /* per-head q total (query+gate) */
     int q_out = H * qdim;                      /* q_proj output dim */
     int kv_out = KV * kvd;                     /* k/v_proj output dim */
-    int q_per_kv = H / KV;
     int rotary = c->rotary_dim;
     /* HF always chunks q_proj output into query(head_dim) ++ gate(head_dim),
      * regardless of the attn_output_gate config flag -- so split whenever the
@@ -6276,7 +6596,6 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* the step's K and V as the cache keeps them (float16, q36_kv16), before anything reads them:
      * a row reads the same numbers from here as from the cache */
     if (q36_kv16()) { kv16_round(k, (int64_t)S*KV*kvd); kv16_round(vv, (int64_t)S*KV*kvd); }
-    float scale = 1.f / sqrtf((float)hd);
     const int win = c->win_layer && c->win_layer[layer] ? c->window : 0;
     /* A sliding layer's ring (q36_kv_rows): the step's own rows are read from k/vv, where
      * the cache would have them, and go into the ring after the scores; written first, the
@@ -6304,47 +6623,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     float *ctx = falloc((int64_t)S*H*hd);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int hh = 0; hh < H; hh++) {
-        for (int s = 0; s < S; s++) {
-            int kvh = hh / q_per_kv;
-            int qpos = mr ? mr[s].pos : pos_base + s;
-            const void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
-            const float *qv = query + ((int64_t)s*H + hh)*hd;
-            int tid = 0;
-#ifdef _OPENMP
-            tid = omp_get_thread_num();
-#endif
-            float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
-            /* a sliding-window layer (Flint) sees the window's rows, its own included */
-            int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
-            /* from tb on, the step's own rows (a ring's, from the scratch): a multiplexed
-             * row's is itself, the others' from pos_base */
-            int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
-            const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
-            for (int t = t0; t <= qpos; t++) {
-                float acc = t < tb ? q36_kv_dot(qv, Kl, q36_kv_at(m, layer, kvh, t), kvd)
-                                   : dot_f32_lanes(qv, Kb + (int64_t)(t - sp0)*KV*kvd, kvd);
-                sc[t] = acc * scale;
-            }
-            if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
-                float mx = l->sinks[hh];
-                for (int t = t0; t <= qpos; t++) if (sc[t] > mx) mx = sc[t];
-                float sum = expf(l->sinks[hh] - mx);
-                for (int t = t0; t <= qpos; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
-                float inv = 1.f / sum;
-                for (int t = t0; t <= qpos; t++) sc[t] *= inv;
-            } else softmax_row(sc + t0, qpos + 1 - t0);
-            float *cx = ctx + ((int64_t)s*H + hh)*hd;
-            for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
-            for (int t = t0; t <= qpos; t++) {
-                float a = sc[t];
-                if (t < tb) { q36_kv_axpy(cx, a, Vl, q36_kv_at(m, layer, kvh, t), kvd); continue; }
-                const float *vrow = Vb + (int64_t)(t - sp0)*KV*kvd;
-                for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
-            }
-        }
-    }
+    attention_scores_ctx(m, l, layer, query, k, vv, S, pos_base, win, ring, ctx);
     if (ring)   /* the step's rows into the ring: its last `ring` (an earlier one would be overwritten here) */
         for (int s = !mr && S > ring ? S - ring : 0; s < S; s++) {
             int t = mr ? mr[s].pos : pos_base + s;
@@ -10124,11 +10403,7 @@ static int tf_run(Model *m, const int *full, int nfull, const int *tf, int ntf) 
 }
 
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 1, 0, INT_MIN);
 }
 
 #ifndef QWEN36_NO_MAIN
@@ -12638,6 +12913,7 @@ int main(int argc, char **argv) {
     }
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
         if (!g_tok) { fprintf(stderr, "[serve] tokenizer.json required (put in SNAP or set TOK)\n"); return 1; }
+        q36_preload_start(&m);
         serve_loop(&m);
         return 0;
     }
@@ -12826,6 +13102,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
         free(cache->slot_by_expert); free(cache->slots);
     }
     free(model->attn_sc);
+    free(model->attn_sc_grp); model->attn_sc_grp = NULL; model->attn_sc_grp_cap = 0;
     free(model->seen); free(model->is_queued); free(model->is_pinned);
     free(model->momentum_logits); free(model->freq);
     free(model->DN_conv); free(model->DN_rec); free(model->dn_dev_fresh); free(model->dn_host_stale);

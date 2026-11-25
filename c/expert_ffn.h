@@ -432,6 +432,124 @@ static inline float xf_dot_i8_sse2_int16(const uint8_t *w, const float *sc, cons
 }
 #endif /* SSE2 i8 */
 
+/* ---- AVX i8 kernel (no AVX2, no FMA: Sandy Bridge, Ivy Bridge) --------------
+ * The SSE2 kernel's numbers, which are xf_dot_i8_ref's, where the build has AVX
+ * and SSSE3 but not AVX2+FMA. Three things differ from the SSE2 kernel, none in
+ * the result:
+ *   - a block's 8 lane sums come from PMADDUBSW + PMADDWD on its two 16-byte
+ *     halves (a pair sum is at most 2 * 15 * 128 = 3840, inside int16), exact as
+ *     any integer path is;
+ *   - the emulated fmaf holds four lanes in a 256-bit double register, and takes
+ *     the short way where it is safe: the double sum s rounded to float IS the
+ *     correctly rounded fmaf unless s lies exactly on the midpoint of two floats
+ *     (rounding to double is monotone, so the exact sum and s are on the same
+ *     side of every midpoint that s is not). A float midpoint held in a double
+ *     has its low 28 mantissa bits zero, among the normal floats and among the
+ *     subnormal ones (there more than 28), so a lane with those bits zero is
+ *     suspect and its block is redone by xf_fmaf4_avx, the SSE2 kernel's TwoSum
+ *     and rounding to odd in four lanes. On real rows about one lane in 2^28 is
+ *     suspect, plus every lane whose sum is exactly a float (an all-zero
+ *     activation block; an infinite or NaN sum) where both ways give the bits;
+ *   - two weight rows run interleaved against one activation row (gate and up
+ *     of a row, two down rows): a row's chain of emulated fmafs is some 25
+ *     cycles a block, and a second row fills the gaps. Each row's operations
+ *     and their order are the single row's; the rows' correction chains share
+ *     a register, one lane each.
+ * The same conditions as the SSE2 kernel: round to nearest with gradual
+ * underflow (the dispatch checks MXCSR and falls back), no FMA contraction.
+ * tests/test_xf_sse2_int16.c built for Sandy Bridge (tests/test_xf_avx_i8)
+ * checks both fmaf forms against libm and the kernel against xf_dot_i8_ref. */
+#if defined(XF_HAVE_SSE2_INT16) && defined(__AVX__) && defined(__SSSE3__)
+#define XF_HAVE_AVX_I8 1
+/* fmaf(a, b, c) in four lanes, p = a*b EXACT in double, c a float held in a double:
+ * the float fmaf returns, held in a double (xf_fmaf2_sse2 in four lanes) */
+static inline __m256d xf_fmaf4_avx(__m256d p, __m256d c) {
+    __m256d s  = _mm256_add_pd(p, c);
+    __m256d bb = _mm256_sub_pd(s, p);
+    __m256d e  = _mm256_add_pd(_mm256_sub_pd(p, _mm256_sub_pd(s, bb)), _mm256_sub_pd(c, bb));   /* s + e == p + c */
+    __m256d ne = _mm256_cmp_pd(e, _mm256_setzero_pd(), _CMP_NEQ_OQ);                            /* inexact; false when s is not finite (e is NaN) */
+    __m256d sg = _mm256_xor_pd(e, s);                                                           /* sign bit set: the exact value is nearer zero than s */
+    /* rounding to odd on the bit patterns, 128 bits at a time (AVX has no 256-bit integers):
+     * u = (u - (inexact & nearer)) | inexact */
+    __m128i s0 = _mm_castpd_si128(_mm256_castpd256_pd128(s)),  s1 = _mm_castpd_si128(_mm256_extractf128_pd(s, 1));
+    __m128i n0 = _mm_srli_epi64(_mm_castpd_si128(_mm256_castpd256_pd128(ne)), 63), n1 = _mm_srli_epi64(_mm_castpd_si128(_mm256_extractf128_pd(ne, 1)), 63);
+    __m128i g0 = _mm_srli_epi64(_mm_castpd_si128(_mm256_castpd256_pd128(sg)), 63), g1 = _mm_srli_epi64(_mm_castpd_si128(_mm256_extractf128_pd(sg, 1)), 63);
+    s0 = _mm_or_si128(_mm_sub_epi64(s0, _mm_and_si128(g0, n0)), n0);
+    s1 = _mm_or_si128(_mm_sub_epi64(s1, _mm_and_si128(g1, n1)), n1);
+    __m256d r = _mm256_insertf128_pd(_mm256_castpd128_pd256(_mm_castsi128_pd(s0)), _mm_castsi128_pd(s1), 1);
+    return _mm256_cvtps_pd(_mm256_cvtpd_ps(r));
+}
+/* The short way: the double sum rounded to float, right for every lane that is not suspect.
+ * *hit collects the suspect lanes (ones in the low dword of the lane's 64 bits; lanes 2 and 3
+ * only with `upper`: the correction register leaves them zero, which always looks suspect).
+ * The caller redoes a block with a hit through xf_fmaf4_avx. */
+static inline __attribute__((always_inline)) __m256d xf_fmaf4_fast_avx(__m256d p, __m256d c, __m128i *hit, const int upper) {
+    __m256d s = _mm256_add_pd(p, c);
+    __m256d t = _mm256_and_pd(s, _mm256_castsi256_pd(_mm256_set1_epi64x(0x0FFFFFFF)));
+    const __m128i z = _mm_setzero_si128();
+    *hit = _mm_or_si128(*hit, _mm_cmpeq_epi32(_mm_castpd_si128(_mm256_castpd256_pd128(t)), z));
+    if (upper) *hit = _mm_or_si128(*hit, _mm_cmpeq_epi32(_mm_castpd_si128(_mm256_extractf128_pd(t, 1)), z));
+    return _mm256_cvtps_pd(_mm256_cvtpd_ps(s));
+}
+/* 16 nibbles (0..15, a byte each) x 16 int8 -> 4 int32 sums of 4 products, added to acc */
+static inline __m128i xf_dp16_ssse3(__m128i acc, __m128i u, __m128i x) {
+    return _mm_add_epi32(acc, _mm_madd_epi16(_mm_maddubs_epi16(u, x), _mm_set1_epi16(1)));
+}
+/* n = 1 or 2 weight rows against one activation row: y[r] = xf_dot_i8_ref(w[r], sc[r], xq, xsum, sx, I) */
+static inline __attribute__((always_inline)) void xf_dot_i8_avx_n(float *y, const uint8_t *const *w, const float *const *sc,
+                                                                  const int8_t *xq, const float *xsum, float sx, int I, const int n) {
+    const __m128i m4 = _mm_set1_epi8(0x0F), z = _mm_setzero_si128();
+    __m256d alo[2], ahi[2], corr = _mm256_setzero_pd();              /* lanes 0..3 and 4..7 of each row; the rows' corrections */
+    for (int r = 0; r < n; r++) { alo[r] = _mm256_setzero_pd(); ahi[r] = _mm256_setzero_pd(); }
+    const int ng = I / XF_BLOCK;
+    for (int g = 0; g < ng; g++) {
+        const int8_t *xb = xq + (size_t)g * XF_BLOCK;
+        const __m128i x0 = _mm_loadu_si128((const __m128i *)xb),        x1 = _mm_loadu_si128((const __m128i *)(xb + 16));
+        const __m128i x2 = _mm_loadu_si128((const __m128i *)(xb + 32)), x3 = _mm_loadu_si128((const __m128i *)(xb + 48));
+        float scg[4] = {0.f, 0.f, 0.f, 0.f};
+        __m256d plo[2], phi[2], nlo[2], nhi[2];
+        __m128i hit = z, hitc = z;
+        for (int r = 0; r < n; r++) {
+            const uint8_t *blk = w[r] + (size_t)g * XF_BLOCK_BYTES;
+            const __m128i b0 = _mm_loadu_si128((const __m128i *)blk), b1 = _mm_loadu_si128((const __m128i *)(blk + 16));
+            const __m128i d0 = xf_dp16_ssse3(xf_dp16_ssse3(z, _mm_and_si128(b0, m4), x0), _mm_and_si128(_mm_srli_epi16(b0, 4), m4), x2);   /* lanes 0..3 */
+            const __m128i d1 = xf_dp16_ssse3(xf_dp16_ssse3(z, _mm_and_si128(b1, m4), x1), _mm_and_si128(_mm_srli_epi16(b1, 4), m4), x3);   /* lanes 4..7 */
+            const __m256d s = _mm256_set1_pd((double)sc[r][g]);
+            plo[r] = _mm256_mul_pd(_mm256_cvtepi32_pd(d0), s); phi[r] = _mm256_mul_pd(_mm256_cvtepi32_pd(d1), s);   /* exact: 14 + 24 bits */
+            nlo[r] = xf_fmaf4_fast_avx(plo[r], alo[r], &hit, 1);
+            nhi[r] = xf_fmaf4_fast_avx(phi[r], ahi[r], &hit, 1);
+            scg[r] = sc[r][g];
+        }
+        /* corr[r] = fmaf(sc[r][g], xsum[g], corr[r]), row r in lane r */
+        const __m256d pc = _mm256_mul_pd(_mm256_cvtps_pd(_mm_loadu_ps(scg)), _mm256_set1_pd((double)xsum[g]));
+        __m256d nc = xf_fmaf4_fast_avx(pc, corr, &hitc, 0);
+        if (__builtin_expect(_mm_movemask_ps(_mm_castsi128_ps(hit)) & 5, 0))        /* bits 0 and 2: the low dwords of the two lanes of a half */
+            for (int r = 0; r < n; r++) { nlo[r] = xf_fmaf4_avx(plo[r], alo[r]); nhi[r] = xf_fmaf4_avx(phi[r], ahi[r]); }
+        /* the correction on its own: a block sum of few bits (0, 1, 2, 3, 4, 6...) makes its product
+         * exactly a float far more often than a lane's is */
+        if (_mm_movemask_ps(_mm_castsi128_ps(hitc)) & (n > 1 ? 5 : 1)) nc = xf_fmaf4_avx(pc, corr);
+        for (int r = 0; r < n; r++) { alo[r] = nlo[r]; ahi[r] = nhi[r]; }
+        corr = nc;
+    }
+    float c[4]; _mm_storeu_ps(c, _mm256_cvtpd_ps(corr));
+    for (int r = 0; r < n; r++) {
+        float l[8];
+        _mm_storeu_ps(l, _mm256_cvtpd_ps(alo[r])); _mm_storeu_ps(l + 4, _mm256_cvtpd_ps(ahi[r]));
+        y[r] = (xf_hsum8_scalar(l) - 8.f * c[r]) * sx;
+    }
+}
+static inline float xf_dot_i8_avx(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
+    float y; xf_dot_i8_avx_n(&y, &w, &sc, xq, xsum, sx, I, 1); return y;
+}
+/* two weight rows against one activation row: *y0 and *y1 are xf_dot_i8's bits for each */
+static inline void xf_dot_i8_pair_avx(float *y0, float *y1, const uint8_t *w0, const float *sc0, const uint8_t *w1, const float *sc1,
+                                      const int8_t *xq, const float *xsum, float sx, int I) {
+    const uint8_t *w[2] = {w0, w1}; const float *sc[2] = {sc0, sc1}; float y[2];
+    xf_dot_i8_avx_n(y, w, sc, xq, xsum, sx, I, 2);
+    *y0 = y[0]; *y1 = y[1];
+}
+#endif /* AVX i8 */
+
 /* f32, x86 without FMA (Sandy Bridge, Ivy Bridge, the x86-64 baseline and v2). There coli_fmaf is
  * (float)((double)a * b + c) (fma_compat.h): the product is exact in double, the sum rounds once in
  * double and once to float. The reference makes that one element at a time, a code widened to float
@@ -632,7 +750,11 @@ static inline float xf_dot_i8(const uint8_t *w, const float *sc, const int8_t *x
      * Preserve the reference's behavior outside the emulation's assumptions. */
     if (_mm_getcsr() & (_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | 0x0040))
         return xf_dot_i8_ref(w, sc, xq, xsum, sx, I);
+#ifdef XF_HAVE_AVX_I8
+    return xf_dot_i8_avx(w, sc, xq, xsum, sx, I);
+#else
     return xf_dot_i8_sse2_int16(w, sc, xq, xsum, sx, I);
+#endif
 #else
     return xf_dot_i8_ref(w, sc, xq, xsum, sx, I);
 #endif
@@ -929,6 +1051,15 @@ typedef struct {
  * share the activation, so their rows are interleaved in the same pass. */
 static inline void xf_gate_up_rows(float *g, float *u, const XfExpert *e, const XfAct *a, int H, int r0, int r1, int mode) {
     size_t rb = xf_row_bytes(H); int ng = xf_groups(H);
+#ifdef XF_HAVE_AVX_I8
+    /* gate and up of a row in one pass, under the conditions xf_dot_i8 asks of MXCSR */
+    if (mode && !(_mm_getcsr() & (_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | 0x0040))) {
+        for (int r = r0; r < r1; r++)
+            xf_dot_i8_pair_avx(&g[r], &u[r], e->g4 + (size_t)r * rb, e->gs + (size_t)r * ng, e->u4 + (size_t)r * rb, e->us + (size_t)r * ng,
+                               a->xq, a->xsum, a->sx, H);
+        return;
+    }
+#endif
     for (int r = r0; r < r1; r++) {
         const uint8_t *wg = e->g4 + (size_t)r * rb, *wu = e->u4 + (size_t)r * rb;
         const float *sg = e->gs + (size_t)r * ng, *su = e->us + (size_t)r * ng;
@@ -943,6 +1074,13 @@ static inline void xf_swiglu(float *h, const float *g, const float *u, int F) {
 /* down rows [r0,r1) of one expert for one hidden row */
 static inline void xf_down_rows(float *y, const XfExpert *e, const XfAct *h, int F, int r0, int r1, int mode) {
     size_t rb = xf_row_bytes(F); int ng = xf_groups(F);
+#ifdef XF_HAVE_AVX_I8
+    /* two down rows a pass (an odd last row falls to the loop below) */
+    if (mode && !(_mm_getcsr() & (_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | 0x0040)))
+        for (; r0 + 2 <= r1; r0 += 2)
+            xf_dot_i8_pair_avx(&y[r0], &y[r0 + 1], e->d4 + (size_t)r0 * rb, e->ds + (size_t)r0 * ng,
+                               e->d4 + (size_t)(r0 + 1) * rb, e->ds + (size_t)(r0 + 1) * ng, h->xq, h->xsum, h->sx, F);
+#endif
     for (int r = r0; r < r1; r++) {
         const uint8_t *wd = e->d4 + (size_t)r * rb; const float *sd = e->ds + (size_t)r * ng;
         y[r] = mode ? xf_dot_i8(wd, sd, h->xq, h->xsum, h->sx, F) : xf_dot_f32(wd, sd, h->x, F);

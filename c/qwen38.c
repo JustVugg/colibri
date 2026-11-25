@@ -1292,23 +1292,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
 }
 
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    if (a->len < 1 || (uint64_t)a->len > SIZE_MAX / sizeof(int)) {
-        fprintf(stderr, "ref.json: invalid array length for \"%s\"\n", key); exit(1);
-    }
-    int *r = malloc((size_t)a->len * sizeof(int));
-    if (!r) { fprintf(stderr, "ref.json: OOM reading \"%s\"\n", key); exit(1); }
-    for (int i = 0; i < a->len; i++) {
-        jval *v = a->kids[i];
-        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < 0 ||
-            v->num > INT_MAX || floor(v->num) != v->num) {
-            fprintf(stderr, "ref.json: %s[%d] must be a non-negative integer\n", key, i);
-            exit(1);
-        }
-        r[i] = (int)v->num;
-    }
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 1, 1, 0);
 }
 
 static jval *read_reference_logits(jval *root,int vocab){
@@ -1502,23 +1486,8 @@ static int sample_prob_desc(const void *a, const void *b){
     if(x->p!=y->p) return x->p>y->p?-1:1;
     return (x->id>y->id)-(x->id<y->id);
 }
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
- * (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V){
-    static int dump=-1;
-    if(dump<0)dump=getenv("COLI_LOGIT_DUMP")?1:0;
-    if(!dump)return;
-    int id[5]={-1,-1,-1,-1,-1};float v[5]={-3e38f,-3e38f,-3e38f,-3e38f,-3e38f};
-    for(int t=0;t<V;t++){
-        const float x=lo[t];
-        for(int k=0;k<5;k++)if(x>v[k]){for(int j=4;j>k;j--){v[j]=v[j-1];id[j]=id[j-1];}v[k]=x;id[k]=t;break;}
-    }
-    fprintf(stderr,"[LOGITS]");
-    for(int k=0;k<5;k++)fprintf(stderr," %d:%.6f",id[k],v[k]);
-    fprintf(stderr,"\n");
-}
 static int serve_sample(const float *lo, int V, float temp, float top_p){
-    serve_logit_dump(lo, V);
+    coli_logit_dump(lo, V);
     if(temp<=0.f) return argmax_first(lo, V);
     float *p=malloc((size_t)V*sizeof(float)); SampleProb *head=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!p||!head){ fprintf(stderr,"OOM sampling\n"); exit(1); }

@@ -243,4 +243,41 @@ static jval *json_parse_checked(const char *text) {
     return v;
 }
 
+/* Read an integer array field from a JSON object (e.g. ref.json oracles).
+ * Enforces array type, length bounds, overflow-safe allocation, OOM check,
+ * and finite exact-integer elements in [min_val, INT_MAX]. When required == 0
+ * and the key is absent or not an array, returns NULL with *n_out = 0. */
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+static inline int *json_read_int_array(jval *o, const char *key, int *n_out,
+                                       int required, int min_len, int min_val) {
+    jval *a = json_get(o, key);
+    if (!a || a->t != J_ARR) {
+        if (!required) { *n_out = 0; return NULL; }
+        fprintf(stderr, "ref.json: missing array \"%s\"\n", key);
+        exit(1);
+    }
+    if (a->len < min_len || (uint64_t)a->len > SIZE_MAX / sizeof(int)) {
+        fprintf(stderr, "ref.json: invalid array length for \"%s\"\n", key);
+        exit(1);
+    }
+    int *r = (int *)malloc((size_t)(a->len ? a->len : 1) * sizeof(int));
+    if (!r) {
+        fprintf(stderr, "ref.json: OOM reading \"%s\"\n", key);
+        exit(1);
+    }
+    for (int i = 0; i < a->len; i++) {
+        jval *v = a->kids[i];
+        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < (double)min_val ||
+            v->num > (double)INT_MAX || floor(v->num) != v->num) {
+            fprintf(stderr, "ref.json: %s[%d] is not an integer\n", key, i);   /* olmoe's line (test_olmoe_ref_input) */
+            exit(1);
+        }
+        r[i] = (int)v->num;
+    }
+    *n_out = a->len;
+    return r;
+}
+
 #endif

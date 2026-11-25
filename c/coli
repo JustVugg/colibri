@@ -506,6 +506,8 @@ def apply_measured_profile(env, profile, explicit_env, explicit_cap):
     """Apply scheduling/resource results while preserving CLI precedence."""
     from autotune import apply_profile
     result=apply_profile(env,profile,explicit_env)
+    if "OMP_NUM_THREADS" in profile.get("winner",{}).get("env",{}) and "OMP_NUM_THREADS" not in explicit_env:
+        result.pop("COLI_OMP_TEAM_AUTO",None)   # a measured team is not the default the engine may probe
     # This is a launcher-private bridge for engines whose cache capacity is an
     # argv value rather than an environment variable. It must never leak from a
     # parent shell or override an explicit --cap.
@@ -588,8 +590,8 @@ def env_for_engine(a, arch, plan=None):
     # setdefault, so an explicit OMP_NUM_THREADS still wins.
     if not env.get("COLI_NO_OMP_TUNE"):
         if arch != "deepseek_v4":
-            from resource_plan import team_cpu_count
-            env.setdefault("OMP_NUM_THREADS", str(team_cpu_count()))
+            from resource_plan import default_omp_team, team_cpu_count
+            default_omp_team(env, team_cpu_count())
         else:
             env.setdefault("OMP_WAIT_POLICY", "active")
             env.setdefault("GOMP_SPINCOUNT", "200000")
@@ -750,6 +752,7 @@ def env_for_engine(a, arch, plan=None):
             # measured profile (V4 only, below) or the user explicitly chooses
             # a team.
             env.pop("OMP_NUM_THREADS",None)
+            env.pop("COLI_OMP_TEAM_AUTO",None)
         if not getattr(a, "no_tune_profile", False):
             from autotune import load_profile
             profile=load_profile(plan,a.model,engine_for(a.model))
@@ -1039,8 +1042,8 @@ def env_for(a):
     # setdefault, so an explicit OMP_NUM_THREADS still wins, and the whole
     # thing stays behind COLI_NO_OMP_TUNE like the rest of the OMP tuning.
     if not e.get("COLI_NO_OMP_TUNE"):
-        from resource_plan import team_cpu_count
-        e.setdefault("OMP_NUM_THREADS", str(team_cpu_count()))
+        from resource_plan import default_omp_team, team_cpu_count
+        default_omp_team(e, team_cpu_count())
     if sys.platform == "win32":
         # COLI_NO_OMP_TUNE spegne SOLO il blocco OMP (stesso perimetro del
         # self-exec di glm.c; presence-based come nel motore: impostarla a
@@ -1110,7 +1113,12 @@ def env_for(a):
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
+        # COLI_NO_OMP_TUNE promises no automatic team: the launcher set none
+        # above, so the plan sets none either, as in env_for_engine.
+        plan_must_not_choose_omp=("OMP_NUM_THREADS" not in e
+                                  and e.get("COLI_NO_OMP_TUNE"))
         e=environment_for_plan(plan,e,has_cuda)
+        if plan_must_not_choose_omp: e.pop("OMP_NUM_THREADS",None)
         if not getattr(a, "no_tune_profile", False):
             from autotune import load_profile
             profile=load_profile(plan,a.model,GLM)
@@ -1174,7 +1182,11 @@ def env_for(a):
                     try:
                         plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy,
                                         kv_slots=requested_kv_slots(a,e))
-                        e.update(environment_for_plan(plan,e,cuda_enabled=True))
+                        planned=environment_for_plan(plan,e,cuda_enabled=True)
+                        # no automatic team under COLI_NO_OMP_TUNE, as with --auto-tier
+                        if "OMP_NUM_THREADS" not in e and e.get("COLI_NO_OMP_TUNE"):
+                            planned.pop("OMP_NUM_THREADS",None)
+                        e.update(planned)
                         vt=plan["tiers"]["vram"]
                         # #1409: the dense trunk is read on every token; leaving
                         # it on the CPU next to a 30 GB expert tier is the

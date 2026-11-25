@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`coli setup` no longer promises a slow laptop CPU the speed of its RAM.** It estimated a decode on
+  the CPU from the RAM's bandwidth alone, so an i7-1355U laptop (RAM as fast as a desktop's, a third of
+  its compute) was offered Inkling-2-Mini at 11 tok/s where it decodes at 3. The setup now also
+  measures how much the cores compute (under a second) and slows the estimate where they are short.
 - **Vulkan: a long prompt's steps stay on the GPU when the driver refuses their scratch.** On a
   Windows desktop (an RTX PRO 4500 with Qwen3.8) the driver refused memory its budget showed free,
   and every prompt step's experts went to the CPU: a long prompt three times slower. The step now
