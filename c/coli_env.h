@@ -802,6 +802,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q38_EXPERT_PARTIAL", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_EXPERT_PREFETCH",              CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
     {"Q38_FP8_KERNEL", CE_STR, CE_QWEN38, 0, NULL},
+    {"Q38_GROUP_OVERLAP", CE_BOOL, CE_QWEN38, 0, NULL},
     {"Q38_HEAD_PIN_MARKS", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_ILV16", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_KV", CE_STR, CE_QWEN38, 0, NULL},

@@ -2037,6 +2037,7 @@ typedef struct {
     double started; uint64_t hits, misses; Q38Timers timers; QtCounters qt;
     uint64_t prefill_hits, prefill_misses; Q38Timers prefill_timers; QtCounters prefill_qt;
     uint64_t npf[7];   /* Q38_NEXT_PREFETCH's counters (qwen38_cuda_chain.h) */
+    uint64_t group_overlap_waves;   /* Q38_GROUP_OVERLAP waves */
 } Q38ReqClock;
 
 static QtCounters q38_qt_delta(const QtCounters *after,const QtCounters *before){
@@ -2090,6 +2091,12 @@ static void q38_report_request_split(const Model *m,const Q38ReqClock *clk,const
         snprintf(line+sn-1,sizeof line-(size_t)(sn-1)," | next-layer guess %llu, hit %llu (%.1f %%, %.1f %% of %llu routed), "
                  "read ahead %llu, used %llu, wasted %llu%s\n",(unsigned long long)g,(unsigned long long)h,100.0*h/g,
                  r?100.0*h/r:0.0,(unsigned long long)r,(unsigned long long)rd,(unsigned long long)u,(unsigned long long)(rd-u),more);
+    }
+    uint64_t ow=m->group_overlap_waves-clk->group_overlap_waves;
+    if(sn>0&&ow){
+        size_t len=strlen(line);
+        if(len>0&&line[len-1]=='\n'&&len+48<sizeof line)
+            snprintf(line+len-1,sizeof line-(len-1)," | overlap waves %llu\n",(unsigned long long)ow);
     }
     if(sn>0)fputs(line,stderr);
 }
@@ -3061,6 +3068,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     clk->started=now_s(); clk->hits=m->hits; clk->misses=m->miss; clk->timers=m->timers; qt_counters(&clk->qt);
     clk->npf[0]=m->npf_guess; clk->npf[1]=m->npf_hit; clk->npf[2]=m->npf_routed; clk->npf[3]=m->npf_issued; clk->npf[4]=m->npf_used;
     clk->npf[5]=m->npf_cancel; clk->npf[6]=m->npf_held;
+    clk->group_overlap_waves=m->group_overlap_waves;
     /* Prima gli scatti CHIESTI, e il piu profondo: sono punti di ritorno che
      * il client ha dichiarato, e battono la cache automatica, che insegue solo
      * l'ultimo prompt. Se nessuno serve, si ricade su quella. */
@@ -4012,6 +4020,8 @@ int main(int argc, char **argv) {
     qt_stats();   /* VRAM tier hits/misses/swaps, if on */
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
+    if (m.group_overlap_waves)
+        fprintf(stderr, "Grouped prefill overlap waves: %llu\n", (unsigned long long)m.group_overlap_waves);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
 #ifdef COLI_CUDA
     q38cc_report(&m);
