@@ -1616,6 +1616,16 @@ static int vkc_matmul_in(ColiVkTensor *t, VkcBuf *x, size_t xo, VkcBuf *y, size_
     if (!open_frame() || KC.lost || S < 1 || S > 65535 || !vkc_tensor_info(t, &ti)) return 0;
     size_t xb = xo * 4, yb = yo * 4, xn = (size_t)S * ti.I * 4, yn = (size_t)S * ti.O * 4;
     if (xb + xn > x->bytes || yb + yn > y->bytes) { fprintf(stderr, "[VK] chain: matmul out of range\n"); return 0; }
+    /* vkc_gemm_rows(0) past 4 rows (a multiplexed decode step, a long verify): groups of 4, each the GEMV that
+     * decodes a weight once for its rows and gives them a decode step's bits, instead of a GEMV a row each that
+     * reads every weight S times. COLI_VK_GEMV_GROUPS=0: a row each. */
+    static int groups = -1;
+    if (groups < 0) { const char *e = getenv("COLI_VK_GEMV_GROUPS"); groups = !(e && *e == '0'); }
+    if (S > 4 && KC.gemm_rows == 0 && groups) {
+        for (int r0 = 0; r0 < S; r0 += 4)
+            if (!vkc_matmul_in(t, x, xo + (size_t)r0 * ti.I, y, yo + (size_t)r0 * ti.O, S - r0 < 4 ? S - r0 : 4)) return 0;
+        return 1;
+    }
     if (xb % KC.align == 0 && yb % KC.align == 0) return matmul_aligned(&ti, x, xb, y, yb, S);
     /* an offset the device cannot bind: through temporaries that live with the frame */
     VkcFrame *f = open_frame();
