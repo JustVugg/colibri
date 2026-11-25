@@ -168,6 +168,7 @@ def check_lossless(engine, model, ref_name, extra=None):
     extra = dict(extra or {})
     data = json.loads((model / ref_name).read_text(encoding="utf-8"))
     n_new = len(data["full_ids"]) - len(data["prompt_ids"])
+    row = 4 * len(data["final_logits"])   # one logits row of DUMP, float32
     print(f"lossless: {model} ({ref_name}{', ' + ' '.join(f'{k}={v}' for k, v in extra.items()) if extra else ''})")
     configs, failed_before = 0, len(FAILS)
     with tempfile.TemporaryDirectory() as tmp:
@@ -187,7 +188,11 @@ def check_lossless(engine, model, ref_name, extra=None):
                         on = run(engine, model, [cap, 8, model / ref_name],
                                  dict(env, DUMP=str(dump), Q38_MTP="1", Q38_MTP_FORCE=mode))
                         name = f"{tag} {mode or 'normal'}"
-                        same = on.returncode == 0 and on.stdout == off.stdout and dump.read_bytes() == base_logits
+                        # DUMP holds every sampled row (#2950); MTP's verify computes its rows in a batch, so
+                        # the gate stays what it was: the same tokens and the same last logits, as many rows
+                        on_logits = dump.read_bytes()
+                        same = (on.returncode == 0 and on.stdout == off.stdout and len(on_logits) == len(base_logits)
+                                and on_logits[-row:] == base_logits[-row:])
                         counts = spec_counts(on.stderr)
                         if mode:
                             want = expected_counts(n_new, mode)

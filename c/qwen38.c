@@ -1257,7 +1257,8 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         free(logit); out[len++] = best;
         if (m->draft_vocab) draft_vocab_count_token(m->draft_vocab, best);
         /* the steps' own picks (greedy), the last token's logits kept: a verify that reaches it has them */
-        sp->greedy = !g_capture_last_logit || n_new - 1 - s > Q38_SPEC_ROWS;
+        /* DUMP: every row's logits, none of them picked on the card without them */
+        sp->greedy = !(getenv("DUMP") && *getenv("DUMP")) && (!g_capture_last_logit || n_new - 1 - s > Q38_SPEC_ROWS);
         logit = q38_spec_step(m, sp, best, len - 1, n_new - 1 - s);
         picked = logit ? sp->next_tok : -1;
     }
@@ -3843,7 +3844,8 @@ int main(int argc, char **argv) {
     q38_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the tier sizes its budget */
 #endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
-    g_capture_last_logit=ref_logits!=NULL;   /* DUMP writes its rows itself (dump_logits) */
+    /* the last row exact for the oracle and for DUMP (an MTP run's last logits are the plain run's) */
+    g_capture_last_logit=ref_logits!=NULL||(getenv("DUMP")&&*getenv("DUMP"));
     if(is_ref){g_q38_mtp_oracle=full;g_q38_mtp_oracle_n=nfull;}   /* Q38_MTP_FORCE=accept|mixed */
     int64_t hist = q38_telemetry_init(snap, &m);
     if (g_q38_gguf_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
