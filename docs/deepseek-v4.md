@@ -464,6 +464,50 @@ runs took 20.31 to 20.66 s and with the drain 20.19 to 20.61 s: these runs do
 not separate the two. Not measured: a second card, the peer pool, Linux. The
 record is in `docs/experiments/v4-upload-thread-2026-11-12/`.
 
+### A read copied to its mirror as it lands (`V4_UPLOAD_PIECES`, opt-in)
+
+With the uploader thread, a mirror's copies start when its expert's read is
+complete: the link to the card is idle under the read and busy after it.
+`V4_UPLOAD_PIECES=N` has a decode lane reserve the mirror before its read; the
+store reads the record in N pieces and reports each as it lands, and the piece
+is copied to its place in the mirror at once, on the device's second stream.
+When the last piece is in, the mirror is its expert's and the step finds it
+there: nothing is left to upload. `N=1` is the whole record once it is in.
+
+It needs the uploader thread with its copies fenced (`V4_UPLOAD_THREAD=1`,
+`V4_UPLOAD_FENCE` not `0`), two-run mirrors (`V4_MIRROR_BLOCK=1`), the record
+where its read lands (`V4_SLAB_SHIFT`, the default), and a mirror cache that
+recycles: while the cache still grows, and for any expert these do not hold
+for, the read goes the usual way and the uploader attaches it. A read that
+fails, or ends short of the whole record, leaves the reserved mirror empty and
+the expert takes the usual path. On Windows every piece's read is in flight at
+once; elsewhere the pieces are read one after the other.
+
+The exit line `v4_gpu pieces: reserved= mirrored= abandoned= copies=
+verified= mismatches=` counts them; `V4_MIRROR_BLOCK_VERIFY=1` reads every
+mirror filled this way back and compares it with the host bytes.
+
+Measured on an RTX 5080 (3,278-token prompt, 36 tokens, `--memory-gb 16`,
+`V4_BANK_MAKE_ROOM=1 V4_UPLOAD_THREAD=1 V4_MIRROR_BLOCK=1` in every cell,
+three interleaved runs per cell, medians: seconds for the 35 tokens after the
+first; the text is the same in every run of a system):
+
+| `V4_UPLOAD_PIECES` | Linux (Ryzen 9 3900X, 94 GiB) | Windows 11 (Ryzen 9 5950X, 32 GB) |
+|---|---|---|
+| unset | 12.54 | 17.25 |
+| `1` | 12.47 (+0.5 % tok/s) | 16.51 (+4.5 %) |
+| `2` | 12.28 (+2.1 %) | 15.84 (+8.9 %) |
+| `3` | 12.50 (+0.3 %) | 15.95 (+8.1 %) |
+| `4` | 12.99 (-3.5 %) | 16.54 (+7.0 %, an earlier set of runs) |
+
+Two pieces is the best on both, and it is worth much less on Linux, where an
+upload costs the thread that makes it far less to begin with. The Linux column
+was measured at this change; the Windows column on 2026-11-13 at a local merge
+of dev with this change, before it was rebased. On Linux with `--memory-gb 80`
+from a cold start, 13.96 s against 13.92 s: no difference. The verifier read
+4,231 mirrors back on Linux and 4,305 on Windows with no difference. The
+record is in `docs/experiments/v4-upload-pieces-2026-11-16/`.
+
 ### Expert-pruned checkpoints (REAP) and the generic kernels
 
 Expert-pruned checkpoints such as `puwaer/DeepSeek-V4-Flash-0731-reap-150b`
@@ -1187,6 +1231,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_MIRROR_BLOCK_VERIFY` (0) | `1` = read every two-run fill back and compare it with the host bytes (`verified= mismatches=` in the `v4_gpu mirror-block` exit line); slow |
 | `V4_UPLOAD_THREAD` (0) | `1` = a decode step hands each mirror upload to an uploader thread and starts its lane's next read at once; the copies go on the device's second stream and the expert group is ordered after them by an event (see [The decode mirror uploads on an uploader thread](#the-decode-mirror-uploads-on-an-uploader-thread-v4_upload_thread-opt-in)) |
 | `V4_UPLOAD_FENCE` (1) | with `V4_UPLOAD_THREAD=1`: `0` = the uploader drains the second stream after each mirror instead of the event |
+| `V4_UPLOAD_PIECES` (0) | `N` = a decode lane's read lands in N pieces, each copied to a mirror reserved before the read as it lands (`1`: the whole record once it is in; 16 at most); needs `V4_UPLOAD_THREAD=1`, `V4_MIRROR_BLOCK=1` and `V4_SLAB_SHIFT` (see [A read copied to its mirror as it lands](#a-read-copied-to-its-mirror-as-it-lands-v4_upload_pieces-opt-in)) |
+| `DSV4_UPLOAD_SUBMIT` (1, `.cu`) | `0` = an enqueued upload is not submitted to the driver at once (a stream status query after the copy); no difference measured on Windows |
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
 | `V4_HOT_SPLIT` (on for one HIP card below 10 GiB of `--vram`, else 0) | `1` = decode computes the experts mirrored in VRAM on the GPU while the CPU computes the others, and at most one expert per layer is uploaded, after it, by use count (see [Hot experts on the card, the rest on the CPU](#hot-experts-on-the-card-the-rest-on-the-cpu-v4_hot_split-on-below-10-gib-on-hip)); needs the shared experts in RAM |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
