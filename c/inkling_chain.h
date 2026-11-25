@@ -784,7 +784,7 @@ static int inkc_norm(VkcBuf *x, size_t xo, VkcBuf *w, size_t wo, VkcBuf *y, size
     return vkc_norm(x, w, y, &p);
 }
 static int inkc_conv(InkChain *ch, VkcBuf *x, size_t xo, int n, int C, int bank, int i, const Cfg *c) {
-    VkcSconv p = {0, n, C, c->conv_k, (int)xo, C, (int)ch->o_cw[bank][i], 0, 0, 1.f};
+    VkcSconv p = {0, n, C, c->conv_k, (int)xo, C, (int)ch->o_cw[bank][i], 0, 0, 1.f, 0};
     return vkc_sconv(x, ch->prm, ch->ring[bank][i], &p);
 }
 /* nrm in; the attention block's o_proj rows in tmp; the new K/V rows into the device
@@ -818,7 +818,7 @@ static int inkc_attention(InkChain *ch, Model *m, int i, int n, int pb) {
     }
     VkcRelAttn a = {n, H, KV, hd, pb, cap, local ? c->window : 0, L_EXT(c, i), dr,
                     0, H * hd, 0, H * hd, 0, 0, 0, (int)vs, kvo, 0, H * dr, (int)ch->o_relp[i], local ? ch->rows : 0,
-                    1.f / (float)hd, 0, 0};
+                    1.f / (float)hd, 0, 0, 0};
     ok = ok && vkc_relattn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->kvs, ch->r, ch->prm, ch->tau, &a);
     if (!ok) return 0;
     /* the step's rows into the ring after the attention read them: the last `cap` of them */
@@ -860,7 +860,7 @@ static int inkc_mlp_out(InkChain *ch, int i, int n, const Cfg *c) {
 static int inkc_dense(InkChain *ch, Model *m, Layer *l, int i, int n) {
     Cfg *c = &m->c; int DI = c->dense_inter;
     VkcEw sw = {VKC_EW_SWIGLU, n * DI, DI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-    VkcSconv sc = {1, 0, 0, 0, 0, 0, 0, 0, n * c->hidden, l->dgs};
+    VkcSconv sc = {1, 0, 0, 0, 0, 0, 0, 0, n * c->hidden, l->dgs, 0};
     return vkc_matmul(ch->t_dg[i], ch->h2, 0, ch->gs, 0, n) && vkc_matmul(ch->t_du[i], ch->h2, 0, ch->us, 0, n) &&
            vkc_ew(ch->gs, ch->gs, ch->us, NULL, NULL, &sw) && vkc_matmul(ch->t_dd[i], ch->gs, 0, ch->mlp, 0, n) &&
            vkc_sconv(ch->mlp, NULL, NULL, &sc) && inkc_mlp_out(ch, i, n, c);
@@ -966,7 +966,7 @@ static int inkc_forward_seg(Model *m, InkChain *ch, float *xh, int S, int pos_ba
             ok = vkc_copy(ch->csd, ch->o_csd[(size_t)b * LT + i], ch->ring[b][i], 0, (size_t)inkc_cs_cells(c, b, i));
         int last = c0 + n == S;
         if (ok && last && full) {
-            VkcSconv dv = {2, 0, 0, 0, 0, 0, 0, 0, D, c->mup};
+            VkcSconv dv = {2, 0, 0, 0, 0, 0, 0, 0, D, c->mup, 0};
             ok = inkc_norm(ch->x, (size_t)(n - 1) * D, ch->prm, ch->o_final, ch->fin, 0, 1, D, c->eps) &&
                  vkc_sconv(ch->fin, NULL, NULL, &dv) && vkc_matmul(ch->t_lm, ch->fin, 0, ch->outd, 0, 1);
         }

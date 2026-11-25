@@ -3367,11 +3367,11 @@ int vkc_ink2_dconv(VkcBuf *x, VkcBuf *dyn, VkcBuf *prm, VkcBuf *ring, const VkcI
     KC.kind = PK_DNCONV;
     if (!pipe || p->S < 0 || p->C < 1 || p->K < 1 || p->K > 9 || p->hd < 1 || p->C % p->hd) return 0;
     if (p->S == 0) return open_frame() && !KC.lost;
-    int32_t pc[12] = {2, p->S, p->C, p->K, p->x_off, p->x_row, p->d_off, p->d_row, p->st_off, p->ring_off, p->hd, 0};
+    int32_t pc[13] = {2, p->S, p->C, p->K, p->x_off, p->x_row, p->d_off, p->d_row, p->st_off, p->ring_off, p->hd, 0, p->tab};
     memcpy(&pc[11], &p->fc, 4);
     VkcBind bd[4] = {B(x, 1), B(dyn, 0), B(prm, 0), B(ring, 1)};
     uint32_t gx, gy; grid(((uint64_t)p->C + 255) / 256, &gx, &gy);
-    return record(pipe, bd, 4, pc, sizeof pc, gx, gy, 1);
+    return record(pipe, bd, 4, pc, sizeof pc, gx, gy, p->tab > 0 ? (uint32_t)p->S : 1);   /* tab: a row a z */
 }
 int vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p) {
     VkPipeline pipe = kx_pipe(0);
@@ -3381,7 +3381,7 @@ int vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p) {
     if (p->mode == 0) {
         VkcBind bd[3] = {B(x, 1), B(w, 0), B(ring, 1)};
         grid(((uint64_t)p->C + 63) / 64, &gx, &gy);
-        return record(pipe, bd, 3, p, sizeof *p, gx, gy, 1);
+        return record(pipe, bd, 3, p, sizeof *p, gx, gy, p->tab > 0 ? (uint32_t)p->S : 1);   /* tab: a row a z */
     }
     VkcBind bd[1] = {B(x, 1)};
     grid(((uint64_t)p->n + 63) / 64, &gx, &gy);

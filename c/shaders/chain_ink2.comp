@@ -23,7 +23,9 @@
 //   y    = (sum_lag u_lag * tap + u_0) / fc,   fc = sqrt(2K + 1)
 // where u_0 is the row's input and u_lag the input lag rows before it (the state's K-1
 // inputs, ring[y_off + c*(K-1) + j] oldest first, then the step's rows); the state keeps the
-// last K-1 inputs. One thread per channel. K <= 9.
+// last K-1 inputs. One thread per channel. K <= 9. TAB > 0 (KV_SLOTS, a multiplexed step):
+// row s = WorkGroupID.z is the next input of its own conversation, whose state is at
+// y_off + w[TAB + s] (an int in the parameters).
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -32,6 +34,7 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) buffer XB { float xv[]; };            // 0: the stream; 1, 2: in place
 layout(std430, binding = 1) readonly buffer BB { float bv[]; };   // 0: the block states; 2: dyn
 layout(std430, binding = 2) readonly buffer WB { float wv[]; };   // the parameters
+layout(std430, binding = 2) readonly buffer WBI { int wvi[]; };   // the same, as ints (mode 2's TAB)
 layout(std430, binding = 3) buffer YB { float yv[]; };            // 0: the mix; 2: the state
 
 layout(push_constant) uniform P { int v[32]; } p;
@@ -59,6 +62,7 @@ layout(push_constant) uniform P { int v[32]; } p;
 #define K_      p.v[3]
 #define HD_     p.v[10]
 #define FC      intBitsToFloat(p.v[11])
+#define TAB     p.v[12]
 
 shared float rms[256];
 shared float pms[64 * 16];   // mode 0: per subgroup and vector, the sums of squares and of q . v
@@ -143,9 +147,11 @@ void dconv() {
     int c = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
     if (c >= C_) return;
     int K = K_, nh = K - 1, h = c / HD_;
+    int s0 = 0, s1 = S_, yo = Y_OFF;
+    if (TAB > 0) { s0 = int(gl_WorkGroupID.z); s1 = s0 + 1; yo += wvi[TAB + s0]; }
     float hist[8];
-    [[unroll]] for (int k = 0; k < 8; k++) hist[k] = k < nh ? yv[Y_OFF + c * nh + k] : 0.0;
-    for (int s = 0; s < S_; s++) {
+    [[unroll]] for (int k = 0; k < 8; k++) hist[k] = k < nh ? yv[yo + c * nh + k] : 0.0;
+    for (int s = s0; s < s1; s++) {
         int xi = X_OFF + s * X_ROW + c;
         float cur = xv[xi];
         int db = B_OFF + s * B_ROW + h * K;
@@ -156,7 +162,7 @@ void dconv() {
         [[unroll]] for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
         [[unroll]] for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
     }
-    [[unroll]] for (int k = 0; k < 8; k++) if (k < nh) yv[Y_OFF + c * nh + k] = hist[k];
+    [[unroll]] for (int k = 0; k < 8; k++) if (k < nh) yv[yo + c * nh + k] = hist[k];
 }
 
 void main() {
