@@ -108,7 +108,9 @@ static int ink2cc_geometry_ok(const Model *m, int say) {
 static size_t ink2cc_plan_bytes(const Model *m) {
     const Cfg *c = &m->c;
     size_t D = (size_t)c->hidden, E = (size_t)c->n_experts, CK = (size_t)c->conv_k, K = (size_t)c->topk, b = 0, row = 0;
-    int t = ink_ctx_max() + 8;
+    int t = ink_ctx_max();
+    if (t > 65536) t = 65536;
+    t += 8;
     size_t kvm = 0;
     for (int v = 0; v < c->n_state; v++) { size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v); if (kvo > kvm) kvm = kvo; }
     for (int v = c->n_layers; v < c->n_state; v++) {                   /* the loop's later passes' state */
@@ -477,9 +479,9 @@ static int ink2cc_norm(CcBuf *x, CcBuf *w, size_t wo, CcBuf *y, int rows, int D,
 /* a static short convolution through bank `bank` and its scale: (conv + input) / sqrt(K + 1);
  * the taps of weight layer i, the state of state layer v */
 static int ink2cc_sconv(Ink2CuChain *ch, CcBuf *x, size_t xo, int n, int C, int bank, int i, int v, const Cfg *c) {
-    CcSconv p = {0, n, C, c->conv_k, (int)xo, C, (int)ch->o_cw[bank][i], (int)ch->o_csd[(size_t)bank * ch->NS + v], 0, 1.f};
-    CcSconv dv = {2, 0, 0, 0, (int)xo, 0, 0, 0, n * C, (float)sqrt((double)(c->conv_k + 1))};
-    return cc_sconv(x, ch->prm, ch->rings, &p) && cc_sconv(x, NULL, NULL, &dv);
+    CcSconv p = {0, n, C, c->conv_k, (int)xo, C, (int)ch->o_cw[bank][i], (int)ch->o_csd[(size_t)bank * ch->NS + v], 0,
+                 (float)sqrt((double)(c->conv_k + 1))};
+    return cc_sconv(x, ch->prm, ch->rings, &p);
 }
 /* a global layer's dynamic convolution of K (bank 0, from nk) or V (bank 1, from nv) in kvs */
 static int ink2cc_dconv(Ink2CuChain *ch, Model *m, int i, int v, int bank, CcBuf *xin, int n) {

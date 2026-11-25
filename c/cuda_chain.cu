@@ -124,9 +124,58 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
     int tid = threadIdx.x;
     float acc = 0.f;
     const bool pre = (p.flags & 8) != 0, wt = pre || !(p.flags & 2);
-    /* up to 2048 a row: x and the weights in registers, loaded together before the sum (the
-     * weights used to be read after it, a second trip to memory on the step's path); the same
-     * values in the same order, so the same bits */
+    /* Fast vectorized float4 single-pass path up to D <= 4096 (covers D=2304 Inkling-2-Mini):
+     * caches x and w in registers (4 float4s = 16 floats/thread max) and uses warp-shuffle reduce. */
+    const bool f4 = ((p.D | xb | yb | wb) & 3) == 0 && p.D <= 4096;
+    if (f4) {
+        const int D4 = p.D >> 2;
+        const float4 *x4 = reinterpret_cast<const float4 *>(x + xb);
+        const float4 *w4 = wt ? reinterpret_cast<const float4 *>(w + wb) : nullptr;
+        float4 *y4 = reinterpret_cast<float4 *>(y + yb);
+        float4 xv4[4], wv4[4];
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const int i4 = tid + 256 * k;
+            if (i4 < D4) {
+                float4 vx = __ldg(x4 + i4);
+                float4 vw = wt ? __ldg(w4 + i4) : make_float4(1.f, 1.f, 1.f, 1.f);
+                xv4[k] = vx; wv4[k] = vw;
+                float4 v = pre ? make_float4(vx.x * vw.x, vx.y * vw.y, vx.z * vw.z, vx.w * vw.w) : vx;
+                acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        if ((tid & 31) == 0) red[tid >> 5] = acc;
+        __syncthreads();
+        if (tid < 8) {
+            float s = red[tid];
+            s += __shfl_xor_sync(0xffu, s, 4);
+            s += __shfl_xor_sync(0xffu, s, 2);
+            s += __shfl_xor_sync(0xffu, s, 1);
+            if (tid == 0) red[0] = (p.flags & 4) ? rsqrtf(s + p.eps) : rsqrtf(s / (float)p.D + p.eps);
+        }
+        __syncthreads();
+        const float rp = red[0] * p.post;
+        const bool now = (p.flags & 2) != 0, add1 = (p.flags & 1) != 0;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const int i4 = tid + 256 * k;
+            if (i4 >= D4) break;
+            float4 vx = xv4[k], vw = wv4[k], o;
+            if (now && !pre) {
+                o = make_float4(vx.x * rp, vx.y * rp, vx.z * rp, vx.w * rp);
+            } else if (add1 && !pre) {
+                o = make_float4(vx.x * (1.f + vw.x) * rp, vx.y * (1.f + vw.y) * rp,
+                                vx.z * (1.f + vw.z) * rp, vx.w * (1.f + vw.w) * rp);
+            } else {
+                o = make_float4(vx.x * vw.x * rp, vx.y * vw.y * rp,
+                                vx.z * vw.z * rp, vx.w * vw.w * rp);
+            }
+            y4[i4] = o;
+        }
+        return;
+    }
     const bool fit = p.D <= 8 * 256;
     float xv[8], wv8[8];
     if (fit) {

@@ -34,7 +34,8 @@ __global__ static void ccg_sconv_k(float *x, const float *w, float *ring, CcScon
 #pragma unroll
         for (int k = 0; k < 8; k++) if (k < nh) acc += wc[k] * hist[k];
         acc += wl * cur;
-        x[xi] = acc + cur;
+        const float outv = acc + cur;
+        x[xi] = (p.fc != 1.f && p.fc != 0.f) ? outv / p.fc : outv;
 #pragma unroll
         for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
 #pragma unroll
@@ -86,6 +87,77 @@ __device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, c
     m = mn;
     __syncthreads();
 }
+/* Fast coalesced warp-per-token tile for hd==128 (4 warps = 128 threads):
+ * each warp loads a full 128-float K row as 32 coalesced float4s (1 transaction instead of 32). */
+__device__ __forceinline__ void ccg_relattn_tile_hd128(
+        const float *__restrict__ kc, const float *__restrict__ vc, const float *__restrict__ kvs,
+        const float *__restrict__ relp, const CcRelAttn &p, float4 qv, const float *rs,
+        float *pe, float *red, int *pt,
+        int kvh, int qpos, int t0, int n, float ts, int b0, int tid,
+        float &m, float &l, float &acc0) {
+    const int warp = tid >> 5, lane = tid & 31;
+    const int cnt = min(128, n - b0);
+    for (int j = warp; j < cnt; j += 4) {
+        const int t = t0 + b0 + j;
+        const float *kr = t < p.pos_base
+            ? kc + p.k_off + ((long)kvh * p.cap + t % p.cap) * 128
+            : kvs + p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * 128;
+        const float4 kv = __ldg(reinterpret_cast<const float4 *>(kr) + lane);
+        float a = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xffffffffu, a, off);
+        const int dist = qpos - t;
+        float bias = 0.f;
+        if (dist < p.ext && p.d_rel > 0) {
+            if (p.d_rel <= 32) {
+                bias = lane < p.d_rel ? rs[lane] * __ldg(relp + p.relp_off + lane * p.ext + dist) : 0.f;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) bias += __shfl_xor_sync(0xffffffffu, bias, off);
+            } else {
+                for (int rj = lane; rj < p.d_rel; rj += 32)
+                    bias += rs[rj] * __ldg(relp + p.relp_off + rj * p.ext + dist);
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) bias += __shfl_xor_sync(0xffffffffu, bias, off);
+            }
+        }
+        if (lane == 0) {
+            red[j] = ts * (a * p.scale + bias);
+            pt[j] = t;
+        }
+    }
+    __syncthreads();
+    const float sv = tid < cnt ? red[tid] : -3.0e38f;
+    float wm = sv;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) wm = fmaxf(wm, __shfl_xor_sync(0xffffffffu, wm, off));
+    __shared__ float wred[4];
+    if (lane == 0) wred[warp] = wm;
+    __syncthreads();
+    float tmax = fmaxf(fmaxf(wred[0], wred[1]), fmaxf(wred[2], wred[3]));
+    const float mn = fmaxf(m, tmax);
+    const float e = tid < cnt ? expf(sv - mn) : 0.f;
+    pe[tid] = e;
+    float ws = e;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ws += __shfl_xor_sync(0xffffffffu, ws, off);
+    if (lane == 0) wred[warp] = ws;
+    __syncthreads();
+    const float sum_e = wred[0] + wred[1] + wred[2] + wred[3];
+    const float corr = expf(m - mn);
+    l = l * corr + sum_e;
+    acc0 *= corr;
+    for (int j = 0; j < cnt; j++) {
+        const int t = pt[j];
+        const float w = pe[j];
+        const float *vr = t < p.pos_base
+            ? vc + p.v_off + ((long)kvh * p.cap + t % p.cap) * 128
+            : kvs + p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * 128;
+        acc0 += w * __ldg(vr + tid);
+    }
+    m = mn;
+    __syncthreads();
+}
+
 /* one block of 128 per (head, row): chain_relattn.comp's online softmax over tiles of 128 positions.
  * part (the split, a decode step's rows): block z takes tile z alone, its max, sum and weighted V into
  * part (hd + 2 floats a (row, head, tile)), and ccg_relattn_join_k joins the tiles */
@@ -93,15 +165,40 @@ __global__ static void ccg_relattn_k(const float *q, const float *kc, const floa
                                      const float *r, const float *relp, const float *tau, CcRelAttn p, float *part) {
     const int h = (int)blockIdx.x, s = (int)blockIdx.y, tid = (int)threadIdx.x;
     const int kvh = h / (p.H / p.KVH);
-    __shared__ float qs[256], rs[64], pe[128], red[128];
-    __shared__ int pt[128];
-    const int qb = p.q_off + s * p.q_row + h * p.hd;
-    for (int d = tid; d < p.hd; d += 128) qs[d] = q[qb + d];
-    for (int j = tid; j < p.d_rel; j += 128) rs[j] = r[p.r_off + s * p.r_row + h * p.d_rel + j];
     const int qpos = p.pos_base + s;
     const int t0 = p.window > 0 ? max(0, qpos - p.window + 1) : 0;
     const int n = qpos - t0 + 1;
+    if (part && (int)blockIdx.z * 128 >= n) {
+        float *pp = part + (((long)s * p.H + h) * gridDim.z + (int)blockIdx.z) * (p.hd + 2);
+        if (tid == 0) { pp[0] = -3.0e38f; pp[1] = 0.f; }
+        return;
+    }
+    __shared__ float qs[256], rs[64], pe[128], red[128];
+    __shared__ int pt[128];
+    const int qb = p.q_off + s * p.q_row + h * p.hd;
     const float ts = tau[p.tau_off + s];
+    for (int j = tid; j < p.d_rel; j += 128) rs[j] = r[p.r_off + s * p.r_row + h * p.d_rel + j];
+    const bool fast128 = (p.hd == 128) && ((p.q_off | p.q_row | p.k_off | p.ks_off | p.kv_row) & 3) == 0;
+    if (fast128) {
+        const float4 qv = __ldg(reinterpret_cast<const float4 *>(q + qb) + (tid & 31));
+        __syncthreads();
+        float m = -3.0e38f, l = 0.f, acc0 = 0.f;
+        if (part) {
+            const int z = (int)blockIdx.z, b0 = z * 128;
+            ccg_relattn_tile_hd128(kc, vc, kvs, relp, p, qv, rs, pe, red, pt, kvh, qpos, t0, n, ts, b0, tid, m, l, acc0);
+            float *pp = part + (((long)s * p.H + h) * gridDim.z + z) * 130;
+            if (tid == 0) { pp[0] = m; pp[1] = l; }
+            pp[2 + tid] = acc0;
+            return;
+        }
+        if (p.has_sink) { m = tau[p.sink_off + s * p.H + h]; l = 1.f; }
+        for (int b0 = 0; b0 < n; b0 += 128)
+            ccg_relattn_tile_hd128(kc, vc, kvs, relp, p, qv, rs, pe, red, pt, kvh, qpos, t0, n, ts, b0, tid, m, l, acc0);
+        const float inv = l > 0.f ? 1.f / l : 0.f;
+        o[p.o_off + s * p.o_row + h * 128 + tid] = acc0 * inv;
+        return;
+    }
+    for (int d = tid; d < p.hd; d += 128) qs[d] = q[qb + d];
     __syncthreads();
     float m = -3.0e38f, l = 0.f, acc0 = 0.f, acc1 = 0.f;
     if (part) {
@@ -136,6 +233,68 @@ __global__ static void ccg_relattn_join_k(const float *part, const float *tau, f
         if (tid < p.hd) acc += pz[2 + tid] * w;
     }
     if (tid < p.hd) o[p.o_off + s * p.o_row + h * p.hd + tid] = L > 0.f ? acc / L : 0.f;
+}
+
+/* Fast single-pass vectorized float4 ink2_mix: one thread per float4 (up to 1024 threads -> D <= 4096),
+ * caching each vector's float4 in registers so blk and x are read ONLY ONCE from global memory. */
+template<int MAXE>
+__global__ static void ccg_ink2_mix_f4_k(const float *__restrict__ x, const float *__restrict__ blk,
+                                         const float *__restrict__ prm, float *__restrict__ y, CcInk2Mix p) {
+    const int s = (int)(blockIdx.x + blockIdx.y * gridDim.x);
+    if (s >= p.S) return;
+    const int tid = (int)threadIdx.x, wp = tid >> 5, ln = tid & 31, nwp = (int)blockDim.x >> 5;
+    const int D4 = p.D >> 2;
+    const bool act = tid < D4;
+    const float4 *xb4 = reinterpret_cast<const float4 *>(x + p.x_off + (long)s * p.x_row);
+    const float4 *bb4 = blk ? reinterpret_cast<const float4 *>(blk + p.b_off + (long)s * p.b_row) : xb4;
+    const float4 *q4  = reinterpret_cast<const float4 *>(prm + p.w_off);
+    const float4 qv = act ? __ldg(q4 + tid) : make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 vreg[MAXE];
+    __shared__ float pms[32 * MAXE], pdt[32 * MAXE], sc[MAXE], rr[MAXE];
+    const int nvec = p.nb + 1;
+    #pragma unroll
+    for (int e = 0; e < MAXE; e++) {
+        if (e >= nvec) break;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (act) v = __ldg(e < p.nb ? (bb4 + (long)e * D4 + tid) : (xb4 + tid));
+        vreg[e] = v;
+        float a = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        float b = v.x * qv.x + v.y * qv.y + v.z * qv.z + v.w * qv.w;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a += __shfl_xor_sync(0xffffffffu, a, off);
+            b += __shfl_xor_sync(0xffffffffu, b, off);
+        }
+        if (ln == 0) { pms[wp * MAXE + e] = a; pdt[wp * MAXE + e] = b; }
+    }
+    __syncthreads();
+    if (tid < nvec) {
+        float a = 0.f, b = 0.f;
+        for (int g = 0; g < nwp; g++) { a += pms[g * MAXE + tid]; b += pdt[g * MAXE + tid]; }
+        const float r = rsqrtf(a / (float)p.D + p.eps);
+        rr[tid] = r; sc[tid] = (b * r) * p.scale;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float m = sc[0];
+        for (int e = 1; e < nvec; e++) if (sc[e] > m) m = sc[e];
+        float sum = 0.f;
+        for (int e = 0; e < nvec; e++) { sc[e] = expf(sc[e] - m); sum += sc[e]; }
+        const float inv = 1.f / sum;
+        for (int e = 0; e < nvec; e++) sc[e] = (sc[e] * inv) * rr[e];
+    }
+    __syncthreads();
+    if (act) {
+        float4 out = make_float4(0.f, 0.f, 0.f, 0.f);
+        #pragma unroll
+        for (int e = 0; e < MAXE; e++) {
+            if (e >= nvec) break;
+            const float w = sc[e];
+            out.x += w * vreg[e].x; out.y += w * vreg[e].y;
+            out.z += w * vreg[e].z; out.w += w * vreg[e].w;
+        }
+        reinterpret_cast<float4 *>(y + p.y_off + (long)s * p.y_row)[tid] = out;
+    }
 }
 
 /* one block of 256 per row: every vector's sums in one pass, the warps' joined in order */
@@ -269,6 +428,15 @@ static int cc_ink2_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcInk2M
     if (!c || !p || !x || !prm || !y || p->S < 0 || p->D < 1 || p->nb < 0 || p->nb > 15 || (p->nb > 0 && !blk) || y == x || y == blk) return 0;
     if (p->S == 0) return 1;
     dim3 g; cg_grid(p->S, &g);
+    if ((p->D & 3) == 0 && p->D <= 4096 &&
+        ((p->x_off | p->x_row | p->b_off | p->b_row | p->w_off | p->y_off | p->y_row) & 3) == 0) {
+        const int bdim = ((p->D >> 2) + 31) & ~31;
+        if (p->nb < 6)
+            coli_launch(ccg_ink2_mix_f4_k<6>, g, bdim, 0, c->stream, fp(x), p->nb > 0 ? fp(blk) : nullptr, fp(prm), fpw(y), *p);
+        else
+            coli_launch(ccg_ink2_mix_f4_k<16>, g, bdim, 0, c->stream, fp(x), p->nb > 0 ? fp(blk) : nullptr, fp(prm), fpw(y), *p);
+        return launched(c, "ink2 mix f4");
+    }
     coli_launch(ccg_ink2_mix_k, g, 256, 0, c->stream, fp(x), p->nb > 0 ? fp(blk) : nullptr, fp(prm), fpw(y), *p);
     return launched(c, "ink2 mix");
 }

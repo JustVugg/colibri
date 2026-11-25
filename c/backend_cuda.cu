@@ -4999,25 +4999,60 @@ __global__ static void __launch_bounds__(256) f32_gemm_k(float *__restrict__ y, 
 __global__ static void __launch_bounds__(256) f32_gemv_k(float *__restrict__ y, const float *__restrict__ x,
                                                           const float *__restrict__ w, int I, int O) {
     COLI_PDL_WAIT();
-    __shared__ float partial[256];
-    int o = (int)blockIdx.x, s = (int)blockIdx.y, i = threadIdx.x;
+    __shared__ float partial[8];
+    const int o = (int)blockIdx.x, s = (int)blockIdx.y, tid = (int)threadIdx.x;
     const float *wr = w + (size_t)o * I, *xr = x + (size_t)s * I;
     float sum = 0.f;
-    for (; i + 7 * 256 < I; i += 8 * 256) {
-        float a[8], b[8];
-        #pragma unroll
-        for (int k = 0; k < 8; k++) { a[k] = xr[i + k * 256]; b[k] = wr[i + k * 256]; }
-        #pragma unroll
-        for (int k = 0; k < 8; k++) sum = fmaf(a[k], b[k], sum);
+    if ((I & 3) == 0 && (((uintptr_t)wr | (uintptr_t)xr) & 15) == 0) {
+        const int I4 = I >> 2;
+        const float4 *w4 = reinterpret_cast<const float4 *>(wr);
+        const float4 *x4 = reinterpret_cast<const float4 *>(xr);
+        for (int i4 = tid; i4 < I4; i4 += 256) {
+            const float4 a = __ldg(x4 + i4), b = __ldg(w4 + i4);
+            sum = fmaf(a.x, b.x, fmaf(a.y, b.y, fmaf(a.z, b.z, fmaf(a.w, b.w, sum))));
+        }
+    } else {
+        for (int i = tid; i < I; i += 256) sum = fmaf(xr[i], wr[i], sum);
     }
-    for (; i < I; i += 256) sum = fmaf(xr[i], wr[i], sum);
-    partial[threadIdx.x] = sum;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    if ((tid & 31) == 0) partial[tid >> 5] = sum;
     __syncthreads();
-    for (int n = 128; n; n >>= 1) {
-        if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
-        __syncthreads();
+    if (tid < 8) {
+        float v = partial[tid];
+        v += __shfl_xor_sync(0xffu, v, 4);
+        v += __shfl_xor_sync(0xffu, v, 2);
+        v += __shfl_xor_sync(0xffu, v, 1);
+        if (tid == 0) y[(size_t)s * O + o] = v;
     }
-    if (!threadIdx.x) y[(size_t)s * O + o] = partial[0];
+}
+/* Fast F32 GEMV for small K (e.g. Inkling-2 loop-gate W_up: I=64, O=2304):
+ * 16 threads per output row (16 rows per 256-thread block) using float4 loads and 4-step warp reduce. */
+__global__ static void __launch_bounds__(256) f32_gemv_smallk_k(float *__restrict__ y, const float *__restrict__ x,
+                                                                 const float *__restrict__ w, int I, int O) {
+    COLI_PDL_WAIT();
+    __shared__ float4 xs[128];
+    const int s = (int)blockIdx.y, tid = (int)threadIdx.x;
+    const int I4 = I >> 2;
+    const float4 *x4 = reinterpret_cast<const float4 *>(x + (size_t)s * I);
+    if (tid < I4) xs[tid] = __ldg(x4 + tid);
+    __syncthreads();
+    const int r_in_blk = tid >> 4, lane16 = tid & 15;
+    const int o = (int)blockIdx.x * 16 + r_in_blk;
+    const bool valid = o < O;
+    const float4 *w4 = valid ? reinterpret_cast<const float4 *>(w + (size_t)o * I) : nullptr;
+    float sum = 0.f;
+    if (valid) {
+        for (int i4 = lane16; i4 < I4; i4 += 16) {
+            const float4 a = xs[i4], b = __ldg(w4 + i4);
+            sum = fmaf(a.x, b.x, fmaf(a.y, b.y, fmaf(a.z, b.z, fmaf(a.w, b.w, sum))));
+        }
+    }
+    sum += __shfl_xor_sync(0xffffffffu, sum, 8);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+    if (valid && lane16 == 0) y[(size_t)s * O + o] = sum;
 }
 /* f32_gemm_k's products on the tensor cores in three TF32 parts (sm_80 and later): x = xh + xl,
  * w = wh + wl, each part rounded to TF32, xh wh and the corrections xh wl + xl wh summed apart in
@@ -5359,6 +5394,12 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     if (t->fmt == 0 && S <= GEMV_I8_MAX_S && t->O <= 512 && t->I >= 1024) {   /* few outputs, long rows: quant_matmul's bits */
         coli_launch(f32_gemv_k, dim3((unsigned)t->O, (unsigned)S), 256, 0, st, y_dev, x_dev, (const float *)t->weights, t->I, t->O);
         return cuda_ok(cudaGetLastError(), "chain f32 gemv launch");
+    }
+    if (t->fmt == 0 && S <= GEMV_I8_MAX_S && (t->I & 3) == 0 && t->I <= 512 &&
+        (((uintptr_t)t->weights | (uintptr_t)x_dev) & 15) == 0) {
+        coli_launch(f32_gemv_smallk_k, dim3((unsigned)((t->O + 15) / 16), (unsigned)S), 256, 0, st,
+                    y_dev, x_dev, (const float *)t->weights, t->I, t->O);
+        return cuda_ok(cudaGetLastError(), "chain f32 gemv smallk launch");
     }
     if (t->fmt == 0 && S > GEMV_I8_MAX_S && t->O <= F32_FEW_MAX) {   /* few outputs, a chunk's rows: a block a row */
         coli_launch(f32_few_k, dim3((unsigned)S), 256, 0, st, y_dev, x_dev, (const float *)t->weights, t->I, t->O);

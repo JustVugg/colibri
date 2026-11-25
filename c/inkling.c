@@ -310,6 +310,7 @@ static inline void ink_glu(const Cfg *c, float *g, const float *u, int64_t n) {
 static inline void ink2_head_post(const Cfg *c, float *lo, int64_t n) {
     if (!c->v2 || c->logit_cap <= 0) return;
     const float cap = c->logit_cap;
+    #pragma omp parallel for schedule(static) if (n >= 16384)
     for (int64_t i = 0; i < n; i++) lo[i] = tanhf(lo[i] / cap) * cap;
 }
 
@@ -2807,7 +2808,9 @@ static int  ink_vk_load_batch(void *ctx, int layer, const int *e, int n, VktExpe
 static int ink_ctx_max(void);
 static size_t ink_kv_later(const Model *m) {
     const Cfg *c = &m->c;
-    int t = ink_ctx_max() + 8;
+    int t = ink_ctx_max();
+    if (t > 65536) t = 65536;
+    t += 8;
     size_t b = 0;
     for (int i = 0; i < c->n_state; i++)   /* the loop's later passes keep their own (Inkling-2-Mini) */
         b += 2 * (size_t)L_KV(c, i) * (size_t)kv_ring_rows(c, i, t) * (size_t)L_HD(c, i) * sizeof(float);
@@ -4210,22 +4213,45 @@ static void serve_logit_dump(const float *lo, int V) {
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
     serve_logit_dump(logit, n);
     int best = 0;
-    for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
+    float max_l = logit[0];
+    for (int i = 1; i < n; i++) if (logit[i] > max_l) { max_l = logit[i]; best = i; }
     if (temp <= 0.f) return best;
-    PI *c = malloc((size_t)n * sizeof(PI));
-    double sum = 0;
+    const float inv_t = 1.f / temp;
+    const float cutoff = max_l - 18.f * temp;
+    PI stack_c[1024];
+    PI *c = stack_c;
+    int cap = 1024, m = 0;
+    double sum = 0.0;
     for (int i = 0; i < n; i++) {
-        c[i].p = expf((logit[i] - logit[best]) / temp);
-        c[i].i = i; sum += c[i].p;
+        float li = logit[i];
+        if (li < cutoff) continue;
+        if (m == cap) {
+            int ncap = cap * 2;
+            PI *nc = (c == stack_c) ? (PI *)malloc((size_t)ncap * sizeof(PI)) : (PI *)realloc(c, (size_t)ncap * sizeof(PI));
+            if (!nc) { if (c != stack_c) free(c); return best; }
+            if (c == stack_c) memcpy(nc, stack_c, (size_t)cap * sizeof(PI));
+            c = nc; cap = ncap;
+        }
+        float p = expf((li - max_l) * inv_t);
+        c[m].p = p; c[m].i = i; m++;
+        sum += p;
     }
-    qsort(c, n, sizeof(PI), pi_desc);
-    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum;
-    double acc = 0; int k = 0;
-    while (k < n && acc < cut) acc += c[k++].p;
-    double r = rng_next() * acc, run = 0;
+    if (m <= 0) { if (c != stack_c) free(c); return best; }
+    if (top_p <= 0.f || top_p >= 1.f) {
+        double r = rng_next() * sum, run = 0.0;
+        int pick = c[0].i;
+        for (int i = 0; i < m; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
+        if (c != stack_c) free(c);
+        return pick;
+    }
+    qsort(c, (size_t)m, sizeof(PI), pi_desc);
+    double cut = top_p * sum;
+    double acc = 0.0; int k = 0;
+    while (k < m && acc < cut) acc += c[k++].p;
+    double r = rng_next() * acc, run = 0.0;
     int pick = c[0].i;
     for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
-    free(c);
+    if (c != stack_c) free(c);
     return pick;
 }
 
