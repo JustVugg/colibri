@@ -865,6 +865,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q38_TRUNK_STATS_IN", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_VISION",                       CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
     {"QIV_PROFILE", CE_STR, CE_QWENIMAGE, 0, NULL},
+    {"QT_ARENA", CE_BOOL, CE_QWEN | CE_QWEN38, 0, NULL},
     {"QT_GGUF_ARENA", CE_STR, CE_QWEN | CE_QWEN38, 0, NULL},
     {"QT_HOME", CE_STR, CE_QWEN | CE_QWEN38, 0, NULL},
     {"QT_LAYER_SPLIT", CE_INT, CE_QWEN | CE_QWEN38, 0, NULL},

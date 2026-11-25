@@ -206,6 +206,11 @@ void qt_shutdown(void);
 void qt_note(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
+/* qt_note for n computations of the same expert at once (a grouped prefill's rows):
+ * n heat, one promotion test and at most one copy. */
+void qt_note_n(int layer, int eid, uint32_t n,
+             const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
+             const float *gs, const float *us, const float *ds);
 
 /* Launch the GPU groups for the resident subset of the K selected experts
  * (async, all devices in parallel). Returns a bitmask of the k handled by
@@ -424,6 +429,7 @@ static inline void qt_source_planar(int a){(void)a;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
+static inline void qt_note_n(int a,int b,uint32_t n,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)n;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline uint32_t qt_issue_mode(int a,const int*b,int c,const float*d,int e){(void)e;return qt_issue(a,b,c,d);}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}

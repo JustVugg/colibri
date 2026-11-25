@@ -121,7 +121,7 @@ int main(void) {
     /* Queue an LFRU swap directly -- exactly what qt_lfru_tick_locked does. */
     pthread_mutex_lock(&G.mx);
     qs(0, resident_eid)->resident = 0;
-    int queued = enqueue_locked(0, 1, 0, resident_eid, 0);
+    int queued = enqueue_locked(0, 1, 0, resident_eid, 0, 0);
     pthread_mutex_unlock(&G.mx);
     check(queued, "the swap should have been enqueued (queue has room, victim provided)");
 

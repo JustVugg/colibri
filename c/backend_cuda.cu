@@ -77,6 +77,7 @@ struct ColiCudaTensor {
     size_t scale_count;        /* scale elements: ue8m0 bytes for fmt=7, floats otherwise */
     int tracked;
     int weights_owned;
+    int view;                  /* coli_cuda_tensor_upload_view: weights and scales are the caller's */
 #ifdef COLI_ANS
     size_t archive_bytes;
     int compressed;
@@ -2170,6 +2171,9 @@ extern "C" int coli_cuda_block_elems(int fmt) { return bd_file_row_bytes(fmt, 25
  * thread_local so the widely-wired upload signature (and the Windows DLL ABI)
  * stays untouched. pin_load uploads in parallel, hence thread_local. */
 static thread_local int g_upload_gs = 0;
+/* coli_cuda_tensor_upload_view's destination, the same way (NULL: cudaMalloc) */
+static thread_local void *g_upload_view_w = nullptr, *g_upload_view_s = nullptr;
+static thread_local size_t g_upload_view_wb = 0, g_upload_view_sb = 0;
 extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
                                          const void *weights, const float *scales,
                                          int fmt, int I, int O, int device, int gs);
@@ -2211,14 +2215,17 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         t->ng = (int)fp8_nblk(I);
         t->scale_count = (size_t)fp8_nblk(O) * (size_t)t->ng;
     }
-    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
+    if (g_upload_view_w) {
+        if (t->weight_bytes > g_upload_view_wb) { coli_cuda_tensor_free(t); return 0; }
+        t->weights = g_upload_view_w; t->view = 1;
+    } else if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
         coli_cuda_tensor_free(t);
         return 0;
     }
     /* Ownership is a fact of the allocation, not the copy: set it BEFORE the
      * memcpy, or a failed H2D upload frees the tensor while weights_owned is
      * still 0 and free()'s ownership gate leaks the device buffer. */
-    t->weights_owned=1;
+    t->weights_owned=!t->view;
     if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
         coli_cuda_tensor_free(t);
         return 0;
@@ -2227,7 +2234,11 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
     if (fmt && fmt != 6) {
-        if (!cuda_ok(cudaMalloc(&t->scales, tensor_scale_bytes(t)), "scale allocation") ||
+        if (t->view) {
+            if (!g_upload_view_s || tensor_scale_bytes(t) > g_upload_view_sb) { coli_cuda_tensor_free(t); return 0; }
+            t->scales = static_cast<float *>(g_upload_view_s);
+        }
+        if ((!t->view && !cuda_ok(cudaMalloc(&t->scales, tensor_scale_bytes(t)), "scale allocation")) ||
             !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
             return 0;
@@ -2249,11 +2260,23 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
     g_upload_gs = 0;
     return r;
 }
+extern "C" int coli_cuda_tensor_upload_view(ColiCudaTensor **tensor,
+        const void *weights, const float *scales, int fmt, int I, int O, int device, int gs,
+        void *dev_w, size_t dev_w_bytes, void *dev_s, size_t dev_s_bytes){
+    if (!tensor) return 1;                  /* probe */
+    if (*tensor || !dev_w || fmt >= 100) return 0;   /* never cached-tensor; block formats use upload_at */
+    g_upload_gs = gs>0 ? gs : 0;
+    g_upload_view_w = dev_w; g_upload_view_wb = dev_w_bytes; g_upload_view_s = dev_s; g_upload_view_sb = dev_s_bytes;
+    int r = coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device);
+    g_upload_gs = 0;
+    g_upload_view_w = g_upload_view_s = nullptr; g_upload_view_wb = g_upload_view_sb = 0;
+    return r;
+}
 
 extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights, const float *scales) {
     /* a block-format tensor: its own buffer or an arena's slot (coli_cuda_tensor_upload_at) */
     if (t && weights && t->weights && t->fmt >= 100) { DeviceContext *c = find_ctx(t->device); return select_ctx(c) && bd_rows_copy(t, weights, 0); }
-    if (!t || !weights || !t->weights || !t->weights_owned) return 0;
+    if (!t || !weights || !t->weights || !(t->weights_owned || t->view)) return 0;
 #ifdef COLI_ANS
     if (t->compressed) return 0;            /* archive bytes, not a weight buffer of this size */
 #endif
@@ -3565,7 +3588,7 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
     if (tensor->weights&&tensor->weights_owned) cudaFree(tensor->weights);
-    if (tensor->scales) cudaFree(tensor->scales);
+    if (tensor->scales && !tensor->view) cudaFree(tensor->scales);
     for(int i=0;i<tensor->ragged_count;i++)ragged_kv_clear(&tensor->ragged[i]);
     std::free(tensor);
 }

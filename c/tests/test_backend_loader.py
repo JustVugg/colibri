@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 25 optional, parsed from backend_loader.c.
+        """47 mandatory + 26 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,8 +929,8 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 25)  # +ink_ops (inkling's bf16 matrices, backend_cuda_ink.h); +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tier_ops (the routed-expert tier's table, cu_tier_ops.h); +vision_attention (the Qwen vision tower's attention); +tensor_upload_rows (qwen36's GGUF matrices read straight to the device)
-        self.assertEqual(len(f.exports), 72)
+        self.assertEqual(len(f.optional), 26)  # +ink_ops (inkling's bf16 matrices, backend_cuda_ink.h); +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tensor_upload_view (QT_ARENA FP8/int4/int8 slab slots); +tier_ops (the routed-expert tier's table, cu_tier_ops.h); +vision_attention (the Qwen vision tower's attention); +tensor_upload_rows (qwen36's GGUF matrices read straight to the device)
+        self.assertEqual(len(f.exports), 73)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
@@ -948,6 +948,8 @@ class LoaderStubFixtureTest(unittest.TestCase):
         # answers NULL and inkling.exe runs on Vulkan or the CPU.
         self.assertIn("coli_cuda_ink_ops", f.optional)
         self.assertIn("coli_cuda_tensor_upload_at", f.optional)
+        # tensor_upload_view: QT_ARENA scaled-tensor slab slots (FP8/int4/int8); older DLLs keep cudaMalloc.
+        self.assertIn("coli_cuda_tensor_upload_view", f.optional)
         # vision_attention: the Qwen vision tower's attention on the card (qwen38_vision.h); a DLL
         # predating it answers 0 and the tower keeps the CPU's.
         self.assertIn("coli_cuda_vision_attention", f.optional)

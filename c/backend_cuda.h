@@ -195,6 +195,15 @@ COLI_CUDA_DLLEXPORT int coli_cuda_block_elems(int fmt);
  * (a 576 KiB matrix took 1 MiB) and none of its synchronisation. Optional in the DLL loader. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights,
                                                    int fmt, int I, int O, int device);
+/* coli_cuda_tensor_upload(_g) into device memory the caller owns (dev_w for the
+ * weights, dev_s for the scales, of the given capacities; e.g. a slot of a
+ * coli_cuda_pipe_alloc slab): one cudaMalloc per slab instead of two per matrix,
+ * each rounded up by the allocator. The tensor frees neither; overwrite works.
+ * gs as upload_g (fmt=4). tensor == NULL is the probe: 1 from a backend that has
+ * it. Optional in the DLL loader: 0 from an older one. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_view(ColiCudaTensor **tensor,
+        const void *weights, const float *scales, int fmt, int I, int O, int device, int gs,
+        void *dev_w, size_t dev_w_bytes, void *dev_s, size_t dev_s_bytes);
 #ifdef COLI_ANS
 /* Experimental Linux-only GPU-resident entropy tier. The archive remains in
  * VRAM and is decoded into per-device scratch immediately before a grouped
