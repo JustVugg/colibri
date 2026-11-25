@@ -3757,6 +3757,9 @@ static InkPinState *ink_pin_state_save(Model *m, InkPinState *reuse){
             }
         }
     }
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     for (int j = 0; j < 4; j++)
         for (int i = 0; i < c->n_state; i++)
             memcpy(st->cs[j][i], m->cs[j][i],
@@ -3916,10 +3919,16 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
 
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
 static void ink_seq_swap(Model *m, InkSeq *q) {
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     float **K = m->K, **V = m->V; int len = m->kv_len; kv_prefix p = m->kvp;
     m->K = q->K; m->V = q->V; m->kv_len = q->kv_len; m->kvp = q->kvp;
     q->K = K; q->V = V; q->kv_len = len; q->kvp = p;
     for (int j = 0; j < 4; j++) { float **cs = m->cs[j]; m->cs[j] = q->cs[j]; q->cs[j] = cs; }
+#ifdef COLI_CUDA
+    ink2cc_host_wrote(m, 0);
+#endif
 }
 /* A conversation's state of its own, the shape the Model's has at its max_t. */
 static void ink_seq_alloc(Model *m, InkSeq *q) {
@@ -4431,6 +4440,9 @@ static ColiParkPart *ink_park_parts(Model *m, int *n_out) {
 static void ink_park(Model *m, int np, int max_tok) {
     int n = m->K && g_ink_mux_slots == 1 ? coli_park_rows_for(&g_ink_park, &m->kvp, m->kv_len, np, max_tok, 16) : 0, k = 0;
     if (!n) return;
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     ColiParkPart *p = ink_park_parts(m, &k);
     if (p) coli_park_save(&g_ink_park, &m->kvp, m->kv_len, p, k, n);
     free(p);

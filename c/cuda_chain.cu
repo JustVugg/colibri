@@ -71,6 +71,7 @@ namespace {
 struct CcCtx {
     unsigned kernel_mask;
     int device, up, lost, in_frame, device_profile, qx_warmed;
+    int capturing, cap_broke;   /* graph_begin..graph_end: the stream records; an error then breaks the capture */
     int major, minor;   /* the device's compute capability: cc_attn_fk's tensor cores from 7.0, cc_attn_f2's from 7.5 */
     int f2_big;  /* cc_attn_f2's head dim 256 (66 KiB of shared memory): 1 allowed, -1 refused, 0 not asked */
     int f2_big_h;   /* the same for its float16 cache's kernel */
@@ -137,6 +138,12 @@ CcCtx *live(CcCtx *c, CcOrdering order) {
 CcCtx *live(CcOrdering order = CC_ORDERED) { return live(cur(), order); }
 int cc_ok(CcCtx *c, cudaError_t e, const char *what) {
     if (e == cudaSuccess) return 1;
+    if (c && c->capturing) {   /* graph_end reports it; the caller runs the ops again without a graph */
+        std::fprintf(stderr, "[CUDA] chain: %s: %s -- during a graph capture\n", what, cudaGetErrorString(e));
+        (void)cudaGetLastError();
+        c->cap_broke = 1;
+        return 0;
+    }
     std::fprintf(stderr, "[CUDA] chain: %s: %s -- the device is lost to the chain\n", what, cudaGetErrorString(e));
     (void)cudaGetLastError();
     if (c) c->lost = 1;
@@ -3709,7 +3716,7 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     const int ok = coli_cuda_tensor_gemm_async(t, y->d + yo, xp, S, (void *)c->stream);
     coli_cuda_bd_x_same(0);
     last = {xp, S, I, t_cc_seq, c->stream};
-    if (!ok) { c->lost = 1; last.x = nullptr; return 0; }
+    if (!ok) { if (c->capturing) c->cap_broke = 1; else c->lost = 1; last.x = nullptr; return 0; }
     return 1;
 }
 static int cc_addnorm(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p) {
@@ -5340,6 +5347,59 @@ static int cc_relattn_split(void) {
 }
 #include "cuda_inkc.cuh"    /* Inkling's and Inkling-2's ops */
 #include "cuda_dflash.cuh"  /* DFlash2's drafter's convolution */
+/* graphs: the ops between graph_begin and graph_end recorded on the stream, instantiated once and
+ * replayed with one launch. HIP: no graphs, NULL entries. */
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+static int cc_graph_begin(void) {
+    CcCtx *c = live();
+    if (!c || c->capturing) return 0;
+    if (cudaStreamBeginCapture(c->stream, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    c->capturing = 1; c->cap_broke = 0;
+    return 1;
+}
+static void *cc_graph_end(int *broke) {
+    *broke = 0;
+    CcCtx *c = cur();
+    if (!c || !c->up || !c->capturing) return nullptr;
+    if (cudaSetDevice(c->device) != cudaSuccess) { c->capturing = 0; c->lost = 1; (void)cudaGetLastError(); return nullptr; }
+    cudaGraph_t g = nullptr;
+    cudaError_t e = cudaStreamEndCapture(c->stream, &g);
+    c->capturing = 0;
+    cudaGraphExec_t x = nullptr;
+    if (e == cudaSuccess && !c->cap_broke && g) e = cudaGraphInstantiate(&x, g, 0);
+    if (g) cudaGraphDestroy(g);
+    if (e == cudaSuccess && !c->cap_broke && x) return (void *)x;
+    std::fprintf(stderr, "[CUDA] chain: graph capture: %s%s -- the ops run without a graph\n",
+                 c->cap_broke ? "an op broke it" : cudaGetErrorString(e), c->lost ? " (a failure inside it)" : "");
+    (void)cudaGetLastError();
+    if (x) cudaGraphExecDestroy(x);
+    *broke = !c->lost;
+    c->cap_broke = 0;
+    return nullptr;
+}
+static int cc_graph_launch(void *g) {
+    CcCtx *c = live();
+    if (!c || !g || c->capturing) return 0;
+    return cc_ok(c, cudaGraphLaunch((cudaGraphExec_t)g, c->stream), "graph launch");
+}
+static void cc_graph_free(void *g) {
+    if (!g) return;
+    CcCtx *c = cur();
+    if (c && c->up && cudaSetDevice(c->device) == cudaSuccess) {
+        if (!c->lost) cudaStreamSynchronize(c->stream);
+        cudaGraphExecDestroy((cudaGraphExec_t)g);
+    }
+    (void)cudaGetLastError();
+}
+static const void *cc_graph_scratch(void) { return nullptr; }
+#define CC_GRAPH_OPS cc_graph_begin, cc_graph_end, cc_graph_launch, cc_graph_free, cc_graph_scratch
+#else
+#define CC_GRAPH_OPS nullptr, nullptr, nullptr, nullptr, nullptr
+#endif
+
 static int cc_ink2_caps_(void) { return CC_INK2_MOE | CC_INK2_LOOPGATE; }
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
@@ -5384,5 +5444,7 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_ink2_caps_,
     cc_ew_norm, cc_matmul_swiglu, cc_select_qwen36_profile, cc_set_kernel_mask_, cc_swiglu_pair_codes,
     cc_probe_qwen36_profile_,
+    CC_GRAPH_OPS,
+    cc_relattn_pb, cc_ink2_kv_put,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
