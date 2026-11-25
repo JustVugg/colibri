@@ -369,6 +369,24 @@ static inline void coli_omp_probe_team(const char *engine, int team)
 #endif
 }
 
+/* The team from the counts: a hybrid CPU's performance cores, else the physical cores, no
+ * more than a container's CPU quota lets run at once (`quota`, 0: none), and never above
+ * OpenMP's own team (`logical`: the affinity mask, a container's cpuset; a quota of 7 CPUs
+ * on a cpuset of 4 stays at the 4). Where the topology cannot be read (`phys` 0: a sandbox
+ * with no /sys/devices/system/cpu) there is no count to guess, and OpenMP's team stands, but
+ * the quota still bounds it: it used to be skipped with the rest (#3038). `bounded`: the
+ * quota is what set the team. */
+static inline int coli_omp_team_from(int phys, int perf, int logical, int quota, int *bounded)
+{
+    int team = phys > 0 ? (perf > 0 && perf < phys ? perf : phys) : logical;
+    if (bounded) *bounded = 0;
+    if (quota > 0 && quota < team) {
+        team = quota;
+        if (bounded) *bounded = 1;
+    }
+    return team < logical ? team : logical;
+}
+
 /* Dimensiona la squadra OpenMP sui core fisici. Rispetta OMP_NUM_THREADS se
  * l'utente l'ha impostata, e non fa nulla se il conteggio non e' affidabile.
  * `engine` finisce solo nella riga di log. The launcher sets OMP_NUM_THREADS too, as its
@@ -384,29 +402,26 @@ static inline void coli_omp_tune_threads(const char *engine)
         return;                            /* l'utente comanda */
     }
 
-    int phys = coli_physical_cores();
-    if (phys <= 0) return;                 /* sconosciuto -> default di OpenMP */
-    int perf = coli_performance_cores();   /* a hybrid CPU: its P-cores pace the team */
-    int team = perf > 0 && perf < phys ? perf : phys;
+    int phys = coli_physical_cores();      /* 0: sconosciuto, la squadra resta quella di OpenMP */
+    int perf = phys > 0 ? coli_performance_cores() : 0;   /* a hybrid CPU: its P-cores pace the team */
     int logical = omp_get_max_threads();
 
     double cg_quota = 0.0;
-    int cg_threads = compat_cgroup_cpu_limit(&cg_quota);
     int bounded_by_cgroup = 0;
-    if (cg_threads > 0 && cg_threads < team) {
-        team = cg_threads;
-        bounded_by_cgroup = 1;
-    }
+    int team = coli_omp_team_from(phys, perf, logical, compat_cgroup_cpu_limit(&cg_quota), &bounded_by_cgroup);
 
-    /* never above OpenMP's own default: that is the affinity mask, a container's cpuset
-     * (a quota of 7 CPUs on a cpuset of 4 stays at the 4) */
     if (team >= logical) {                 /* niente da evitare: silenzio */
         coli_omp_probe_team(engine, logical);
         return;
     }
 
     omp_set_num_threads(team);
-    if (bounded_by_cgroup)
+    if (bounded_by_cgroup && phys <= 0)
+        fprintf(stderr, "[OMP] %s: %d threads bounded by container CPU quota "
+                        "(cgroup: %.2f cores; the CPU topology cannot be read here); "
+                        "set OMP_NUM_THREADS=<n> to override\n",
+                engine, team, cg_quota);
+    else if (bounded_by_cgroup)
         fprintf(stderr, "[OMP] %s: %d threads bounded by container CPU quota "
                         "(cgroup: %.2f cores, %d physical cores on host); "
                         "set OMP_NUM_THREADS=<n> to override\n",
