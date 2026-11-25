@@ -51,8 +51,13 @@
 /* Rows of a cache by position: row t of head h at base + h * head_stride + t * row, t < rows. A
  * compressed cache keeps a row for `per` positions (0 or 1: a row a position): row j once the
  * positions [j * per, (j + 1) * per) are read, the group still filling being the engine's state;
- * the block's tokens must be a multiple of it. */
-typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; int per; } ColiPsPart;
+ * the block's tokens must be a multiple of it. A part whose rows are NOT one array says so with
+ * `rows_io`: rows [row0, row0 + n) then come from (or go to) `buf`, n * row bytes, through it
+ * (a mirror of block-wide sections, where a row's bytes are not 2048 B from its block's start
+ * as its neighbour's are). Then `row` is a row's STAGING width and `heads`/`head_stride` do
+ * not apply: the store copies what the part writes. */
+typedef void (*ColiPsRowsIo)(void *base, int row0, int n, char *buf, int out);
+typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; int per; ColiPsRowsIo rows_io; } ColiPsPart;
 
 typedef struct {
     int parent;                 /* the block before (-1: the prompt's first) */
@@ -79,7 +84,7 @@ typedef struct {
 
 typedef struct {
     int on, B;
-    uint64_t sig;               /* the layout: parts' row sizes and heads */
+    uint64_t sig;               /* the layout: parts' row sizes, heads and staging */
     size_t blk_bytes;           /* a block's rows over every part */
     ColiPsBlock *blk; int nblk, cblk;
     ColiPsCkpt *ck; int nck, cck;
@@ -173,10 +178,12 @@ static inline void coli_ps_clear(ColiPrefixStore *s) {
 
 static inline int coli_ps_per(const ColiPsPart *q) { return q->per > 1 ? q->per : 1; }
 /* the bytes of every part's rows for n positions from a block's start (a compressed part's whole
- * groups) */
+ * groups). A rows_io part's staging is the one run the part itself moves -- heads do not apply
+ * to it, as coli_ps_rows reads it -- so the span prices it once, not once a head. */
 static inline size_t coli_ps_span(const ColiPsPart *parts, int nparts, int n) {
     size_t b = 0;
-    for (int p = 0; p < nparts; p++) b += (size_t)(n / coli_ps_per(&parts[p])) * parts[p].row * (size_t)parts[p].heads;
+    for (int p = 0; p < nparts; p++) b += (size_t)(n / coli_ps_per(&parts[p])) * parts[p].row
+                                             * (size_t)(parts[p].rows_io ? 1 : parts[p].heads);
     return b;
 }
 /* What a checkpoint at P costs the store with its whole chain: every position's rows and token, and
@@ -193,6 +200,8 @@ static inline int coli_ps_layout(ColiPrefixStore *s, const ColiPsPart *parts, in
         h = coli_ps_mix(h, (uint64_t)parts[p].row);
         h = coli_ps_mix(h, (uint64_t)parts[p].heads);
         h = coli_ps_mix(h, (uint64_t)coli_ps_per(&parts[p]));
+        h = coli_ps_mix(h, (uint64_t)!!parts[p].rows_io);   /* staging counts too: the same
+         * widths moved by the part itself are not the layout the store copied head by head */
     }
     if (s->sig && s->sig != h) coli_ps_clear(s);
     s->sig = h; s->blk_bytes = coli_ps_span(parts, nparts, s->B);
@@ -207,6 +216,11 @@ static inline void coli_ps_rows(const ColiPsPart *parts, int nparts, int t0, int
         const int per = coli_ps_per(q);
         const size_t len = (size_t)(n / per) * q->row;
         if (!len) continue;
+        if (q->rows_io) {   /* rows that are not one array: the part moves them itself */
+            q->rows_io(q->base, t0 / per, n / per, buf, out);
+            buf += len;
+            continue;
+        }
         for (int h = 0; h < q->heads; h++) {
             char *a = (char *)q->base + (size_t)h * q->head_stride + (size_t)(t0 / per) * q->row;
             if (out) memcpy(buf, a, len); else memcpy(a, buf, len);

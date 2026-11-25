@@ -1,0 +1,11 @@
+{
+ "port": 8061,
+ "target_tokens": 16000,
+ "status": 200,
+ "prompt_tokens": 16046,
+ "completion_tokens": 9,
+ "wall_seconds": 978.66,
+ "passphrase_found": true,
+ "long_enough": true,
+ "text": "XQ7-ZEBRA-4416"
+}

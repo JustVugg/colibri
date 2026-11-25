@@ -5,6 +5,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **The packed KV cache is the default on DeepSeek V4.1 Flash** (`COLI_VK_KV_FP32` unset,
+  `1` is the exact fp32 opt-out): the chain's device KV mirrors *and* the host's own KV
+  arrays stay in the checkpoint's cache formats — MXFP8 window rings (528 B a row), FP4
+  compressed rows (288 B), FP4 index keys (68 B) — so the host state costs 890 B a position
+  against fp32's 6,400 (86.1% less at the released geometry), read paths dequantizing on
+  read and the boundaries (pull, park, reset, rollback) moving code rows. An approximate
+  mode: the logits drift a little and the `kv-quant-deepseek` family gates that documented
+  tolerance instead of bit-identity. The planner prices it — the host's window rings and
+  the `(dspark_block_size + 1)` rollback rows a layer included, 3,032,832 B packed against
+  11,763,712 B fp32, and 17,614,592 B at 16K, the engine's own `host kv` figure — reading
+  the stage count the way the released `config.json` spells it
+  (`num_nextn_predict_layers`, which it carries where `n_mtp_layers` is absent). New CI leg:
+  `kv-quant-deepseek` in the `vulkan-engines` job runs the codec bit-for-bit, the six chain
+  arms, the KV split's give-way and the CPU host
+  ([deepseek-v41.md](docs/deepseek-v41.md#quantized-kv-mirrors-coli_vk_kv_fp32)).
+- **qwen36: teacher forcing (`TF=1`), colibri's for this engine.** On a `.json` reference the
+  engine feeds `full_ids` through the model as a prompt, 256 rows at a time, reads every row's
+  logits out and compares each position's argmax with the reference's `tf_pred`, the prompt's
+  positions included, which the greedy oracle never looks at: the prefill path checked apart
+  from the decode. A mismatch is named and exits 1 (`ORACLE_TF_MAX_MISMATCHES` allows some),
+  `DEBUG_LOGITS=1` prints a mismatched position's top five logits and top1-top2 gap, `DUMP`
+  takes one row a position. `tools/make_qwen36_tiny.py --emit-ref` and
+  `tools/make_qwen36_oracle.py` write `tf_pred` (one cache-free forward, the argmax at every
+  position), `c/ref_qwen36.json` carries it, and `make -C c qwen36-tf-check` is the gate on the
+  generated fixture (CI): 21/21 positions, one dump row a position, a wrong entry fails.
+
+- **`COLI_MAX_BODY` sets the gateway's request-body cap** (default 4 MiB, as before), for requests
+  with several base64 images. **`COLI_BODY_LINGER_S`** (default off) lets a client that is still
+  uploading a body over the cap read the 400 instead of a connection reset.
+- **`DSV4_CUDA_REQUIRE=1` makes DeepSeek V4 exit when its GPU tier does not start** (missing
+  backend DLL or CUDA runtime, init failure, unsupported device), with the cause on stderr,
+  instead of running the whole model on the CPU at a fraction of the speed. Default off.
+
 ### Fixed
 
 - **`coli setup` no longer promises a slow laptop CPU the speed of its RAM.** It estimated a decode on
@@ -28,25 +63,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   no VRAM budget; when it is off it warns and names the variable; a Metal build on a Mac with no
   Metal GPU found says so. (#2921)
 
-### New
-
-- **qwen36: teacher forcing (`TF=1`), colibri's for this engine.** On a `.json` reference the
-  engine feeds `full_ids` through the model as a prompt, 256 rows at a time, reads every row's
-  logits out and compares each position's argmax with the reference's `tf_pred`, the prompt's
-  positions included, which the greedy oracle never looks at: the prefill path checked apart
-  from the decode. A mismatch is named and exits 1 (`ORACLE_TF_MAX_MISMATCHES` allows some),
-  `DEBUG_LOGITS=1` prints a mismatched position's top five logits and top1-top2 gap, `DUMP`
-  takes one row a position. `tools/make_qwen36_tiny.py --emit-ref` and
-  `tools/make_qwen36_oracle.py` write `tf_pred` (one cache-free forward, the argmax at every
-  position), `c/ref_qwen36.json` carries it, and `make -C c qwen36-tf-check` is the gate on the
-  generated fixture (CI): 21/21 positions, one dump row a position, a wrong entry fails.
-
-- **`COLI_MAX_BODY` sets the gateway's request-body cap** (default 4 MiB, as before), for requests
-  with several base64 images. **`COLI_BODY_LINGER_S`** (default off) lets a client that is still
-  uploading a body over the cap read the 400 instead of a connection reset.
-- **`DSV4_CUDA_REQUIRE=1` makes DeepSeek V4 exit when its GPU tier does not start** (missing
-  backend DLL or CUDA runtime, init failure, unsupported device), with the cause on stderr,
-  instead of running the whole model on the CPU at a fraction of the speed. Default off.
 ### Changed
 
 - **qwen36, qwen38: `DUMP` writes every sampled row, `SNAP` falls back to `COLI_MODEL`.** `DUMP=<path>` used
@@ -863,9 +879,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   which no writer produces: the first topk in block order, every slot written). A conversation
   reset and a prefix-store take now drop the blocks too, as they already dropped the shared
   top-k list: the rows a reset keeps apart were saved by park first, and a new conversation
-  no longer holds the last one's allocation (2 GiB at 262144) live. The device masks the
-  chain still paints stay dense (a separate change), and so does allocating the prompt's
-  rows rather than the tail's (2 GiB to 19.8 MB at 262144), which is named there.
+  no longer holds the last one's allocation (2 GiB at 262144) live. On the host this PR's
+  packed cache packs those device masks too (one bit a column, `v41c_mask_words`), so the
+  readback unpacks the bit row into the ids' keep row; allocating the prompt's rows rather
+  than the tail's stays as it was (2 GiB to 19.8 MB at 262144), which is named there.
 - **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
   WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
   them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the

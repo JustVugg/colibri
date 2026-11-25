@@ -50,6 +50,7 @@
 #define COLI_VK_KVSPLIT_H
 #include "vk_chain.h"
 #include "kv16.h"
+#include "dsv41_kvq.h"   /* VkcKvPart/VkcKvDs kvq: DeepSeek V4.1's code rows, unpacked on read */
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef _WIN32
@@ -76,12 +77,14 @@ typedef struct {
  * of a head-major cache; 1 segment for a position-major one). The host's: segment h of
  * position t at host + h*host_seg + t*seglen, in elements: floats, or float16 with kv16 (a
  * cache kept in float16, kv16.h; the device's copy is float32 either way). The device's:
- * segment h of row r at dev_off + (h*rows + r)*seglen in dev. */
+ * segment h of row r at dev_off + (h*rows + r)*seglen in dev. kvq (DeepSeek V4.1 under
+ * the packed cache, its own rows only): the host's rows are 288-byte code rows of
+ * seglen/2 bytes (a compressed row, dsv41_kvq.h), unpacked to floats on their way up. */
 typedef struct {
     int nseg, seglen;
     const void *host; size_t host_seg;
     VkcBuf *dev; size_t dev_off;
-    int kv16;
+    int kv16, kvq;
 } VkcKvPart;
 /* element idx of a host array of floats, or of float16 (kv16) */
 static inline const void *vkc_kv_el(const void *base, size_t idx, int kv16) {
@@ -96,6 +99,13 @@ static int vkc_kv_write(VkcBuf *dst, size_t at, const void *src, size_t n, int k
     int ok = vkc_write(dst, at, f, n * sizeof(float));   /* copied into the frame's staging here */
     free(f);
     return ok;
+}
+/* n elements of a kvq host cache (n/seglen rows of code), as floats into a buffer */
+static int vkc_kvq_rows(float *out, const void *src, size_t n, int seglen) {
+    size_t rows = seglen ? (n + (size_t)seglen - 1) / (size_t)seglen : 0;
+    for (size_t t = 0; t < rows; t++)
+        kvq_unpack_ckv(out + t * (size_t)seglen, (const uint8_t *)src + t * KVQ_CKV_BYTES);
+    return 1;
 }
 
 /* COLI_VK_KV_COLD=device: a split layer's host rows in memory the device reads in place,
@@ -385,10 +395,21 @@ static int vkc_kv_push(VkcKvSplit *ks, int li, const VkcKvPart *pt, int npart, i
         t->fresh[j] = 0;
         if (t1 <= t0) continue;
         for (int k = 0; k < npart && ok; k++)
-            for (int h = 0; h < pt[k].nseg && ok; h++)
+            for (int h = 0; h < pt[k].nseg && ok; h++) {
+                if (pt[k].kvq) {   /* the host's rows are codes: they unpack on their way up */
+                    size_t n = (size_t)(t1 - t0) * (size_t)pt[k].seglen;
+                    float *f = (float *)malloc(n * sizeof(float));
+                    if (!f) { ok = 0; break; }
+                    vkc_kvq_rows(f, (const uint8_t *)pt[k].host + (size_t)t0 * KVQ_CKV_BYTES, n, pt[k].seglen);
+                    ok = vkc_write(pt[k].dev, pt[k].dev_off + ((size_t)h * ks->rows + (size_t)j * B + (size_t)(t0 - b * B)) * pt[k].seglen,
+                                   f, n * sizeof(float));
+                    free(f);
+                    continue;
+                }
                 ok = vkc_kv_write(pt[k].dev, pt[k].dev_off + ((size_t)h * ks->rows + (size_t)j * B + (t0 - b * B)) * pt[k].seglen,
                                   vkc_kv_el(pt[k].host, h * pt[k].host_seg + (size_t)t0 * pt[k].seglen, pt[k].kv16),
                                   (size_t)(t1 - t0) * pt[k].seglen, pt[k].kv16);
+            }
     }
     t->valid = pos_base;
     if (ok && t->dirty) {   /* bt with bit 30 on the pinned blocks, then rb */
@@ -1137,7 +1158,8 @@ typedef struct {
     VkcBuf *q, *win, *cmp, *prm, *list, *out;
     int S, H, hd, cnt, l_off, l_row, nwin, w_off, q_off, q_row, sink_off, v4, o_off, o_row, n_cmp;
     float scale;
-    const float *Ch;
+    const uint8_t *Ch;   /* the layer's compressed rows: fp32 floats, or 288 B code rows (kvq) */
+    int kvq;             /* the packed cache: Ch holds codes, unpacked a staged row at a time */
 } VkcKvDs;
 /* Sparse scratch grows exactly, without vkc_reserve's geometric over-allocation.
  * Include the existing allocation when checking the driver budget before replacement. */
@@ -1190,7 +1212,8 @@ static int vkc_kv_ds_stage(VkcKvDs *a) {
             if (r >= a->n_cmp || b >= t->nblk) { ok = 0; break; }
             if (t->bt[b] >= 0) continue;
             if (n == limit) { ok = 0; break; }
-            memcpy(cold + n * a->hd, a->Ch + (size_t)r * a->hd, (size_t)a->hd * sizeof(float));
+            if (a->kvq) kvq_unpack_ckv(cold + n * a->hd, a->Ch + (size_t)r * KVQ_CKV_BYTES);
+            else memcpy(cold + n * a->hd, a->Ch + (size_t)r * a->hd * sizeof(float), (size_t)a->hd * sizeof(float));
             mapped[j] = -2 - (int)n++;
         }
         ks->host_ms += vkc_kv_now() - start;
@@ -1237,7 +1260,7 @@ static int vkc_kv_mla_qkv(VkcKvSplit *ks, int li, const VkcMla *m, VkcMlaScratch
                           int pos_base, VkcBuf *cs, VkcMlaCache *c, VkcMlaCache *tmp, VkcBuf *down, size_t down_off) {
     VkcMlaCache t = {tmp->lat, tmp->rope, S};
     if (tmp->cap < S || !vkc_mla_qkv(m, s, x, x_off, S, 0, cs, &t, down, down_off)) return 0;
-    VkcKvPart pl = {1, m->K, NULL, 0, c->lat, 0, 0}, pr = {1, m->R, NULL, 0, c->rope, 0, 0};
+    VkcKvPart pl = {1, m->K, NULL, 0, c->lat, 0, 0, 0}, pr = {1, m->R, NULL, 0, c->rope, 0, 0, 0};
     return vkc_kv_store(ks, li, &pl, tmp->lat, 0, (size_t)m->K, 0, pos_base, S) &&
            (m->R == 0 || vkc_kv_store(ks, li, &pr, tmp->rope, 0, (size_t)m->R, 0, pos_base, S));
 }

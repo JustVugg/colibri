@@ -603,8 +603,8 @@ static int olc_push_kv(OlmChain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int hd = c->head_dim, ok = 1;
     for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
         if (ch->ks.on) {
-            VkcKvPart pt[2] = {{c->n_heads, hd, m->K[i], (size_t)m->max_t * hd, ch->kc[i], 0, 0},
-                               {c->n_heads, hd, m->V[i], (size_t)m->max_t * hd, ch->vc[i], 0, 0}};
+            VkcKvPart pt[2] = {{c->n_heads, hd, m->K[i], (size_t)m->max_t * hd, ch->kc[i], 0, 0, 0},
+                               {c->n_heads, hd, m->V[i], (size_t)m->max_t * hd, ch->vc[i], 0, 0, 0}};
             vkc_kv_place(&ch->ks, i - ch->lo, pos_base, n_rows);
             ok = vkc_kv_push(&ch->ks, i - ch->lo, pt, 2, pos_base);
             ch->kv_valid[i] = pos_base;
@@ -642,7 +642,7 @@ static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb,
     }
     if (!ok) return 0;
     if (ch->ks.on) {   /* the split: the rows into their window slots, the attention in two parts */
-        VkcKvPart pk = {H, hd, m->K[i], (size_t)m->max_t * hd, ch->kc[i], 0, 0}, pv = {H, hd, m->V[i], (size_t)m->max_t * hd, ch->vc[i], 0, 0};
+        VkcKvPart pk = {H, hd, m->K[i], (size_t)m->max_t * hd, ch->kc[i], 0, 0, 0}, pv = {H, hd, m->V[i], (size_t)m->max_t * hd, ch->vc[i], 0, 0, 0};
         VkcKvGqa a = {&ch->ks, i - ch->lo, ch->q, ch->kc[i], ch->vc[i], NULL, NULL, NULL, ch->ctx, n, H, H, hd, hd, pb, 0, 0, 0, 0,
                       D, hd, 0, 0, 0, 0, D, 0, 0, 1.f / sqrtf((float)hd),
                       m->K[i], m->V[i], (size_t)m->max_t * hd, (size_t)hd, (size_t)m->max_t * hd, (size_t)hd, 0};

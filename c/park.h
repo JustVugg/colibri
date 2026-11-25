@@ -39,8 +39,11 @@
  * bytes, a row for `per` positions. A cache by position (row t at t, or at t % rows for a
  * ring) keeps its rows [0, n) apart, all of them when it has fewer; a compressed one (a row
  * for `per` positions) the rows of positions [0, n); a block saved whole is one row of its
- * size. */
-typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; int per; } ColiParkPart;
+ * size. `block` (0 = none) rounds what a park keeps to whole `block`-row blocks: a cache
+ * whose rows sit in block-wide sections (DeepSeek V4.1's index keys under the packed
+ * cache, COLI_VK_KV_FP32 unset -- a row's scales at its block's 2048-byte mark) must not have a
+ * block cut in half, and its `rows` is the mirror's block-rounded capacity. */
+typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; int per, block; } ColiParkPart;
 
 typedef struct {
     int on, len, kv_len, n, nparts;
@@ -50,16 +53,19 @@ typedef struct {
 } ColiPark;
 
 static inline ColiParkPart coli_park_rows(void *base, size_t row, int rows) {
-    ColiParkPart p = {base, row, rows, 1, 0, 1}; return p;
+    ColiParkPart p = {base, row, rows, 1, 0, 1, 0}; return p;
 }
 static inline ColiParkPart coli_park_heads(void *base, size_t row, int rows, int heads, size_t head_stride) {
-    ColiParkPart p = {base, row, rows, heads, head_stride, 1}; return p;
+    ColiParkPart p = {base, row, rows, heads, head_stride, 1, 0}; return p;
 }
 static inline ColiParkPart coli_park_per(void *base, size_t row, int rows, int per) {
-    ColiParkPart p = {base, row, rows, 1, 0, per > 1 ? per : 1}; return p;
+    ColiParkPart p = {base, row, rows, 1, 0, per > 1 ? per : 1, 0}; return p;
+}
+static inline ColiParkPart coli_park_per_blocks(void *base, size_t row, int rows, int per, int block) {
+    ColiParkPart p = {base, row, rows, 1, 0, per > 1 ? per : 1, block > 1 ? block : 1}; return p;
 }
 static inline ColiParkPart coli_park_whole(void *base, size_t bytes) {
-    ColiParkPart p = {base, bytes, 1, 1, 0, 1}; return p;
+    ColiParkPart p = {base, bytes, 1, 1, 0, 1, 0}; return p;
 }
 
 static inline void coli_park_free(ColiPark *p) {
@@ -81,7 +87,10 @@ static inline int coli_park_rows_for(const ColiPark *p, const kv_prefix *kvp, in
 
 static inline size_t coli_park_part_bytes(const ColiParkPart *q, int n) {
     int r = q->per > 1 ? (n + q->per - 1) / q->per : n;
-    return (size_t)(r < q->rows ? r : q->rows) * q->row;
+    if (r > q->rows) r = q->rows;
+    if (q->block > 1) r = (r + q->block - 1) / q->block * q->block;   /* whole blocks only */
+    if (r > q->rows) r = q->rows;   /* a capacity that is not a block multiple still fits */
+    return (size_t)r * q->row;
 }
 static inline void coli_park_copy(const ColiParkPart *q, void *copy, int n, int out) {
     const size_t b = coli_park_part_bytes(q, n);
@@ -125,7 +134,7 @@ static inline int coli_park_restore(ColiPark *p, kv_prefix *kvp, int *kv_len, in
     for (int i = 0; ok && i < nparts; i++)
         ok = parts[i].base == p->part[i].base && parts[i].row == p->part[i].row && parts[i].rows == p->part[i].rows &&
              parts[i].heads == p->part[i].heads && parts[i].head_stride == p->part[i].head_stride &&
-             parts[i].per == p->part[i].per;
+             parts[i].per == p->part[i].per && parts[i].block == p->part[i].block;
     if (!ok) {
         if (getenv("COLI_PREFIX_LOG"))
             fprintf(stderr, "[PREFIX] the request wrote past the rows kept apart: the conversation will be read again\n");

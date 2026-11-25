@@ -3,6 +3,7 @@
 The end-to-end path (the gateway, a mock engine, HTTP) is test_context_compaction_e2e.py.
 """
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -31,8 +32,10 @@ QWEN36_35B_CONFIG = {
     "linear_conv_kernel_dim": 4,
 }
 
-# DeepSeek V4.1 Flash's shape: four compressing KV sources (ratios 2, 2, 2, 1), and a
-# prompt prefilled in one forward through four residual streams of 5120.
+# DeepSeek V4.1 Flash's shape: four compressing KV sources (ratios 2, 2, 2, 1), a prompt
+# prefilled in one forward through four residual streams of 5120, and the attention widths
+# the workspace's per-row closed form reads (64 heads of 512, q_lora 1280, index_topk 512)
+# plus the DSpark head that keeps main_hidden (3 target layers of a 5-token block).
 DSV41_FLASH_CONFIG = {
     "model_type": "deepseek_v41",
     "text_config": {
@@ -44,6 +47,12 @@ DSV41_FLASH_CONFIG = {
         "sliding_window": 128,
         "index_head_dim": 128,
         "hc_mult": 4,
+        "num_attention_heads": 64,
+        "q_lora_rank": 1280,
+        "index_topk": 512,
+        "dspark_block_size": 5,
+        "dspark_target_layer_ids": [37, 38, 39],
+        "num_nextn_predict_layers": 3,
         "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0],
         "kv_source_layer_ids": [2, 8, 14, 20],
     },
@@ -160,17 +169,40 @@ class ChatContextTest(unittest.TestCase):
         self.assertEqual(gateway.chat_context_env(env, family, self.model), 12000)
 
     def test_a_cache_the_plan_sizes_keeps_room_for_the_prompt(self):
-        # V4.1's state is 6.4 KB a token, its prompt's workspace 200 KB: the state alone
-        # took 131072 tokens on 16 GB and 262144 on 64 GB, where the plan then reserved
-        # 53.7 GB of workspace and gave the expert cache no slot (the server refused to
-        # start). Counted together: 16384 (3.5 GB), 65536 (13.8 GB of a quarter of 64 GB),
-        # and 131072 (27.7 GB, a tenth) only from 277 GB.
+        # V4.1's state is 890 B a token at the packed default (COLI_VK_KV_FP32 unset
+        # runs the packed cache: the code rows, 86% less than fp32's 6.4 KB), and the
+        # prompt's WORKSPACE is 416,368 B a token -- what ONE forward of the prompt
+        # allocates (forward_full's per-row buffers beside attention_run's; the engine has
+        # no chunker to bound it, deepseek_v41.c). So the workspace decides every rung,
+        # and the ladder is short: 16384 alone is 6.8 GB, 32768 13.6, 65536 27.3, 131072
+        # 54.6, 262144 109.2. Under the quarter share that applies up to CHAT_CONTEXT_AGENT
+        # a box needs 27.3 GB of RAM to hold 16384 and 109.2 to hold 32768; above it the
+        # share is a tenth. Hence 8/16 GB -> None (the engine's own default, which is what
+        # returns no step), 64 GB -> 32768 (13.6 fits the 16 GB share, 27.3 does not),
+        # 256 GB -> 65536 (27.3 of 64; 54.6 misses 25.6), 512 GB -> 65536 (54.6 misses
+        # 51.2), 1024 GB -> 131072 (54.6 of 102.4; 109.2 misses 102.4). Priced fp32
+        # (COLI_VK_KV_FP32=1, the exact opt-out) the frame is the SAME -- the flag moves
+        # the host's KV rows, not the prefill's buffers -- so both arms read the one table;
+        # the state is 0.1 GB at 65536 packed and 0.4 GB fp32 beside the same 27.3 GB.
         (Path(self.tmp.name) / "config.json").write_text(json.dumps(DSV41_FLASH_CONFIG))
-        for available, expected in ((8 * GB, None), (16 * GB, 16384), (64 * GB, 65536),
-                                    (256 * GB, 65536), (512 * GB, 131072),
-                                    (1024 * GB, 262144)):
+        for available, expected in ((8 * GB, None), (16 * GB, None), (64 * GB, 32768),
+                                    (256 * GB, 65536), (512 * GB, 65536),
+                                    (1024 * GB, 131072)):
             with self.subTest(gb=available / GB):
-                context, why = chat_context(self.model, {}, available=available)
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("COLI_VK_KV_FP32", None)   # the default: nothing set
+                    context, why = chat_context(self.model, {}, available=available)
+                self.assertEqual(context, expected)
+                if context:
+                    self.assertIn("GB of prompt workspace", why)
+        # the fp32 arm, pinned: FP32=1 is the exact opt-out, and its ladder is the same
+        # one (the FP32=1 seam test_dsv41_kvq_host_plan pins the price itself)
+        for available, expected in ((8 * GB, None), (16 * GB, None), (64 * GB, 32768),
+                                    (256 * GB, 65536), (512 * GB, 65536),
+                                    (1024 * GB, 131072)):
+            with self.subTest(gb=available / GB, flag="0"):
+                with patch.dict("os.environ", {"COLI_VK_KV_FP32": "1"}):
+                    context, why = chat_context(self.model, {}, available=available)
                 self.assertEqual(context, expected)
                 if context:
                     self.assertIn("GB of prompt workspace", why)

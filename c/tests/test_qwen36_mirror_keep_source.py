@@ -81,9 +81,10 @@ class MirrorFirstKeep(unittest.TestCase):
         self.assertIn("if (avail > 0 && avail < free_b) free_b = avail;", self.rows)
 
     def test_the_staging_room_on_the_primary(self):
-        # as vkc_chunk_rows leaves it out: the tier stages host pool experts on the primary device only
+        # as vkc_chunk_rows leaves it out: the tier stages host pool experts on the primary
+        # device only (the kv-quant wave's form: staging and slot reserve, one `reserved`)
         self.assertRegex(self.block, r"stage\s*=\s*ch->d\s*\?\s*0\s*:\s*vkt_stage_room\(\)")
-        self.assertIn("if (g_kd == 0) free_b -= (double)vkt_stage_room();", self.rows)
+        self.assertIn("reserved = vkt_stage_room() + vkt_slot_reserve();", self.rows)
 
     def test_the_order_the_rule_relies_on(self):
         # the first-forward branch before the tier gives memory back and the mirror is allocated...

@@ -1,0 +1,23 @@
+# ledger.txt -- the host/mirror ledger lines, one representative turn an arm.
+# Source logs (not copied here, they are 2 MB of engine chatter):
+#   /root/Projects/colibri-pr2712-testrun/logs/E12-serve.log  (packed default, 12 turns: 12 lines match 'kv mirror|host kv')
+#   /root/Projects/colibri-pr2712-testrun/logs/E13-serve.log  (fp32, COLI_VK_KV_FP32=1, 12 turns: 12 lines match)
+# Each turn prints one '[VK] deepseek_v41 vram: ...' line that carries BOTH the
+# 'kv mirror' and the 'host kv' field, so the representative turn below is
+#   grep -m1 -E 'kv mirror|host kv' <log>   (the brief's grep -m2 returns that same
+#   line twice; -m1 is the one-turn excerpt). Verbatim, nothing edited.
+
+== packed default (COLI_VK_KV_FP32 unset), E12-serve.log, first turn ==
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) | chain 61.6 MiB (dev 64.0 in 1 blocks, down 64.0 in 1, up 64.0 in 1) | tier resident 843.8 MiB + 39 slots 822.7 MiB = 1666.4 of 1700.8 in 7 blocks | extra layers 105.5 in 1 blocks | kv mirror 13.1 MiB (quantized; a second device's mirrors, when there are two, are not in this line) | host kv 16.8 MiB (packed) | process 11.42 GiB of 11.43 GiB in pools (0.0 MiB outside) | device 15.13 GiB used of 15.98, gtt 1.11 GiB (card2)
+
+== fp32 (COLI_VK_KV_FP32=1), E13-serve.log, first turn ==
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) | chain 106.9 MiB (dev 128.0 in 2 blocks, down 64.0 in 1, up 64.0 in 1) | tier resident 843.8 MiB + 39 slots 822.7 MiB = 1666.4 of 1701.5 in 7 blocks | extra layers 105.5 in 1 blocks | kv mirror 51.6 MiB | process 11.48 GiB of 11.50 GiB in pools (0.0 MiB outside) | device 15.19 GiB used of 15.98, gtt 1.11 GiB (card2)
+
+# The two fields a reader is meant to compare:
+#   packed: kv mirror 13.1 MiB (quantized) | host kv 16.8 MiB (packed)
+#   fp32:   kv mirror 51.6 MiB             | (no 'host kv' field: the host rows are f32)
+# The 'kv mirror' size differs because the packed arm stores the mirrors as the
+# checkpoint's cache codes (528 B a window row, 288 B a compressed row); the fp32
+# arm stores them as f32 (2048 B a row). At ctx 16384 the engine's closed form is
+#   890*16384 + 3,032,832 = 17,614,592 B = 16.8 MiB (packed host KV)
+#   6400*16384 + 11,763,712 = 116,621,312 B (fp32 host KV, not printed as 'host kv')
