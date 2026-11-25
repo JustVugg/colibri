@@ -521,6 +521,20 @@ static void test_cuda_model_filter(const Model *trunk) {
         {"model-00000.safetensors", 3, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
         {"config.json", 2, "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"},
     };
+    char *gg_path = weight_path;
+    gguf_ctx gg = {.n_files = 1, .fds = &fd, .paths = &gg_path};
+    ck(q36_gguf_checkpoint_matches(&gg, &fixture_files[0], fixture_dir), "GGUF matches the opened bytes");
+    ck(q36_gguf_checkpoint_matches(&gg, &fixture_files[0], fixture_dir), "verified GGUF still qualifies");
+    gg.n_files = 2;
+    ck(!q36_gguf_checkpoint_matches(&gg, &fixture_files[0], fixture_dir), "split GGUF stays on its original path");
+    gg.n_files = 1;
+    ck(!q36_gguf_checkpoint_matches(&gg, &q36_gguf_q4_k_xl, fixture_dir), "other GGUF stays on its original path");
+    ck(write_fixture_file(weight_path, "abd") && !q36_gguf_checkpoint_matches(&gg, &fixture_files[0], fixture_dir),
+       "same-size GGUF with different bytes invalidates a cached match");
+    ck(write_fixture_file(weight_path, "abc"), "restore GGUF test data");
+    char gg_cache[256];
+    snprintf(gg_cache, sizeof gg_cache, "%s/.colibri-qwen36-cuda-gguf-v1", fixture_dir);
+    unlink(gg_cache);
     const Q36Checkpoint fixture_checkpoint = {fixture_dir, fixture_files, 1, 2};
     shards fixture_shards = {.nfd = 1, .fds = {fd}, .paths = {weight_path}, .sizes = {3}};
     const ColiCudaChainOps saved = fake_chain_table;
@@ -988,6 +1002,25 @@ static void test_request_kernel_mask(void) {
        (rtx3090.decode_permissions & Q36_PROMPT_CACHE),
        "RTX 3090 resumes the growable cache when the same prefix is not live");
     q36cc_end_request(&rtx3090);
+    const int saved_gguf = g_gguf;
+    const int devices[] = {Q36_GPU_L4, Q36_GPU_A100, Q36_GPU_3090, Q36_GPU_PRO4000,
+                           Q36_GPU_4090, Q36_GPU_5090, Q36_GPU_PRO6000, Q36_GPU_L40S};
+    for (size_t i = 0; i < sizeof devices / sizeof devices[0]; i++) {
+        int device = devices[i];
+        fake_device_profile = device;
+        for (int gguf = 0; gguf <= 1; gguf++) {
+            Q36CChain tested = {0};
+            g_gguf = gguf;
+            tested.device_profile = cc_select_qwen36_profile(1);
+            const unsigned mask = q36_device_features(device);
+            const unsigned expected = gguf && device == Q36_GPU_4090
+                                      ? mask & ~Q36_ACTIVATION_CACHE : mask;
+            q36cc_set_permissions(&tested, mask);
+            ck(tested.active_permissions == expected && fake_kernel_mask == expected,
+               "the GGUF activation-cache exception is restricted to the RTX 4090");
+        }
+    }
+    g_gguf = saved_gguf;
     fake_device_profile = Q36_GPU_PRO6000;
     Q36CChain pro6000 = {0};
     pro6000.device_profile = cc_select_qwen36_profile(1);

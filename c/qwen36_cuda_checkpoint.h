@@ -18,6 +18,12 @@ typedef struct {
     const char *sha256;
 } Q36CheckpointFile;
 
+/* unsloth/Qwen3.6-35B-A3B-GGUF at a483e9e6cbd595906af30beda3187c2663a1118c. */
+static const Q36CheckpointFile q36_gguf_q4_k_xl = {
+    "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", INT64_C(22360456160),
+    "707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450"
+};
+
 enum { Q36_CHECKPOINT_SHARDS = 41 };
 static const Q36CheckpointFile q36_checkpoint_files[] = {
     {"model-00000.safetensors", 527831896, "96c003f9a1e2d0b9ee8211ea70c3f0ae3e22a8056b5e5b6c74cec672498a3350"},
@@ -173,7 +179,7 @@ static int q36_checkpoint_digest(int fd, const Q36CheckpointFile *file) {
 enum { Q36_CHECKPOINT_LINE = 320 };
 typedef char Q36CheckpointCache[Q36_CHECKPOINT_NFILES][Q36_CHECKPOINT_LINE];
 
-static void q36_checkpoint_cache_read(const char *path, Q36CheckpointCache lines, int nfiles) {
+static void q36_checkpoint_cache_read(const char *path, char lines[][Q36_CHECKPOINT_LINE], int nfiles) {
 #if defined(__linux__) || defined(__APPLE__)
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     struct stat st;
@@ -197,7 +203,7 @@ static void q36_checkpoint_cache_read(const char *path, Q36CheckpointCache lines
 #endif
 }
 
-static void q36_checkpoint_cache_write(const char *path, Q36CheckpointCache lines, int nfiles) {
+static void q36_checkpoint_cache_write(const char *path, char lines[][Q36_CHECKPOINT_LINE], int nfiles) {
 #if defined(__linux__) || defined(__APPLE__)
     char temp[2100];
     int n = snprintf(temp, sizeof temp, "%s.XXXXXX", path);
@@ -228,6 +234,29 @@ static int q36_checkpoint_stamp(char line[Q36_CHECKPOINT_LINE], const Q36Checkpo
                      (intmax_t)st->st_mtime, q36_checkpoint_mtime_ns(st),
                      (intmax_t)st->st_ctime, q36_checkpoint_ctime_ns(st));
     return n >= 0 && n < Q36_CHECKPOINT_LINE;
+}
+
+/* Check the descriptor opened by the GGUF reader. A renamed file with the same
+ * bytes qualifies. A same-size requant or a multipart container does not. */
+static int q36_gguf_checkpoint_matches(const gguf_ctx *gg, const Q36CheckpointFile *file, const char *snap) {
+    if (!snap || gg->n_files != 1 || !gg->fds || !gg->paths || !gg->paths[0]) return 0;
+    int fd = gg->fds[0];
+    struct stat before, after, named;
+    if (fstat(fd, &before) || !S_ISREG(before.st_mode) || before.st_size != file->bytes) return 0;
+
+    char cache[2048], old[1][Q36_CHECKPOINT_LINE] = {{0}}, fresh[1][Q36_CHECKPOINT_LINE];
+    /* SNAP may name an import directory or the GGUF itself. */
+    int n = gguf_is_file(snap)
+        ? snprintf(cache, sizeof cache, "%s.colibri-qwen36-cuda-gguf-v1", snap)
+        : snprintf(cache, sizeof cache, "%s/.colibri-qwen36-cuda-gguf-v1", snap);
+    int stamp = n >= 0 && (size_t)n < sizeof cache && q36_checkpoint_stamp(fresh[0], file, fd, &before);
+    if (stamp) q36_checkpoint_cache_read(cache, old, 1);
+    int hit = stamp && !strcmp(old[0], fresh[0]);
+    if (!hit && !q36_checkpoint_digest(fd, file)) return 0;
+    if (fstat(fd, &after) || !q36_checkpoint_same_file(&before, &after) ||
+        stat(gg->paths[0], &named) || !q36_checkpoint_same_file(&after, &named)) return 0;
+    if (stamp && !hit) q36_checkpoint_cache_write(cache, fresh, 1);
+    return 1;
 }
 
 static int q36_checkpoint_matches(const shards *s, const Q36Checkpoint *checkpoint) {
