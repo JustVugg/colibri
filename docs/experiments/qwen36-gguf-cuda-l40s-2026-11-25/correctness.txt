@@ -203,7 +203,8 @@ See manifest.json and raw.json for the timings and per-run comparisons.
 Project checks on the submitted code
 
 Dev revision: e8b1c9b3f28c4724603e64a3a692f2e9d1141344
-Compiled c/ tree with the patch: dce451b587551ef2164fdcac3d404de73122ec58
+Qualified repository tree with the patch: dce451b587551ef2164fdcac3d404de73122ec58
+Qualified c/ subtree, identical to the submitted c/ subtree: 824631008787ce9c997953aef84d0abf0635d9fe
 make check (macOS): passed. Python reported 3,592 tests, 671 skipped.
 glm_tiny: 32/32 teacher-forced positions and 20/20 greedy tokens.
 All 17 oracle regression tests passed.
