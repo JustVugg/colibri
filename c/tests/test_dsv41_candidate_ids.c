@@ -104,7 +104,7 @@ static int paint_width(void) {
 
 static int clipped_row(void) {
     /* A row the chain converted: the device painted blocks 0 and 1 of a 16-position row and
-     * the conversion clips it at the chunk's reach wc = 12 (deepseek_v41_chain.h:1454), so
+     * the conversion clips it at the chunk's reach wc = 12 (deepseek_v41_chain.h:1698-1699), so
      * block 1 is set on [8,12) and 0 on [12,16); the ids are extracted over wh = 16 and the
      * reader repaints at w = 16. This is the one geometry in which a painted block's *last*
      * in-scan position is 0: an extraction that asked "is the last position set" (`hit =`

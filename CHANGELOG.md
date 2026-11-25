@@ -817,9 +817,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   which no writer produces: the first topk in block order, every slot written). A conversation
   reset and a prefix-store take now drop the blocks too, as they already dropped the shared
   top-k list: the rows a reset keeps apart were saved by park first, and a new conversation
-  no longer holds the last one's allocation (2 GiB at 262144) live. The device masks the
-  chain still paints stay dense (a separate change), and so does allocating the prompt's
-  rows rather than the tail's (2 GiB to 19.8 MB at 262144), which is named there.
+  no longer holds the last one's allocation (2 GiB at 262144) live. On the host this PR's
+  packed cache packs those device masks too (one bit a column, `v41c_mask_words`), so the
+  readback unpacks the bit row into the ids' keep row; allocating the prompt's rows rather
+  than the tail's stays as it was (2 GiB to 19.8 MB at 262144), which is named there.
 - **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
   WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
   them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the
