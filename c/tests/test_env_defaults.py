@@ -6,10 +6,13 @@ Carica `coli` come modulo (ha la guardia __main__) e verifica il contratto:
 - COLI_NO_OMP_TUNE spegne SOLO il blocco OMP, non i default I/O
 - non-win32: env_for non tocca nulla di tutto questo
 """
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import os
 import json
+import struct
 import subprocess
 import sys
 import tempfile
@@ -85,6 +88,64 @@ class EnvDefaultsTest(unittest.TestCase):
         e = self.env_for_with({}, "linux")
         for k in ("DIRECT", "PIPE", "PILOT_REAL", "OMP_WAIT_POLICY", "KMP_BLOCKTIME"):
             self.assertNotIn(k, e)
+
+
+class AutoTierKillSwitchTest(unittest.TestCase):
+    """--auto-tier on the GLM path: the plan's team under COLI_NO_OMP_TUNE.
+
+    env_for sets no team of its own under the kill switch (above), and the
+    sibling launcher takes the plan's team out again under it. The model is the
+    smallest one build_plan reads; the machine is 48 cores under a CPU quota of
+    7.65, so the launcher's team and the plan's are both 7. Its free memory is
+    given too: under the Windows platform a host with no /proc/meminfo would
+    otherwise be asked through the Windows API."""
+
+    def team(self, environ, windows_gpu=False):
+        """OMP_NUM_THREADS as the engine gets it. `windows_gpu`: no --auto-tier, the
+        plan a bare Windows launch builds when it finds a card for its CUDA build."""
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp)
+            (model / "config.json").write_text(json.dumps({
+                "model_type": "glm_moe_dsa", "num_hidden_layers": 2, "n_routed_experts": 2,
+                "kv_lora_rank": 4, "qk_rope_head_dim": 2, "qk_nope_head_dim": 3,
+                "v_head_dim": 5, "num_attention_heads": 2}), encoding="utf-8")
+            header, end = {}, 0
+            for name, size in (("model.embed_tokens.weight", 100),
+                               ("model.layers.0.self_attn.q_a_proj.weight", 200),
+                               ("model.layers.1.mlp.experts.0.gate_proj.weight", 30),
+                               ("model.layers.1.mlp.experts.0.up_proj.weight", 30)):
+                header[name] = {"dtype": "U8", "shape": [size], "data_offsets": [end, end + size]}
+                end += size
+            raw = json.dumps(header).encode()
+            (model / "model.safetensors").write_bytes(struct.pack("<Q", len(raw)) + raw + bytes(end))
+            launch = args(model=str(model), auto_tier=not windows_gpu,
+                          gpu=None if windows_gpu else "none", kv_slots=1,
+                          no_tune_profile=True, cap=None)
+            card = {"index": 0, "name": "card", "total_bytes": 16 << 30, "free_bytes": 15 << 30}
+            with mock.patch.dict(os.environ, {"HOME": tmp, **environ}, clear=True), \
+                 mock.patch.object(sys, "platform", "win32" if windows_gpu else "linux"), \
+                 mock.patch.object(coli, "cuda_binary", return_value=windows_gpu), \
+                 mock.patch.object(coli, "vulkan_binary", return_value=False), \
+                 mock.patch("resource_plan.discover_gpus", return_value=[card]), \
+                 mock.patch("resource_plan.memory_available", return_value=64 << 30), \
+                 mock.patch("resource_plan.performance_core_count", return_value=None), \
+                 mock.patch("resource_plan.physical_cpu_count", return_value=48), \
+                 mock.patch("resource_plan.cgroup_cpu_quota", return_value=7.65), \
+                 mock.patch("resource_plan.allowed_cpu_count", return_value=None), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                return coli.env_for(launch).get("OMP_NUM_THREADS")
+
+    def test_the_kill_switch_keeps_the_plan_from_choosing_a_team(self):
+        self.assertIsNone(self.team({"COLI_NO_OMP_TUNE": "1"}))
+
+    def test_without_the_kill_switch_the_team_is_set(self):
+        self.assertEqual(self.team({}), "7")
+
+    def test_a_team_asked_for_by_name_stays_under_the_kill_switch(self):
+        self.assertEqual(self.team({"COLI_NO_OMP_TUNE": "1", "OMP_NUM_THREADS": "24"}), "24")
+
+    def test_the_kill_switch_holds_for_the_plan_of_a_bare_windows_launch(self):
+        self.assertIsNone(self.team({"COLI_NO_OMP_TUNE": "1"}, windows_gpu=True))
 
 
 class SiblingPlanRefusalTest(unittest.TestCase):

@@ -577,7 +577,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
-	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
+	test_e8x4g64_loader test_qwenimage_vae test_qwenimage_vision test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 test_int_kernel_exact_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
 TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window test_vk_pcache
@@ -2069,6 +2069,15 @@ qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
 	$(PYTHON) tests/qwen36_mtp_harness.py --engine ./qwen36$(EXE) --source ./qwen36_tiny_mtp \
 		--model ./qwen36_tiny_mtp_i8 --model ./qwen36_tiny_mtp_i4
 
+# A Basalt .basalt qwen35 pack -> GGUF (tools/convert_basalt_to_gguf.py): the converter
+# on a tiny pack in Basalt's form (tests/basalt_fixture.py), then the converted file on
+# qwen36 (CPU): GGUF_CHECK, MTP drafts, residuals equal to the pack's values. Here the
+# engine part may not skip; test-python runs the same file and skips it when qwen36 is
+# not built.
+.PHONY: basalt-convert-check
+basalt-convert-check: qwen36$(EXE)
+	BASALT_CONVERT_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_convert_basalt_to_gguf
+
 # Speculative decoding with deeper verifies (docs/speculative.md): the MTP head's
 # drafts up to 3 per verify (Q38_MTP_DRAFTS) and prompt-lookup drafts up to 5
 # (COLI_LOOKUP=1, spec_draft.h), on qwen38 and qwen36. tests/test_spec_draft
@@ -2486,6 +2495,15 @@ tests/test_qwenimage_encoder$(EXE): tests/test_qwenimage_encoder.c
 .PHONY: qwenimage-encoder-check
 qwenimage-encoder-check: tests/test_qwenimage_encoder$(EXE) tests/test_qwenimage_vae$(EXE)
 	$(PYTHON) tools/check_qwenimage_encoder.py
+
+tests/test_qwenimage_vision$(EXE): tests/test_qwenimage_vision.c $(QWEN36_METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) $< $(QWEN36_METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
+
+.PHONY: qwenimage-vision-check
+qwenimage-vision-check: tests/test_qwenimage_vision$(EXE)
+	@set -e; fixture=$$(mktemp -d); trap 'rm -rf "$$fixture"' EXIT; \
+	  $(PYTHON) tools/make_qwenimage_tiny.py "$$fixture" --vision-conditioning && \
+	  ./tests/test_qwenimage_vision$(EXE) "$$fixture"
 
 # Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
 # generazione. Prova che due immagini diverse danno risposte diverse, che e'
@@ -2910,6 +2928,10 @@ tests/test_xf16$(EXE): tests/test_xf16.c
 # the SSE2 i8 expert kernel (no AVX2+FMA) against xf_dot_i8_ref, bit for bit.
 tests/test_xf_sse2_int16$(EXE): tests/test_xf_sse2_int16.c
 	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+# the same source built for Sandy Bridge: the AVX i8 expert kernel (AVX, no AVX2+FMA) against
+# xf_dot_i8_ref, and its fmaf emulation in four lanes and by the short way against fmaf (#2882).
+tests/test_xf_avx_i8$(EXE): tests/test_xf_sse2_int16.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=sandybridge -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
 # coli_fmaf_exact (fma_compat.h) against fmaf, bit for bit, built without FMA where it is the
 # emulation the kernels take there (#2882).
 tests/test_fmaf_exact$(EXE): tests/test_fmaf_exact.c
@@ -3069,6 +3091,10 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 
 # CPU-only state-policy regression; independent of model files and GPU flags.
 tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
+
+# glm53's serve request framing, frozen on synthetic frames (no model)
+tests/test_glm53_serve_framing$(EXE): tests/test_glm53_serve_framing.c glm53.c
 	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
 # Exact sampler order, cumulative mass, selected token and RNG-use regression.

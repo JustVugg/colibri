@@ -2347,13 +2347,14 @@ def cmd_setup(a, ui=None):
 
 
 def machine_fit(hw, root):
-    """The machine as model_fit's estimates read it: setup_hw's report, the RAM's bandwidth
-    measured now (about two seconds), the cards' from the CUDA driver, the disk under `root`."""
+    """The machine as model_fit's estimates read it: setup_hw's report, the RAM's bandwidth and the
+    cores' vector work measured now (about three seconds), the cards' from the CUDA driver, the
+    disk under `root`."""
     import model_fit
     probe = setup_hw._probe_cuda_child() if (hw.get("gpu") or {}).get("nvidia") else None
     return model_fit.machine_from_hw(
         hw, model_fit.measure_ram_bandwidth(avail_bytes=(hw.get("memory") or {}).get("available")),
-        model_fit.disk_kind(root), (probe or {}).get("devices"))
+        model_fit.disk_kind(root), (probe or {}).get("devices"), model_fit.measure_cpu_gbs())
 
 
 def _recommend_for(hw, explicit_dir, requested="auto", tc=None, fit=None):
