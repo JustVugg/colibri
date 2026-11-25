@@ -153,6 +153,7 @@ typedef struct {
     cudaStream_t stream;
     cudaEvent_t ev_done; int ev_done_ok;        /* resident-group issue completion (#431 PR-C0) */
     void *group_desc; size_t group_desc_cap;
+    void *f8m_buf; size_t f8m_cap;   /* COLI_CUDA_F8_MMA: the group's bf16 x and bf16 hidden rows */
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
     void *moe_tab; size_t moe_tab_cap; float *moe_host; size_t moe_host_cap;   /* group_moe_launch's table and row ids */
@@ -1460,6 +1461,17 @@ __global__ static void grouped_down_f8w(float *y,const float *x,const GroupDesc 
     }
 }
 
+/* fmt=8 on the tensor cores (COLI_CUDA_F8_MMA=1, default off; 2026-11-17, ported from
+ * TensorFold): bf16 mma.sync over e4m3 pairs widened in registers, for groups whose
+ * largest member has many rows (prompt chunks, wide verify windows), where the warp
+ * kernels above re-stream the weights every 4 rows. CUDA only: PTX asm. */
+#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__))
+#define COLI_F8_MMA 1
+#include "cuda_f8_mma.cuh"
+#else
+#define COLI_F8_MMA 0
+#endif
+
 /* fmt=7 (MXFP4) expert groups: one WARP owns one (expert, output row) and its
  * lanes take the row's 32-input groups in turn (16 bytes of e2m1 nibbles and one
  * ue8m0 byte each), each decoded once for a tile of up to 4 activation rows. As
@@ -1904,6 +1916,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
+        if (ctx->f8m_buf) cudaFree(ctx->f8m_buf);
         if (ctx->moe_tab) cudaFree(ctx->moe_tab);
         if (ctx->moe_host) cudaFreeHost(ctx->moe_host);
 #ifdef COLI_ANS
@@ -1929,6 +1942,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
         ctx->host_x_cap=ctx->host_y_cap=ctx->host_kv_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
+        ctx->f8m_buf=nullptr; ctx->f8m_cap=0;
         ctx->moe_tab=nullptr; ctx->moe_tab_cap=0; ctx->moe_host=nullptr; ctx->moe_host_cap=0;
     }
     g_nctx = 0;
@@ -2907,6 +2921,48 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
     return 1;
 }
 
+#if COLI_F8_MMA
+static uint64_t g_f8_mma_calls;   /* groups f8_mma_launch took (tests/test_f8_mma_cuda.cu) */
+/* COLI_CUDA_F8_MMA=1 (2026-11-17, default 0 = off), re-read per dispatch like
+ * COLI_CUDA_F8_WARP, and ahead of it for the groups it admits (f8m_eligible).
+ * COLI_CUDA_F8_MMA_MIN_ROWS (default 8) is compared with the group's LARGEST
+ * member: the m16 tile is per expert, so many one-row experts gain nothing.
+ * Never for a pinned call (a speculation's verify keeps a decode step's bits,
+ * like the int4 tensor-core path). The issue/take path has no pin: a tier
+ * verify window whose expert reaches the threshold gets bf16-activation bits
+ * there, which a decode step of the same token (one row) does not. */
+static int f8_mma_wanted(const DeviceContext *ctx,const GroupDesc *host,int count,int I,int D,
+                         int max_rows,int pin){
+    int aligned=1;
+    for(int c=0;c<count;c++)
+        aligned&=!(((uintptr_t)host[c].g|(uintptr_t)host[c].u|(uintptr_t)host[c].d)&15);
+    return f8m_eligible(f8m_parse(std::getenv("COLI_CUDA_F8_MMA"),0),
+                        f8m_parse(std::getenv("COLI_CUDA_F8_MMA_MIN_ROWS"),F8M_DEFAULT_MIN_ROWS),
+                        ctx->compute_major*10+ctx->compute_minor,D,I,max_rows,pin,aligned);
+}
+/* ctx->x [total][D] f32 -> bf16, gate+up (+silu) -> bf16 hidden, down -> ctx->y.
+ * ctx->gate/up are not written. */
+static int f8_mma_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,int max_rows,int count,int total){
+    size_t xbb=(size_t)total*D*2,hbb=(size_t)total*I*2;
+    if(!reserve_bytes(&ctx->f8m_buf,&ctx->f8m_cap,xbb+hbb)) return 0;
+    uint16_t *xb=(uint16_t*)ctx->f8m_buf; uint32_t *hb=(uint32_t*)((char*)ctx->f8m_buf+xbb);
+    size_t n2=(size_t)total*D/2;
+    f8m_to_bf16<<<(unsigned)((n2+255)/256),256,0,ctx->stream>>>((uint32_t*)xb,ctx->x,n2);
+    dim3 hg((unsigned)(I/F8M_COLS),(unsigned)count,(unsigned)f8m_row_blocks(2,max_rows));
+    if(f8m_row_tiles(2,max_rows)==1) f8m_group<2,1><<<hg,F8M_WARPS*32,0,ctx->stream>>>(xb,dev,D,I,nullptr,hb);
+    else                             f8m_group<2,2><<<hg,F8M_WARPS*32,0,ctx->stream>>>(xb,dev,D,I,nullptr,hb);
+    dim3 og((unsigned)(D/F8M_COLS),(unsigned)count,(unsigned)f8m_row_blocks(1,max_rows));
+    const uint16_t *hx=(const uint16_t*)hb;
+    switch(f8m_row_tiles(1,max_rows)){
+    case 1:  f8m_group<1,1><<<og,F8M_WARPS*32,0,ctx->stream>>>(hx,dev,I,D,ctx->y,nullptr); break;
+    case 2:  f8m_group<1,2><<<og,F8M_WARPS*32,0,ctx->stream>>>(hx,dev,I,D,ctx->y,nullptr); break;
+    default: f8m_group<1,4><<<og,F8M_WARPS*32,0,ctx->stream>>>(hx,dev,I,D,ctx->y,nullptr); break;
+    }
+    g_f8_mma_calls++;
+    return 1;
+}
+#endif
+
 /* Single launch site for the fmt=8 group kernels, shared by the sync and the
  * issue/take dispatches so both stay one-line call sites (rebase-tolerant
  * against #935's e8_group_launch refactor of the adjacent branch).
@@ -2916,9 +2972,15 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
  * 2 = warp kernels decoding through cuda_fp8.h — a real cvt instruction only
  * on sm_89+, the header's bit-manip emulation below that, and plain =1
  * behavior where cuda_fp8.h is absent (HIP); experimental until the
- * 256-value sweep certifies it bit-identical on the target silicon. */
-static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
-                            int max_rows,int count){
+ * 256-value sweep certifies it bit-identical on the target silicon.
+ * COLI_CUDA_F8_MMA=1 (f8_mma_wanted) takes eligible groups before any of these. */
+static int f8_group_launch(DeviceContext *ctx,GroupDesc *dev,const GroupDesc *host,int I,int D,
+                           int max_rows,int count,int total,int pin){
+#if COLI_F8_MMA
+    if(f8_mma_wanted(ctx,host,count,I,D,max_rows,pin)) return f8_mma_launch(ctx,dev,I,D,max_rows,count,total);
+#else
+    (void)host;(void)total;(void)pin;
+#endif
     int mode=f8_warp_mode();
     if(mode){
         dim3 hg((unsigned)((I+7)/8),(unsigned)count),og((unsigned)((D+7)/8),(unsigned)count);
@@ -2926,16 +2988,17 @@ static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
         if(mode==2){
             grouped_hidden_f8w_dual<1><<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
             grouped_down_f8w<1><<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
-            return;
+            return 1;
         }
 #endif
         grouped_hidden_f8w_dual<0><<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
         grouped_down_f8w<0><<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
-        return;
+        return 1;
     }
     dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
     grouped_hidden_f8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
     grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    return 1;
 }
 
 /* fmt=7 groups, the sync and the issue dispatch alike (silu fused in the dual) */
@@ -3086,7 +3149,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
         if(!e8_group_launch(ctx,dev,I,D,max_rows,count,total)) return 0;
     }else if(all_f8){
         /* fp8-e4m3 groups: silu fused in the dual epilogue, like the w4/g4 duals. */
-        f8_group_launch(ctx,dev,I,D,max_rows,count);
+        if(!f8_group_launch(ctx,dev,host,I,D,max_rows,count,total,pin_small_batch)) return 0;
     }else if(all_mx4){
         mx4_group_launch(ctx,dev,I,D,count);
     }else if(tc){
@@ -3286,7 +3349,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     }else if(all_f8){
         /* fp8-e4m3 groups on the async decode path: same launch helper as the
          * sync dispatch, silu fused in the dual epilogue. */
-        f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count);
+        if(!f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,host,I,D,max_rows,count,total,0)) return 0;
     }else if(all_mx4){
         mx4_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,count);
     }else if(group_moe_ok(host,count,D,I)){

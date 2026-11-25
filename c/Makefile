@@ -1119,7 +1119,7 @@ libcoli_xdna.so: backend_xdna_helper.cpp
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h qwen36_cuda_profile.h
+cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h qwen36_cuda_profile.h cuda_f8_mma.cuh f8_mma.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
@@ -1168,7 +1168,7 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config qwen36_cuda_profile.h
+backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h cuda_f8_mma.cuh f8_mma.h .build-config qwen36_cuda_profile.h
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
@@ -1367,6 +1367,16 @@ expert-group-rows-test: tests/test_expert_group_rows_cuda.cu backend_cuda.cu bac
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
 	./expert_group_rows_test$(EXE)
+
+# COLI_CUDA_F8_MMA (cuda_f8_mma.cuh): the tensor-core fmt=8 expert group against the
+# warp kernels and a CPU double reference within a derived per-output bound, its
+# invariances, and kernel times at 1..256 rows per expert. Needs an sm_80+ GPU; on
+# demand (args: make f8-mma-test F8_MMA_ARGS="D I count", default 2048 512 10).
+.PHONY: f8-mma-test
+f8-mma-test: tests/test_f8_mma_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h cuda_f8_mma.cuh f8_mma.h
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/test_f8_mma_cuda.cu -o f8_mma_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./f8_mma_test$(EXE) $(F8_MMA_ARGS)
 
 cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu tests/test_vision_attention_cuda.cu tests/test_gemv_sk_part_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -1602,6 +1612,7 @@ gpu-compile: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_gemv_sk_part_cuda.cu -o gemv_sk_part_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_f8_mma_cuda.cu -o f8_mma_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -3068,6 +3079,11 @@ tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_fp8_passthrough$(EXE): tests/test_fp8_passthrough.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# COLI_CUDA_F8_MMA's index maps, e4m3 pair widening and dispatch gate on the CPU
+# (f8_mma.h): a model of one f8m_group block against the direct dot, bit for bit.
+tests/test_f8_mma_idx$(EXE): tests/test_f8_mma_idx.c f8_mma.h quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Host-only: backend_cuda.h's format predicate is plain C, so its truth table is
