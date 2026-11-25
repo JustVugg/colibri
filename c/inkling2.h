@@ -252,7 +252,8 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
     const int D = c->hidden, H = L_HEADS(c, li), KV = L_KV(c, li), hd = L_HD(c, li), ext = L_EXT(c, li);
     const int local = c->local[li], dr = c->d_rel;
     const InkRow *mr = m->mux_rows;
-    if (mr) { for (int s = 0; s < S; s++) if (mr[s].pos >= m->max_t) { fprintf(stderr, "attention: pos %d exceeds kv alloc %d\n", mr[s].pos, m->max_t); exit(1); } }
+    int mt = m->max_t;   /* a multiplexed step: each row's conversation has rows of its own (InkSeq.max_t) */
+    if (mr) { mt = 0; for (int s = 0; s < S; s++) { if (mr[s].pos >= mr[s].seq->max_t) { fprintf(stderr, "attention: pos %d exceeds kv alloc %d\n", mr[s].pos, mr[s].seq->max_t); exit(1); } if (mr[s].seq->max_t > mt) mt = mr[s].seq->max_t; } }
     else if (pos0 + S > m->max_t) { fprintf(stderr, "attention: pos %d+%d exceeds kv alloc %d\n", pos0, S, m->max_t); exit(1); }
     const int qdim = H * hd, kvdim = KV * hd, group = H / KV;
     float *q = falloc((int64_t)S * qdim), *k = falloc((int64_t)S * kvdim), *vv = falloc((int64_t)S * kvdim);
@@ -280,17 +281,18 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
             ink2_unorm(vv + (int64_t)s * kvdim + h * hd, vv + (int64_t)s * kvdim + h * hd, hd, c->eps);
         }
     }
-    const int win = kv_ring_rows(c, li, m->max_t);
+    const int win0 = kv_ring_rows(c, li, m->max_t);
     const float scale = (float)(1.0 / sqrt((double)hd));
     float *ctx = falloc((int64_t)S * qdim);
     #pragma omp parallel
     {
         float *rl = malloc((size_t)ext * sizeof(float));
-        float *sc = malloc((size_t)m->max_t * sizeof(float));
+        float *sc = malloc((size_t)mt * sizeof(float));
         #pragma omp for collapse(2) schedule(static)
         for (int h = 0; h < H; h++) {
             for (int s = 0; s < S; s++) {
                 const int qpos = mr ? mr[s].pos : pos0 + s;
+                const int win = mr ? kv_ring_rows(c, li, mr[s].seq->max_t) : win0;
                 const int sp0 = mr ? qpos : pos0;
                 const int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
                 const int tb = sp0 > t0 ? sp0 : t0;
@@ -336,9 +338,10 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
         }
         free(rl); free(sc);
     }
-    const int s0 = !mr && S - win > 0 ? S - win : 0;
+    const int s0 = !mr && S - win0 > 0 ? S - win0 : 0;
     for (int s = s0; s < S; s++) for (int h = 0; h < KV; h++) {
         const int t = mr ? mr[s].pos : pos0 + s;
+        const int win = mr ? kv_ring_rows(c, li, mr[s].seq->max_t) : win0;
         float *Kd = mr ? mr[s].seq->K[li] : m->K[li], *Vd = mr ? mr[s].seq->V[li] : m->V[li];
         memcpy(Kd + ((int64_t)h * win + t % win) * hd, k + (int64_t)s * kvdim + h * hd, hd * sizeof(float));
         memcpy(Vd + ((int64_t)h * win + t % win) * hd, vv + (int64_t)s * kvdim + h * hd, hd * sizeof(float));

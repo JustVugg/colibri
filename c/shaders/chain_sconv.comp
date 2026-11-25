@@ -10,17 +10,21 @@
 //   mode 1: x[i] = x[i] * fc, i < n       (the dense MLP's global scale)
 //   mode 2: x[i] = x[i] / fc, i < n       (the logits' width multiplier)
 // x[x_off + s*x_row + c]; w[w_off + c*CK + k]; ring[ring_off + c*(CK-1) + k], oldest first.
+//   mode 0 with tab > 0 (KV_SLOTS, a multiplexed step): row s = WorkGroupID.z is the next input of
+//     its own conversation, whose ring is at ring_off + w[tab + s] (an int in the parameters).
 // Limits: CK <= 9.
 layout(local_size_x = 64) in;
 
 layout(std430, binding = 0) buffer XB { float x[]; };
 layout(std430, binding = 1) readonly buffer WB { float w[]; };
+layout(std430, binding = 1) readonly buffer WBI { int wi[]; };   // the same, as ints (tab)
 layout(std430, binding = 2) buffer RB { float ring[]; };
 
 layout(push_constant) uniform P {
     int mode, S, C, CK;
     int x_off, x_row, w_off, ring_off, n;
     float fc;
+    int tab;
 } p;
 
 void main() {
@@ -33,11 +37,13 @@ void main() {
     }
     if (c >= p.C) return;
     int nh = p.CK - 1;
+    int s0 = 0, s1 = p.S, ro = p.ring_off;
+    if (p.tab > 0) { s0 = int(gl_WorkGroupID.z); s1 = s0 + 1; ro += wi[p.tab + s0]; }
     float hist[8];
-    for (int k = 0; k < 8; k++) hist[k] = k < nh ? ring[p.ring_off + c * nh + k] : 0.0;
+    for (int k = 0; k < 8; k++) hist[k] = k < nh ? ring[ro + c * nh + k] : 0.0;
     int wb = p.w_off + c * p.CK;
     float wl = w[wb + p.CK - 1];
-    for (int s = 0; s < p.S; s++) {
+    for (int s = s0; s < s1; s++) {
         int xi = p.x_off + s * p.x_row + c;
         float cur = x[xi];
         float acc = 0.0;
@@ -48,5 +54,5 @@ void main() {
         for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
         for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
     }
-    for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
+    for (int k = 0; k < 8; k++) if (k < nh) ring[ro + c * nh + k] = hist[k];
 }

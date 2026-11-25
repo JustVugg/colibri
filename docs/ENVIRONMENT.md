@@ -626,6 +626,9 @@ Read **only** by `c/inkling.c`.
 | Variable | Default | Effect |
 |---|---|---|
 | `CTX_MAX` | `8192` | Served KV bound. A prompt plus its requested generation beyond this is rejected rather than truncated. |
+| `KV_SLOT_CTX` | `16384` | Inkling serving with `KV_SLOTS` > 1: served KV bound for cache slots `1..N-1` (never above `CTX_MAX`; slot 0 keeps `CTX_MAX`), so extra slots do not each reserve the full context's K/V. |
+| `INK_MUX_CHUNK` | `256` | Inkling serving with `KV_SLOTS` > 1: rows of a plain-text prompt prefilled per turn (round-robin, after the multiplexed decode step), so a long prompt does not stall active decoding slots. |
+| `INK2C_MUX_ROWS` | `8` | Inkling-2 Vulkan dense chain with `KV_SLOTS` > 1: maximum multiplexed decode rows per frame (`1..8`), keeping experts in-frame and split attention active. |
 | `PIN_N` | `cap / 2` | Experts pinned per layer. Measured on the 975B: `cap/4` (19/layer) gave 83.6% hit / 0.32 tok/s, 40/layer gave 95.6% / 0.80 tok/s — decode fills run at queue depth ~1, so every pinned expert removes a ~35 ms stall. Clamped to `cap - 8`. |
 | `REP_PEN` | `1.1`, Inkling-2 `1` (off) | Repetition penalty over a 128-token history (prompt tail + emitted). Off for Inkling-2: its tool calls repeat the declaration's tokens, and the penalty broke them. |
 | `INK_DENSE_Q4` | auto | Use the `dense-int4g64/` sidecar for dense weights when that directory exists. `=0` forces the unquantized dense path. |

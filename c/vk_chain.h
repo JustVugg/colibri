@@ -416,7 +416,7 @@ int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, 
  * a build without the shader keeps every other op, and that engine's chain off).
  * chain_sconv.comp (mode 0: the depthwise causal short convolution, residual inside, in
  * place, its ring carried; mode 1: x *= fc over n floats; mode 2: x /= fc) */
-typedef struct { int mode, S, C, CK, x_off, x_row, w_off, ring_off, n; float fc; } VkcSconv;
+typedef struct { int mode, S, C, CK, x_off, x_row, w_off, ring_off, n; float fc; int tab; } VkcSconv;   /* tab > 0: a ring a row (chain_sconv.comp) */
 int  vkc_sconv_ready(void);
 int  vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p);
 /* chain_relattn.comp: attention with a relative-position bias bank, a per-row scale
@@ -424,7 +424,8 @@ int  vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p);
 typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
                  int q_off, q_row, o_off, o_row, k_off, v_off, ks_off, vs_off, kv_row;
                  int r_off, r_row, relp_off, tau_off; float scale;
-                 int has_sink, sink_off; } VkcRelAttn;   /* Inkling-2: a sink logit per (row, head) in tau at sink_off */
+                 int has_sink, sink_off;
+                 int tab; } VkcRelAttn;   /* Inkling-2: a sink logit per (row, head) in tau at sink_off; tab > 0: a conversation a row (chain_relattn.comp) */
 int  vkc_relattn_ready(void);
 int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                  const VkcRelAttn *p);
@@ -444,7 +445,7 @@ void vkc_relattn_part(VkcBuf *part);
  *                  hd channels), (conv + input) / fc, the state of K-1 inputs a channel in ring */
 typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps, scale; } VkcInk2Mix;
 typedef struct { int nseg, n, per_row, x_off, x_row, has_w, w_off; float thr; } VkcInk2Clip;
-typedef struct { int S, C, K, hd, x_off, x_row, d_off, d_row, st_off, ring_off; float fc; } VkcInk2Dconv;
+typedef struct { int S, C, K, hd, x_off, x_row, d_off, d_row, st_off, ring_off; float fc; int tab; } VkcInk2Dconv;   /* tab > 0: a state a row (chain_ink2.comp) */
 int  vkc_ink2_ready(void);
 int  vkc_ink2_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcInk2Mix *p);
 int  vkc_ink2_clip(VkcBuf *x, VkcBuf *prm, const VkcInk2Clip *p);

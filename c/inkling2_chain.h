@@ -52,8 +52,18 @@
  * blocks: their entries carry it (VkcDmoe.escale; gate's and up's one number, as the tier
  * requires). TOPP and ROUTE_TRACE take the host's step.
  *
- * The chain declines (the per-matrix path runs) with several conversations at once (KV_SLOTS),
- * on a geometry outside its shaders (head dim above 256, a bias bank wider than 64, more than 9
+ * Several conversations at once (KV_SLOTS>1, serve_mux): the device holds every cache slot's
+ * state, slot k's K/V mirror of state layer v at koff[k][v] in kc[v] (its own ring and context:
+ * slot 0 CTX_MAX, the others KV_SLOT_CTX; laid out again when a slot's host cache is) and its four
+ * convolution states at k * csd_n in rings. A prompt chunk is one slot's (the Model holds it:
+ * pos_base + s, the slot's offsets in the push constants); a multiplexed decode step's rows are
+ * one a slot (m->mux_rows), in frames of up to 8 rows (INK2C_MUX_ROWS), each row reading its slot's
+ * K/V up to its own position and its slot's convolution states through tables in prm (o_mux):
+ * chain_relattn/chain_sconv/chain_ink2's `tab`. Every kernel is row-local, the GEMMs run a row's
+ * GEMV (vkc_gemm_rows(0)) and the attention splits as a lone decode step's, so a row gets the bits
+ * it would alone (but a row of fewer than 129 positions, which a lone step attends whole).
+ *
+ * The chain declines (the per-matrix path runs) on a geometry outside its shaders (head dim above 256, a bias bank wider than 64, more than 9
  * taps or 15 block states), when a matrix is not on the device, and when the device refuses its
  * memory. It needs the dense matrices on the device (the per-matrix path's copies); the router,
  * the sink projection and the dynamic taps' projections go up as f32. */
@@ -66,15 +76,19 @@
 typedef struct {
     int ok, failed, tried;
     int rows;                                  /* scratch capacity in rows */
-    int max_t; float **hostK;                  /* the host cache the mirrors copy */
+    int nslot;                                 /* the cache slots (KV_SLOTS; 1 = the Model's conversation) */
+    int *smax; float ***shK;                   /* [nslot] the host caches the mirrors were laid out for */
+    size_t *koff;                              /* [nslot*NS] slot k's mirror of state layer v in kc[v], vc[v] (floats) */
+    int fslot;                                 /* this frame's slot, -1 a multiplexed frame (the tables at o_mux) */
+    size_t o_mux;                              /* KV_SLOTS>1: [nslot] rows' ring bases, then [NS][nslot][3] koff, cap, pos */
     int maxb, hmax, kvo_max, qo_max, ro_max, dyn_max;
     VkcBuf *prm;
     size_t *o_n1, *o_n2, *o_n3, *o_post, *o_qc, *o_rc, *o_relp, *o_cw[4], *o_aq, *o_mq, o_outq, o_final;
     ColiVkTensor *t_lm, **t_q, **t_k, **t_v, **t_r, **t_o, **t_ag, **t_sink, **t_router, **t_wp[2];
     VkcBuf **kc, **vc, *rings;                 /* rings: every layer's four convolution states, at o_csd */
-    int *cap, *dlo, *dhi;
+    int *cap, *dlo, *dhi;                      /* [nslot*NS] */
     size_t vs_off, *o_csd, csd_n;
-    int cs_where, host_zero;
+    int *cs_where, *host_zero;                 /* [nslot] */
     VkcBuf *x, *res, *blk, *hq, *hk, *hv, *nq, *nk, *nv, *q, *kvs, *r, *gt, *ctx, *a, *mo, *dyn, *ts, *lg, *fin;
     VkcBuf *h2d, *lgd, *kvd, *csd, *outd, *xd, *routed;
     int NS;                                    /* state layers (n_state): kc, vc, cap, dlo, dhi, o_csd by them */
@@ -88,7 +102,7 @@ typedef struct {
     size_t o_lq;                               /* the loop's message queries, [loop layer][q, k, v, mlp][D] */
     VkcBuf *xpre, *xprev, *pblk, *msg[4], *hn2, *lz, *lf, *lgv;
     float *host_routed;
-    unsigned long long forwards;
+    unsigned long long forwards, mux_forwards, mux_rows;   /* mux: the multiplexed steps and their rows */
     double host_ms;
 } Ink2Chain;
 
@@ -149,6 +163,13 @@ static size_t ink2c_plan_bytes(const Model *m) {
         for (int i = 0; i < c->n_layers; i++) { if ((size_t)L_HEADS(c, i) > hm) hm = L_HEADS(c, i); if ((size_t)L_HD(c, i) > hdm) hdm = L_HD(c, i); }
         b += (size_t)VKC_DMOE_ROWS * hm * (((size_t)t + 127) / 128) * (hdm + 2) * 4;
     }
+    for (int k = 1; k < g_ink_mux_slots; k++) {   /* KV_SLOTS: the other slots' mirrors (KV_SLOT_CTX), states and read-back */
+        int tk = ink_slot_ctx(k) + 8;
+        for (int v = 0; v < c->n_state; v++) {
+            size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v);
+            b += 2 * kvo * (size_t)kv_ring_rows(c, v, tk) * 4 + (2 * kvo + 2 * D) * (CK - 1) * 4 * 2;
+        }
+    }
     return b + row * 256 + (size_t)c->unpad_vocab * 4 + ((size_t)ink2c_maxb(c) * D * 4) * 256;
 }
 
@@ -158,20 +179,24 @@ static Ink2Chain *ink2c_new(Model *m) {
     if (ch) return ch;
     if (!(ch = calloc(1, sizeof *ch))) return NULL;
     m->ink2chain = ch;
-    int L = m->c.n_layers, NS = m->c.n_state;
-    ch->NS = NS;
+    int L = m->c.n_layers, NS = m->c.n_state, NK = g_ink_mux_slots > 1 ? g_ink_mux_slots : 1;
+    ch->NS = NS; ch->nslot = NK;
 #define INK2C_ARR(f, T) (ch->f = calloc((size_t)L, sizeof(T)))
 #define INK2C_ARS(f, T) (ch->f = calloc((size_t)NS, sizeof(T)))
+#define INK2C_ARK(f, T) (ch->f = calloc((size_t)NS * NK, sizeof(T)))
     if (!INK2C_ARR(o_n1, size_t) || !INK2C_ARR(o_n2, size_t) || !INK2C_ARR(o_n3, size_t) || !INK2C_ARR(o_post, size_t) ||
         !INK2C_ARR(o_qc, size_t) || !INK2C_ARR(o_rc, size_t) || !INK2C_ARR(o_relp, size_t) || !INK2C_ARR(o_cw[0], size_t) ||
         !INK2C_ARR(o_cw[1], size_t) || !INK2C_ARR(o_cw[2], size_t) || !INK2C_ARR(o_cw[3], size_t) || !INK2C_ARR(o_aq, size_t) ||
         !INK2C_ARR(o_mq, size_t) || !INK2C_ARR(o_rb, size_t) || !INK2C_ARR(t_q, void *) || !INK2C_ARR(t_k, void *) || !INK2C_ARR(t_v, void *) ||
         !INK2C_ARR(t_r, void *) || !INK2C_ARR(t_o, void *) || !INK2C_ARR(t_ag, void *) || !INK2C_ARR(t_sink, void *) ||
         !INK2C_ARR(t_router, void *) || !INK2C_ARR(t_wp[0], void *) || !INK2C_ARR(t_wp[1], void *) ||
-        !INK2C_ARS(kc, void *) || !INK2C_ARS(vc, void *) || !INK2C_ARS(cap, int) || !INK2C_ARS(dlo, int) ||
-        !INK2C_ARS(dhi, int)) return NULL;
+        !INK2C_ARS(kc, void *) || !INK2C_ARS(vc, void *) || !INK2C_ARK(cap, int) || !INK2C_ARK(dlo, int) ||
+        !INK2C_ARK(dhi, int) || !INK2C_ARK(koff, size_t)) return NULL;
 #undef INK2C_ARR
 #undef INK2C_ARS
+#undef INK2C_ARK
+    if (!(ch->smax = calloc((size_t)NK, sizeof(int))) || !(ch->shK = calloc((size_t)NK, sizeof(float **))) ||
+        !(ch->cs_where = calloc((size_t)NK, sizeof(int))) || !(ch->host_zero = calloc((size_t)NK, sizeof(int)))) return NULL;
     if (!(ch->o_csd = calloc((size_t)4 * NS, sizeof(size_t))) || !(ch->t_lg = calloc((size_t)L * 12, sizeof(void *)))) return NULL;
     return ch;
 }
@@ -193,8 +218,19 @@ static void ink2c_free_own(Model *m, Ink2Chain *ch) {
     vkc_free(ch->kvl); ch->kvl = NULL; ch->kvl_rows = 0;
     vkc_free(ch->rings); ch->rings = NULL;
     vkc_free(ch->prm); ch->prm = NULL;
-    ch->max_t = 0; ch->hostK = NULL;
+    for (int k = 0; k < ch->nslot; k++) { ch->smax[k] = 0; ch->shK[k] = NULL; }
 }
+
+/* ---- the cache slots (KV_SLOTS) ---- */
+/* slot k's host state: the Model's when it holds k (or the one conversation), else its InkSeq's */
+typedef struct { float **K, **V, ***cs; int max_t, kv_len; } Ink2cHost;
+static Ink2cHost ink2c_host(Model *m, int k) {
+    if (g_ink_mux_slots <= 1 || k == g_ink_mux_cur) return (Ink2cHost){m->K, m->V, m->cs, m->max_t, m->kv_len};
+    InkSeq *q = &g_ink_mux_seq[k];
+    return (Ink2cHost){q->K, q->V, q->cs, q->max_t, q->kv_len};
+}
+/* the slot a one-conversation forward runs on: the one the Model holds */
+static int ink2c_cur(void) { return g_ink_mux_slots > 1 && g_ink_mux_cur > 0 ? g_ink_mux_cur : 0; }
 
 /* The model's parameters on the device, its tensors resolved; NULL = the chain cannot run. */
 static Ink2Chain *ink2c_setup(Model *m) {
@@ -262,6 +298,8 @@ static Ink2Chain *ink2c_setup(Model *m) {
     ch->o_outq = n; n += D;
     ch->o_final = n; n += D;
     ch->o_lq = n; if (c->loop_p > 1) n += (size_t)(c->loop_e - c->loop_s) * 4 * D;
+    ch->o_mux = 0;
+    if (ch->nslot > 1) { ch->o_mux = n; n += (size_t)ch->nslot * (1 + 3 * (size_t)ch->NS); }
     float *arena = calloc(n, sizeof(float));
     if (!arena) { ink2c_free_own(m, ch); return NULL; }
     for (int i = 0; i < L; i++) {
@@ -297,8 +335,9 @@ static Ink2Chain *ink2c_setup(Model *m) {
     ch->csd_n = 0;   /* the states one after another, the same layout on the device and in the read-back */
     for (int v = 0; v < ch->NS; v++)
         for (int b = 0; b < 4; b++) { ch->o_csd[(size_t)b * ch->NS + v] = ch->csd_n; ch->csd_n += (size_t)ink_cs_cells(c, b, v); }
-    if (!(ch->rings = vkc_buf((ch->csd_n ? ch->csd_n : 1) * sizeof(float), VKC_DEV))) { ink2c_free_own(m, ch); return NULL; }
-    ch->cs_where = INK2C_HOST; ch->host_zero = 0;
+    /* KV_SLOTS: a set of states a slot, slot k's at k * csd_n */
+    if (!(ch->rings = vkc_buf((ch->csd_n ? ch->csd_n : 1) * (size_t)ch->nslot * sizeof(float), VKC_DEV))) { ink2c_free_own(m, ch); return NULL; }
+    for (int k = 0; k < ch->nslot; k++) { ch->cs_where[k] = INK2C_HOST; ch->host_zero[k] = 0; }
     ch->ok = 1;
     if (c->loop_p > 1)
         fprintf(stderr, "[VK] inkling2 chain: %d layers on the device, layers %d-%d %d passes, %.1f MiB of parameters\n",
@@ -323,7 +362,7 @@ static int ink2c_bufs(Ink2Chain *ch, Model *m, int rows) {
            vkc_reserve(&ch->dyn, r * dyn * 4, VKC_DEV) && vkc_reserve(&ch->ts, (2 * r + r * ch->hmax) * 4, VKC_DEV) &&
            vkc_reserve(&ch->lg, r * E * 4, VKC_DEV) && vkc_reserve(&ch->fin, D * 4, VKC_DEV) &&
            vkc_reserve(&ch->h2d, r * D * 4, VKC_DOWN) && vkc_reserve(&ch->lgd, r * E * 4, VKC_DOWN) &&
-           vkc_reserve(&ch->kvd, 2 * r * ch->kvo_max * 4, VKC_DOWN) && vkc_reserve(&ch->csd, (ch->csd_n ? ch->csd_n : 1) * 4, VKC_DOWN) &&
+           vkc_reserve(&ch->kvd, 2 * r * ch->kvo_max * 4, VKC_DOWN) && vkc_reserve(&ch->csd, (ch->csd_n ? ch->csd_n : 1) * ((size_t)ch->nslot < r ? (size_t)ch->nslot : r) * 4, VKC_DOWN) &&
            vkc_reserve(&ch->outd, (size_t)c->unpad_vocab * 4, VKC_DOWN) && vkc_reserve(&ch->routed, r * D * 4, VKC_UP) &&
            (c->loop_p <= 1 ||
             (vkc_reserve(&ch->xpre, r * D * 4, VKC_DEV) && vkc_reserve(&ch->xprev, r * D * 4, VKC_DEV) &&
@@ -341,26 +380,62 @@ static int ink2c_chunk_rows(Ink2Chain *ch, Model *m) {
                  (c->loop_p > 1 ? ((size_t)(9 + ch->maxb) * D + (size_t)c->loop_r) * 4 : 0);
     return vkc_chunk_rows("inkling2", row);
 }
-/* the K/V mirrors at the host's layout, made again when the host's cache was */
+/* the K/V mirrors at the hosts' layouts, every slot's region in one buffer a state layer, made
+ * again when a host's cache was: that slot's rows go up from the host's (canonical), the other
+ * slots' regions are copied on the device with their pending uploads (dlo, dhi) kept */
 static int ink2c_mirror(Ink2Chain *ch, Model *m) {
     Cfg *c = &m->c;
-    if (ch->max_t == m->max_t && ch->hostK == m->K) return 1;
-    for (int i = 0; i < ch->NS; i++) {
-        vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
-        int cap = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i), KV = L_KV(c, i);
-        ch->cap[i] = cap;
-        ch->dlo[i] = 0; ch->dhi[i] = cap < m->max_t ? m->max_t : m->kv_len;   /* a ring: every row; else the positions held */
-        ch->kc[i] = vkc_buf((size_t)KV * cap * hd * sizeof(float), VKC_DEV);
-        ch->vc[i] = vkc_buf((size_t)KV * cap * hd * sizeof(float), VKC_DEV);
-        if (!ch->kc[i] || !ch->vc[i]) { ch->max_t = 0; ch->hostK = NULL; return 0; }
+    const int NS = ch->NS;
+    int same = ch->kc[0] != NULL, mt = 1;
+    for (int k = 0; k < ch->nslot; k++) {
+        Ink2cHost h = ink2c_host(m, k);
+        if (h.max_t != ch->smax[k] || h.K != ch->shK[k]) same = 0;
+        if (h.max_t > mt) mt = h.max_t;
     }
+    if (same) return 1;
+    size_t *old = malloc((size_t)ch->nslot * sizeof(size_t));
+    if (!old) return 0;
+    for (int i = 0; i < NS; i++) {
+        VkcBuf *ok0 = ch->kc[i], *ov0 = ch->vc[i];
+        int hd = L_HD(c, i), KV = L_KV(c, i), keep = 0;
+        size_t tot = 0;
+        for (int k = 0; k < ch->nslot; k++) {
+            Ink2cHost h = ink2c_host(m, k);
+            int cap = h.K ? kv_ring_rows(c, i, h.max_t) : 0, x = k * NS + i;
+            const int kept = ok0 && h.K && h.max_t == ch->smax[k] && h.K == ch->shK[k];
+            old[k] = kept ? ch->koff[x] : (size_t)-1;
+            keep |= kept;
+            ch->cap[x] = cap; ch->koff[x] = tot;
+            if (!kept) {
+                ch->dlo[x] = 0; ch->dhi[x] = cap < h.max_t ? h.max_t : h.kv_len;   /* a ring: every row; else the positions held */
+                if (!h.K) ch->dhi[x] = 0;
+            }
+            tot += (size_t)KV * cap * hd;
+        }
+        if (!keep) { vkc_free(ok0); vkc_free(ov0); ok0 = ov0 = NULL; }
+        ch->kc[i] = vkc_buf((tot ? tot : 1) * sizeof(float), VKC_DEV);
+        ch->vc[i] = vkc_buf((tot ? tot : 1) * sizeof(float), VKC_DEV);
+        int ok = ch->kc[i] && ch->vc[i];
+        if (ok && keep) {
+            ok = vkc_begin();
+            for (int k = 0; k < ch->nslot && ok; k++) if (old[k] != (size_t)-1) {
+                const int x = k * NS + i;
+                const size_t nf = (size_t)KV * ch->cap[x] * hd;
+                ok = vkc_copy(ch->kc[i], ch->koff[x], ok0, old[k], nf) && vkc_copy(ch->vc[i], ch->koff[x], ov0, old[k], nf);
+            }
+            ok = ok && vkc_submit(1);
+            vkc_free(ok0); vkc_free(ov0);
+        }
+        if (!ok) { free(old); for (int k = 0; k < ch->nslot; k++) { ch->smax[k] = 0; ch->shK[k] = NULL; } return 0; }
+    }
+    free(old);
     /* the split attention's partials: a decode step's rows (VKC_DMOE_ROWS) at the whole context;
      * without them every step's attention runs whole, as before */
     vkc_relattn_part(NULL); vkc_free(ch->relpart);
     int hdmax = 0;
     for (int i = 0; i < c->n_layers; i++) if (L_HD(c, i) > hdmax) hdmax = L_HD(c, i);
-    ch->relpart = vkc_buf((size_t)VKC_DMOE_ROWS * ch->hmax * ((m->max_t + 8 + 127) / 128) * (hdmax + 2) * sizeof(float), VKC_DEV);
-    ch->max_t = m->max_t; ch->hostK = m->K;
+    ch->relpart = vkc_buf((size_t)VKC_DMOE_ROWS * ch->hmax * ((mt + 8 + 127) / 128) * (hdmax + 2) * sizeof(float), VKC_DEV);
+    for (int k = 0; k < ch->nslot; k++) { Ink2cHost h = ink2c_host(m, k); ch->smax[k] = h.max_t; ch->shK[k] = h.K; }
     return 1;
 }
 static int ink2c_scratch(Ink2Chain *ch, Model *m, int rows) {
@@ -375,45 +450,60 @@ static int ink2c_scratch(Ink2Chain *ch, Model *m, int rows) {
 }
 
 /* ---- state between the host and the device (inkling_chain.h's, for Inkling-2) ---- */
-static void ink2c_host_wrote(Model *m, int zero) {
+static void ink2c_host_wrote(Model *m, int zero) {   /* the slot the Model holds */
     Ink2Chain *ch = ink2c_of(m);
     if (!ch || !ch->ok) return;
-    ch->cs_where = INK2C_HOST; ch->host_zero = zero;
+    int k = ink2c_cur();
+    ch->cs_where[k] = INK2C_HOST; ch->host_zero[k] = zero;
 }
-static void ink2c_cpu_step(Model *m, int pos_base, int S) {
-    Ink2Chain *ch = ink2c_of(m);
-    if (!ch || !ch->ok) return;
-    ch->cs_where = INK2C_HOST; ch->host_zero = 0;
-    for (int i = 0; i < ch->NS; i++) {
+static void ink2c_cpu_slot(Ink2Chain *ch, int k, int pos_base, int S) {
+    ch->cs_where[k] = INK2C_HOST; ch->host_zero[k] = 0;
+    for (int i = k * ch->NS; i < (k + 1) * ch->NS; i++) {
         if (ch->dlo[i] >= ch->dhi[i]) { ch->dlo[i] = pos_base; ch->dhi[i] = pos_base + S; continue; }
         if (pos_base < ch->dlo[i]) ch->dlo[i] = pos_base;
         if (pos_base + S > ch->dhi[i]) ch->dhi[i] = pos_base + S;
     }
 }
+static void ink2c_cpu_step(Model *m, int pos_base, int S) {
+    Ink2Chain *ch = ink2c_of(m);
+    if (!ch || !ch->ok) return;
+    ink2c_cpu_slot(ch, ink2c_cur(), pos_base, S);
+}
+/* a multiplexed step the CPU ran: each row's slot, its position */
+static void ink2c_cpu_rows(Model *m, const InkRow *rows, int S) {
+    Ink2Chain *ch = ink2c_of(m);
+    if (!ch || !ch->ok) return;
+    for (int s = 0; s < S; s++) ink2c_cpu_slot(ch, (int)(rows[s].seq - g_ink_mux_seq), rows[s].pos, 1);
+}
 static int ink2c_push_state(Ink2Chain *ch, Model *m) {
     Cfg *c = &m->c; int ok = 1;
-    if (ch->cs_where == INK2C_HOST) {
-        if (ch->host_zero) ok = !ch->csd_n || vkc_zero(ch->rings, 0, ch->csd_n);
-        else for (int i = 0; i < ch->NS && ok; i++) for (int b = 0; b < 4 && ok; b++) {
-            size_t nc = (size_t)ink_cs_cells(c, b, i);
-            if (nc) ok = vkc_write(ch->rings, ch->o_csd[(size_t)b * ch->NS + i], m->cs[b][i], nc * sizeof(float));
-        }
-        ch->cs_where = INK2C_BOTH;
-    }
-    for (int i = 0; i < ch->NS && ok; i++) {
-        if (ch->dlo[i] >= ch->dhi[i]) continue;
-        int cap = ch->cap[i], hd = L_HD(c, i), KV = L_KV(c, i);
-        int t0 = ch->dhi[i] - cap > ch->dlo[i] ? ch->dhi[i] - cap : ch->dlo[i];
-        for (int t = t0; t < ch->dhi[i] && ok; ) {        /* a run of rows up to the ring's end */
-            int row = t % cap, run = ch->dhi[i] - t < cap - row ? ch->dhi[i] - t : cap - row;
-            for (int h = 0; h < KV && ok; h++) {
-                size_t off = ((size_t)h * cap + row) * hd;
-                ok = vkc_write(ch->kc[i], off, m->K[i] + off, (size_t)run * hd * sizeof(float)) &&
-                     vkc_write(ch->vc[i], off, m->V[i] + off, (size_t)run * hd * sizeof(float));
+    for (int k = 0; k < ch->nslot && ok; k++) {
+        Ink2cHost hs = ink2c_host(m, k);
+        const size_t rb = (size_t)k * ch->csd_n;
+        if (ch->cs_where[k] == INK2C_HOST) {
+            if (ch->host_zero[k]) ok = !ch->csd_n || vkc_zero(ch->rings, rb, ch->csd_n);
+            else for (int i = 0; i < ch->NS && ok; i++) for (int b = 0; b < 4 && ok; b++) {
+                size_t nc = (size_t)ink_cs_cells(c, b, i);
+                if (nc) ok = vkc_write(ch->rings, rb + ch->o_csd[(size_t)b * ch->NS + i], hs.cs[b][i], nc * sizeof(float));
             }
-            t += run;
+            ch->cs_where[k] = INK2C_BOTH;
         }
-        ch->dlo[i] = ch->dhi[i] = 0;
+        for (int i = 0; i < ch->NS && ok; i++) {
+            const int x = k * ch->NS + i;
+            if (ch->dlo[x] >= ch->dhi[x]) continue;
+            int cap = ch->cap[x], hd = L_HD(c, i), KV = L_KV(c, i);
+            int t0 = ch->dhi[x] - cap > ch->dlo[x] ? ch->dhi[x] - cap : ch->dlo[x];
+            for (int t = t0; t < ch->dhi[x] && ok; ) {        /* a run of rows up to the ring's end */
+                int row = t % cap, run = ch->dhi[x] - t < cap - row ? ch->dhi[x] - t : cap - row;
+                for (int h = 0; h < KV && ok; h++) {
+                    size_t off = ((size_t)h * cap + row) * hd;
+                    ok = vkc_write(ch->kc[i], ch->koff[x] + off, hs.K[i] + off, (size_t)run * hd * sizeof(float)) &&
+                         vkc_write(ch->vc[i], ch->koff[x] + off, hs.V[i] + off, (size_t)run * hd * sizeof(float));
+                }
+                t += run;
+            }
+            ch->dlo[x] = ch->dhi[x] = 0;
+        }
     }
     return ok;
 }
@@ -422,6 +512,8 @@ static int ink2c_push_state(Ink2Chain *ch, Model *m) {
 static void ink2c_recover(Model *m, int upto) {
     Ink2Chain *ch = ink2c_of(m);
     Cfg *c = &m->c; int D = c->hidden;
+    /* shortcut: no rebuild of every slot's state from its record; a KV_SLOTS serve stops (the gateway restarts it) */
+    if (g_ink_mux_slots > 1) ink2c_fatal("the device was lost with several conversations on it");
     g_vk_chain = 0;
     if (ch) ch->failed = 1;
     for (int i = 0; i < c->n_state; i++)
@@ -448,23 +540,29 @@ static int ink2c_norm(VkcBuf *x, VkcBuf *w, size_t wo, VkcBuf *y, int rows, int 
 /* a static short convolution through bank `bank` and its scale: (conv + input) / sqrt(K + 1);
  * the taps of weight layer i, the state of state layer v */
 static int ink2c_sconv(Ink2Chain *ch, VkcBuf *x, size_t xo, int n, int C, int bank, int i, int v, const Cfg *c) {
-    VkcSconv p = {0, n, C, c->conv_k, (int)xo, C, (int)ch->o_cw[bank][i], (int)ch->o_csd[(size_t)bank * ch->NS + v], 0, 1.f};
-    VkcSconv dv = {2, 0, 0, 0, (int)xo, 0, 0, 0, n * C, (float)sqrt((double)(c->conv_k + 1))};
+    const size_t rb = ch->fslot > 0 ? (size_t)ch->fslot * ch->csd_n : 0;   /* a slot's states; a multiplexed frame: each row's */
+    VkcSconv p = {0, n, C, c->conv_k, (int)xo, C, (int)ch->o_cw[bank][i], (int)(rb + ch->o_csd[(size_t)bank * ch->NS + v]), 0, 1.f,
+                  ch->fslot < 0 ? (int)ch->o_mux : 0};
+    VkcSconv dv = {2, 0, 0, 0, (int)xo, 0, 0, 0, n * C, (float)sqrt((double)(c->conv_k + 1)), 0};
     return vkc_sconv(x, ch->prm, ch->rings, &p) && vkc_sconv(x, NULL, NULL, &dv);
 }
 /* a global layer's dynamic convolution of K (bank 0, from nk) or V (bank 1, from nv) in kvs */
 static int ink2c_dconv(Ink2Chain *ch, Model *m, int i, int v, int bank, VkcBuf *xin, int n) {
     Cfg *c = &m->c; int KV = L_KV(c, i), hd = L_HD(c, i), K = c->conv_k;
+    const size_t rb = ch->fslot > 0 ? (size_t)ch->fslot * ch->csd_n : 0;
     VkcInk2Dconv p = {n, KV * hd, K, hd, bank ? (int)ch->vs_off : 0, KV * hd, 0, KV * K, (int)ch->o_cw[bank][i],
-                      (int)ch->o_csd[(size_t)bank * ch->NS + v], (float)sqrt((double)(2 * K + 1))};
+                      (int)(rb + ch->o_csd[(size_t)bank * ch->NS + v]), (float)sqrt((double)(2 * K + 1)),
+                      ch->fslot < 0 ? (int)ch->o_mux : 0};
     return vkc_matmul(ch->t_wp[bank][i], xin, 0, ch->dyn, 0, n) && vkc_ink2_dconv(ch->kvs, ch->dyn, ch->prm, ch->rings, &p);
 }
 /* the attention from nq (and nk, nv on a global layer, or with a loop pass's messages: sep): o_proj's
  * rows into a, the step's K/V rows into state layer v's cache on the device and into kvd */
-static int ink2c_attention(Ink2Chain *ch, Model *m, int i, int v, int sep, int n, int pb, VkcBuf *kvdst, size_t ko, size_t vstride) {
+static int ink2c_attention(Ink2Chain *ch, Model *m, int i, int v, int sep, int n, int pb, const int *rk, const int *rp,
+                           VkcBuf *kvdst, size_t ko, size_t vstride) {
     Cfg *c = &m->c;
     int H = L_HEADS(c, i), KV = L_KV(c, i), hd = L_HD(c, i), kvo = KV * hd, dr = c->d_rel;
-    int cap = ch->cap[v], local = c->local[i], R = ch->rows;
+    const int mux = ch->fslot < 0, x0 = rk[0] * ch->NS + v;
+    int cap = mux ? 1 : ch->cap[x0], local = c->local[i], R = ch->rows;
     size_t vs = ch->vs_off;
     VkcBuf *xk = sep ? ch->nk : ch->nq, *xv = sep ? ch->nv : ch->nq;
     int ok = vkc_matmul(ch->t_q[i], ch->nq, 0, ch->q, 0, n) && vkc_matmul(ch->t_k[i], xk, 0, ch->kvs, 0, n) &&
@@ -478,37 +576,47 @@ static int ink2c_attention(Ink2Chain *ch, Model *m, int i, int v, int sep, int n
     VkcNorm vn = {n * KV, hd, KV, (int)vs, kvo, hd, (int)vs, kvo, hd, 0, 0, 2, c->eps, 1.f};
     ok = ok && vkc_ink2_clip(ch->q, ch->prm, &qc) && vkc_ink2_clip(ch->r, ch->prm, &rc) &&
          vkc_ink2_clip(ch->kvs, NULL, &kc) && vkc_norm(ch->kvs, ch->prm, ch->kvs, &vn);
+    const int kb = mux ? 0 : (int)ch->koff[x0];
     VkcRelAttn a = {n, H, KV, hd, pb, cap, local ? c->window : 0, L_EXT(c, i), dr,
-                    0, H * hd, 0, H * hd, 0, 0, 0, (int)vs, kvo, 0, H * dr, (int)ch->o_relp[i], local ? R : 0,
-                    (float)(1.0 / sqrt((double)hd)), 1, 2 * R};
+                    0, H * hd, 0, H * hd, kb, kb, 0, (int)vs, kvo, 0, H * dr, (int)ch->o_relp[i], local ? R : 0,
+                    (float)(1.0 / sqrt((double)hd)), 1, 2 * R,
+                    mux ? (int)(ch->o_mux + ch->nslot + (size_t)v * ch->nslot * 3) : 0};
+    if (mux) { a.pos_base = 0; for (int s = 0; s < n; s++) if (rp[s] > a.pos_base) a.pos_base = rp[s]; }   /* the split's chunks: the furthest row's */
     VkcEw gate = {VKC_EW_SIGMUL, n * H * hd, H * hd, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
     ok = ok && vkc_relattn(ch->q, ch->kc[v], ch->vc[v], ch->ctx, ch->kvs, ch->r, ch->prm, ch->ts, &a) &&
          vkc_ew(ch->ctx, ch->ctx, ch->gt, NULL, NULL, &gate);
     if (!ok) return 0;
-    /* the step's rows into the cache after the attention read them: the last `cap` of them */
-    int s0 = n > cap ? n - cap : 0, nr = (n - s0) * KV;
-    VkcRegion *rk = malloc(sizeof *rk * (size_t)nr * 2), *rv = rk ? rk + nr : NULL;
-    if (!rk) return 0;
+    /* the step's rows into the cache after the attention read them: the last `cap` of them (a
+     * multiplexed frame: every row, each into its slot's region) */
+    int s0 = !mux && n > cap ? n - cap : 0, nr = (n - s0) * KV;
+    VkcRegion *rg = malloc(sizeof *rg * (size_t)nr * 2), *rv = rg ? rg + nr : NULL;
+    if (!rg) return 0;
     for (int s = s0; s < n; s++) for (int h = 0; h < KV; h++) {
-        size_t dst = ((size_t)h * cap + (size_t)(pb + s) % cap) * hd, src = (size_t)s * kvo + (size_t)h * hd;
-        rk[(s - s0) * KV + h] = (VkcRegion){dst, src, (size_t)hd};
+        const int x = rk[s] * ch->NS + v, cp = ch->cap[x];
+        size_t dst = ch->koff[x] + ((size_t)h * cp + (size_t)rp[s] % cp) * hd, src = (size_t)s * kvo + (size_t)h * hd;
+        rg[(s - s0) * KV + h] = (VkcRegion){dst, src, (size_t)hd};
         rv[(s - s0) * KV + h] = (VkcRegion){dst, vs + src, (size_t)hd};
     }
-    ok = vkc_copy_regions(ch->kc[v], ch->kvs, rk, nr) && vkc_copy_regions(ch->vc[v], ch->kvs, rv, nr) &&
+    ok = vkc_copy_regions(ch->kc[v], ch->kvs, rg, nr) && vkc_copy_regions(ch->vc[v], ch->kvs, rv, nr) &&
          vkc_copy(kvdst, ko, ch->kvs, 0, (size_t)n * kvo) && vkc_copy(kvdst, ko + vstride, ch->kvs, vs, (size_t)n * kvo);
-    free(rk);
+    free(rg);
     return ok && vkc_matmul(ch->t_o[i], ch->ctx, 0, ch->a, 0, n);
 }
 /* state layer v's new K/V rows (kv: K, then V vstride floats on) into the host's cache, as
  * ink2_attention writes them */
-static void ink2c_kv_down(Ink2Chain *ch, Model *m, int v, int n, int pb, const float *kv, size_t vstride) {
+static void ink2c_kv_down(Ink2Chain *ch, Model *m, int v, int n, const int *rk, const int *rp, const float *kv, size_t vstride) {
     Cfg *c = &m->c;
-    int KV = L_KV(c, v), hd = L_HD(c, v), kvo = KV * hd, cap = ch->cap[v], s0 = n > cap ? n - cap : 0;
+    const int mux = ch->fslot < 0;
+    int KV = L_KV(c, v), hd = L_HD(c, v), kvo = KV * hd, cap = ch->cap[rk[0] * ch->NS + v], s0 = !mux && n > cap ? n - cap : 0;
     const float *vv = kv + vstride;
-    for (int s = s0; s < n; s++) for (int h = 0; h < KV; h++) {
-        size_t dst = ((size_t)h * cap + (size_t)(pb + s) % cap) * hd, src = (size_t)s * kvo + (size_t)h * hd;
-        memcpy(m->K[v] + dst, kv + src, hd * sizeof(float));
-        memcpy(m->V[v] + dst, vv + src, hd * sizeof(float));
+    Ink2cHost hs = ink2c_host(m, rk[0]);
+    for (int s = s0; s < n; s++) {
+        if (mux) { hs = ink2c_host(m, rk[s]); cap = ch->cap[rk[s] * ch->NS + v]; }
+        for (int h = 0; h < KV; h++) {
+            size_t dst = ((size_t)h * cap + (size_t)rp[s] % cap) * hd, src = (size_t)s * kvo + (size_t)h * hd;
+            memcpy(hs.K[v] + dst, kv + src, hd * sizeof(float));
+            memcpy(hs.V[v] + dst, vv + src, hd * sizeof(float));
+        }
     }
 }
 /* the MoE output of layer i, state layer v (the host's routed sum) joining the stream: x = res + sconv(mo) */
@@ -570,10 +678,10 @@ static int ink2c_dmoe_on(Ink2Chain *ch, Model *m, int i) {
 /* after the frame: a step whose experts ran there (layer i, state layer v), its K/V rows into the
  * host's cache and its books, as moe_ex and ink_vk_moe keep them (a loop's later passes read the
  * layer's ids as the frame left them: the last pass's) */
-static void ink2c_dmoe_done(Ink2Chain *ch, Model *m, int i, int v, int n, int pb) {
+static void ink2c_dmoe_done(Ink2Chain *ch, Model *m, int i, int v, int n, const int *rk, const int *rp) {
     const int K = m->c.topk;
     const size_t reg = (size_t)2 * ch->kvl_rows * ch->kvo_max;
-    ink2c_kv_down(ch, m, v, n, pb, (const float *)vkc_ptr(ch->kvl) + (size_t)v * reg, reg / 2);
+    ink2c_kv_down(ch, m, v, n, rk, rp, (const float *)vkc_ptr(ch->kvl) + (size_t)v * reg, reg / 2);
     const int *ids = vkc_dmoe_ids(&ch->dm, i);
     m->ereq += (uint64_t)n * K; m->euse += (uint64_t)n * K;
     for (int j = 0; j < n * K; j++) {
@@ -586,19 +694,31 @@ static void ink2c_dmoe_done(Ink2Chain *ch, Model *m, int i, int v, int n, int pb
 }
 
 /* Every layer for S rows from host rows xh, the last row's logits (softcapped) into `logit`;
- * xh gets the rows the final norm reads (the output mix applied) when want_x. 0 = not taken:
- * xh is as it was and the caller runs the step on the CPU (after ink2c_recover when the device
- * was lost). 1 = taken. */
+ * xh gets the rows the final norm reads (the output mix applied) when want_x. A multiplexed
+ * step (m->mux_rows: row s the next token of its own slot, at its own position; pos_base unused):
+ * every row's logits, S * unpad_vocab into `logit`. 0 = not taken: xh is as it was and the caller
+ * runs the step on the CPU (after ink2c_recover when the device was lost). 1 = taken. */
 static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit) {
     if (!g_vk_chain) return 0;
     if (g_vk_chain == COLI_VK_CHAIN_PREFILL && S <= 2) return 0;   /* prompts only: decode on the CPU */
-    if (m->mux_rows) return 0;
+    const InkRow *mr = m->mux_rows;
+    if (mr && want_x) return 0;
     Ink2Chain *ch = ink2c_setup(m);
     if (!ch || ch->failed) return 0;
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, E = c->n_experts, blkn = c->res_block > 0 ? c->res_block : 1;
+    const int V = c->unpad_vocab;
     int mirror_ok = ink2c_mirror(ch, m);
     int CH = mirror_ok ? ink2c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
-    if (!mirror_ok || pos_base + S > m->max_t || !ink2c_scratch(ch, m, rows) ||
+    if (mr) {   /* frames of INK2C_MUX_ROWS (VKC_DMOE_ROWS, 8) rows: the experts stay in the frame and the attention
+                 * splits as a decode step's */
+        static int mx = 0;
+        if (!mx) { const char *e = getenv("INK2C_MUX_ROWS"); mx = e && atoi(e) >= 1 && atoi(e) <= VKC_DMOE_ROWS ? atoi(e) : VKC_DMOE_ROWS; }
+        if (rows > mx) rows = mx;
+    }
+    int inside = 1;
+    if (mr) { for (int s = 0; s < S; s++) inside &= mr[s].pos < mr[s].seq->max_t; }
+    else inside = pos_base + S <= m->max_t;
+    if (!mirror_ok || !inside || !ink2c_scratch(ch, m, rows) ||
         (want_x && !vkc_reserve(&ch->xd, (size_t)rows * D * sizeof(float), VKC_DOWN))) {
         fprintf(stderr, "[VK] inkling2 chain: device memory for %d rows refused; per-matrix path\n", rows);
         ink2c_free_own(m, ch);
@@ -611,12 +731,37 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
     vkc_relattn_part(ch->relpart);   /* a decode step's attention split over its positions */
     int *dq = dmoe ? malloc((size_t)2 * c->n_state * sizeof(int)) : NULL, ndq = 0;   /* this frame's in-frame steps (i, v) */
     if (dmoe && !dq) { free(xfin); return 0; }
-    vkc_gemm_rows(-1);
+    vkc_gemm_rows(mr ? 0 : -1);   /* a multiplexed step's rows get a decode step's bits */
+    int *rk = malloc((size_t)2 * rows * sizeof(int)), *rp = rk ? rk + rows : NULL;   /* a frame's rows: slot, position */
+    if (!rk) { free(xfin); free(dq); return 0; }
+    if (mr && (!vkc_reserve(&ch->outd, (size_t)rows * V * 4, VKC_DOWN) || !vkc_reserve(&ch->fin, (size_t)rows * D * 4, VKC_DEV))) {
+        free(xfin); free(dq); free(rk); return 0;
+    }
     for (int c0 = 0; c0 < S; c0 += rows) {
-        if (coli_prompt_break()) { free(xfin); free(dq); return 0; }
+        if (coli_prompt_break()) { free(xfin); free(dq); free(rk); return 0; }
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0, R = ch->rows;
+        ch->fslot = mr ? -1 : ink2c_cur();
+        for (int s = 0; s < n; s++) {
+            rk[s] = mr ? (int)(mr[c0 + s].seq - g_ink_mux_seq) : ch->fslot;
+            rp[s] = mr ? mr[c0 + s].pos : pb + s;
+        }
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !ink2c_push_state(ch, m)) goto lost;
+        if (mr) {   /* the rows' tables (o_mux): their states' base, then a state layer's region, ring and position a row */
+            const int NK = ch->nslot;
+            int *tb = calloc((size_t)NK * (1 + 3 * (size_t)ch->NS), sizeof(int));
+            if (!tb) goto lost;
+            for (int s = 0; s < n; s++) {
+                tb[s] = (int)((size_t)rk[s] * ch->csd_n);
+                for (int v = 0; v < ch->NS; v++) {
+                    int *e = tb + NK + ((size_t)v * NK + s) * 3, x = rk[s] * ch->NS + v;
+                    e[0] = (int)ch->koff[x]; e[1] = ch->cap[x] > 0 ? ch->cap[x] : 1; e[2] = rp[s];
+                }
+            }
+            int wok = vkc_write(ch->prm, ch->o_mux, tb, (size_t)NK * (1 + 3 * (size_t)ch->NS) * sizeof(int));
+            free(tb);
+            if (!wok) goto lost;
+        }
         if (dmoe && !vkc_dmoe_upload(&ch->dm)) goto lost;   /* the tier's residents changed: the table again */
         ndq = 0;
         {   /* attention's tau: the global layers' log-length scale, then 1 for the sliding ones */
@@ -625,7 +770,7 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
             if (!tp) goto lost;
             for (int s = 0; s < n; s++) {
                 float t = 1.f;
-                if (c->log_floor > 0) { double en = (double)(pb + s + 1) / c->log_floor; if (en > 1.0) t = 1.f + c->log_alpha * (float)log(en); }
+                if (c->log_floor > 0) { double en = (double)(rp[s] + 1) / c->log_floor; if (en > 1.0) t = 1.f + c->log_alpha * (float)log(en); }
                 tp[s] = t;
             }
             for (int s = 0; s < n; s++) tp[n + s] = 1.f;
@@ -688,8 +833,8 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
                               ink2c_norm(iv, ch->prm, local ? ch->o_n1[i] : ch->o_n3[i], ch->nv, n, D, c->eps);
             {   /* the step's K/V rows: kvd for the host's step after this frame, kvl's region when the frame goes on */
                 const size_t reg = (size_t)2 * ch->kvl_rows * ch->kvo_max;
-                ok = ok && (dl ? ink2c_attention(ch, m, i, v, sep, n, pb, ch->kvl, (size_t)v * reg, reg / 2)
-                               : ink2c_attention(ch, m, i, v, sep, n, pb, ch->kvd, 0, (size_t)R * ch->kvo_max)) &&
+                ok = ok && (dl ? ink2c_attention(ch, m, i, v, sep, n, pb, rk, rp, ch->kvl, (size_t)v * reg, reg / 2)
+                               : ink2c_attention(ch, m, i, v, sep, n, pb, rk, rp, ch->kvd, 0, (size_t)R * ch->kvo_max)) &&
                      ink2c_sconv(ch, ch->a, 0, n, D, 2, i, v, c);
             }
             /* a block boundary keeps this layer's input stream as a block state and starts the
@@ -727,9 +872,9 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
             ok = ok && vkc_finish();
             m->t_attn += now_s() - t0;
             if (!ok) break;
-            for (int k = 0; k < ndq; k++) ink2c_dmoe_done(ch, m, dq[2 * k], dq[2 * k + 1], n, pb);
+            for (int k = 0; k < ndq; k++) ink2c_dmoe_done(ch, m, dq[2 * k], dq[2 * k + 1], n, rk, rp);
             ndq = 0;
-            ink2c_kv_down(ch, m, v, n, pb, (const float *)vkc_ptr(ch->kvd), (size_t)ch->rows * ch->kvo_max);
+            ink2c_kv_down(ch, m, v, n, rk, rp, (const float *)vkc_ptr(ch->kvd), (size_t)ch->rows * ch->kvo_max);
             double t1 = now_s();
             moe_ex(m, l, i, (float *)vkc_ptr(ch->h2d), n, ch->host_routed, (const float *)vkc_ptr(ch->lgd), NULL);
             memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * D * sizeof(float));
@@ -742,38 +887,54 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
         /* the output's mix of the block states and the last stream: the rows the final norm reads */
         ok = ok && ink2c_mix(ch, ch->x, B, ch->o_outq, ch->hq, n, D);
         if (ok && want_x) ok = vkc_copy(ch->xd, 0, ch->hq, 0, (size_t)n * D);
-        if (ok && ch->csd_n) ok = vkc_copy(ch->csd, 0, ch->rings, 0, ch->csd_n);   /* the convolution states, for the host */
+        if (ok && ch->csd_n) {   /* the convolution states, for the host: the slot's, or each row's */
+            if (!mr) ok = vkc_copy(ch->csd, 0, ch->rings, (size_t)ch->fslot * ch->csd_n, ch->csd_n);
+            else {
+                VkcRegion rg[VKC_DMOE_ROWS];
+                for (int s = 0; s < n; s++) rg[s] = (VkcRegion){(size_t)s * ch->csd_n, (size_t)rk[s] * ch->csd_n, ch->csd_n};
+                ok = vkc_copy_regions(ch->csd, ch->rings, rg, n);
+            }
+        }
         int last = c0 + n == S;
-        if (ok && last) {
-            VkcSconv dv = {2, 0, 0, 0, 0, 0, 0, 0, D, c->mup};
-            VkcNorm fp = {1, D, 1, (n - 1) * D, D, D, 0, D, D, (int)ch->o_final, 0, 0, c->eps, 1.f};
+        if (ok && (last || mr)) {   /* the last row's head; a multiplexed frame's: every row's, each as a decode step's */
+            const int hr = mr ? n : 1;
+            VkcSconv dv = {2, 0, 0, 0, 0, 0, 0, 0, hr * D, c->mup, 0};
+            VkcNorm fp = {hr, D, 1, (n - hr) * D, D, D, 0, D, D, (int)ch->o_final, 0, 0, c->eps, 1.f};
             ok = vkc_norm(ch->hq, ch->prm, ch->fin, &fp) && vkc_sconv(ch->fin, NULL, NULL, &dv) &&
-                 vkc_matmul(ch->t_lm, ch->fin, 0, ch->outd, 0, 1);
+                 vkc_matmul(ch->t_lm, ch->fin, 0, ch->outd, 0, hr);
         }
         double t0 = now_s();
         ok = ok && vkc_submit(1);
         m->t_attn += now_s() - t0;
         if (!ok) goto lost;
-        for (int k = 0; k < ndq; k++) ink2c_dmoe_done(ch, m, dq[2 * k], dq[2 * k + 1], n, pb);
+        for (int k = 0; k < ndq; k++) ink2c_dmoe_done(ch, m, dq[2 * k], dq[2 * k + 1], n, rk, rp);
         ndq = 0;
-        const float *csd = (const float *)vkc_ptr(ch->csd);
-        for (int i = 0; i < ch->NS; i++) for (int b = 0; b < 4; b++)
-            memcpy(m->cs[b][i], csd + ch->o_csd[(size_t)b * ch->NS + i], (size_t)ink_cs_cells(c, b, i) * sizeof(float));
-        ch->cs_where = INK2C_BOTH; ch->host_zero = 0;
+        for (int s = 0; s < (mr ? n : 1); s++) {
+            const float *csd = (const float *)vkc_ptr(ch->csd) + (size_t)s * ch->csd_n;
+            Ink2cHost hs = ink2c_host(m, rk[s]);
+            for (int i = 0; i < ch->NS; i++) for (int b = 0; b < 4; b++)
+                memcpy(hs.cs[b][i], csd + ch->o_csd[(size_t)b * ch->NS + i], (size_t)ink_cs_cells(c, b, i) * sizeof(float));
+            ch->cs_where[rk[s]] = INK2C_BOTH; ch->host_zero[rk[s]] = 0;
+        }
         if (want_x) memcpy(xfin + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
-        if (last) {
+        if (mr) {
+            float *lo = logit + (size_t)c0 * V;
+            memcpy(lo, vkc_ptr(ch->outd), (size_t)n * V * sizeof(float));
+            ink2_head_post(c, lo, (int64_t)n * V);
+        } else if (last) {
             memcpy(logit, vkc_ptr(ch->outd), (size_t)c->unpad_vocab * sizeof(float));
             ink2_head_post(c, logit, c->unpad_vocab);
         }
     }
     if (want_x) { memcpy(xh, xfin, (size_t)S * D * sizeof(float)); free(xfin); }
-    free(dq);
+    free(dq); free(rk);
     vkc_relattn_part(NULL);
     ch->forwards++;
+    if (mr) { ch->mux_forwards++; ch->mux_rows += (unsigned long long)S; }
     return 1;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
-    free(xfin); free(dq);
+    free(xfin); free(dq); free(rk);
     vkc_relattn_part(NULL);
     ink2c_recover(m, pos_base);
     return 0;
@@ -782,6 +943,9 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
 static void ink2c_report(Model *m) {
     Ink2Chain *ch = ink2c_of(m);
     if (!ch || !ch->ok || !ch->forwards) return;
+    if (ch->mux_forwards)
+        fprintf(stderr, "[VK] inkling2 chain: %llu multiplexed steps of %d slots, %.2f rows a step\n",
+                ch->mux_forwards, ch->nslot, (double)ch->mux_rows / (double)ch->mux_forwards);
     VkcStats st; vkc_stats(&st);
     fprintf(stderr, "[VK] inkling2 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps' experts in the frame, "
@@ -794,9 +958,8 @@ static void ink2c_report(Model *m) {
 static void ink2c_start(Model *m) {
     g_vk_chain = g_ink2c_want ? coli_vk_chain_decide("inkling2", vkt_ready(), INKLING_CHAIN_IGPU) : 0;
     if (g_vk_chain && g_ink_mux_slots > 1) {
-        g_vk_chain = 0;
-        fprintf(stderr, "[VK] inkling2: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
-                        "the expert tier runs every conversation's experts\n", g_ink_mux_slots);
+        fprintf(stderr, "[VK] inkling2: KV_SLOTS=%d: the dense chain holds every slot's state (slot 0 %d tokens, the others %d)\n",
+                g_ink_mux_slots, ink_slot_ctx(0), ink_slot_ctx(1));
     }
     if (g_vk_chain && !ink2c_geometry_ok(m, 1)) g_vk_chain = 0;
     if (g_vk_chain && !vkc_init()) g_vk_chain = 0;

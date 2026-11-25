@@ -32,6 +32,10 @@
 //   mode 2  a workgroup a (head, row): the nc chunks of part (binding 4) combined, the sink
 //           (has_sink) one more term with l = 1 and no value, ctx = sum acc e^(m - M) / L.
 // The two agree with mode 0 to rounding (the sums' order).
+// tab > 0 (KV_SLOTS, a multiplexed step: every row the next token of its own conversation): row
+// s reads [koff, cap, qpos] at relp's ints tab + 3*(s0 + s): its conversation's ring at koff
+// (k_off and v_off ignored), positions t < qpos from it and its own (t = qpos) from kvs row s0 + s;
+// pos_base only sizes the split (the furthest row's).
 layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
@@ -41,6 +45,7 @@ layout(std430, binding = 3) writeonly buffer OB { float o[]; };
 layout(std430, binding = 4) readonly buffer SB { float kvs[]; };
 layout(std430, binding = 5) readonly buffer RB { float r[]; };
 layout(std430, binding = 6) readonly buffer PB { float relp[]; };
+layout(std430, binding = 6) readonly buffer PBI { int relpi[]; };   // the same, as ints (tab)
 layout(std430, binding = 7) readonly buffer TB { float tau[]; };
 
 layout(push_constant) uniform P {
@@ -50,6 +55,7 @@ layout(push_constant) uniform P {
     int r_off, r_row, relp_off, tau_off;
     float scale;
     int has_sink, sink_off;
+    int tab;
     int s0;
     int mode, nc;
 } p;
@@ -86,7 +92,12 @@ void main() {
     int qb = p.q_off + s * p.q_row + h * p.hd;
     for (int d = tid; d < p.hd; d += 128) qs[d] = q[qb + d];
     for (int j = tid; j < p.d_rel; j += 128) rs[j] = r[p.r_off + s * p.r_row + h * p.d_rel + j];
-    int qpos = p.pos_base + p.s0 + s;
+    int qpos = p.pos_base + p.s0 + s, lim = p.pos_base, k_off = p.k_off, v_off = p.v_off, cap = p.cap;
+    if (p.tab > 0) {
+        int e = p.tab + 3 * (p.s0 + s);
+        k_off = relpi[e]; v_off = k_off; cap = relpi[e + 1]; qpos = relpi[e + 2]; lim = qpos;
+    }
+    int srow = p.s0 + s - qpos;   // kvs row of position t >= lim: t + srow
     int t0 = p.window > 0 ? max(0, qpos - p.window + 1) : 0;
     int n = qpos - t0 + 1;
     float ts = tau[p.tau_off + s];
@@ -100,11 +111,11 @@ void main() {
         if (i < n) {
             int t = t0 + i;
             pt[tid] = t;
-            int kb = t < p.pos_base ? p.k_off + (kvh * p.cap + t % p.cap) * p.hd
-                                    : p.ks_off + (t - p.pos_base) * p.kv_row + kvh * p.hd;
+            int kb = t < lim ? k_off + (kvh * cap + t % cap) * p.hd
+                             : p.ks_off + (t + srow) * p.kv_row + kvh * p.hd;
             float a = 0.0;
-            if (t < p.pos_base) for (int d = 0; d < p.hd; d++) a += qs[d] * kc[kb + d];
-            else                for (int d = 0; d < p.hd; d++) a += qs[d] * kvs[kb + d];
+            if (t < lim) for (int d = 0; d < p.hd; d++) a += qs[d] * kc[kb + d];
+            else         for (int d = 0; d < p.hd; d++) a += qs[d] * kvs[kb + d];
             int dist = qpos - t;
             float bias = 0.0;
             if (dist < p.ext)
@@ -135,12 +146,12 @@ void main() {
         for (int j = 0; j < cnt; j++) {
             int t = pt[j];
             float w = pe[j];
-            if (t < p.pos_base) {
-                int vb = p.v_off + (kvh * p.cap + t % p.cap) * p.hd;
+            if (t < lim) {
+                int vb = v_off + (kvh * cap + t % cap) * p.hd;
                 if (d0 < p.hd) acc0 += w * vc[vb + d0];
                 if (d1 < p.hd) acc1 += w * vc[vb + d1];
             } else {
-                int vb = p.vs_off + (t - p.pos_base) * p.kv_row + kvh * p.hd;
+                int vb = p.vs_off + (t + srow) * p.kv_row + kvh * p.hd;
                 if (d0 < p.hd) acc0 += w * kvs[vb + d0];
                 if (d1 < p.hd) acc1 += w * kvs[vb + d1];
             }
