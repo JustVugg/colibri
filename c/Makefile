@@ -3861,6 +3861,33 @@ test:
 	$(MAKE) test-c
 	$(MAKE) test-python
 
+# --- GPU-less CUDA gate ---
+# check-cuda-limits compiles every product .cu (coli_cuda.dll's backend_cuda.cu,
+# cuda_chain.cu, cu_xb.cu and backend_cuda_ink.cu, plus the generic
+# coli_cuda_dsv4.dll) for sm_120 with -Xptxas -v and fails on what an RTX 5090
+# would refuse or what got worse: a compile error, shared memory past 48 KiB
+# static or 99 KiB with the opt-in, a literal launch past __launch_bounds__ or
+# past the 64 Ki register file, a dynamic size over 48 KiB with no opt-in, and
+# spills above tools/cuda_limits_baseline/nvcc-<release>.tsv. Planted controls
+# (tests/cuda_limits_controls) run first and must go red, so a green gate is
+# never vacuous; the DeepGEMM sm_120a flavour is skipped (external sources).
+# No GPU: it reads what the compiler recorded. Cached under
+# build/cuda-limits/cache when no source changed. Then check-cuda-dups reports
+# copied device helpers (a report, never a failure). Linux needs a CUDA 12.8+
+# toolkit:
+#   make check-cuda-limits CUDA_HOME=/opt/cudapip/nvidia/cu13
+#   make check-cuda-limits CUDA_LIMITS_FLAGS=--update-baseline   (after a reviewed spill change)
+# Windows: from a vcvars64 shell with nvcc on PATH. Idea and accounting from
+# TensorFold's kernel contract, gate 5 (Apache-2.0).
+CUDA_LIMITS_FLAGS ?=
+.PHONY: check-cuda-limits check-cuda-dups
+check-cuda-limits:
+	$(PYTHON) tools/check_cuda_limits.py --nvcc "$(NVCC)" $(CUDA_LIMITS_FLAGS)
+	$(PYTHON) tools/check_cuda_dups.py
+
+check-cuda-dups:
+	$(PYTHON) tools/check_cuda_dups.py
+
 # --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
 # The tiny-model assertions live in test_inefficiency.py and run as part of
 # test-python (they're discovered by the test_*.py glob). These targets are
