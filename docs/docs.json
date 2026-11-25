@@ -19,7 +19,7 @@
           },
           {
             "group": "Serve models",
-            "pages": ["api-reference/overview", "api", "systemone", "serve_protocol"]
+            "pages": ["api-reference/overview", "api", "openwebui", "systemone", "serve_protocol"]
           },
           {
             "group": "Model engines",
