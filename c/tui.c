@@ -29,6 +29,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <direct.h>
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
 #endif
@@ -49,6 +50,13 @@
 #endif
 
 #include "tui_mascot.h"
+
+#ifdef _WIN32
+#define PATH_SEP '\\'
+static wchar_t *wide(const char *s);
+#else
+#define PATH_SEP '/'
+#endif
 
 #ifndef COLI_VERSION
 #define COLI_VERSION "dev"
@@ -1090,6 +1098,210 @@ static int clip_copy(const char *t) {
 #endif
 }
 
+/* ---------------------------------------------------------------- an image model's picture: PNG
+   coli serve answers an image model with a PNG. The picture is drawn here in half blocks, so this file
+   reads PNG itself: inflate (RFC 1951, stored, fixed and dynamic Huffman blocks, decoded the way
+   zlib's puff.c does) and the five row filters, for 8-bit grey, RGB and RGBA without interlace. */
+typedef struct {
+    const unsigned char *p;
+    size_t n, i;
+    unsigned bit, nb;
+    int err;
+} Bits;
+static unsigned bits_get(Bits *b, int k) {
+    while (b->nb < (unsigned)k) {
+        if (b->i >= b->n) { b->err = 1; return 0; }
+        b->bit |= (unsigned)b->p[b->i++] << b->nb;
+        b->nb += 8;
+    }
+    unsigned v = b->bit & ((1u << k) - 1u);
+    b->bit >>= k;
+    b->nb -= (unsigned)k;
+    return v;
+}
+typedef struct {
+    uint16_t cnt[16], sym[320];
+} Huff;
+static void huff_build(Huff *h, const uint8_t *len, int n) {
+    uint16_t off[16];
+    memset(h->cnt, 0, sizeof h->cnt);
+    for (int i = 0; i < n; i++) h->cnt[len[i]]++;
+    h->cnt[0] = 0;
+    off[1] = 0;
+    for (int l = 1; l < 15; l++) off[l + 1] = (uint16_t)(off[l] + h->cnt[l]);
+    for (int i = 0; i < n; i++)
+        if (len[i]) h->sym[off[len[i]]++] = (uint16_t)i;
+}
+static int huff_dec(Bits *b, const Huff *h) {
+    int code = 0, first = 0, idx = 0;
+    for (int l = 1; l < 16; l++) {
+        code |= (int)bits_get(b, 1);
+        int c = h->cnt[l];
+        if (code - c < first) return h->sym[idx + (code - first)];
+        idx += c;
+        first = (first + c) << 1;
+        code <<= 1;
+    }
+    b->err = 1;
+    return -1;
+}
+/* a zlib stream into exactly want bytes: 0 when it decoded them all */
+static int inflate_z(const unsigned char *z, size_t zn, unsigned char *out, size_t want) {
+    static const uint16_t LB[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const uint8_t LE[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const uint16_t DB[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+    static const uint8_t DE[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+    static const uint8_t ORD[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+    if (zn < 2 || (z[0] & 15) != 8 || ((z[0] << 8) | z[1]) % 31) return -1;
+    Bits b = {z + 2, zn - 2, 0, 0, 0, 0};
+    size_t o = 0;
+    Huff lit, dist;
+    for (int last = 0; !last;) {
+        last = (int)bits_get(&b, 1);
+        int type = (int)bits_get(&b, 2);
+        if (b.err) return -1;
+        if (type == 0) {   /* stored: from the next byte */
+            b.bit = b.nb = 0;
+            if (b.i + 4 > b.n) return -1;
+            unsigned len = b.p[b.i] | (unsigned)b.p[b.i + 1] << 8, nlen = b.p[b.i + 2] | (unsigned)b.p[b.i + 3] << 8;
+            b.i += 4;
+            if ((len ^ 0xffffu) != nlen || b.i + len > b.n || o + len > want) return -1;
+            memcpy(out + o, b.p + b.i, len);
+            b.i += len;
+            o += len;
+            continue;
+        }
+        uint8_t ln[320];
+        if (type == 1) {
+            int i = 0;
+            for (; i < 144; i++) ln[i] = 8;
+            for (; i < 256; i++) ln[i] = 9;
+            for (; i < 280; i++) ln[i] = 7;
+            for (; i < 288; i++) ln[i] = 8;
+            huff_build(&lit, ln, 288);
+            for (i = 0; i < 30; i++) ln[i] = 5;
+            huff_build(&dist, ln, 30);
+        } else if (type == 2) {
+            int nlit = (int)bits_get(&b, 5) + 257, ndist = (int)bits_get(&b, 5) + 1, ncl = (int)bits_get(&b, 4) + 4;
+            if (nlit > 286 || ndist > 30) return -1;
+            uint8_t cl[19] = {0};
+            for (int i = 0; i < ncl; i++) cl[ORD[i]] = (uint8_t)bits_get(&b, 3);
+            Huff clh;
+            huff_build(&clh, cl, 19);
+            int i = 0;
+            while (i < nlit + ndist) {
+                int s = huff_dec(&b, &clh);
+                if (b.err || s < 0) return -1;
+                if (s < 16) { ln[i++] = (uint8_t)s; continue; }
+                int rep, v = 0;
+                if (s == 16) { if (!i) return -1; v = ln[i - 1]; rep = 3 + (int)bits_get(&b, 2); }
+                else if (s == 17) rep = 3 + (int)bits_get(&b, 3);
+                else rep = 11 + (int)bits_get(&b, 7);
+                if (i + rep > nlit + ndist) return -1;
+                while (rep--) ln[i++] = (uint8_t)v;
+            }
+            huff_build(&lit, ln, nlit);
+            huff_build(&dist, ln + nlit, ndist);
+        } else return -1;
+        for (;;) {
+            int s = huff_dec(&b, &lit);
+            if (b.err || s < 0) return -1;
+            if (s < 256) {
+                if (o >= want) return -1;
+                out[o++] = (unsigned char)s;
+                continue;
+            }
+            if (s == 256) break;
+            s -= 257;
+            if (s >= 29) return -1;
+            size_t len = LB[s] + bits_get(&b, LE[s]);
+            int ds = huff_dec(&b, &dist);
+            if (b.err || ds < 0 || ds >= 30) return -1;
+            size_t d = DB[ds] + bits_get(&b, DE[ds]);
+            if (b.err || d > o || o + len > want) return -1;
+            for (size_t k = 0; k < len; k++, o++) out[o] = out[o - d];
+        }
+    }
+    return o == want ? 0 : -1;
+}
+static uint32_t be32(const unsigned char *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+/* a PNG as 8-bit RGB (w * h * 3 bytes, malloc'd), or NULL for a PNG this reader does not take */
+static unsigned char *png_rgb(const unsigned char *p, size_t n, int *pw, int *ph) {
+    if (n < 33 || memcmp(p, "\x89PNG\r\n\x1a\n", 8)) return NULL;
+    uint32_t w = 0, h = 0;
+    int ch = 0;
+    unsigned char *z = NULL;
+    size_t zn = 0;
+    for (size_t i = 8; i + 12 <= n;) {
+        uint32_t len = be32(p + i);
+        const unsigned char *ty = p + i + 4, *d = p + i + 8;
+        if (len > n - i - 12) break;
+        if (!memcmp(ty, "IHDR", 4) && len >= 13) {
+            w = be32(d);
+            h = be32(d + 4);
+            int depth = d[8], color = d[9], lace = d[12];
+            ch = color == 0 ? 1 : color == 2 ? 3 : color == 4 ? 2 : color == 6 ? 4 : 0;
+            if (depth != 8 || lace || !ch || !w || !h || w > 8192 || h > 8192) { free(z); return NULL; }
+        } else if (!memcmp(ty, "IDAT", 4)) {
+            z = xrealloc(z, zn + len + 1);
+            memcpy(z + zn, d, len);
+            zn += len;
+        } else if (!memcmp(ty, "IEND", 4)) break;
+        i += 12 + (size_t)len;
+    }
+    if (!ch || !zn) { free(z); return NULL; }
+    size_t stride = (size_t)w * (size_t)ch, raw_n = (stride + 1) * h;
+    unsigned char *raw = malloc(raw_n), *rgb = malloc((size_t)w * h * 3);
+    if (!raw || !rgb || inflate_z(z, zn, raw, raw_n)) { free(z); free(raw); free(rgb); return NULL; }
+    free(z);
+    for (uint32_t y = 0; y < h; y++) {   /* the filters, in place: each row from the one above */
+        unsigned char *r = raw + y * (stride + 1), f = r[0], *c = r + 1, *u = y ? raw + (y - 1) * (stride + 1) + 1 : NULL;
+        for (size_t x = 0; x < stride; x++) {
+            int a = x >= (size_t)ch ? c[x - ch] : 0, b = u ? u[x] : 0, cc = u && x >= (size_t)ch ? u[x - ch] : 0;
+            switch (f) {
+            case 1: c[x] = (unsigned char)(c[x] + a); break;
+            case 2: c[x] = (unsigned char)(c[x] + b); break;
+            case 3: c[x] = (unsigned char)(c[x] + ((a + b) >> 1)); break;
+            case 4: {
+                int pp = a + b - cc, pa = abs(pp - a), pb = abs(pp - b), pc = abs(pp - cc);
+                c[x] = (unsigned char)(c[x] + (pa <= pb && pa <= pc ? a : pb <= pc ? b : cc));
+                break;
+            }
+            default: break;
+            }
+        }
+        for (uint32_t x = 0; x < w; x++) {
+            const unsigned char *s = c + (size_t)x * (size_t)ch;
+            unsigned char *o = rgb + ((size_t)y * w + x) * 3;
+            if (ch >= 3) { o[0] = s[0]; o[1] = s[1]; o[2] = s[2]; }
+            else o[0] = o[1] = o[2] = s[0];
+        }
+    }
+    free(raw);
+    *pw = (int)w;
+    *ph = (int)h;
+    return rgb;
+}
+/* base64 into bytes (malloc'd, *n its length); characters outside the alphabet skipped */
+static unsigned char *b64dec(const char *s, size_t sn, size_t *n) {
+    unsigned char *o = malloc(sn / 4 * 3 + 4);
+    if (!o) return NULL;
+    unsigned v = 0;
+    int k = 0;
+    size_t m = 0;
+    for (size_t i = 0; i < sn; i++) {
+        int c = (unsigned char)s[i], d = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 :
+                                         c >= '0' && c <= '9' ? c - '0' + 52 : c == '+' ? 62 : c == '/' ? 63 : -1;
+        if (d < 0) continue;
+        v = v << 6 | (unsigned)d;
+        if (++k == 4) { o[m++] = (unsigned char)(v >> 16); o[m++] = (unsigned char)(v >> 8); o[m++] = (unsigned char)v; k = 0; v = 0; }
+    }
+    if (k == 3) { o[m++] = (unsigned char)(v >> 10); o[m++] = (unsigned char)(v >> 2); }
+    else if (k == 2) o[m++] = (unsigned char)(v >> 4);
+    *n = m;
+    return o;
+}
+
 /* ---------------------------------------------------------------- the bird as a picture */
 
 /* The mascot's palette (the chat page's COL) and the CSS pixels a cell: the sixel pixels of one
@@ -1622,6 +1834,12 @@ typedef struct {
     char *docs, *files; /* the documents' text sent ahead of the message, the files' names */
     char **img;         /* its pictures, data: URLs */
     int nimg;
+    unsigned char *pic; /* an image model's answer: its pixels (RGB, pw x ph), saved as ppath */
+    int pw, ph, psteps;
+    long pseed;
+    char *ppath;
+    unsigned char *thumb; /* the picture at the size drawn: tw cells, th rows of two pixels */
+    int tw, th;
     double reason_s, tps, secs;
     time_t when;
 } Msg;
@@ -1648,6 +1866,7 @@ static const Model MODELS[] = {
 #define NMODELS ((int)(sizeof MODELS / sizeof MODELS[0]))
 #define LIVE_MODEL NMODELS /* the model the server runs, not one of the demo's */
 static char live_model[96] = "colibri";
+static int live_draws;   /* the served model draws: its turns go to /v1/images/generations */
 static long live_ctx = 262144;
 static const char *mname(int i) { return i >= NMODELS ? live_model : MODELS[i].name; }
 static long mctx(int i) { return i >= NMODELS ? live_ctx : MODELS[i].ctx; }
@@ -1804,7 +2023,7 @@ static const char *DEMO_EN =
     "**tab** to move between conversations.";
 
 static struct {
-    int on, cid, mi, phase, toks;
+    int on, cid, mi, phase, toks, img;   /* img: an image model draws this turn (/v1/images/generations) */
     double t0, t2, prompt_s, reason_s, tps;
     const char *full;
     size_t len, pos;
@@ -2454,6 +2673,37 @@ static void live_send(Conv *c, double t) {
     m->text = xstrdup("");
     char *b = NULL;
     size_t n = 0, cap = 0;
+    gen.img = 0;
+    if (live_draws) {   /* an image model: the last message is the prompt, the answer a PNG */
+        const Msg *u = c->n >= 2 ? &c->m[c->n - 2] : NULL;
+        buf_add(&b, &n, &cap, "{\"model\":\"");
+        json_esc(&b, &n, &cap, live_model);
+        buf_add(&b, &n, &cap, "\",\"n\":1,\"response_format\":\"b64_json\",\"prompt\":\"");
+        json_esc(&b, &n, &cap, u && u->text ? u->text : "");
+        buf_add(&b, &n, &cap, "\"}");
+        gen.on = 1;
+        gen.img = 1;
+        gen.cid = c->id;
+        gen.mi = c->n - 1;
+        gen.t0 = gen.t2 = t;
+        gen.phase = 0;
+        gen.toks = 0;
+        gen.prompt_s = 0;
+        gen_tr0 = 0;
+        gen_ptoks = 0;
+        m_begin(MS_WORK);
+        m_work(WORK_READ, N_OF(WORK_READ), t);
+        int bad = http_start(&hc_chat, "POST", "/v1/images/generations", b);
+        free(b);
+        if (bad) {
+            free(m->text);
+            m->text = xstrdup(T("Il motore non risponde: è acceso `coli serve`?", "The engine does not answer: is `coli serve` running?"));
+            m->err = 1;
+            gen.img = 0;
+            gen_finish(c, m, t, 1);
+        }
+        return;
+    }
     buf_add(&b, &n, &cap, "{\"model\":\"");
     json_esc(&b, &n, &cap, live_model);
     buf_add(&b, &n, &cap, "\",\"stream\":true,\"messages\":[");
@@ -2534,6 +2784,73 @@ static void live_fail(Conv *c, Msg *m, const char *why, double t) {
     gen_finish(c, m, t, 1);
 }
 
+/* where the pictures go: ~/colibri-images (%USERPROFILE%\colibri-images), made when missing */
+static int pic_dir(char *out, size_t cap) {
+#ifdef _WIN32
+    const char *home = getenv("USERPROFILE");
+#else
+    const char *home = getenv("HOME");
+#endif
+    if (!home || !*home) return 0;
+    snprintf(out, cap, "%s%ccolibri-images", home, PATH_SEP);
+#ifdef _WIN32
+    wchar_t *w = wide(out);
+    _wmkdir(w);
+    free(w);
+#else
+    mkdir(out, 0755);
+#endif
+    return 1;
+}
+static int file_write(const char *path, const unsigned char *d, size_t n) {
+#ifdef _WIN32
+    wchar_t *w = wide(path);
+    FILE *f = _wfopen(w, L"wb");
+    free(w);
+#else
+    FILE *f = fopen(path, "wb");
+#endif
+    if (!f) return 0;
+    int ok = fwrite(d, 1, n, f) == n;
+    return fclose(f) == 0 && ok;
+}
+/* the answer of /v1/images/generations: the PNG saved, its pixels on the message */
+static void live_picture(Conv *c, Msg *m, double t) {
+    const char *why = NULL;
+    if (json_parse(hc_chat.buf, (int)hc_chat.n) <= 0) why = T("risposta non leggibile", "an answer this cannot read");
+    int k = why ? -1 : jget(jat(jget(0, "data"), 0), "b64_json"), cb = why ? -1 : jget(0, "colibri");
+    if (!why && (k < 0 || jt[k].type != 's')) why = T("la risposta non contiene un'immagine", "the reply holds no image");
+    size_t pn = 0;
+    unsigned char *png = why ? NULL : b64dec(js + jt[k].start, (size_t)(jt[k].end - jt[k].start), &pn);
+    if (!why) {
+        m->pseed = (long)jnum(jget(cb, "seed"), -1);
+        m->psteps = (int)jnum(jget(cb, "steps"), 0);
+        m->pic = png ? png_rgb(png, pn, &m->pw, &m->ph) : NULL;
+        if (!m->pic) why = T("l'immagine non si legge", "the image cannot be read");
+    }
+    char dir[1024], path[1200];
+    if (m->pic && pic_dir(dir, sizeof dir)) {
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        snprintf(path, sizeof path, "%s%ccolibri-%ld-%04d%02d%02d-%02d%02d%02d.png", dir, PATH_SEP, m->pseed,
+                 tm ? tm->tm_year + 1900 : 0, tm ? tm->tm_mon + 1 : 0, tm ? tm->tm_mday : 0,
+                 tm ? tm->tm_hour : 0, tm ? tm->tm_min : 0, tm ? tm->tm_sec : 0);
+        if (file_write(path, png, pn)) m->ppath = xstrdup(path);
+    }
+    free(png);
+    http_close(&hc_chat);
+    hc_chat.state = 0;
+    gen.img = 0;
+    if (why) {
+        free(m->text);
+        m->text = xstrdup(fmt("%s: %s", T("Errore", "Error"), why));
+        m->err = 1;
+        gen_finish(c, m, t, 1);
+        return;
+    }
+    gen_finish(c, m, t, 0);
+}
+
 static void live_stream(double t) {
     if (!gen.on) return;
     Conv *c = conv_by_id(gen.cid);
@@ -2547,6 +2864,10 @@ static void live_stream(double t) {
         char why[600] = "";
         if (json_parse(hc_chat.buf, (int)hc_chat.n) > 0) jstr(jget(jget(0, "error"), "message"), why, sizeof why);
         live_fail(c, m, fmt("%s %d: %s", T("Errore", "Error"), hc_chat.status, *why ? why : T("il motore ha rifiutato la richiesta", "the engine refused the request")), t);
+        return;
+    }
+    if (gen.img) {   /* the whole JSON first: the PNG is in it */
+        if (hc_chat.state == 3) live_picture(c, m, t);
         return;
     }
     static char piece[65536];
@@ -2771,7 +3092,11 @@ static int live_probe(void) {
     int ok = json_parse(h.buf, (int)h.n) > 0 && jget(0, "status") >= 0;
     if (ok && !http_get_sync(&h, "/v1/models", 3.0) && json_parse(h.buf, (int)h.n) > 0) {
         char id[96];
-        if (jstr(jget(jat(jget(0, "data"), 0), "id"), id, sizeof id)) snprintf(live_model, sizeof live_model, "%s", id);
+        int m0 = jat(jget(0, "data"), 0), caps = jget(m0, "capabilities");
+        if (jstr(jget(m0, "id"), id, sizeof id)) snprintf(live_model, sizeof live_model, "%s", id);
+        live_draws = 0;   /* an image model (Qwen-Image): the server refuses chat for it */
+        for (int i = 0; jat(caps, i) >= 0; i++)
+            if (jstr(jat(caps, i), id, sizeof id) && !strcmp(id, "image_generation")) live_draws = 1;
     }
     free(h.buf);
     return ok;
@@ -2785,7 +3110,7 @@ typedef struct {
     uint8_t st;
 } SC;
 typedef struct {
-    int a, b, ind, code;
+    int a, b, ind, code, blk; /* code: 0 text, 1 a code line, 2 a code block's header; blk: its block, -1 none */
 } VL;
 enum { ST_N, ST_B, ST_CODE, ST_DIM };
 static SC *sc;
@@ -2806,7 +3131,7 @@ static void vl_put(int a, int b, int ind, int code) {
         vlcap = vlcap ? vlcap * 2 : 256;
         vl = xrealloc(vl, sizeof(VL) * (size_t)vlcap);
     }
-    vl[vln++] = (VL){a, b, ind, code};
+    vl[vln++] = (VL){a, b, ind, code, -1};
 }
 
 static void wrap(int a, int b, int w, int ind, int code) {
@@ -2832,7 +3157,7 @@ static void wrap(int a, int b, int w, int ind, int code) {
 /* the markdown the models write most: **bold**, `code`, ``` blocks, lists, headings */
 static void md_layout(const char *s, int w, int base) {
     scn = vln = 0;
-    int code = 0;
+    int code = 0, nblk = 0;
     if (w < 4) w = 4;
     while (*s) {
         const char *e = strchr(s, '\n');
@@ -2840,10 +3165,19 @@ static void md_layout(const char *s, int w, int base) {
         const char *p = s, *end = s + len;
         if (len >= 3 && !strncmp(s, "```", 3)) {
             code = !code;
+            if (code) {   /* the block's header row: its language, and its copy button (draw_vl) */
+                int a = scn;
+                const char *q = s + 3;
+                while (q < end && *q == ' ') q++;
+                while (q < end && *q != ' ' && scn - a < 24) sc_put(u8next(&q), ST_DIM);
+                vl_put(a, scn, 0, 2);
+                vl[vln - 1].blk = nblk++;
+            }
         } else if (code) {
-            int a = scn;
+            int a = scn, v0 = vln;
             while (p < end) sc_put(u8next(&p), ST_CODE);
             wrap(a, scn, w - 2, 0, 1);
+            for (int i = v0; i < vln; i++) vl[i].blk = nblk - 1;
         } else {
             int a = scn, ind = 0, bold = 0, inl = 0;
             if (len >= 2 && (p[0] == '-' || p[0] == '*') && p[1] == ' ') {
@@ -2873,8 +3207,18 @@ static void md_layout(const char *s, int w, int base) {
     }
 }
 
+static const char *copy_label(void) { return T(" copia ", " copy "); }
 static int draw_vl(const VL *v, int x, int y, uint32_t fg, uint32_t bg, int w) {
     int col = v->ind;
+    if (v->code == 2) {   /* a code block's header: its language at the left, copy at the right */
+        fill(x, y, w, 1, S3);
+        col = 1;
+        if (v->b > v->a)
+            for (int i = v->a; i < v->b; i++) { put(x + col, y, sc[i].cp, MUTED, S3, 0); col += wcw(sc[i].cp); }
+        else col += text(x + col, y, w - col, T("codice", "code"), MUTED, S3, 0);
+        textr(x + w, y, w - col, copy_label(), ACCT, S3, 0);
+        return w;
+    }
     if (v->code) {
         fill(x, y, w, 1, CODEBG);
         col += 2;
@@ -2895,6 +3239,79 @@ static int draw_vl(const VL *v, int x, int y, uint32_t fg, uint32_t bg, int w) {
     return col;
 }
 
+/* ---------------------------------------------------------------- the buttons in the chat */
+
+/* Copying with a drag takes the cells on the screen: a message longer than the screen comes out cut,
+   a code line the screen wrapped comes out as two. Each answer and each code block has a copy button
+   instead, which copies the text the model wrote; a picture's opens it. The frame records where it
+   drew them, the click looks there. */
+enum { HIT_TEXT, HIT_CODE, HIT_OPEN, HIT_PATH };
+#define NHITS 160
+typedef struct { int x0, x1, y, cid, mi, blk, what; } Hit;
+static Hit hits[NHITS];
+static int nhits, hit_y0, hit_y1;
+static void hit_add(int x0, int x1, int y, int cid, int mi, int blk, int what) {
+    if (nhits < NHITS && y >= hit_y0 && y < hit_y1) hits[nhits++] = (Hit){x0, x1, y, cid, mi, blk, what};
+}
+/* the k-th ``` block of a message, without its fences (malloc'd) */
+static char *md_code(const char *s, int k) {
+    char *o = xrealloc(NULL, 1);
+    size_t n = 0;
+    int code = 0, blk = -1, any = 0;
+    o[0] = 0;
+    while (s && *s) {
+        const char *e = strchr(s, '\n');
+        size_t len = e ? (size_t)(e - s) : strlen(s);
+        if (len >= 3 && !strncmp(s, "```", 3)) {
+            code = !code;
+            if (code) blk++;
+            else if (blk == k) break;
+        } else if (code && blk == k) {
+            o = xrealloc(o, n + len + 2);
+            if (any) o[n++] = '\n';
+            memcpy(o + n, s, len);
+            n += len;
+            o[n] = 0;
+            any = 1;
+        }
+        s += len;
+        if (e) s++;
+    }
+    return o;
+}
+static int md_blocks(const char *s) {   /* how many ``` blocks a message opens */
+    int n = 0, code = 0;
+    for (const char *l = s; l && *l;) {
+        if (!strncmp(l, "```", 3)) { code = !code; n += code; }
+        const char *e = strchr(l, '\n');
+        if (!e) break;
+        l = e + 1;
+    }
+    return n;
+}
+static void copied(const char *what, const char *s) {
+    size_t n = 0, lines = 1;
+    for (const char *q = s; *q; q++) { n += ((unsigned char)*q & 0xc0) != 0x80; lines += *q == '\n'; }
+    if (!n) { toast(T("Niente da copiare", "Nothing to copy")); return; }
+    if (clip_copy(s))
+        toast(fmt("%s: %zu %s, %zu %s", what, n, n == 1 ? T("carattere", "character") : T("caratteri", "characters"),
+                  lines, lines == 1 ? T("riga", "line") : T("righe", "lines")));
+}
+/* a picture's file in the system's viewer */
+static void open_path(const char *p) {
+#ifdef _WIN32
+    wchar_t *w = wide(fmt("start \"\" \"%s\"", p));
+    _wsystem(w);
+    free(w);
+#else
+    if (strchr(p, '\'')) return;
+    char cmd[1400];
+    snprintf(cmd, sizeof cmd, "(xdg-open '%s' || wslview '%s' || open '%s') >/dev/null 2>&1 &", p, p, p);
+    if (system(cmd)) {}
+#endif
+    toast(fmt("%s %s", T("Apro", "Opening"), p));
+}
+
 /* ---------------------------------------------------------------- drawing */
 
 static uint32_t spin_cp(double t) {
@@ -2903,6 +3320,32 @@ static uint32_t spin_cp(double t) {
 }
 
 static int live_msg(const Conv *c, int mi) { return gen.on && gen.cid == c->id && gen.mi == mi; }
+
+/* the picture at tw cells by th rows (2 * th pixels high), each pixel the mean of the ones it covers */
+static void pic_thumb(Msg *m, int tw, int th) {
+    if (m->thumb && m->tw == tw && m->th == th) return;
+    free(m->thumb);
+    int ty = 2 * th;
+    m->thumb = xrealloc(NULL, (size_t)tw * (size_t)ty * 3);
+    m->tw = tw;
+    m->th = th;
+    for (int y = 0; y < ty; y++) {
+        int y0 = (int)((long)y * m->ph / ty), y1 = (int)((long)(y + 1) * m->ph / ty);
+        if (y1 <= y0) y1 = y0 + 1;
+        for (int x = 0; x < tw; x++) {
+            int x0 = (int)((long)x * m->pw / tw), x1 = (int)((long)(x + 1) * m->pw / tw);
+            if (x1 <= x0) x1 = x0 + 1;
+            unsigned long sum[3] = {0, 0, 0}, k = 0;
+            for (int yy = y0; yy < y1 && yy < m->ph; yy++)
+                for (int xx = x0; xx < x1 && xx < m->pw; xx++, k++) {
+                    const unsigned char *p = m->pic + ((size_t)yy * m->pw + xx) * 3;
+                    sum[0] += p[0]; sum[1] += p[1]; sum[2] += p[2];
+                }
+            unsigned char *o = m->thumb + ((size_t)y * tw + x) * 3;
+            for (int c = 0; c < 3; c++) o[c] = (unsigned char)(k ? sum[c] / k : 0);
+        }
+    }
+}
 
 /* one message at (x, y), w columns: its height; with draw 0 it only measures */
 static int msg_draw(const Conv *c, int mi, int x, int y, int w, int draw, double t) {
@@ -2918,7 +3361,10 @@ static int msg_draw(const Conv *c, int mi, int x, int y, int w, int draw, double
                 int col = text(x + 2, y + 1, w - 4, T("Allegati: ", "Attached: "), MUTED, S2, 0);
                 text(x + 2 + col, y + 1, w - 4 - col, m->files, ACCT, S2, 0);
             }
-            for (int i = 0; i < vln; i++) draw_vl(&vl[i], x + 2, y + 1 + fl + i, INK, S2, w - 4);
+            for (int i = 0; i < vln; i++) {
+                draw_vl(&vl[i], x + 2, y + 1 + fl + i, INK, S2, w - 4);
+                if (vl[i].code == 2) hit_add(x + w - 2 - strw(copy_label()), x + w - 2, y + 1 + fl + i, c->id, mi, vl[i].blk, HIT_CODE);
+            }
             struct tm *tm = localtime(&m->when);
             if (tm) textr(x + w - 2, y + h - 1, 8, fmt("%02d:%02d", tm->tm_hour, tm->tm_min), MUTED, S2, 0);
         }
@@ -2929,7 +3375,8 @@ static int msg_draw(const Conv *c, int mi, int x, int y, int w, int draw, double
         if (draw) {
             int col = text(x, y, w, mname(m->model), MUTED, BG, 0);
             const char *meta = NULL;
-            if (live && gen.phase == 0) meta = T("legge il prompt", "reading the prompt");
+            if (live && gen.img) meta = fmt("%s %s s", T("disegna l'immagine", "drawing the image"), dec(t - gen.t0, 0));
+            else if (live && gen.phase == 0) meta = T("legge il prompt", "reading the prompt");
             else if (live && gen.phase == 1)
                 meta = fmt("%s %s s", T("ragiona", "reasoning"), dec(t - gen.t0 - gen.prompt_s, 1));
             else if (m->reason_s > 0)
@@ -2942,6 +3389,38 @@ static int msg_draw(const Conv *c, int mi, int x, int y, int w, int draw, double
                 }
                 text(x + col, y, w - col, meta, MUTED, BG, 0);
             }
+            if (!live && ((m->text && *m->text) || m->ppath)) {   /* the whole answer, as the model wrote it */
+                const char *lab = m->ppath ? T(" copia percorso ", " copy path ") : copy_label();
+                int lw = strw(lab);
+                if (lw < w - col - 2) {
+                    textr(x + w, y, lw, lab, MUTED, BG, 0);
+                    hit_add(x + w - lw, x + w, y, c->id, mi, -1, m->ppath ? HIT_PATH : HIT_TEXT);
+                }
+            }
+        }
+        if (m->pic && m->pw > 0 && m->ph > 0) {   /* the picture in half blocks: a cell is two pixels, one above the other */
+            int tw = w > 80 ? 80 : w < 1 ? 1 : w, th = (m->ph * tw + m->pw) / (2 * m->pw), cap = H * 2 / 3 < 6 ? 6 : H * 2 / 3;
+            if (th < 1) th = 1;
+            if (th > cap) { th = cap; tw = (2 * th * m->pw + m->ph / 2) / m->ph; if (tw < 1) tw = 1; }
+            if (draw) {
+                pic_thumb((Msg *)m, tw, th);
+                for (int r = 0; r < th; r++)
+                    for (int cx = 0; cx < tw; cx++) {
+                        const unsigned char *a = m->thumb + ((size_t)(2 * r) * tw + cx) * 3, *b = a + (size_t)tw * 3;
+                        put(x + cx, y + h + r, 0x2580, (uint32_t)a[0] << 16 | a[1] << 8 | a[2], (uint32_t)b[0] << 16 | b[1] << 8 | b[2], 0);
+                    }
+                const char *cap_s = fmt("%d\xc3\x97%d \xc2\xb7 seed %ld \xc2\xb7 %d %s", m->pw, m->ph, m->pseed, m->psteps, T("passi", "steps"));
+                int col = text(x, y + h + th, w, cap_s, MUTED, BG, 0);
+                if (m->ppath) {
+                    const char *lab = T(" apri ", " open ");
+                    int lw = strw(lab);
+                    if (col + lw + 2 < w) {
+                        text(x + col + 2, y + h + th, lw, lab, ACCT, S2, 0);
+                        hit_add(x + col + 2, x + col + 2 + lw, y + h + th, c->id, mi, -1, HIT_OPEN);
+                    }
+                } else text(x + col, y + h + th, w - col, T(" \xc2\xb7 non salvata", " \xc2\xb7 not saved"), MUTED, BG, 0);
+            }
+            h += th + 1;
         }
         if (show_reason && m->reason && m->reason_s > 0) {
             md_layout(m->reason, w - 2, ST_DIM);
@@ -2955,7 +3434,10 @@ static int msg_draw(const Conv *c, int mi, int x, int y, int w, int draw, double
         md_layout(m->text ? m->text : "", w, ST_N);
         int endc = 0;
         if (draw)
-            for (int i = 0; i < vln; i++) endc = draw_vl(&vl[i], x, y + h + i, m->err ? 0xff7a88 : SOFT, BG, w);
+            for (int i = 0; i < vln; i++) {
+                endc = draw_vl(&vl[i], x, y + h + i, m->err ? 0xff7a88 : SOFT, BG, w);
+                if (vl[i].code == 2 && !live) hit_add(x + w - strw(copy_label()), x + w, y + h + i, c->id, mi, vl[i].blk, HIT_CODE);
+            }
         if (live && gen.phase == 2) { /* the cursor where the next token lands */
             if (vln) {
                 if (draw) put(x + endc, y + h + vln - 1, 0x258d, ACC, BG, 0);
@@ -2993,6 +3475,7 @@ static void draw_welcome(int x, int y0, int y1, int w) {
 }
 
 static void draw_chat(const Conv *c, int x, int y0, int y1, int w, double t) {
+    nhits = 0;
     clip(x, y0, x + w, y1);
     if (c->n == 0) {
         draw_welcome(x, y0, y1, w);
@@ -3000,6 +3483,8 @@ static void draw_chat(const Conv *c, int x, int y0, int y1, int w, double t) {
         clip_all();
         return;
     }
+    hit_y0 = y0;
+    hit_y1 = y1;
     int total = 0;
     for (int i = 0; i < c->n; i++) total += msg_draw(c, i, x, 0, w, 0, t) + (i ? 1 : 0);
     int vh = y1 - y0, maxs = total > vh ? total - vh : 0;
@@ -3533,6 +4018,8 @@ static const Cmd CMDS[] = {
     {"Monitor: CPU, GPU, memoria, turni", "Monitor: CPU, GPU, memory, turns", "F2", 10},
     {"Mappa degli esperti", "Expert map", "ctrl+e", 3},
     {"Mostra il ragionamento", "Show the reasoning", "ctrl+r", 4},
+    {"Copia l'ultima risposta", "Copy the last answer", "ctrl+y", 12},
+    {"Copia l'ultimo blocco di codice", "Copy the last code block", "ctrl+k", 13},
     {"Conversazioni a lato", "Conversations sidebar", "ctrl+b", 5},
     {"Colibrì: le sue mosse", "Hummingbird: its moves", "", 8},
     {"Mostra o nascondi il colibrì", "Show or hide the hummingbird", "", 9},
@@ -3587,6 +4074,40 @@ static void new_conv(void) {
     m_act(0, now_s());
 }
 
+/* a copy button, or the keys: the answer (whole) or one of its code blocks to the clipboard, a picture opened */
+static void hit_run(const Hit *h) {
+    Conv *c = conv_by_id(h->cid);
+    if (!c || h->mi < 0 || h->mi >= c->n) return;
+    const Msg *m = &c->m[h->mi];
+    switch (h->what) {
+    case HIT_TEXT: copied(T("Risposta copiata", "Answer copied"), m->text ? m->text : ""); break;
+    case HIT_CODE: { char *s = md_code(m->text, h->blk); copied(T("Codice copiato", "Code copied"), s); free(s); break; }
+    case HIT_OPEN: if (m->ppath) open_path(m->ppath); break;
+    case HIT_PATH: if (m->ppath) copied(T("Percorso copiato", "Path copied"), m->ppath); break;
+    default: break;
+    }
+}
+/* the last answer with text (code: its last code block) in this conversation */
+static void copy_last(int code) {
+    const Conv *c = &conv[cur];
+    for (int i = c->n - 1; i >= 0; i--) {
+        const Msg *m = &c->m[i];
+        if (m->kind != M_ASSIST || live_msg(c, i)) continue;
+        if (code) {
+            int nb = md_blocks(m->text);
+            if (!nb) continue;
+            Hit h = {0, 0, 0, c->id, i, nb - 1, HIT_CODE};
+            hit_run(&h);
+        } else {
+            if ((!m->text || !*m->text) && !m->ppath) continue;
+            Hit h = {0, 0, 0, c->id, i, -1, m->ppath && (!m->text || !*m->text) ? HIT_PATH : HIT_TEXT};
+            hit_run(&h);
+        }
+        return;
+    }
+    toast(code ? T("Nessun blocco di codice da copiare", "No code block to copy") : T("Nessuna risposta da copiare", "No answer to copy"));
+}
+
 static void pal_run(int id) {
     if (pal.mode == 2) {
         pal.open = 0;
@@ -3611,6 +4132,8 @@ static void pal_run(int id) {
     case 8: pal_open(2); break;
     case 10: show_mon = !show_mon; mon_scroll = 0; break;
     case 11: del_pending = conv[cur].id; break;
+    case 12: copy_last(0); break;
+    case 13: copy_last(1); break;
     case 9:
         M.shown = !M.shown;
         if (M.shown) m_idle(now_s());
@@ -3924,6 +4447,9 @@ static void conv_delete(int id, double t) {
         free(m->files);
         for (int j = 0; j < m->nimg; j++) free(m->img[j]);
         free(m->img);
+        free(m->pic);
+        free(m->ppath);
+        free(m->thumb);
     }
     free(c->m);
     memmove(conv + i, conv + i + 1, sizeof(Conv) * (size_t)(nconv - i - 1));
@@ -4077,6 +4603,8 @@ static void on_key(const Key *k, double t) {
             break;
         }
         case 'a': incur = 0; break;
+        case 'y': copy_last(0); break;
+        case 'k': copy_last(1); break;
         default: break;
         }
         return;
@@ -4097,6 +4625,8 @@ static void on_key(const Key *k, double t) {
     case K_PGUP: scroll += H / 2; return;
     case K_PGDN: scroll = scroll > H / 2 ? scroll - H / 2 : 0; return;
     case K_CLICK:
+        for (int i = 0; i < nhits; i++)
+            if (k->y == hits[i].y && k->x >= hits[i].x0 && k->x < hits[i].x1) { hit_run(&hits[i]); return; }
         if (side_w && k->x < side_w) {
             if (k->y == side_new_y) new_conv();
             for (int i = 0; i < side_items; i++)
