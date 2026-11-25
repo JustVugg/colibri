@@ -970,10 +970,53 @@ __device__ __forceinline__ bool bd_dec16(int t, const bd_u32 *__restrict__ W, bd
  * A row of the matrix over lpr lanes (a power of two up to the warp, a few steps a lane:
  * bd_lpr), so a warp works on 32 / lpr rows at once; a block of 256 threads takes nr rows of
  * x (up to NR: a speculative verify's), each lane's steps against all of them, so the weights
- * are read once for the nr; at most BD_GEMV_BLOCKS blocks, the rest by a grid-stride (each
- * block prepares x once for more rows). chain_gemv_bd.comp's arrangement. */
+ * are read once for the nr; at most BD_GEMV_BLOCKS blocks (bd_gemv_cap), the rest by a
+ * grid-stride (each block prepares x once for more rows). chain_gemv_bd.comp's arrangement. */
 #define BD_GEMV_NR 4
 #define BD_GEMV_BLOCKS 256
+/* The GEMVs' grid cap: BD_GEMV_BLOCKS blocks for the integer forms, four times that for the float
+ * and BF16 forms (8 rows a block), unless COLI_CUDA_BD_BLOCKS says otherwise: "n" n blocks, "nx" n
+ * blocks a multiprocessor of the current device (a card of 170 SMs held 256 blocks to 1.5 a
+ * multiprocessor), the float and BF16 forms four times that. Each output row is one warp's
+ * (lpr lanes'), its steps and butterfly the same whatever the grid; the grid only sets how many
+ * rows a block walks, so the bits are the same. Unset, empty or not a count: the default. */
+static int g_bd_blocks_force = -1;   /* tests: a cap over the environment (0: the default) */
+/* COLI_CUDA_BD_BLOCKS's value: n of 1 to 2^20, *per_sm 1 for "nx"; 0 for the default */
+static inline int bd_gemv_cap_parse(const char *e, int *per_sm) {
+    *per_sm = 0;
+    if (!e || !*e) return 0;
+    char *end = nullptr;
+    long v = strtol(e, &end, 10);
+    int x = end != e && (*end == 'x' || *end == 'X') && end[1] == '\0';
+    if (end == e || !(v > 0 && v <= (1L << 20)) || !(*end == '\0' || x)) return 0;
+    *per_sm = x;
+    return (int)v;
+}
+#ifndef BD_GEMV_BLOCKS_ENV
+static inline const char *bd_gemv_blocks_env_default(void) { return getenv("COLI_CUDA_BD_BLOCKS"); }
+#define BD_GEMV_BLOCKS_ENV bd_gemv_blocks_env_default
+#endif
+static int bd_gemv_cap(void) {
+    /* the environment's, read once into one word (n, bit 30 for "nx"): two threads at the first launch
+     * never see a count without its mode */
+    static int word = -1;
+    static int sms[32];
+    int w = word;
+    if (w < 0) { int p = 0, v = bd_gemv_cap_parse(BD_GEMV_BLOCKS_ENV(), &p); w = v | (p ? 1 << 30 : 0); word = w; }
+    if (g_bd_blocks_force >= 0) return g_bd_blocks_force > 0 ? g_bd_blocks_force : BD_GEMV_BLOCKS;
+    const int n = w & ((1 << 30) - 1), per_sm = w >> 30 & 1;
+    if (n == 0) return BD_GEMV_BLOCKS;
+    if (!per_sm) return n;
+    int dev = 0;   /* asked only in this mode: the default never asks for the device (#2757) */
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev > 31) { (void)cudaGetLastError(); return BD_GEMV_BLOCKS; }
+    if (sms[dev] <= 0) {
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess || p.multiProcessorCount <= 0) { (void)cudaGetLastError(); return BD_GEMV_BLOCKS; }
+        sms[dev] = p.multiProcessorCount;
+    }
+    long c = (long)n * sms[dev];
+    return c > (1L << 20) ? (1 << 20) : (int)c;
+}
 /* lanes a row: about six 32-weight steps each (an RTX PRO 4000, Q4_K 10240 x 2560 against
  * four and eight lanes: 53 -> 46 us for one row, chain_gemv_bd's measure) */
 __host__ __device__ inline int bd_lpr(int I) { int steps = I / 32, l = 1; while (l < 32 && l * 6 < steps) l *= 2; return l; }
@@ -1691,7 +1734,8 @@ static int bd_gemv_bf16_launch(float *y, const float *x, const bd_u32 *W, int I,
     if (I % 8 || (rowWords & 3) || ((uintptr_t)x & 15) || ((uintptr_t)W & 15)) return 0;
     const int nr = S < BD_GEMV_NR ? S : BD_GEMV_NR;
     int bx = (O + 7) / 8;
-    if (bx > 4 * BD_GEMV_BLOCKS) bx = 4 * BD_GEMV_BLOCKS;
+    const int cap = 4 * bd_gemv_cap();
+    if (bx > cap) bx = cap;
     dim3 g((unsigned)bx, (unsigned)((S + nr - 1) / nr));
     if (nr > 1) coli_launch(bd_gemv_bf16_k<BD_GEMV_NR>, g, 256, 0, st, y, x, W, I, O, rowWords, S, nr);
     else coli_launch(bd_gemv_bf16_k<1>, g, 256, 0, st, y, x, W, I, O, rowWords, S, 1);
@@ -1843,7 +1887,8 @@ static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd
     size_t sm = bd_gemv_i8_smem(T, I, nr);
     if (sm > smem_max) return 0;
     int lpr = bd_lpr(I), rows_b = 256 / lpr, bx = (O + rows_b - 1) / rows_b;
-    if (bx > BD_GEMV_BLOCKS) bx = BD_GEMV_BLOCKS;
+    const int cap = bd_gemv_cap();
+    if (bx > cap) bx = cap;
     dim3 g((unsigned)bx, (unsigned)((S + nr - 1) / nr));
     const uint4 *gq = nullptr;
     const size_t block_bytes = (size_t)((O + bx - 1) / bx) * rowWords * 4;
@@ -1867,7 +1912,8 @@ static int bd_gemv_rows_i8_launch(float *y, const float *x, const bd_u32 *W, con
     size_t sm = bd_gemv_i8_smem(T, I, 1);
     if (sm > smem_max) return 0;
     int lpr = bd_lpr(I), rows_b = 256 / lpr, bx = (n + rows_b - 1) / rows_b;
-    if (bx > BD_GEMV_BLOCKS) bx = BD_GEMV_BLOCKS;
+    const int cap = bd_gemv_cap();
+    if (bx > cap) bx = cap;
     static unsigned raised;
     bd_smem_raise((const void *)bd_gemv_rows_i8_k<T>, sm, smem_max, &raised);
     coli_launch(bd_gemv_rows_i8_k<T>, dim3((unsigned)bx), 256, sm, st, y, x, W, tab, ids, I, O, rowWords, n, lpr);
@@ -1880,7 +1926,8 @@ static int bd_gemv_f_launch(float *y, const float *x, const bd_u32 *W, const bd_
     size_t sm = bd_gemv_f_smem(I, nr);
     if (sm > smem_max) return 0;
     int bx = (O + 7) / 8;
-    if (bx > 4 * BD_GEMV_BLOCKS) bx = 4 * BD_GEMV_BLOCKS;
+    const int cap = 4 * bd_gemv_cap();
+    if (bx > cap) bx = cap;
     dim3 g((unsigned)bx, (unsigned)((S + nr - 1) / nr));
     if (nr > 1) {
         static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */

@@ -1573,6 +1573,17 @@ cuda-dflash-check: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_dflash.cu -o cuda_dflash_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_dflash_test$(EXE)
 
+# A GGUF's block formats on the device (cuda_bd.cuh): every type's GEMV against the CPU's decoders
+# (tests/cuda_bd_ref.c), a verify's rows, the SwiGLU pass, the tensor cores' rows, and the GEMVs' grid
+# (COLI_CUDA_BD_BLOCKS) to the bit under caps from 1 block to past every row. Needs a GPU; BENCH=1 and
+# BENCH_GRID=1 add timings. The test includes backend_cuda.cu itself.
+.PHONY: cuda-bd-check
+cuda-bd-check: tests/test_cuda_bd.cu tests/cuda_bd_ref.c ggml_quants.h backend_cuda.cu backend_cuda.h cuda_bd.cuh blockdec_host.h fp8_format.h backend_gpu_compat.h
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -fPIC -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_bd.cu $(if $(filter 1,$(HIP)),-x none) tests/cuda_bd_ref.o -o cuda_bd_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_bd_test$(EXE)
+
 hip-test:
 	$(MAKE) cuda-test HIP=1
 

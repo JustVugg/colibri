@@ -15,8 +15,11 @@
  *     two GEMVs and the elementwise product;
  *   - the tensor cores' integer steps (bd_mmg_launch, sm_80 on) of 1 to 8 rows, each row the bits
  *     of the GEMV's same row alone; again with x's quantization kept (g_bd_x_same), and after
- *     another x at the same address without it.
- * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows. Build from c/:
+ *     another x at the same address without it;
+ *   - the GEMVs' grid (bd_gemv_cap, COLI_CUDA_BD_BLOCKS): every type at shapes past the default
+ *     cap, each call's bits under caps from 1 block to past every row the default grid's.
+ * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows; BENCH_GRID=1 the decode shapes under
+ * the default grid and n blocks a multiprocessor. make cuda-bd-check, or build from c/:
  *   gcc -O2 -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
  *   nvcc -O2 -std=c++17 -arch=native tests/test_cuda_bd.cu tests/cuda_bd_ref.o -o tests/test_cuda_bd */
 #include <cstdio>
@@ -40,7 +43,12 @@ const char *ref_name(int t);
 static int fails;
 static unsigned long long g_rng = 0x9e3779b97f4a7c15ull;
 static unsigned rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17; return (unsigned)(g_rng >> 11); }
+#ifdef _WIN32   /* nvcc with MSVC: no clock_gettime, strtok_r is strtok_s */
+#define strtok_r strtok_s
+static double now(void) { struct timespec t; timespec_get(&t, TIME_UTC); return t.tv_sec + t.tv_nsec * 1e-9; }
+#else
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+#endif
 
 /* sane scale fields in a random block (test_vk_chain.c's bd_fix, with the float-form types) */
 static void bd_fix(int t, uint8_t *b) {
@@ -719,6 +727,159 @@ out:
     free(w); free(x); free(x2); free(one); free(two); free(got);
 }
 
+/* The GEMVs' grid (bd_gemv_cap, COLI_CUDA_BD_BLOCKS): type t at I inputs, O rows, shapes past the
+ * default cap (BD_GEMV_BLOCKS, four times that for the float forms). Under the default grid: 1 to 4
+ * rows of x with x quantized each of its ways, the gate and up in one pass, the rows of an id list
+ * (bd_gemv_rows_launch, with ids no row holds); then under every cap of caps[] the same calls, to
+ * the bit. Every 61st output of one row against the CPU (the integer form's sums, or the
+ * dequantized row), as check() does. */
+static int g_grid;
+static void check_grid(int t, int I, int O, const int *caps, int ncap) {
+    long rb = ref_row_bytes(t, I);
+    int bb = ref_block_bytes(t), be = ref_block_elems(t);
+    if (rb <= 0 || I % be) return;
+    const int rw = (int)((rb + 3) / 4), fmt = 100 + t, SM = 4, idot = bdi_has(t);
+    const size_t wbytes = (size_t)O * rw * 4;
+    uint8_t *w = (uint8_t *)calloc((size_t)O, (size_t)rw * 4);
+    for (int o = 0; o < O; o++) {
+        uint8_t *r = w + (size_t)o * rw * 4;
+        for (long i = 0; i < rb; i++) r[i] = (uint8_t)rnd();
+        for (long k = 0; k + bb <= rb; k += bb) bd_fix(t, r + k);
+    }
+    float *x = (float *)malloc((size_t)SM * I * 4);
+    for (int i = 0; i < SM * I; i++) x[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f;
+    const int NI = O < 9000 ? O : 9000;   /* the id list: past the default grid of 16-row blocks */
+    int *ids = (int *)malloc((size_t)NI * 4);
+    for (int j = 0; j < NI; j++) ids[j] = j % 97 == 5 ? -1 : j % 89 == 7 ? O + j : (int)(rnd() % (unsigned)O);
+    bd_u32 *wd = NULL, *ud = NULL; float *xd = NULL, *yd = NULL; int *idd = NULL;
+    int ok = cudaMalloc(&wd, wbytes) == cudaSuccess && cudaMalloc(&xd, (size_t)SM * I * 4) == cudaSuccess &&
+             cudaMalloc(&yd, (size_t)SM * O * 4) == cudaSuccess && cudaMalloc(&idd, (size_t)NI * 4) == cudaSuccess;
+    if (ok && idot) {   /* the up matrix: the gate's rows a row on, the last the first (no second copy on the host) */
+        ok = cudaMalloc(&ud, wbytes) == cudaSuccess && cudaMemcpy(ud, w + (size_t)rw * 4, wbytes - (size_t)rw * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMemcpy((uint8_t *)ud + wbytes - (size_t)rw * 4, w, (size_t)rw * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    ok = ok && cudaMemcpy(wd, w, wbytes, cudaMemcpyHostToDevice) == cudaSuccess && cudaMemcpy(xd, x, (size_t)SM * I * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+         cudaMemcpy(idd, ids, (size_t)NI * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    /* the calls: S 1..4 for x quantized by each block, once, once in shared memory (the float forms: once,
+     * the mode does not apply), the GLU's 1 and 4 rows, the id list (the integer forms) */
+    const int npq = idot ? 4 : 1;   /* 0..2 the forced ways, 3 the launch's own choice (bd_gemv_preq at this grid) */
+    const int ncall = npq * SM + (idot ? 3 : 0);
+    const size_t per = (size_t)SM * O;
+    float *want = (float *)malloc(per * 4 * ncall), *got = (float *)malloc(per * 4);
+    auto run = [&](int c) -> int {
+        int okc = 1;
+        cudaMemset(yd, 0xff, per * 4);
+        if (c < npq * SM) {
+            int pq = c / SM, S = c % SM + 1;
+            g_bd_preq_force = pq == 3 ? -1 : pq > 0; g_bd_xs_force = pq == 3 ? -1 : pq == 2;
+            okc = bd_gemv_launch(yd, xd, wd, g_tab, fmt, I, O, rw, S, g_smem, 0, 0);
+        } else if (c < npq * SM + 2) {
+            okc = bd_glu_launch(yd, xd, wd, ud, g_tab, fmt, I, O, rw, c == npq * SM ? 1 : 4, g_smem, 0);
+        } else {
+            okc = bd_gemv_rows_launch(yd, xd, wd, g_tab, idd, fmt, I, O, rw, NI, g_smem, 0);
+        }
+        g_bd_preq_force = -1; g_bd_xs_force = -1;
+        return okc && cudaDeviceSynchronize() == cudaSuccess && cudaMemcpy(got, yd, per * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+    };
+    g_bd_blocks_force = 0;
+    for (int c = 0; c < ncall && ok; c++) { ok = run(c); memcpy(want + per * c, got, per * 4); }
+    if (!ok) { printf("FAIL grid %s [%d x %d]: a launch under the default grid failed (%s)\n", ref_name(t), O, I, cudaGetErrorString(cudaGetLastError())); fails++; }
+    int bad = 0;
+    for (int k = 0; k < ncap && ok; k++) {
+        g_bd_blocks_force = caps[k];
+        for (int c = 0; c < ncall; c++) {
+            const size_t n = c >= npq * SM + 2 ? (size_t)NI : c >= npq * SM ? (size_t)(c == npq * SM ? 1 : 4) * O : (size_t)(c % SM + 1) * O;
+            if (!run(c) || memcmp(got, want + per * c, n * 4)) {
+                if (bad++ < 4) printf("FAIL grid %s [%d x %d]: a cap of %d blocks, call %d differs from the default grid's bits\n", ref_name(t), O, I, caps[k], c);
+                fails++;
+            }
+        }
+    }
+    g_bd_blocks_force = -1;
+    /* the first row of x against the CPU at every 61st output, from the default grid's S 1 */
+    double worst = 0;
+    if (ok) {
+        int8_t *w8 = (int8_t *)malloc(I), *xq = (int8_t *)malloc(I);
+        float *sw = (float *)malloc((size_t)I / 16 * 4), *mw = (float *)malloc((size_t)I / 16 * 4), *dx = (float *)malloc((size_t)I / 32 * 4);
+        float *deq = (float *)malloc((size_t)I * 4);
+        int32_t *xs = (int32_t *)malloc((size_t)I / 16 * 4);
+        ref_quant(x, I, xq, dx, xs);
+        for (int o = 0; o < O && ok; o += 61) {
+            const uint8_t *r = w + (size_t)o * rw * 4;
+            double ref = 0, mag = 0;
+            if (idot) {
+                if (ref_unpack(t, r, I, w8, sw, mw)) { ok = 0; break; }
+                for (int b = 0; b < I / 32; b++) {
+                    double s0 = 0, s1 = 0, a0 = 0, a1 = 0;
+                    for (int i = 0; i < 16; i++) { s0 += w8[32 * b + i] * xq[32 * b + i]; a0 += fabs((double)w8[32 * b + i] * xq[32 * b + i]); }
+                    for (int i = 16; i < 32; i++) { s1 += w8[32 * b + i] * xq[32 * b + i]; a1 += fabs((double)w8[32 * b + i] * xq[32 * b + i]); }
+                    ref += (double)dx[b] * ((double)sw[2 * b] * s0 + (double)sw[2 * b + 1] * s1 - (double)mw[2 * b] * xs[2 * b] - (double)mw[2 * b + 1] * xs[2 * b + 1]);
+                    mag += fabs((double)dx[b]) * (fabs((double)sw[2 * b]) * a0 + fabs((double)sw[2 * b + 1]) * a1 +
+                                                  fabs((double)mw[2 * b] * xs[2 * b]) + fabs((double)mw[2 * b + 1] * xs[2 * b + 1]));
+                }
+            } else {
+                if (ref_dequant(t, r, deq, I)) { ok = 0; break; }
+                for (int i = 0; i < I; i++) { ref += (double)deq[i] * x[i]; mag += fabs((double)deq[i] * x[i]); }
+            }
+            double e = fabs(want[o] - ref) / (mag + 1e-6);
+            if (!(e <= worst)) worst = e;
+        }
+        free(w8); free(xq); free(sw); free(mw); free(dx); free(deq); free(xs);
+        if (!ok) { printf("FAIL grid %s: the CPU's decoder refused the row\n", ref_name(t)); fails++; }
+        else if (!(worst <= 2e-5)) { printf("FAIL grid %s [%d x %d]: %s off by %.3g of the terms' magnitude\n", ref_name(t), O, I, idot ? "integer form" : "float form", worst); fails++; }
+    }
+    if (ok && !bad) {
+        g_grid++;
+        printf("grid %-8s [%6d x %5d] %s: %d calls under %d caps, the default grid's bits; within %.2g of the CPU's\n", ref_name(t), O, I,
+               idot ? "integer form" : t == 30 ? "BF16 rows   " : "float form  ", ncall, ncap, worst);
+    }
+    cudaFree(wd); cudaFree(ud); cudaFree(xd); cudaFree(yd); cudaFree(idd);
+    free(w); free(x); free(ids); free(want); free(got);
+}
+/* BENCH_GRID: the decode shapes (1 row of x) under the default grid and under caps of n blocks a
+ * multiprocessor, us a call over BENCH_MB of copies (past L2), as check()'s bench */
+static void bench_grid(int t, int I, int O, const int *per_sm, int np, int sms) {
+    long rb = ref_row_bytes(t, I);
+    int bb = ref_block_bytes(t), be = ref_block_elems(t);
+    if (rb <= 0 || I % be) return;
+    const int rw = (int)((rb + 3) / 4), fmt = 100 + t;
+    const size_t mb = (size_t)O * rw * 4, wantb = (size_t)(getenv("BENCH_MB") ? atoi(getenv("BENCH_MB")) : 256) << 20;
+    uint8_t *w = (uint8_t *)calloc((size_t)O, (size_t)rw * 4);
+    for (int o = 0; o < O; o++) {
+        uint8_t *r = w + (size_t)o * rw * 4;
+        for (long i = 0; i < rb; i++) r[i] = (uint8_t)rnd();
+        for (long k = 0; k + bb <= rb; k += bb) bd_fix(t, r + k);
+    }
+    int ncopy = mb >= wantb ? 1 : (int)(wantb / mb);
+    bd_u32 *wb = NULL; float *xd = NULL, *yd = NULL;
+    while (ncopy > 1 && cudaMalloc(&wb, mb * ncopy) != cudaSuccess) { (void)cudaGetLastError(); ncopy /= 2; }
+    if (!wb && cudaMalloc(&wb, mb) != cudaSuccess) { printf("FAIL bench grid %s: no memory\n", ref_name(t)); fails++; free(w); return; }
+    for (int c = 0; c < ncopy; c++) cudaMemcpy((uint8_t *)wb + mb * c, w, mb, cudaMemcpyHostToDevice);
+    float *x = (float *)malloc((size_t)I * 4);
+    for (int i = 0; i < I; i++) x[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f;
+    cudaMalloc(&xd, (size_t)I * 4); cudaMalloc(&yd, (size_t)O * 4);
+    cudaMemcpy(xd, x, (size_t)I * 4, cudaMemcpyHostToDevice);
+    printf("  %-8s [%6d x %5d] %6.1f MB:", ref_name(t), O, I, (double)mb / 1e6);
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+    for (int k = -1; k < np; k++) {
+        g_bd_blocks_force = k < 0 ? 0 : per_sm[k] * sms;
+        double best = 1e9;
+        for (int rep = 0; rep < 5; rep++) {
+            cudaDeviceSynchronize(); cudaEventRecord(e0);
+            for (int j = 0; j < 40; j++) bd_gemv_launch(yd, xd, (const bd_u32 *)((uint8_t *)wb + mb * (j % ncopy)), g_tab, fmt, I, O, rw, 1, g_smem, 0, 0);
+            cudaEventRecord(e1); cudaEventSynchronize(e1);
+            float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+            if (ms / 40 * 1e-3 < best) best = ms / 40 * 1e-3;
+        }
+        if (k < 0) printf(" default %.1f us (%.0f GB/s)", best * 1e6, (double)mb / best / 1e9);
+        else printf(" %dx %.1f (%.0f)", per_sm[k], best * 1e6, (double)mb / best / 1e9);
+    }
+    printf("\n");
+    g_bd_blocks_force = -1;
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    cudaFree(wb); cudaFree(xd); cudaFree(yd); free(w); free(x);
+}
+
 /* the backend's matmuls (coli_cuda_tensor_gemm_async) with the chain's word: A (6 rows, the tensor
  * cores) quantizes x; x changes; B (float rows, which quantize nothing) without the word; A with it:
  * x quantized again (B forgot the scratch's x), the new x's bits */
@@ -828,6 +989,40 @@ int main(void) {
             printf("mmq: %d types and shapes, 1 to 8 rows on the tensor cores, each the bits of the GEMV's row alone\n", g_mmq);
             check_xq_forget();
         } else printf("mmq: SKIP (compute capability %d, the tensor cores' integer steps need 8)\n", major);
+    }
+    /* the GEMVs' grid (COLI_CUDA_BD_BLOCKS): its values, then the bits under caps from 1 block to past every row */
+    {
+        static const struct { const char *s; int n, x; } pv[] = {
+            {NULL, 0, 0}, {"", 0, 0}, {"0", 0, 0}, {"-3", 0, 0}, {"abc", 0, 0}, {"12y", 0, 0}, {"4xx", 0, 0}, {"x", 0, 0},
+            {"1048577", 0, 0}, {"1", 1, 0}, {"640", 640, 0}, {"1048576", 1048576, 0}, {"4x", 4, 1}, {"8X", 8, 1}};
+        int pok = 1;
+        for (auto &p : pv) { int x = -1, n = bd_gemv_cap_parse(p.s, &x); pok &= n == p.n && x == p.x; }
+        g_bd_blocks_force = 0; pok &= bd_gemv_cap() == BD_GEMV_BLOCKS;
+        g_bd_blocks_force = 77; pok &= bd_gemv_cap() == 77;
+        g_bd_blocks_force = -1;
+        check_ok(pok, "grid: COLI_CUDA_BD_BLOCKS's values (n, nx, refused ones the default) and the tests' cap");
+        cudaDeviceProp p;
+        int sms = cudaGetDeviceProperties(&p, 0) == cudaSuccess && p.multiProcessorCount > 0 ? p.multiProcessorCount : 46;
+        {   /* what a launch takes from COLI_CUDA_BD_BLOCKS here: "nx" against this card's SMs */
+            const char *e = getenv("COLI_CUDA_BD_BLOCKS");
+            int px = 0, pn = bd_gemv_cap_parse(e, &px);
+            long wl = !pn ? BD_GEMV_BLOCKS : px ? (long)pn * sms : pn;
+            const int want = wl > (1L << 20) ? 1 << 20 : (int)wl;
+            check_ok(bd_gemv_cap() == want, "grid: the environment's cap (COLI_CUDA_BD_BLOCKS) is the one a launch takes");
+            printf("grid: COLI_CUDA_BD_BLOCKS=%s: %d blocks a launch (%d for the float forms)\n", e ? e : "(unset)", bd_gemv_cap(), 4 * bd_gemv_cap());
+        }
+        const int caps[] = {1, 3, 64, sms, 2 * sms, 4 * sms, 8 * sms, 1 << 20};
+        const int gt[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 6, 7, 2, 3, 34, 35, 39, 40, 41, 1, 30};
+        const int gs[][2] = {{2560, 10240}, {10240, 2560}};
+        for (int t : gt) for (auto &sh : gs) check_grid(t, sh[0], sh[1], caps, (int)(sizeof caps / sizeof *caps));
+        for (int t : {14, 8}) check_grid(t, 2560, 248320, caps, (int)(sizeof caps / sizeof *caps));   /* an lm_head's rows */
+        printf("grid: %d types and shapes under %d caps (%d SMs), the default grid's bits\n", g_grid, (int)(sizeof caps / sizeof *caps), sms);
+        if (getenv("BENCH_GRID") && *getenv("BENCH_GRID") == '1') {
+            const int ps[] = {1, 2, 4, 6, 8, 16};
+            printf("BENCH grid (1 row of x; default, then n blocks a multiprocessor: us (GB/s)), %d SMs\n", sms);
+            for (int t : {12, 13, 14, 8, 23, 20, 16, 17, 22, 29, 40, 42, 30})
+                for (auto &sh : {std::pair<int, int>{2560, 10240}, {10240, 2560}, {2560, 248320}}) bench_grid(t, sh.first, sh.second, ps, 6, sms);
+        }
     }
     if (bench) {
         printf("BENCH (rows of x: 1 2 3 4)\n");
