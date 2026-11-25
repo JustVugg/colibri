@@ -1100,6 +1100,7 @@ static int q38cc_deltanet(Q38CChain *ch, Model *m, Layer *l, int i, int n, int c
 /* the n-gram rows of n tokens, in order, as q38_ple fills them (history and the verify's snapshot) */
 static void q38cc_ple_rows(Model *m, const int *ids, int c0, int n, float *emb) {
     Cfg *c = &m->c; int E = c->ngram_heads * c->ngram_head_dim;
+    q38_pla_need(m, c0 + n);   /* Q38_PLE_AHEAD: the chunk's rows from the thread, waited for here */
     for (int r = 0; r < n; r++) {
         int s = c0 + r; float *e = emb + (size_t)r * E;
         int64_t p1 = m->ple_history_len >= 1 ? m->ple_history[m->ple_history_len - 1] : c->eos_id;
@@ -1119,6 +1120,7 @@ static void q38cc_ple_rows(Model *m, const int *ids, int c0, int n, float *emb) 
             m->snap_ple_history_len[s] = m->ple_history_len;
         }
     }
+    q38_ple_trace_rows("PLEC", c0, n, emb, (size_t)n * E);
 }
 /* The PLE's key and value projections (BF16 in a GGUF) as BF16 rows, a GGUF's type 30, where the
  * backend has its kernels: half the bytes of the f32 copy the chain uploaded before. A decode step
@@ -3625,7 +3627,6 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
                 cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
             }
         }
-        if (c->ple_layer >= 0 && c->ple_layer < L) q38cc_ple_rows(m, ids, c0, n, ch->host_emb);
         /* the routed experts in the frame (the table before the frame): a decode-sized step's every
          * layer, a prompt chunk's layers whose experts are all on the device or in the host pool (a
          * layer with some on the host keeps the host's step there) */
@@ -3653,6 +3654,10 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
             continue;
         }
+        /* the chunk's PLE rows, here and not before the lanes: q38cc_chunk_lanes reads each lane's, and
+         * reading the chunk's too moved the two-token history twice (a row not prefetched then hashed
+         * from the chunk's end) */
+        if (c->ple_layer >= 0 && c->ple_layer < L) q38cc_ple_rows(m, ids, c0, n, ch->host_emb);
         if (dm && (sv = q38cc_srv_of(ch, m, n)))
             q38cc_srv_open(sv, (const volatile unsigned *)cc_ptr(ch->dm_dfl), (volatile unsigned *)cc_ptr(ch->dm_hfl),
                            (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy));

@@ -2106,6 +2106,12 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
     /* a chain's segment is the one its own layer-by-layer prompt takes (q38cc_lm_rows), so it
      * does the same work as when it took the prompt in one call */
     const int seg=coli_prompt_segment_rows(chain?8192:2048);
+    /* Q38_PLE_AHEAD: the PLE rows read on a thread while the forwards run (q38_pla_start), a quarter
+     * segment at a time and one segment ahead. The forwards are the ones below either way (their row
+     * counts pick the chain's path, and so its arithmetic); each waits for its rows chunk by chunk where
+     * it reads them (q38_pla_need), so the first one waits for its first piece, not its segment */
+    const int piece=(seg+3)/4;
+    if(np-from>piece)q38_pla_start(m,ids+from,np-from,piece,seg+piece,chain);
     if(!ctl){
         float *lo=NULL;
         for(int at=from;at<np;){
@@ -2115,6 +2121,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
             if(!next)break;
             at+=n;
         }
+        q38_pla_end();
         return lo;
     }
     Q38PinState *st=NULL;
@@ -2143,6 +2150,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
         }
         free(lo);lo=next;at+=n;
     }
+    q38_pla_end();
     q38_pin_state_free(st);
     return lo;
 }

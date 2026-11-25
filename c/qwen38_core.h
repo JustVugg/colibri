@@ -3041,11 +3041,159 @@ static void q38_ple_advise(Model *m,const int *ids,int S,int from) {
     for(int64_t i=(int64_t)from*c->ngram_heads;i<(int64_t)S*c->ngram_heads;i++)
         if(rows[i]>=0&&rows[i]<t->ne[1]) gguf_advise(q38_gg_ctx_of(t),t,rows[i]*rb,rb);
 }
+/* Q38_PLE_TRACE=<file> (a check, not a speed-up): every forward's first position and rows, and an
+ * FNV-1a of the PLE rows each reader took, appended as lines; two runs that must agree (Q38_PLE_AHEAD=1
+ * and 0) give the same file */
+static FILE *q38_ple_trace(void) {
+    static int init=0; static FILE *f=NULL;
+    if(!init){ init=1; const char *p=getenv("Q38_PLE_TRACE"); if(p&&*p) f=fopen(p,"a"); }
+    return f;
+}
+static unsigned long long q38_fnv(unsigned long long h,const void *p,size_t n) {
+    const unsigned char *b=(const unsigned char*)p;
+    for(size_t i=0;i<n;i++){ h^=b[i]; h*=0x100000001b3ULL; }
+    return h;
+}
+static void q38_ple_trace_rows(const char *tag,int c0,int n,const float *emb,size_t floats) {
+    FILE *f=q38_ple_trace();
+    if(!f) return;
+    fprintf(f,"%s %d %d %016llx\n",tag,c0,n,q38_fnv(0xcbf29ce484222325ULL,emb,floats*sizeof(float)));
+    fflush(f);
+}
+/* Q38_PLE_AHEAD: a served prompt of several forwards (q38_serve_prefill) has its PLE rows read on a
+ * thread of its own, a piece of `ch` rows at a time and at most `ahead` rows past the last forward's,
+ * while the forwards run; q38_ple_prefetch then waits for its rows and copies them instead of reading
+ * them in line with the card idle. The same rows, hashed from the prompt's start with the same
+ * simulated history: the same bytes as the in-line read. */
+typedef struct {
+    Model *m; const int *ids; int S, ch, ahead;
+    int64_t *rows; float **pc;      /* pc[k]: piece k's rows (positions k*ch..), freed once taken */
+    int done, taken, stop, failed;  /* under mx */
+    float *fb; int foff, fS;        /* the forward m->ple_pref is bound to (q38_pla_take): its buffer, first row, rows */
+    pthread_t th; pthread_mutex_t mx; pthread_cond_t cv; int live;
+} Q38PleAhead;
+static Q38PleAhead g_q38_pla = {.mx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+static void *q38_pla_main(void *arg) {
+    Q38PleAhead *a=(Q38PleAhead*)arg; Model *m=a->m; Cfg *c=&m->c;
+    const int nh=c->ngram_heads; const int64_t pr=c->ngram_head_dim;
+    for(int b=0,k=0;b<a->S;b+=a->ch,k++){
+        const int n=a->S-b<a->ch?a->S-b:a->ch;
+        pthread_mutex_lock(&a->mx);
+        while(!a->stop&&b+n-a->taken>a->ahead) pthread_cond_wait(&a->cv,&a->mx);
+        const int stop=a->stop;
+        pthread_mutex_unlock(&a->mx);
+        if(stop) break;
+        float *buf=(float*)malloc((size_t)n*nh*pr*sizeof(float));
+        if(buf){
+            const int64_t i0=(int64_t)b*nh,i1=(int64_t)(b+n)*nh;
+            if(m->ple_gg&&q38_env_bool("Q38_PLE_ADVISE",1)){   /* asked of the OS first, as q38_ple_prefetch does */
+                const gguf_tensor *t=m->ple_gg; const int64_t rb=gq_row_bytes(t->type,c->ngram_head_dim);
+                #pragma omp parallel for schedule(static)
+                for(int64_t i=i0;i<i1;i++) if(a->rows[i]>=0&&a->rows[i]<t->ne[1]) gguf_advise(q38_gg_ctx_of(t),t,a->rows[i]*rb,rb);
+            }
+            #pragma omp parallel for schedule(static)
+            for(int64_t i=i0;i<i1;i++) q38_ple_row(m,a->rows[i],buf+(i-i0)*pr);
+        }
+        pthread_mutex_lock(&a->mx);
+        a->pc[k]=buf; if(!buf) a->failed=1;
+        a->done=buf?b+n:a->S; pthread_cond_broadcast(&a->cv);
+        pthread_mutex_unlock(&a->mx);
+        if(!buf) break;
+    }
+    return NULL;
+}
+/* Q38_PLE_AHEAD=1 on, 0 off; unset, on for a GGUF's table read by a chain (`chain`), whose forwards
+ * leave the CPU idle */
+static int q38_pla_on(int chain){
+    const char *e=getenv("Q38_PLE_AHEAD");
+    return e&&*e ? *e=='1' : g_q38_gguf&&chain;
+}
+/* q38_serve_prefill's: ids[0..S) of one prompt read in forwards; 0 = not started (in-line reads) */
+static int q38_pla_start(Model *m,const int *ids,int S,int ch,int ahead,int chain) {
+    Cfg *c=&m->c; Q38PleAhead *a=&g_q38_pla;
+    if(!q38_pla_on(chain)||a->live||m->mux_rows||c->ple_layer<0||c->ngram_heads<1||c->ngram_head_dim<1||S<2||ch<1||
+       !q38_env_bool("Q38_PLE_PREFETCH",1)||S>INT_MAX/c->ngram_heads) return 0;
+    a->rows=(int64_t*)malloc((size_t)S*c->ngram_heads*sizeof(int64_t));
+    a->pc=(float**)calloc((size_t)(S+ch-1)/ch,sizeof(float*));
+    if(!a->rows||!a->pc){free(a->rows);free(a->pc);a->rows=NULL;a->pc=NULL;return 0;}
+    q38_ple_hash_rows(m,ids,S,a->rows);   /* the model's history at the prompt's start, simulated across it */
+    a->m=m; a->ids=ids; a->S=S; a->ch=ch; a->ahead=ahead>ch?ahead:ch; a->done=a->taken=a->stop=a->failed=0;
+    a->fb=NULL; a->foff=a->fS=0;
+    if(pthread_create(&a->th,NULL,q38_pla_main,a)){free(a->rows);free(a->pc);a->rows=NULL;a->pc=NULL;return 0;}
+    a->live=1;
+    return 1;
+}
+/* every exit of the prompt's loop: the thread stopped, its pieces freed */
+static void q38_pla_end(void) {
+    Q38PleAhead *a=&g_q38_pla;
+    if(!a->live) return;
+    pthread_mutex_lock(&a->mx); a->stop=1; pthread_cond_broadcast(&a->cv); pthread_mutex_unlock(&a->mx);
+    pthread_join(a->th,NULL);
+    for(int k=0;k<(a->S+a->ch-1)/a->ch;k++) free(a->pc[k]);
+    free(a->pc); free(a->rows); a->pc=NULL; a->rows=NULL; a->fb=NULL; a->live=0;
+}
+/* ids[0..S) inside the prompt the thread reads, a forward's (q38_ple_prefetch): m->ple_pref bound to
+ * the thread with no rows yet (1), the forward starting at once; q38_pla_need then copies its rows as
+ * the PLE layer reaches them. 0: read in line (outside the prompt, a multiplexed step, rows already
+ * handed over). The forwards are the ones dev runs: a forward's row count picks the chain's path
+ * (layer by layer above COLI_CUDA_CHAIN_ROWS, the pooled experts on the CPU up to
+ * COLI_CUDA_CHAIN_POOL_CPU_ROWS, the lanes), and so its arithmetic. */
+static int q38_pla_take(Model *m,const int *ids,int S) {
+    Q38PleAhead *a=&g_q38_pla;
+    if(!a->live||a->m!=m||m->mux_rows||ids<a->ids||ids+S>a->ids+a->S) return 0;
+    const int off=(int)(ids-a->ids); const size_t pp=(size_t)m->c.ngram_heads*m->c.ngram_head_dim;
+    pthread_mutex_lock(&a->mx);
+    const int again=off<a->taken;   /* rows a forward took already (their pieces may be freed) */
+    pthread_mutex_unlock(&a->mx);
+    if(again) return 0;
+    float *b=(float*)malloc((size_t)S*pp*sizeof(float));
+    if(!b) return 0;
+    pthread_mutex_lock(&a->mx);
+    a->taken=off;   /* the thread may read past a skipped part */
+    if(a->ahead<S+a->ch) a->ahead=S+a->ch;   /* room for this forward's rows whatever its size */
+    pthread_cond_broadcast(&a->cv);
+    pthread_mutex_unlock(&a->mx);
+    a->fb=b; a->foff=off; a->fS=S;
+    m->ple_pref=b; m->ple_pref_rows=0;
+    return 1;
+}
+/* every reader of m->ple_pref (q38_ple, the chains' ple_rows) before rows [0, upto) of the forward: the
+ * thread's rows copied in, waited for. A piece the thread could not read is read in line from the
+ * rows it hashed at the prompt's start, never from the live history: the rows the in-line read takes. */
+static void q38_pla_need(Model *m,int upto) {
+    Q38PleAhead *a=&g_q38_pla;
+    if(!a->live||!a->fb||m->ple_pref!=a->fb) return;
+    if(upto>a->fS) upto=a->fS;
+    const int have=m->ple_pref_rows;
+    if(upto<=have) return;
+    const int nh=m->c.ngram_heads; const int64_t pr=m->c.ngram_head_dim; const size_t pp=(size_t)nh*pr;
+    const int s0=a->foff+have, s1=a->foff+upto;
+    pthread_mutex_lock(&a->mx);
+    while(a->done<s1) pthread_cond_wait(&a->cv,&a->mx);   /* a failed piece ends it: done = S */
+    pthread_mutex_unlock(&a->mx);
+    float *b=a->fb;
+    for(int s=s0;s<s1;){   /* pieces done are not written again: copied outside the lock */
+        const int k=s/a->ch, e=(k+1)*a->ch<s1?(k+1)*a->ch:s1;
+        if(a->pc[k]) memcpy(b+(size_t)(s-a->foff)*pp,a->pc[k]+(size_t)(s-k*a->ch)*pp,(size_t)(e-s)*pp*sizeof(float));
+        else {
+            #pragma omp parallel for schedule(static)
+            for(int64_t i=(int64_t)s*nh;i<(int64_t)e*nh;i++) q38_ple_row(m,a->rows[i],b+(size_t)(i-(int64_t)a->foff*nh)*pr);
+        }
+        s=e;
+    }
+    pthread_mutex_lock(&a->mx);
+    for(int k=0;k<s1/a->ch;k++){free(a->pc[k]);a->pc[k]=NULL;}   /* the pieces wholly read */
+    a->taken=s1; pthread_cond_broadcast(&a->cv);
+    pthread_mutex_unlock(&a->mx);
+    m->ple_pref_rows=upto;
+}
 static void q38_ple_prefetch(Model *m,const int *ids,int S) {
     Cfg *c=&m->c;
+    g_q38_pla.fb=NULL;   /* a later buffer at the same address is not the thread's */
     free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
     if(c->ple_layer<0||S<1||c->ngram_heads<1||c->ngram_head_dim<1) return;
     if(!q38_env_bool("Q38_PLE_PREFETCH",1)) return;
+    if(q38_pla_take(m,ids,S)) return;
 
     int64_t per_row=c->ngram_head_dim, per_pos=(int64_t)c->ngram_heads*per_row;
     if(S>INT_MAX/c->ngram_heads) return;
@@ -3097,6 +3245,7 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
     int state_len=(c->ple_convk-1)*c->ngram_size; float *ring=m->PLE_conv_state;
     for(int base=0;base<S;base+=B){
         int rows=S-base<B?S-base:B;
+        q38_pla_need(m,base+rows);   /* Q38_PLE_AHEAD: the block's rows from the thread */
         for(int r=0;r<rows;r++){
             int s=base+r; float *emb=embs+(int64_t)r*E;
             int64_t *hist=m->ple_history; int *hlen=&m->ple_history_len;
@@ -3121,6 +3270,7 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
                 m->snap_ple_history_len[s]=m->ple_history_len;
             }
         }
+        q38_ple_trace_rows("PLE",base,rows,embs,(size_t)rows*E);
         q38_dense_matmul(m,keysb,embs,&l->ple_key,rows,E,W);q38_dense_matmul(m,valueb,embs,&l->ple_value,rows,E,H);
         for(int r=0;r<rows;r++){
             int s=base+r; const float *keys=keysb+(int64_t)r*W,*value=valueb+(int64_t)r*H;
@@ -5495,6 +5645,7 @@ static void q38_embed_row(Model *m,int id,int abs_pos,float *out) {
 static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits,float **streams) {
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
+    if(q38_ple_trace()){ fprintf(q38_ple_trace(),"FWD %d %d\n",pos_base,S); fflush(q38_ple_trace()); }
     float *hyper=falloc((int64_t)S*W);
     /* Le righe PLE partono ADESSO, non al layer 2 dove servono: sono note dagli
      * id dei token soltanto, e i due layer che le precedono danno il tempo di

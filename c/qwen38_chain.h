@@ -1105,6 +1105,7 @@ static int q38c_deltanet(Q38Chain *ch, Model *m, Layer *l, int i, int n, int c0,
 /* the n-gram rows of n tokens, in order, as q38_ple fills them (history and the verify's snapshot) */
 static void q38c_ple_rows(Model *m, const int *ids, int c0, int n, float *emb) {
     Cfg *c = &m->c; int E = c->ngram_heads * c->ngram_head_dim;
+    q38_pla_need(m, c0 + n);   /* Q38_PLE_AHEAD: the chunk's rows from the thread, waited for here */
     for (int r = 0; r < n; r++) {
         int s = c0 + r; float *e = emb + (size_t)r * E;
         int64_t p1 = m->ple_history_len >= 1 ? m->ple_history[m->ple_history_len - 1] : c->eos_id;
@@ -1124,6 +1125,7 @@ static void q38c_ple_rows(Model *m, const int *ids, int c0, int n, float *emb) {
             m->snap_ple_history_len[s] = m->ple_history_len;
         }
     }
+    q38_ple_trace_rows("PLEC", c0, n, emb, (size_t)n * E);
 }
 /* ns as q38c_deltanet's: the copies of the PLE ring after rows 0..ns-1 go to the ring
  * buffer's slots ple_slot[1+c0+r]. The convolution reads a row's gate and norm outputs
