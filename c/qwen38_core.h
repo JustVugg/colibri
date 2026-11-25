@@ -2785,15 +2785,23 @@ static void q38_ehit_mark(Model *m,int layer,int eid) {
 /* The slot a full layer cache gives up: the least recently used outside `protect`
  * (NULL: none protected), and before it the least recently used of those whose expert
  * the Vulkan tier holds (vkt_ram_first: no second copy in RAM when RAM is short).
- * -1 when every slot is protected. */
+ * -1 when every slot is protected.
+ * Q38_RAM_EXCL=1 (default off; g_q38_ram_excl = the CUDA tier's layers, 0 = off): the same
+ * for an expert the CUDA tier holds in VRAM now, so the RAM cache keeps the experts the
+ * card does not have. Which slot is given up never changes an expert's bytes. */
+static int g_q38_ram_excl;
+static unsigned long long g_q38_ram_excl_gave;   /* slots given up so */
 static int q38_victim(const LCache *lc,int layer,const uint8_t *protect){
-    int lru=-1,dev=-1;
+    int lru=-1,dev=-1,excl=layer<g_q38_ram_excl;
     for(int i=0;i<lc->n;i++){
         if(protect&&protect[i])continue;
-        if(lc->slots[i].eid>=0&&vkt_ram_first(layer,lc->slots[i].eid)){if(dev<0||lc->slots[i].used<lc->slots[dev].used)dev=i;continue;}
+        if(lc->slots[i].eid>=0&&(excl?qt_is_resident(layer,lc->slots[i].eid):vkt_ram_first(layer,lc->slots[i].eid))){
+            if(dev<0||lc->slots[i].used<lc->slots[dev].used)dev=i;
+            continue;
+        }
         if(lru<0||lc->slots[i].used<lc->slots[lru].used)lru=i;
     }
-    if(dev>=0){vkt_ram_gave();return dev;}
+    if(dev>=0){if(excl)g_q38_ram_excl_gave++;else vkt_ram_gave();return dev;}
     return lru;
 }
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
@@ -4194,8 +4202,15 @@ static int q38_tier_offer_chain(Model *m) {
     return 1;
 }
 #endif
+static void q38_ram_excl_init(int layers) {
+    if(q38_env_bool("Q38_RAM_EXCL",0)){
+        g_q38_ram_excl=layers;
+        fprintf(stderr,"[qwen38] Q38_RAM_EXCL=1: a full RAM layer gives up first a slot whose expert VRAM holds\n");
+    }
+}
 static void q38_tier_start(Model *m,int cap) {
     const char *on=getenv("COLI_CUDA");
+    g_q38_ram_excl=0;
     if(!on||on[0]!='1'||on[1])return;
     Cfg *c=&m->c;
     if(g_q38_gguf){
@@ -4228,6 +4243,7 @@ static void q38_tier_start(Model *m,int cap) {
         if(ok&&qt_init_gguf(L,c->experts,c->hidden,c->inter,cap,c->topk,tg,td,bg,bd,1)){
             atexit(qt_shutdown); g_q38_gguf_tier=1;
             fprintf(stderr,"[qtier] qwen38: the GGUF's experts on the CUDA tier as the file has them (RAM LRU %d/layer; experts go to VRAM as they get hot)\n",cap);
+            q38_ram_excl_init(L);
             q38_trunk_place_all(m);   /* the warm start (q38_tier_warm) once the history is loaded */
         }
         free(tg); free(td); free(bg); free(bd);
@@ -4278,6 +4294,7 @@ static void q38_tier_start(Model *m,int cap) {
     if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
         atexit(qt_shutdown);
         fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
+        q38_ram_excl_init(c->layers);
         q38_trunk_place_all(m);
         /* Q38_DN_GPU=1: where dnqkv, dnz and dnout of a DeltaNet layer all sit
          * on one card, the conv ring, the recurrence and the gated norm go there
