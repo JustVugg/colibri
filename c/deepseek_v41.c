@@ -4400,6 +4400,13 @@ static void hc_mixes(Model *m, const float *hc_fn, const float *scale, const flo
     free(mixes);
 }
 
+/* At single-token decode (n == 1), run coli_hc_post_team on the calling thread
+ * (team = 1) rather than waking the OpenMP team for a 4 x 5120 residual mix;
+ * coli_hc_post_team uses the same loop with if(team == 0), so the bits match. */
+static inline int v41_hc_post_team(int n) {
+    return n == 1 ? 1 : 0;
+}
+
 /* Run one chunk: the whole prompt on the first call, one token per call after.
  * Returns the logits of the last position (the caller owns the buffer). */
 /* `image_rows` (or NULL) is the aligner's output for a pending image and `image_at`
@@ -4693,9 +4700,9 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
         }
         spec_attention(m, stage, branch_in, block, start_pos, main_x, main_rows, branch_out);
         for (int i = 0; i < block; i++)
-            coli_hc_post(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
-                         residual + (size_t)i * hc * dim, post + (size_t)i * hc,
-                         comb + (size_t)i * hc * hc, hc, dim);
+            coli_hc_post_team(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
+                              residual + (size_t)i * hc * dim, post + (size_t)i * hc,
+                              comb + (size_t)i * hc * hc, hc, dim, v41_hc_post_team(block));
         memcpy(pre_mix, pre, (size_t)block * hc * sizeof(float));
 
         memcpy(residual, h, (size_t)block * hc * dim * sizeof(float));
@@ -4715,9 +4722,9 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
         moe_run_at(m, l, &sp->cache[stage], "mtp", stage, c->spec_routed, c->spec_activated,
                    branch_in, block, branch_out, 1);
         for (int i = 0; i < block; i++)
-            coli_hc_post(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
-                         residual + (size_t)i * hc * dim, post + (size_t)i * hc,
-                         comb + (size_t)i * hc * hc, hc, dim);
+            coli_hc_post_team(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
+                              residual + (size_t)i * hc * dim, post + (size_t)i * hc,
+                              comb + (size_t)i * hc * hc, hc, dim, v41_hc_post_team(block));
         memcpy(pre_mix, pre, (size_t)block * hc * sizeof(float));
     }
 
@@ -5064,9 +5071,9 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
         attention_run(m, layer, branch_in, n, start_pos, branch_out);
         trace("attn_out", layer, branch_out + (size_t)trace_row * dim, dim);
         for (int t = 0; t < n; t++)
-            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
-                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
-                         comb + (size_t)t * hc * hc, hc, dim);
+            coli_hc_post_team(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                              residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                              comb + (size_t)t * hc * hc, hc, dim, v41_hc_post_team(n));
         /* the attention's own `pre` collapses the FFN input */
         memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));
 
@@ -5092,9 +5099,9 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
             trace("ffn_out", layer, branch_out + (size_t)trace_row * dim, dim);
         }
         for (int t = 0; t < n; t++)
-            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
-                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
-                         comb + (size_t)t * hc * hc, hc, dim);
+            coli_hc_post_team(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                              residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                              comb + (size_t)t * hc * hc, hc, dim, v41_hc_post_team(n));
         memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));   /* the FFN's, for the next block */
         if (layer == tail_after && tail > 0 && tail < n)   /* v41_prefill_tail: the prompt's tail from here on */
             v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
@@ -5276,9 +5283,9 @@ static void forward_rows(Model *m, const int *slots, const int *ids, int n, floa
             attention_run(m, layer, branch_in + (size_t)t * dim, 1, pos[t], branch_out + (size_t)t * dim);
         }
         for (int t = 0; t < n; t++)
-            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
-                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
-                         comb + (size_t)t * hc * hc, hc, dim);
+            coli_hc_post_team(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                              residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                              comb + (size_t)t * hc * hc, hc, dim, v41_hc_post_team(n));
         memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));
         memcpy(residual, h, (size_t)n * hc * dim * sizeof(float));
         for (int t = 0; t < n; t++) {
@@ -5295,9 +5302,9 @@ static void forward_rows(Model *m, const int *slots, const int *ids, int n, floa
         }
         moe_run(m, layer, branch_in, n, branch_out);
         for (int t = 0; t < n; t++)
-            coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
-                         residual + (size_t)t * hc * dim, post + (size_t)t * hc,
-                         comb + (size_t)t * hc * hc, hc, dim);
+            coli_hc_post_team(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
+                              residual + (size_t)t * hc * dim, post + (size_t)t * hc,
+                              comb + (size_t)t * hc * hc, hc, dim, v41_hc_post_team(n));
         memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));
     }
     for (int t = 0; t < n; t++) {
