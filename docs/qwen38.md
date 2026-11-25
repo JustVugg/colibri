@@ -434,9 +434,17 @@ give the same bits. The sidecar is used only when asked for (the int4-g64 one
 is the only sidecar picked up unasked), refused when its `index.json` or a
 record disagrees with `config.json`, and an incomplete one is refused rather
 than falling back to FP8. The trunk, the shared expert and the MTP head stay
-the FP8 snapshot's. The CUDA and the Vulkan expert tiers do not take MXFP4
-experts yet: with `COLI_CUDA=1` or `COLI_VULKAN=1` they stay on the CPU, with a
-line saying so.
+the FP8 snapshot's. With `COLI_CUDA=1` the CUDA expert tier streams the records
+as the FP8 tier streams its experts (fmt 7 copy mode, `qt_init_mxfp4`): an
+expert the CPU computed is copied to the card when it is hot enough, at 3.2 MiB of
+VRAM against 6.0 MiB for an FP8 one, its nibbles and scale bytes as the record has
+them, and the card computes it with the grouped MXFP4 kernels; at start the most
+used experts of `.coli_usage` (or every layer's in turn) fill the card
+(`COLI_CUDA_TIER_WARM=0`: it fills as experts pass). The chain's own MoE kernels
+have no MXFP4 format: with `COLI_CUDA_CHAIN=1` the routed experts take the
+host's step, the tier's groups computing the residents. The Vulkan tier does not
+take MXFP4 experts: with `COLI_VULKAN=1` they stay on the CPU, with a line
+saying so.
 
 `make -C c qwen38-tiny-mxfp4-check` runs the engine on the fixture's sidecar
 through the single, batched, prompt-batch and mapped expert paths at caps 1, 2

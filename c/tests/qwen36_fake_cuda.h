@@ -16,7 +16,14 @@
  *   fake_upload_hook  - called at the start of every tensor upload, on the
  *                       uploader thread, with the tensor's fmt. A test that
  *                       needs an upload to take TIME (a real cudaMemcpy does)
- *                       sleeps here; NULL (the default) uploads instantly. */
+ *                       sleeps here; NULL (the default) uploads instantly.
+ *   fake_group_hook   - called by coli_cuda_expert_group_issue with the group's
+ *                       tensors, the row count and the input rows; its return
+ *                       value is what issue returns, and coli_cuda_expert_group_take
+ *                       then hands back fake_group_out. With fake_own_mx4 set, an
+ *                       fmt 7 upload keeps its own copy of the nibbles and scale
+ *                       bytes (the tier frees its staging after the call), so the
+ *                       hook can compute the experts. NULL: fake_issue_hook's. */
 #ifndef QWEN36_FAKE_CUDA_H
 #define QWEN36_FAKE_CUDA_H
 #include <math.h>
@@ -29,7 +36,7 @@
 
 #include "../backend_cuda.h"
 
-struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; const float *sc; };
+struct ColiCudaTensor { int fmt, I, O, device, gs, owned; const void *w; const float *sc; void *dw, *ds; size_t dwb, dsb; };
 
 static int fake_uploads;
 static int fake_overwrites;      /* coli_cuda_tensor_overwrite calls (in-place swaps) */
@@ -38,6 +45,13 @@ static int last_fmt = -1;
 static size_t last_bytes;
 static unsigned char captured[4096];
 static size_t captured_len;
+/* fmt=7: the ue8m0 scale bytes of the first three uploads (gate, up, down) */
+static unsigned char captured_e8[3][4096];
+static size_t captured_e8_len[3];
+static int fake_own_mx4;
+static int (*fake_group_hook)(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                              int count, const float *x) = NULL;
+static const float *fake_group_out;
 
 static int fake_ndev = 1;
 static size_t fake_free_bytes = 2ull << 30;    /* what coli_cuda_mem_info reports as free */
@@ -62,6 +76,12 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int
         if (q && s) { memcpy(q, w, (size_t)I * O); memcpy(s, sc, (size_t)O * sizeof(float)); n->w = q; n->sc = s; }
         else { free(q); free(s); n->w = NULL; n->sc = NULL; }
     }
+    if (fake_own_mx4 && fmt == 7 && w && sc) {   /* [O, I/2] nibbles and [O, I/32] scale bytes */
+        size_t wb = (size_t)O * ((I + 1) / 2), sb = (size_t)O * ((I + 31) / 32);
+        void *q = malloc(wb), *e = malloc(sb);
+        if (q && e) { memcpy(q, w, wb); memcpy(e, sc, sb); n->w = q; n->sc = (const float *)e; n->owned = 1; }
+        else { free(q); free(e); n->w = NULL; n->sc = NULL; }
+    }
     if (fake_dense_compute && fmt == 0 && w) {   /* f32 rows (the chain's b|a, gate rows): the caller frees its copy */
         float *f = (float *)malloc((size_t)I * O * sizeof(float));
         if (f) { memcpy(f, w, (size_t)I * O * sizeof(float)); n->w = f; n->sc = NULL; } else n->w = NULL;
@@ -75,6 +95,11 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int
         captured_len = last_bytes < sizeof captured ? last_bytes : sizeof captured;
         memcpy(captured, w, captured_len);
     }
+    if (fmt == 7 && sc && fake_uploads <= 3) {
+        size_t nb = (size_t)O * ((I + 31) / 32);
+        captured_e8_len[fake_uploads - 1] = nb < sizeof captured_e8[0] ? nb : sizeof captured_e8[0];
+        memcpy(captured_e8[fake_uploads - 1], sc, captured_e8_len[fake_uploads - 1]);
+    }
     return 1;
 }
 int coli_cuda_tensor_upload(ColiCudaTensor **t, const void *w, const float *s,
@@ -86,8 +111,13 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
     return upload_common(t, w, s, fmt, I, O, device, gs);
 }
 static int fake_tensor_frees;   /* tensors freed (a tier giving memory back) */
+#define FAKE_VIEWS 4096
+static ColiCudaTensor *fake_views[FAKE_VIEWS];
+static void fake_view_add(ColiCudaTensor *t) { for (int i = 0; i < FAKE_VIEWS; i++) if (!fake_views[i]) { fake_views[i] = t; return; } }
+static void fake_view_drop(ColiCudaTensor *t) { for (int i = 0; i < FAKE_VIEWS; i++) if (fake_views[i] == t) fake_views[i] = NULL; }
 void coli_cuda_tensor_free(ColiCudaTensor *t) {
-    if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
+    if (t && ((fake_dense_compute && t->fmt == 1) || t->owned)) { free((void *)t->w); free((void *)t->sc); }
+    if (t && t->dw) fake_view_drop(t);
     fake_tensor_frees += t != NULL;
     free(t);
 }
@@ -96,28 +126,57 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) {
  * ranges of that size, and fake_host_reg_max to refuse a page-lock once that many are held
  * (the driver's limit, 0: none); the page-locks taken and the releases are counted. */
 static int fake_host_reg_ok, fake_planar_rows, fake_host_regs, fake_host_unregs, fake_host_reg_max;
-static size_t fake_host_reg_bytes;
+static int fake_host_reg_fail;
+static size_t fake_host_reg_bytes, fake_host_reg_total;
 int coli_cuda_host_register(void *p, size_t bytes) {
-    (void)p;
-    int ok = fake_host_reg_ok && (!fake_host_reg_bytes || bytes == fake_host_reg_bytes) &&
+    int ok = p && fake_host_reg_ok && !fake_host_reg_fail && (!fake_host_reg_bytes || bytes == fake_host_reg_bytes) &&
              (!fake_host_reg_max || fake_host_regs - fake_host_unregs < fake_host_reg_max);
-    fake_host_regs += ok;
+    if (ok) { fake_host_regs++; fake_host_reg_total += bytes; }
     return ok;
 }
-void coli_cuda_host_unregister(void *p) { (void)p; fake_host_unregs++; }
+void coli_cuda_host_unregister(void *p) { if (p) fake_host_unregs++; }
 int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (void)I; return fake_planar_rows; }
 /* a GGUF's block formats: fake_block_elems for every fmt >= 100 (0: the backend takes none) */
 static int fake_block_elems;
 int coli_cuda_block_elems(int fmt) { return fmt >= 100 ? fake_block_elems : 0; }
-/* device memory (the tier's arena): host memory here; fake_alloc_fail refuses it */
-static int fake_alloc_fail;
-void *coli_cuda_pipe_alloc(int device, size_t bytes) { (void)device; return fake_alloc_fail ? NULL : calloc(1, bytes ? bytes : 1); }
-void coli_cuda_pipe_free(int device, void *p) { (void)device; free(p); }
+/* device memory (the tier's arena): host memory here; fake_alloc_fail refuses it;
+ * fake_pipe_max != 0 refuses larger allocs (fragmented card) */
+static int fake_alloc_fail, fake_pipe_allocs, fake_pipe_frees;
+static size_t fake_pipe_bytes, fake_pipe_max;
+void *coli_cuda_pipe_alloc(int device, size_t bytes) {
+    (void)device;
+    if (fake_alloc_fail || (fake_pipe_max && bytes > fake_pipe_max)) return NULL;
+    void *p = calloc(1, bytes ? bytes : 1);
+    if (p) { fake_pipe_allocs++; fake_pipe_bytes += bytes; }
+    return p;
+}
+void coli_cuda_pipe_free(int device, void *p) { (void)device; if (p) fake_pipe_frees++; free(p); }
 /* an arena's slot: the fake keeps the host bytes as an upload would */
 static int fake_upload_at;
 int coli_cuda_tensor_upload_at(ColiCudaTensor **t, void *dev, size_t cap, const void *w, int fmt, int I, int O, int device) {
     (void)dev; (void)cap; fake_upload_at++;
     return upload_common(t, w, NULL, fmt, I, O, device, 0);
+}
+/* QT_ARENA scaled-tensor view: upload_view records its slot; NULL tensor = probe */
+static size_t fake_wb(int fmt, int I, int O) { return fmt == 4 || fmt == 2 || fmt == 7 ? (size_t)O * ((I + 1) / 2) : (size_t)O * I; }
+static size_t fake_sb(int fmt, int I, int O, int gs) {
+    if (fmt == 7) return (size_t)O * ((I + 31) / 32);
+    if (fmt == 8) return (size_t)((O + 127) / 128) * ((I + 127) / 128) * sizeof(float);
+    if (fmt == 4 && gs > 0) return (size_t)O * ((I + gs - 1) / gs) * sizeof(float);
+    return (size_t)O * sizeof(float);
+}
+static int fake_upload_view_n, fake_upload_view_absent;
+int coli_cuda_tensor_upload_view(ColiCudaTensor **t, const void *w, const float *s, int fmt, int I, int O,
+                                 int device, int gs, void *dw, size_t dwb, void *ds, size_t dsb) {
+    if (!t) return !fake_upload_view_absent;
+    if (fake_upload_view_absent || !dw || !dwb || (fmt && fmt != 6 && (!ds || !dsb))) return 0;
+    if (!upload_common(t, w, s, fmt, I, O, device, gs)) return 0;
+    (*t)->dw = dw; (*t)->ds = ds; (*t)->dwb = dwb; (*t)->dsb = dsb;
+    if (w) { size_t nb = fake_wb(fmt, I, O); if (nb <= dwb) memcpy(dw, w, nb); }
+    if (s && ds) { size_t nb = fake_sb(fmt, I, O, gs); if (nb <= dsb) memcpy(ds, s, nb); }
+    fake_upload_view_n++;
+    fake_view_add(*t);
+    return 1;
 }
 /* a block-format matrix a range of rows at a time: the first range makes the tensor (one upload),
  * the rest go to it; nothing is kept (the fake computes no block format). _absent: an older
@@ -142,10 +201,55 @@ int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *w, const float *sc
     if (fake_upload_hook) fake_upload_hook(t->fmt);
     if (fake_dense_compute && t->fmt == 1 && t->w && t->sc) {
         memcpy((void *)t->w, w, (size_t)t->I * t->O); memcpy((void *)t->sc, sc, (size_t)t->O * sizeof(float));
+    } else if (t->owned) {
+        memcpy((void *)t->w, w, (size_t)t->O * ((t->I + 1) / 2)); memcpy((void *)t->sc, sc, (size_t)t->O * ((t->I + 31) / 32));
     } else { t->w = w; t->sc = sc; }
     fake_overwrites++;
     return 1;
 }
+/* QT_GPU_MISS: the async overwrite records the (pinned) source like the sync one;
+ * _absent = an older backend (probe 0), _fail_at = refuse the n-th call (1-based) */
+static int fake_async_overwrites, fake_async_absent, fake_async_fail_at;
+static int fake_host_allocs, fake_host_frees, fake_host_alloc_fail, fake_pipe_syncs;
+static int fake_copies, fake_copy_absent;
+static ColiCudaTensor *fake_async_last_t;
+static const void *fake_async_last_w; static const float *fake_async_last_sc;
+int coli_cuda_tensor_overwrite_async(ColiCudaTensor *t, const void *w, const float *sc) {
+    if (!t) return !fake_async_absent;
+    if (!w || ++fake_async_overwrites == fake_async_fail_at) return 0;
+    fake_async_last_t = t; fake_async_last_w = w; fake_async_last_sc = sc;
+    size_t wb = fake_wb(t->fmt, t->I, t->O), sb = fake_sb(t->fmt, t->I, t->O, t->gs);
+    if (t->dw && wb <= t->dwb) memcpy(t->dw, w, wb);
+    if (t->ds && sc && sb <= t->dsb) memcpy(t->ds, sc, sb);
+    if (t->owned) { memcpy((void *)t->w, w, wb); if (sc) memcpy((void *)t->sc, sc, sb); }
+    else { t->w = t->dw ? t->dw : w; t->sc = t->ds ? (const float *)t->ds : sc; }
+    return 1;
+}
+void *coli_cuda_host_alloc(size_t bytes) {
+    if (fake_host_alloc_fail) return NULL;
+    fake_host_allocs++;
+    return malloc(bytes);
+}
+void coli_cuda_host_free(void *p) { if (p) { fake_host_frees++; free(p); } }
+int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes) {
+    (void)device;
+    if (fake_copy_absent || !dst || !src) return 0;
+    memcpy(dst, src, bytes);
+    uintptr_t d0 = (uintptr_t)dst, d1 = d0 + bytes;
+    for (int i = 0; i < FAKE_VIEWS; i++) {
+        ColiCudaTensor *t = fake_views[i];
+        if (!t || (uintptr_t)t->dw < d0 || (uintptr_t)t->dw >= d1) continue;
+        const void *w = (const uint8_t *)src + ((uintptr_t)t->dw - d0);
+        const float *sc = t->ds && (uintptr_t)t->ds >= d0 && (uintptr_t)t->ds < d1 ? (const float *)((const uint8_t *)src + ((uintptr_t)t->ds - d0)) : t->sc;
+        if (t->owned) {
+            size_t wb = fake_wb(t->fmt, t->I, t->O), sb = fake_sb(t->fmt, t->I, t->O, t->gs);
+            memcpy((void *)t->w, w, wb); if (sc) memcpy((void *)t->sc, sc, sb);
+        } else { t->w = t->dw; t->sc = t->ds ? (const float *)t->ds : sc; }
+    }
+    fake_copies++;
+    return 1;
+}
+int coli_cuda_pipe_sync(int device) { (void)device; fake_pipe_syncs++; return 1; }
 int coli_cuda_available_device_count(void) { return fake_ndev; }
 int coli_cuda_device_count(void) { return fake_ndev; }
 int coli_cuda_init(const int *d, int n) { (void)d; (void)n; return 1; }
@@ -160,11 +264,20 @@ int coli_cuda_mem_info(int device, size_t *freeb, size_t *total) {
 int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const *u,
                                  ColiCudaTensor *const *d, const int *rows,
                                  int count, const float *x) {
-    (void)u; (void)d; (void)rows;
+    (void)rows;
+    if (fake_group_hook) return fake_group_hook(g, u, d, count, x);
     if (fake_issue_hook) return fake_issue_hook(count > 0 ? g[0]->device : -1, count, x);
     return 0;
 }
-const float *coli_cuda_expert_group_take(int device) { (void)device; return NULL; }
+const float *coli_cuda_expert_group_take(int device) { (void)device; return fake_group_hook ? fake_group_out : NULL; }
+/* QT_GPU_MISS_FOLD: absent (0, the probe too) unless a test sets the hook */
+static int (*fake_append_hook)(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                               const int *rows, int count, const float *x);
+int coli_cuda_expert_group_append(ColiCudaTensor *const *g, ColiCudaTensor *const *u,
+                                  ColiCudaTensor *const *d, const int *rows,
+                                  int count, const float *x) {
+    return fake_append_hook ? fake_append_hook(g, u, d, rows, count, x) : 0;
+}
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d, double *kernel, double *d2h) {
     if (calls) *calls = 0; if (experts) *experts = 0; if (rows) *rows = 0;

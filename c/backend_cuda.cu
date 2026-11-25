@@ -77,6 +77,7 @@ struct ColiCudaTensor {
     size_t scale_count;        /* scale elements: ue8m0 bytes for fmt=7, floats otherwise */
     int tracked;
     int weights_owned;
+    int view;                  /* coli_cuda_tensor_upload_view: weights and scales are the caller's */
 #ifdef COLI_ANS
     size_t archive_bytes;
     int compressed;
@@ -155,6 +156,7 @@ typedef struct {
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
+    int group_pending_rows,group_pending_count,group_pending_mx4;   /* its rows and entries; MXFP4: its I (else 0), for coli_cuda_expert_group_append */
     void *moe_tab; size_t moe_tab_cap; float *moe_host; size_t moe_host_cap;   /* group_moe_launch's table and row ids */
     bd_u32 *bdtab;          /* blockdec_host.h's table, made with the first block-format tensor */
     size_t smem_optin;      /* shared bytes a block may ask for (the block GEMVs past 48 KiB) */
@@ -2170,6 +2172,9 @@ extern "C" int coli_cuda_block_elems(int fmt) { return bd_file_row_bytes(fmt, 25
  * thread_local so the widely-wired upload signature (and the Windows DLL ABI)
  * stays untouched. pin_load uploads in parallel, hence thread_local. */
 static thread_local int g_upload_gs = 0;
+/* coli_cuda_tensor_upload_view's destination, the same way (NULL: cudaMalloc) */
+static thread_local void *g_upload_view_w = nullptr, *g_upload_view_s = nullptr;
+static thread_local size_t g_upload_view_wb = 0, g_upload_view_sb = 0;
 extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
                                          const void *weights, const float *scales,
                                          int fmt, int I, int O, int device, int gs);
@@ -2211,14 +2216,17 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         t->ng = (int)fp8_nblk(I);
         t->scale_count = (size_t)fp8_nblk(O) * (size_t)t->ng;
     }
-    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
+    if (g_upload_view_w) {
+        if (t->weight_bytes > g_upload_view_wb) { coli_cuda_tensor_free(t); return 0; }
+        t->weights = g_upload_view_w; t->view = 1;
+    } else if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
         coli_cuda_tensor_free(t);
         return 0;
     }
     /* Ownership is a fact of the allocation, not the copy: set it BEFORE the
      * memcpy, or a failed H2D upload frees the tensor while weights_owned is
      * still 0 and free()'s ownership gate leaks the device buffer. */
-    t->weights_owned=1;
+    t->weights_owned=!t->view;
     if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
         coli_cuda_tensor_free(t);
         return 0;
@@ -2227,7 +2235,11 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
     if (fmt && fmt != 6) {
-        if (!cuda_ok(cudaMalloc(&t->scales, tensor_scale_bytes(t)), "scale allocation") ||
+        if (t->view) {
+            if (!g_upload_view_s || tensor_scale_bytes(t) > g_upload_view_sb) { coli_cuda_tensor_free(t); return 0; }
+            t->scales = static_cast<float *>(g_upload_view_s);
+        }
+        if ((!t->view && !cuda_ok(cudaMalloc(&t->scales, tensor_scale_bytes(t)), "scale allocation")) ||
             !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
             return 0;
@@ -2249,11 +2261,23 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
     g_upload_gs = 0;
     return r;
 }
+extern "C" int coli_cuda_tensor_upload_view(ColiCudaTensor **tensor,
+        const void *weights, const float *scales, int fmt, int I, int O, int device, int gs,
+        void *dev_w, size_t dev_w_bytes, void *dev_s, size_t dev_s_bytes){
+    if (!tensor) return 1;                  /* probe */
+    if (*tensor || !dev_w || fmt >= 100) return 0;   /* never cached-tensor; block formats use upload_at */
+    g_upload_gs = gs>0 ? gs : 0;
+    g_upload_view_w = dev_w; g_upload_view_wb = dev_w_bytes; g_upload_view_s = dev_s; g_upload_view_sb = dev_s_bytes;
+    int r = coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device);
+    g_upload_gs = 0;
+    g_upload_view_w = g_upload_view_s = nullptr; g_upload_view_wb = g_upload_view_sb = 0;
+    return r;
+}
 
 extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights, const float *scales) {
     /* a block-format tensor: its own buffer or an arena's slot (coli_cuda_tensor_upload_at) */
     if (t && weights && t->weights && t->fmt >= 100) { DeviceContext *c = find_ctx(t->device); return select_ctx(c) && bd_rows_copy(t, weights, 0); }
-    if (!t || !weights || !t->weights || !t->weights_owned) return 0;
+    if (!t || !weights || !t->weights || !(t->weights_owned || t->view)) return 0;
 #ifdef COLI_ANS
     if (t->compressed) return 0;            /* archive bytes, not a weight buffer of this size */
 #endif
@@ -2270,6 +2294,39 @@ extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights
     if (t->fmt && t->fmt != 6 &&
         !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale overwrite")) return 0;
     return upload_settled("tensor overwrite");
+}
+/* On ctx->stream, where coli_cuda_expert_group_issue launches: the group kernel
+ * runs after these copies without a host sync. cudaMemcpyDefault: the source may
+ * also be device memory of this card (QT_GPU_MISS_PROMOTE copies a transient slot
+ * into a resident's), unified addressing tells the two apart. */
+extern "C" int coli_cuda_tensor_overwrite_async(ColiCudaTensor *t, const void *weights, const float *scales) {
+    if (!t) return 1;                       /* probe */
+    if (!weights || !t->weights || !(t->weights_owned || t->view)) return 0;
+#ifdef COLI_ANS
+    if (t->compressed) return 0;
+#endif
+    if (t->fmt && t->fmt != 6 && (!scales || !t->scales)) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(t->weights, weights, t->weight_bytes, cudaMemcpyDefault, ctx->stream), "tensor overwrite async")) return 0;
+    if (t->fmt==2||t->fmt==4) {
+        offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256,0,ctx->stream>>>((uint8_t*)t->weights,t->weight_bytes);
+        if (!cuda_ok(cudaGetLastError(),"int4 weight conversion")) return 0;
+    }
+    if (t->fmt && t->fmt != 6 &&
+        !cuda_ok(cudaMemcpyAsync(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyDefault, ctx->stream), "scale overwrite async")) return 0;
+    return 1;
+}
+/* cudaMallocHost memory is portable across devices under unified addressing */
+extern "C" void *coli_cuda_host_alloc(size_t bytes) {
+    void *p = nullptr;
+    return cuda_ok(cudaMallocHost(&p, bytes), "pinned host allocation") ? p : nullptr;
+}
+extern "C" void coli_cuda_host_free(void *p) { if (p) cudaFreeHost(p); }
+extern "C" int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!dst || !src || !select_ctx(ctx)) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, ctx->stream), "copy async");
 }
 
 #ifdef COLI_ANS
@@ -3344,6 +3401,80 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                 "expert group issue download")) return 0;
     ctx->group_pending=1; ctx->group_pending_bytes=xb;
+    ctx->group_pending_rows=total; ctx->group_pending_count=count; ctx->group_pending_mx4=all_mx4?I:0;
+    { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+      int index=(int)(ctx-g_ctx);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
+      g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
+      g_device_group_rows[index]+=(uint64_t)total; }
+    return 1;
+}
+
+/* A second group behind the one in flight on a device (QT_GPU_MISS_FOLD: a layer's routed
+ * misses behind its hits), MXFP4 experts only: its rows follow the pending group's in x and
+ * y and its kernels queue on the stream with no host wait; coli_cuda_expert_group_take then
+ * returns the pending group's rows followed by these. Each row is computed by
+ * coli_cuda_expert_group_issue's kernels from the same inputs, so its bits are the same.
+ * 0 = nothing appended (no MXFP4 group pending, more than 32 rows in all, an allocation
+ * failure): the pending group's rows are still its take's, and the caller takes it and
+ * issues as before. All-NULL arguments: the probe, 1. */
+extern "C" int coli_cuda_expert_group_append(ColiCudaTensor *const *gates,
+                                               ColiCudaTensor *const *ups,
+                                               ColiCudaTensor *const *downs,
+                                               const int *rows, int count,
+                                               const float *x) {
+    if (!gates && !ups && !downs && !rows && !x) return 1;
+    if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64 || !gates[0]) return 0;
+    int device=gates[0]->device,D=gates[0]->I,I=gates[0]->O,total=0;
+    DeviceContext *ctx=find_ctx(device);
+    if(!ctx||!ctx->group_pending||ctx->group_pending_mx4!=I) return 0;
+    int r0=ctx->group_pending_rows,c0=ctx->group_pending_count;
+    if(c0+count>64) return 0;
+    GroupDesc host[64];
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
+        if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
+           g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D||g->fmt!=7||u->fmt!=7||d->fmt!=7) return 0;
+#ifdef COLI_ANS
+        if(g->compressed||u->compressed||d->compressed) return 0;
+#endif
+        host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
+                 g->fmt,u->fmt,d->fmt,rows[c],r0+total,
+                 g->gs,u->gs,d->gs};
+        total+=rows[c];
+    }
+    size_t xb=(size_t)total*D*sizeof(float),x0=(size_t)r0*D*sizeof(float);
+    if(r0+total>32||ctx->group_pending_bytes!=x0||!select_ctx(ctx)) return 0;
+    if(ctx->x_cap<x0+xb||ctx->y_cap<x0+xb||ctx->gate_cap<(size_t)(r0+total)*I*sizeof(float)||
+       ctx->host_x_cap<x0+xb||ctx->host_y_cap<x0+xb||
+       ctx->group_desc_cap<(size_t)(c0+count)*sizeof(GroupDesc)){
+        /* The scratch buffers were sized by smaller groups and cannot grow under a group in
+         * flight: wait for the pending group once, keep its rows, and size everything for a
+         * full group (32 rows, 64 entries) so no later append comes here. host_y first: after
+         * a failure it either holds the pending rows or is NULL, and the take says so. */
+        if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group append regrow")) return 0;
+        std::vector<float> keep(ctx->host_y,ctx->host_y+(size_t)r0*D);
+        size_t fx=(size_t)32*D*sizeof(float),fi=(size_t)32*I*sizeof(float);
+        if(!reserve_pinned(&ctx->host_y,&ctx->host_y_cap,fx)) return 0;
+        std::memcpy(ctx->host_y,keep.data(),x0);
+        if(!reserve_pinned(&ctx->host_x,&ctx->host_x_cap,fx)||
+           !reserve(&ctx->x,&ctx->x_cap,fx)||!reserve(&ctx->y,&ctx->y_cap,fx)||
+           !reserve(&ctx->gate,&ctx->gate_cap,fi)||
+           !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,64*sizeof(GroupDesc))) return 0;
+    }
+    GroupDesc *dev=(GroupDesc*)ctx->group_desc+c0;
+    float *hx=ctx->host_x+(size_t)r0*D,*px=ctx->x+(size_t)r0*D,*py=ctx->y+(size_t)r0*D;
+    std::memcpy(hx,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(dev,host,(size_t)count*sizeof(GroupDesc),
+                                cudaMemcpyHostToDevice,ctx->stream),
+                "expert group append descriptors")||
+       !cuda_ok(cudaMemcpyAsync(px,hx,xb,cudaMemcpyHostToDevice,ctx->stream),
+                "expert group append upload")) return 0;
+    mx4_group_launch(ctx,dev,I,D,count);
+    if(!cuda_ok(cudaGetLastError(),"expert group append launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y+(size_t)r0*D,py,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                "expert group append download")) return 0;
+    ctx->group_pending_rows=r0+total; ctx->group_pending_count=c0+count; ctx->group_pending_bytes=x0+xb;
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       int index=(int)(ctx-g_ctx);
       g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
@@ -3565,7 +3696,7 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
     if (tensor->weights&&tensor->weights_owned) cudaFree(tensor->weights);
-    if (tensor->scales) cudaFree(tensor->scales);
+    if (tensor->scales && !tensor->view) cudaFree(tensor->scales);
     for(int i=0;i<tensor->ragged_count;i++)ragged_kv_clear(&tensor->ragged[i]);
     std::free(tensor);
 }

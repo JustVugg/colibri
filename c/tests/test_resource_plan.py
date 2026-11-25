@@ -1702,6 +1702,44 @@ memInfo.free:                     23.50 GB (97%)
             self.assertNotIn("qwen38_int4_experts", partial["model"])
             self.assertEqual(partial["model"]["per_cap_bytes"], 384)
 
+    def test_qwen38_mxfp4_sidecar_plans_the_cuda_tier(self):
+        # qwen38's CUDA tier streams experts-mxfp4/'s records (fmt 7 copy mode): a GPU is
+        # planned, the VRAM tier counted in records (2,611,200 bytes on the release) and the
+        # engine given COLI_CUDA. Under the Vulkan tier, which takes no mxfp4 record, the
+        # experts stay on the CPU as every other sidecar's do.
+        self.write_qwen38()
+        record = 2611200
+        sidecar = self.model / "experts-mxfp4"
+        sidecar.mkdir()
+        (sidecar / "index.json").write_text(json.dumps(
+            {"format": "colibri.qwen38.experts-mxfp4", "version": 1, "complete": True,
+             "layers": 2, "experts": 2, "hidden_size": 8, "moe_intermediate_size": 4,
+             "record_bytes": record}))
+        gpu = {"index": 0, "name": "card", "total_bytes": 32 * GB, "free_bytes": 30 * GB}
+        kwargs = dict(context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[gpu])
+        with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "mxfp4"}):
+            for name in ("Q38_EXPERT_INT4", "COLI_VULKAN", "COLI_CUDA"):
+                os.environ.pop(name, None)
+            plan = build_plan(self.model, gpu_indices=[0], **kwargs)
+            model, vram = plan["model"], plan["tiers"]["vram"]
+            self.assertTrue(model["qwen38_int4_experts"])
+            self.assertEqual((model["qwen38_lowbit"], model["typical_expert_bytes"], model["per_cap_bytes"]),
+                             ("mxfp4", record, record))
+            self.assertEqual([device["index"] for device in vram["devices"]], [0])
+            self.assertEqual(vram["expert_capacity"], 2)   # every expert of the sparse layer fits
+            self.assertEqual(vram["hot_expert_bytes"], 2 * record)
+            self.assertEqual(environment_for_plan(plan).get("COLI_CUDA"), "1")
+            # no GPU named: the card is planned all the same, as for the FP8 experts
+            self.assertEqual(build_plan(self.model, **kwargs)["tiers"]["vram"]["expert_capacity"], 2)
+            os.environ["COLI_VULKAN"] = "1"
+            with self.assertRaisesRegex(ValueError, r"mxfp4 experts \(experts-mxfp4/\) run on the CPU"):
+                build_plan(self.model, gpu_indices=[0], vulkan={"type": "discrete"}, **kwargs)
+            vk = build_plan(self.model, vulkan={"type": "discrete"}, **kwargs)
+            self.assertEqual(vk["tiers"]["vram"]["devices"], [])
+            os.environ["COLI_CUDA"] = "1"   # both built: the CUDA tier wins, as in the engine
+            self.assertEqual(build_plan(self.model, gpu_indices=[0], vulkan={"type": "discrete"},
+                                        **kwargs)["tiers"]["vram"]["expert_capacity"], 2)
+
     def test_qwen38_int2_sidecar_is_priced_when_the_engine_takes_it(self):
         # Q38_EXPERT_INT2=1 makes qwen38 load experts-int2g32/ (int2_g32.h) instead of
         # the int4 one: its records are what the cache holds, and nothing else

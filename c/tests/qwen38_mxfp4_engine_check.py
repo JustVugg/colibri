@@ -9,8 +9,9 @@ sidecar through every expert path. It checks:
     index.json for another geometry, an incomplete conversion, a record whose
     tensors are not the layout's, no sidecar at all, and an unknown
     Q38_EXPERT_LOWBIT;
-  * under COLI_CUDA=1 the engine says the expert tier does not take MXFP4 yet
-    and still reproduces ref.json on the CPU.
+  * under COLI_CUDA=1 the engine reproduces ref.json and says where the experts
+    went: the CUDA tier's fmt 7 copy mode where a card and its backend are there,
+    else the CPU (a build without CUDA, or no device or backend library).
 
   python3 tests/qwen38_mxfp4_engine_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38 \\
       --mxfp4 logits/mxfp4.f32 --fp8 logits/fp8.f32
@@ -72,8 +73,10 @@ def main():
     check(cos >= 0.99999, f"last logits of the MXFP4 run against the FP8 run's: cosine {cos:.8f} >= 0.99999")
 
     rc, out, err = run(engine, model, Q38_EXPERT_LOWBIT="mxfp4", COLI_CUDA="1")
-    check(rc == 0 and "Matching tokens: 8/8" in out and "the mxfp4 experts stay on the CPU" in err,
-          "COLI_CUDA=1: the tier declines the MXFP4 experts, the CPU reproduces ref.json", err)
+    tier = "mxfp4 expert tier on" in err
+    check(rc == 0 and "Matching tokens: 8/8" in out and (tier or "the mxfp4 experts stay on the CPU" in err),
+          "COLI_CUDA=1: ref.json reproduced, the experts " + ("on the CUDA tier" if tier else "on the CPU (no tier here)"),
+          err)
     rc, _, err = run(engine, model, Q38_EXPERT_LOWBIT="mxfp5")
     check(rc != 0 and "mxfp4" in err, "an unknown Q38_EXPERT_LOWBIT is refused, naming mxfp4", err)
 

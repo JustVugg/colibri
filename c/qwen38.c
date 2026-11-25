@@ -2009,7 +2009,8 @@ typedef struct {
 
 static QtCounters q38_qt_delta(const QtCounters *after,const QtCounters *before){
     QtCounters d={after->hits-before->hits,after->miss-before->miss,after->uploads-before->uploads,
-                  after->swaps-before->swaps,after->q_full_skips-before->q_full_skips};
+                  after->swaps-before->swaps,after->q_full_skips-before->q_full_skips,
+                  after->gpu_miss-before->gpu_miss,after->gpu_miss_fallback-before->gpu_miss_fallback};
     return d;
 }
 
@@ -2031,6 +2032,11 @@ static int q38_format_expert_split(char *out,size_t capacity,const char *id,cons
                     (unsigned long long)(tier[0].uploads+tier[1].uploads),
                     (unsigned long long)(tier[0].swaps+tier[1].swaps),
                     (unsigned long long)(tier[0].q_full_skips+tier[1].q_full_skips));
+    /* QT_GPU_MISS: CPU misses the device computed after all; absent with the switch off */
+    if(n>=0&&(size_t)n<capacity&&tier_on&&(tier[0].gpu_miss|tier[1].gpu_miss|tier[0].gpu_miss_fallback|tier[1].gpu_miss_fallback))
+        n+=snprintf(out+n,capacity-(size_t)n," | gpu_miss %llu, fallback %llu",
+                    (unsigned long long)(tier[0].gpu_miss+tier[1].gpu_miss),
+                    (unsigned long long)(tier[0].gpu_miss_fallback+tier[1].gpu_miss_fallback));
     if(n>=0&&(size_t)n+1<capacity){out[n++]='\n';out[n]=0;return n;}
     return -1;
 }
@@ -3834,7 +3840,7 @@ int main(int argc, char **argv) {
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     if(is_ref){g_q38_mtp_oracle=full;g_q38_mtp_oracle_n=nfull;}   /* Q38_MTP_FORCE=accept|mixed */
     int64_t hist = q38_telemetry_init(snap, &m);
-    if (g_q38_gguf_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
+    if (g_q38_gguf_tier || g_q38_mx4_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
 #ifdef COLI_CUDA
     if (g_cuda_chain) q38cc_dm_recheck(&m);   /* every expert on the card: the frame takes them, whatever the RAM cache's size */
     if (g_cuda_chain) q38cc_pool_init(&m);    /* the experts the card leaves, in RAM it reads over the bus */
@@ -3968,6 +3974,8 @@ int main(int argc, char **argv) {
     qt_stats();   /* VRAM tier hits/misses/swaps, if on */
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
+    if (g_q38_async_miss_layers && m.async_miss)   /* process total: a test runs several models */
+        fprintf(stderr, "Q38_ASYNC_MISS: %llu decode layers staged their misses as the reads landed\n", g_q38_async_miss_layers);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
 #ifdef COLI_CUDA
     q38cc_report(&m);

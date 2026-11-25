@@ -172,6 +172,21 @@ COLI_CUDA_DLLEXPORT int  coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, 
  * async expert groups. Optional in the DLL loader: 0 from a backend that
  * predates it (or on any failure), and the caller frees and uploads as before. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const void *weights, const float *scales);
+/* The same with cudaMemcpyAsync on the device's expert-group stream (QT_GPU_MISS):
+ * a group issued after it reads the new bytes, stream-ordered, with no host sync.
+ * weights/scales must be pinned (coli_cuda_host_alloc) or memory of the same card,
+ * and stay untouched until that stream has passed the copy (the caller's next group
+ * take). int4 (fmt 2/4) is converted after the copy: a device source must hold the
+ * container's bytes, not an uploaded tensor's. tensor == NULL
+ * is the probe: 1 from a backend that has it and the two host calls below.
+ * Optional in the DLL loader: 0 from an older one. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_overwrite_async(ColiCudaTensor *tensor, const void *weights, const float *scales);
+COLI_CUDA_DLLEXPORT void *coli_cuda_host_alloc(size_t bytes);   /* pinned host memory, NULL on failure */
+COLI_CUDA_DLLEXPORT void coli_cuda_host_free(void *p);
+/* bytes from pinned host memory (or memory of the same card) to device memory of `device`,
+ * on its expert-group stream: a group issued after it reads them, as with
+ * coli_cuda_tensor_overwrite_async. 0 on failure; optional in the DLL loader. */
+COLI_CUDA_DLLEXPORT int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes);
 /* Host memory the device copies from at the bus's full rate (the qwen36 tier's RAM cache,
  * staged for a prompt chunk's experts): coli_cuda_host_register page-locks bytes at p
  * (portable to every context), 0 on failure (the memory stays as it was);
@@ -195,6 +210,15 @@ COLI_CUDA_DLLEXPORT int coli_cuda_block_elems(int fmt);
  * (a 576 KiB matrix took 1 MiB) and none of its synchronisation. Optional in the DLL loader. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights,
                                                    int fmt, int I, int O, int device);
+/* coli_cuda_tensor_upload(_g) into device memory the caller owns (dev_w for the
+ * weights, dev_s for the scales, of the given capacities; e.g. a slot of a
+ * coli_cuda_pipe_alloc slab): one cudaMalloc per slab instead of two per matrix,
+ * each rounded up by the allocator. The tensor frees neither; overwrite works.
+ * gs as upload_g (fmt=4). tensor == NULL is the probe: 1 from a backend that has
+ * it. Optional in the DLL loader: 0 from an older one. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_view(ColiCudaTensor **tensor,
+        const void *weights, const float *scales, int fmt, int I, int O, int device, int gs,
+        void *dev_w, size_t dev_w_bytes, void *dev_s, size_t dev_s_bytes);
 #ifdef COLI_ANS
 /* Experimental Linux-only GPU-resident entropy tier. The archive remains in
  * VRAM and is decoded into per-device scratch immediately before a grouped
@@ -275,6 +299,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_issue(ColiCudaTensor *const *gate
                                ColiCudaTensor *const *downs,
                                const int *rows, int count, const float *x);
 COLI_CUDA_DLLEXPORT const float *coli_cuda_expert_group_take(int device);
+/* A second MXFP4 group queued behind the one in flight on its device, no host wait; the
+ * take then returns the pending rows followed by these. 0 = not appended (the caller takes
+ * and issues as before); all-NULL arguments probe for the entry point. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_append(ColiCudaTensor *const *gates,
+                               ColiCudaTensor *const *ups,
+                               ColiCudaTensor *const *downs,
+                               const int *rows, int count, const float *x);
 
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            ColiCudaTensor *const *ups,
