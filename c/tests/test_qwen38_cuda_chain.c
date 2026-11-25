@@ -19,6 +19,7 @@
 #undef main
 
 #ifdef _WIN32
+#include <direct.h>
 #undef unsetenv
 #define unsetenv(name) _putenv_s(name, "")
 #endif
@@ -51,11 +52,12 @@ static int brake_frame(Q38CChain *b, unsigned routes, unsigned miss) { b->routes
  * capture refuses would; fg_break_at = n breaks the n-th recorded op instead; fg_refuse makes
  * the stream refuse to capture. */
 typedef struct { int op; ColiCudaTensor *t; CcBuf *b[8]; size_t z[2]; int iv;
-                 union { CcNorm n; CcRope r; CcDnConv dc; CcDnRec dr; CcEw e; } p; } FgOp;
+                 union { CcNorm n; CcRope r; CcDnConv dc; CcDnRec dr; CcEw e; CcRoute rt; CcMoe mo; } p; } FgOp;
 typedef struct { int n, cap; FgOp *ops; } FgGraph;
 static FgGraph *fg_cur;
 static int fg_broke, fg_break_at, fg_recorded, fg_refuse;
 static unsigned long long fg_replays, fg_captures, fg_frees, fg_breaks, fg_refused, fg_pushed;
+static unsigned long long fg_route_rec, fg_moe_rec, fg_waits;
 static FgOp *fg_push(int op) {
     fg_pushed++;
     if (fg_break_at && ++fg_recorded == fg_break_at) { fg_broke = 1; return NULL; }
@@ -102,7 +104,75 @@ static int fg_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *p
     FgOp *o = fg_push(7); if (!o) return 0;
     o->b[0] = y; o->b[1] = a; o->b[2] = b; o->b[3] = c; o->b[4] = e; o->p.e = *p; return 1;
 }
+static int fg_route(CcBuf *logits, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *p) {
+    if (!fg_cur) return fcc_route(logits, bias, ids, w, p);
+    FgOp *o = fg_push(8); if (!o) return 0;
+    fg_route_rec++;
+    o->b[0] = logits; o->b[1] = bias; o->b[2] = ids; o->b[3] = w; o->p.rt = *p; return 1;
+}
+/* cc_moe on the fake card: fmt 1 via fcc_moe, GGUF block formats (>= 100) via gq_dequant_row */
+static int fg_moe_exec(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {
+    if (!p || p->fmt < 100) return fcc_moe(tab, x, ids, w, hid, y, hy, p);
+    if (!fcc_ready() || !tab || !ids || !w || !hid || !y) return 0;
+    const int tg = p->fmt - 100, td = (p->fmt_d >= 100 ? p->fmt_d : p->fmt) - 100;
+    const int64_t rg = gq_row_bytes(tg, p->D), rd = gq_row_bytes(td, p->I);
+    if (rg <= 0 || rd <= 0 || p->D > 256 || p->I > 256) return 0;
+    fake_chain_ops++;
+    const CcExpert *tb = (const CcExpert *)tab->d + p->t_off;
+    const int *id = (const int *)ids->d;
+    const int LS = p->lay_S > 0 ? p->lay_S : p->S;
+    if (p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
+    float *hd = hid->d + (size_t)LS * p->K * p->I;
+    if (p->parts & 1) {
+        if (!x) return 0;
+        float rgw[256], ruw[256], rdw[256];
+        for (int s = 0; s < p->S; s++) {
+            const float *xr = x->d + p->x_off + s * p->x_row;
+            for (int k = 0; k < p->K; k++) {
+                int e = id[p->i_off + s * p->i_row + k];
+                float *h = hid->d + ((size_t)s * p->K + k) * p->I, *dn = hd + ((size_t)s * p->K + k) * p->D;
+                if (e < 0 || e >= p->E || !tb[e].g) { memset(dn, 0, (size_t)p->D * 4); continue; }
+                const uint8_t *gw = (const uint8_t *)tb[e].g, *uw = (const uint8_t *)tb[e].u, *dw = (const uint8_t *)tb[e].d;
+                for (int o = 0; o < p->I; o++) {
+                    if (gq_dequant_row(tg, gw + (size_t)o * (size_t)rg, rgw, p->D) ||
+                        gq_dequant_row(tg, uw + (size_t)o * (size_t)rg, ruw, p->D)) return 0;
+                    float ga = 0.f, ua = 0.f;
+                    for (int i = 0; i < p->D; i++) { ga += xr[i] * rgw[i]; ua += xr[i] * ruw[i]; }
+                    h[o] = ga * fcc_sig(ga) * ua;
+                }
+                for (int o = 0; o < p->D; o++) {
+                    if (gq_dequant_row(td, dw + (size_t)o * (size_t)rd, rdw, p->I)) return 0;
+                    float a = 0.f; for (int i = 0; i < p->I; i++) a += h[i] * rdw[i];
+                    dn[o] = a;
+                }
+            }
+        }
+    }
+    if (p->parts & 2) {
+        for (int s = 0; s < p->S; s++) {
+            float *yr = y->d + p->y_off + s * p->y_row;
+            if (p->h_off >= 0 && hy) memcpy(yr, hy->d + p->h_off + s * p->D, (size_t)p->D * 4);
+            else memset(yr, 0, (size_t)p->D * 4);
+            for (int k = 0; k < p->K; k++) {
+                int e = id[p->i_off + s * p->i_row + k];
+                if (e < 0 || e >= p->E || !tb[e].g) continue;
+                float wk = w->d[p->w_off + s * p->w_row + k];
+                const float *dn = hd + ((size_t)(p->lay_s0 + s) * p->K + k) * p->D;
+                for (int d = 0; d < p->D; d++) yr[d] += wk * dn[d];
+            }
+        }
+    }
+    return 1;
+}
+static int fg_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {
+    if (!fg_cur) return fg_moe_exec(tab, x, ids, w, hid, y, hy, p);
+    FgOp *o = fg_push(9); if (!o) return 0;
+    fg_moe_rec++;
+    o->b[0] = tab; o->b[1] = x; o->b[2] = ids; o->b[3] = w; o->b[4] = hid; o->b[5] = y; o->b[6] = hy; o->p.mo = *p; return 1;
+}
 /* the ops no segment holds: inside a capture they break it */
+static int fg_signal(CcBuf *flag, size_t word, unsigned v) { if (fg_cur) { fg_broke = 1; return 0; } return fcc_signal(flag, word, v); }
+static int fg_wait_host(CcBuf *flag, size_t word, unsigned v) { if (fg_cur) { fg_broke = 1; return 0; } fg_waits++; return fcc_wait_host(flag, word, v); }
 static int fg_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) { if (fg_cur) { fg_broke = 1; return 0; } return fcc_copy_regions(dst, src, r, n); }
 static int fg_zero(CcBuf *dst, size_t off, size_t n) { if (fg_cur) { fg_broke = 1; return 0; } return fcc_zero(dst, off, n); }
 static int fg_write(CcBuf *dst, size_t off, const void *src, size_t bytes) { if (fg_cur) { fg_broke = 1; return 0; } return fcc_write(dst, off, src, bytes); }
@@ -144,7 +214,9 @@ static int fg_launch(void *gv) {
         case 4: ok = fcc_rope(o->b[0], o->b[1], &o->p.r); break;
         case 5: ok = fcc_dnconv(o->b[0], o->b[1], o->b[2], o->b[3], o->b[4], &o->p.dc); break;
         case 6: ok = fcc_dnrec(o->iv, o->b[0], o->b[1], o->b[2], o->b[3], o->b[4], o->b[5], o->b[6], &o->p.dr); break;
-        default: ok = fcc_ew(o->b[0], o->b[1], o->b[2], o->b[3], o->b[4], &o->p.e); break;
+        case 7: ok = fcc_ew(o->b[0], o->b[1], o->b[2], o->b[3], o->b[4], &o->p.e); break;
+        case 8: ok = fcc_route(o->b[0], o->b[1], o->b[2], o->b[3], &o->p.rt); break;
+        default: ok = fg_moe_exec(o->b[0], o->b[1], o->b[2], o->b[3], o->b[4], o->b[5], o->b[6], &o->p.mo); break;
         }
     }
     if (ok) fg_replays++;
@@ -156,6 +228,7 @@ static void fg_install(void) {
     ColiCudaChainOps *t = &fake_chain_table;
     t->size = sizeof *t;   /* the optional ops qwen38 asks for: these, tensor_dev and dev_addr (the fake's), pick_rows */
     t->copy = fg_copy; t->matmul = fg_matmul; t->norm = fg_norm; t->rope = fg_rope; t->dnconv = fg_dnconv; t->dnrec = fg_dnrec; t->ew = fg_ew;
+    t->route = fg_route; t->moe = fg_moe; t->signal = fg_signal; t->wait_host = fg_wait_host;
     t->copy_regions = fg_copy_regions; t->zero = fg_zero; t->write = fg_write; t->attn = fg_attn; t->qsa = fg_qsa; t->ple = fg_ple;
     t->graph_begin = fg_begin; t->graph_end = fg_end; t->graph_launch = fg_launch; t->graph_free = fg_free;
     t->graph_scratch = fg_scratch_of;
@@ -207,6 +280,370 @@ static void t_graph_switch(char **argv, const char *title, const unsigned long l
     free(o0); free(o1); free(d0); free(d1);
     static const char *const tmp[] = {"q38g_off.out", "q38g_on.out", "q38g_off.err", "q38g_on.err", "q38g_off.f32", "q38g_on.f32"};
     for (size_t i = 0; i < sizeof tmp / sizeof *tmp; i++) remove(tmp[i]);
+}
+
+/* ---- tiny block-typed qwen38 GGUF fixture + dm_on + Q38_CC_GRAPH=1 ----
+ * A self-contained 4-layer qwen4exp GGUF (DeltaNet, QSA, DeltaNet, QSA; PLE on layer 0;
+ * hidden 32, inter 32, 4 experts, top-2) whose routed experts are GQ_Q8_0 blocks, run on the
+ * fake card with dm_on=1 and Q38_CC_GRAPH=1 against Q38_CC_GRAPH=0:
+ *   1. all experts on the card: router, routes, shared expert and routed experts captured and
+ *      replayed in the segment graphs, bit-for-bit parity with Q38_CC_GRAPH=0;
+ *   2. graph_scratch invalidation: moving scratch before every segment (no capture/replay),
+ *      moving scratch mid-run (old graphs invalidated, never replayed), and missing graph_scratch
+ *      refused at setup;
+ *   3. pend_v layer-after-hosted fallback: layer 1 with one expert on the host (hosted -> op by
+ *      op, sets pend_v), layer 2 after it also op by op (pend_v != 0 -> no graph captured), layers
+ *      0 and 3 captured and replayed, bit-for-bit parity with Q38_CC_GRAPH=0. */
+typedef struct {
+    char name[96];
+    int type, ndims;
+    uint64_t ne[4];
+    uint8_t *data;
+    size_t nbytes;
+} TgTensor;
+typedef struct { TgTensor *t; int n, cap; } TgList;
+
+static void tg_add(TgList *g, const char *name, int type, int ndims, uint64_t d0, uint64_t d1, uint64_t d2, int is_norm) {
+    if (g->n == g->cap) {
+        g->cap = g->cap ? 2 * g->cap : 64;
+        g->t = (TgTensor *)realloc(g->t, (size_t)g->cap * sizeof *g->t);
+    }
+    TgTensor *x = &g->t[g->n++];
+    memset(x, 0, sizeof *x);
+    snprintf(x->name, sizeof x->name, "%s", name);
+    x->type = type; x->ndims = ndims;
+    x->ne[0] = d0; x->ne[1] = ndims > 1 ? d1 : 1; x->ne[2] = ndims > 2 ? d2 : 1; x->ne[3] = 1;
+    if (type == GQ_F32) {
+        size_t nel = (size_t)(x->ne[0] * x->ne[1] * x->ne[2]);
+        x->nbytes = nel * sizeof(float);
+        float *f = (float *)malloc(x->nbytes);
+        for (size_t k = 0; k < nel; k++) {
+            float v = ((float)(t_rnd() % 2001) / 1000.f - 1.f) * 0.05f;
+            f[k] = is_norm ? 1.f + v : v;
+        }
+        x->data = (uint8_t *)f;
+    } else {
+        int rows = (int)(x->ne[1] * x->ne[2]), cols = (int)x->ne[0];
+        int64_t rb = gq_row_bytes(type, cols);
+        if (rb <= 0) return;
+        x->nbytes = (size_t)rows * (size_t)rb;
+        x->data = (uint8_t *)calloc(1, x->nbytes);
+        t_fill(type, x->data, rows, cols);
+    }
+}
+static void tg_wr_u32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
+static void tg_wr_u64(FILE *f, uint64_t v) { fwrite(&v, 8, 1, f); }
+static void tg_wr_str(FILE *f, const char *s) { uint64_t n = (uint64_t)strlen(s); tg_wr_u64(f, n); fwrite(s, 1, (size_t)n, f); }
+static void tg_wr_kv_str(FILE *f, const char *k, const char *v) { tg_wr_str(f, k); tg_wr_u32(f, GGUF_T_STRING); tg_wr_str(f, v); }
+static void tg_wr_kv_i64_arr(FILE *f, const char *k, const int64_t *a, uint64_t n) {
+    tg_wr_str(f, k); tg_wr_u32(f, GGUF_T_ARRAY); tg_wr_u32(f, GGUF_T_I64); tg_wr_u64(f, n);
+    fwrite(a, sizeof(int64_t), (size_t)n, f);
+}
+static void tg_pad32(FILE *f) {
+    long pos = ftell(f), rem = pos & 31;
+    if (rem) { uint8_t z[32] = {0}; fwrite(z, 1, (size_t)(32 - rem), f); }
+}
+
+static int t_make_tiny_gguf(const char *dir) {
+#ifdef _WIN32
+    _mkdir(dir);
+#else
+    mkdir(dir, 0755);
+#endif
+    char path[256];
+    snprintf(path, sizeof path, "%s/config.json", dir);
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    fputs("{\n"
+          "  \"model_type\": \"qwen4_exp_text\",\n"
+          "  \"hidden_act\": \"silu\",\n"
+          "  \"output_gate_type\": \"sigmoid\",\n"
+          "  \"attention_bias\": false,\n"
+          "  \"tie_word_embeddings\": false,\n"
+          "  \"hidden_size\": 32,\n"
+          "  \"num_hidden_layers\": 4,\n"
+          "  \"vocab_size\": 64,\n"
+          "  \"max_position_embeddings\": 128,\n"
+          "  \"eos_token_id\": 0,\n"
+          "  \"rms_norm_eps\": 1e-6,\n"
+          "  \"rope_theta\": 10000.0,\n"
+          "  \"hc_count\": 4,\n"
+          "  \"hc_lowrank\": 8,\n"
+          "  \"num_attention_heads\": 4,\n"
+          "  \"num_key_value_heads\": 2,\n"
+          "  \"head_dim\": 8,\n"
+          "  \"partial_rotary_factor\": 1.0,\n"
+          "  \"indexer_n_heads\": 2,\n"
+          "  \"indexer_kv_heads\": 1,\n"
+          "  \"indexer_head_dim\": 8,\n"
+          "  \"indexer_budget\": 8,\n"
+          "  \"indexer_compress_ratio\": 4,\n"
+          "  \"num_experts\": 4,\n"
+          "  \"num_experts_per_tok\": 2,\n"
+          "  \"moe_intermediate_size\": 32,\n"
+          "  \"shared_expert_intermediate_size\": 32,\n"
+          "  \"norm_topk_prob\": true,\n"
+          "  \"linear_num_key_heads\": 2,\n"
+          "  \"linear_num_value_heads\": 4,\n"
+          "  \"linear_key_head_dim\": 8,\n"
+          "  \"linear_value_head_dim\": 8,\n"
+          "  \"linear_conv_kernel_dim\": 4,\n"
+          "  \"ple_embed_dim\": 16,\n"
+          "  \"ple_conv_kernel_size\": 4,\n"
+          "  \"ngram_size\": 3,\n"
+          "  \"heads_per_ngram\": 1,\n"
+          "  \"split_ngram_parts\": 1,\n"
+          "  \"ple_layer_ids\": [1],\n"
+          "  \"layer_types\": [\"linear_attention\", \"full_attention\", \"linear_attention\", \"full_attention\"]\n"
+          "}\n", f);
+    fclose(f);
+
+    snprintf(path, sizeof path, "%s/gguf.json", dir);
+    f = fopen(path, "wb");
+    if (!f) return 0;
+    fputs("{\"gguf\": \"tiny.gguf\"}\n", f);
+    fclose(f);
+
+    TgList g = {0};
+    unsigned saved_seed = t_seed; t_seed = 424242u;
+    /* top-level */
+    tg_add(&g, "token_embd.weight", GQ_F32, 2, 32, 64, 1, 0);
+    tg_add(&g, "output.weight", GQ_F32, 2, 32, 64, 1, 0);
+    tg_add(&g, "output_hc_norm.weight", GQ_F32, 1, 128, 1, 1, 1);
+    tg_add(&g, "output_hc_down.weight", GQ_F32, 2, 128, 8, 1, 0);
+    tg_add(&g, "output_hc_up.weight", GQ_F32, 2, 8, 128, 1, 0);
+    /* PLE on layer 0 */
+    tg_add(&g, "blk.0.ple_key.weight", GQ_F32, 2, 16, 128, 1, 0);
+    tg_add(&g, "blk.0.ple_value.weight", GQ_F32, 2, 16, 32, 1, 0);
+    tg_add(&g, "blk.0.ple_norm_key.weight", GQ_F32, 1, 128, 1, 1, 1);
+    tg_add(&g, "blk.0.ple_norm_query.weight", GQ_F32, 1, 128, 1, 1, 1);
+    tg_add(&g, "blk.0.ple_norm_conv.weight", GQ_F32, 1, 128, 1, 1, 1);
+    tg_add(&g, "blk.0.ple_conv1d.weight", GQ_F32, 2, 4, 128, 1, 0);
+    tg_add(&g, "per_layer_token_embd.weight", GQ_F32, 2, 8, 64, 1, 0);
+    for (int i = 0; i < 4; i++) {
+        char nm[96];
+        snprintf(nm, sizeof nm, "blk.%d.hc_attn_norm.weight", i); tg_add(&g, nm, GQ_F32, 1, 128, 1, 1, 1);
+        snprintf(nm, sizeof nm, "blk.%d.hc_attn_down.weight", i); tg_add(&g, nm, GQ_F32, 2, 128, 8, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.hc_attn_up.weight", i); tg_add(&g, nm, GQ_F32, 2, 8, 128, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.hc_attn_inject.weight", i); tg_add(&g, nm, GQ_F32, 2, 128, 4, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.hc_ffn_norm.weight", i); tg_add(&g, nm, GQ_F32, 1, 128, 1, 1, 1);
+        snprintf(nm, sizeof nm, "blk.%d.hc_ffn_down.weight", i); tg_add(&g, nm, GQ_F32, 2, 128, 8, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.hc_ffn_up.weight", i); tg_add(&g, nm, GQ_F32, 2, 8, 128, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.hc_ffn_inject.weight", i); tg_add(&g, nm, GQ_F32, 2, 128, 4, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_gate_inp.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 4, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_gate_shexp.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 32, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_up_shexp.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 32, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_down_shexp.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 32, 1, 0);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_gate_inp_shexp.weight", i); tg_add(&g, nm, GQ_F32, 1, 32, 1, 1, 0);
+        /* block-typed routed experts (GQ_Q8_0) */
+        snprintf(nm, sizeof nm, "blk.%d.ffn_gate_exps.weight", i); tg_add(&g, nm, GQ_Q8_0, 3, 32, 32, 4, 0);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_up_exps.weight", i); tg_add(&g, nm, GQ_Q8_0, 3, 32, 32, 4, 0);
+        snprintf(nm, sizeof nm, "blk.%d.ffn_down_exps.weight", i); tg_add(&g, nm, GQ_Q8_0, 3, 32, 32, 4, 0);
+        if (i & 1) {   /* QSA attention */
+            snprintf(nm, sizeof nm, "blk.%d.attn_q.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 64, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.attn_k.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 16, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.attn_v.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 16, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.attn_output.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 32, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", i); tg_add(&g, nm, GQ_F32, 1, 8, 1, 1, 1);
+            snprintf(nm, sizeof nm, "blk.%d.attn_k_norm.weight", i); tg_add(&g, nm, GQ_F32, 1, 8, 1, 1, 1);
+            snprintf(nm, sizeof nm, "blk.%d.indexer.q_proj.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 16, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.indexer.k_proj.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 8, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.indexer.q_norm.weight", i); tg_add(&g, nm, GQ_F32, 1, 8, 1, 1, 1);
+            snprintf(nm, sizeof nm, "blk.%d.indexer.k_norm.weight", i); tg_add(&g, nm, GQ_F32, 1, 8, 1, 1, 1);
+        } else {   /* DeltaNet */
+            snprintf(nm, sizeof nm, "blk.%d.attn_qkv.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 64, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.attn_gate.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 32, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.ssm_beta.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 4, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.ssm_alpha.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 4, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.ssm_conv1d.weight", i); tg_add(&g, nm, GQ_F32, 2, 4, 64, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.ssm_dt.bias", i); tg_add(&g, nm, GQ_F32, 1, 4, 1, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.ssm_a", i); tg_add(&g, nm, GQ_F32, 1, 4, 1, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.ssm_norm.weight", i); tg_add(&g, nm, GQ_F32, 1, 8, 1, 1, 0);
+            snprintf(nm, sizeof nm, "blk.%d.ssm_out.weight", i); tg_add(&g, nm, GQ_F32, 2, 32, 32, 1, 0);
+        }
+    }
+    t_seed = saved_seed;
+
+    snprintf(path, sizeof path, "%s/tiny.gguf", dir);
+    f = fopen(path, "wb");
+    if (!f) { for (int i = 0; i < g.n; i++) free(g.t[i].data); free(g.t); return 0; }
+    fwrite("GGUF", 1, 4, f);
+    tg_wr_u32(f, 3);
+    tg_wr_u64(f, (uint64_t)g.n);
+    tg_wr_u64(f, 4);
+    static const int64_t ple_mul[3] = {1, 3, 5}, ple_voc[2] = {32, 32}, ple_off[2] = {0, 32};
+    tg_wr_kv_str(f, "general.architecture", "qwen4exp");
+    tg_wr_kv_i64_arr(f, "qwen4exp.ple.layer_multipliers", ple_mul, 3);
+    tg_wr_kv_i64_arr(f, "qwen4exp.ple.head_vocab_sizes", ple_voc, 2);
+    tg_wr_kv_i64_arr(f, "qwen4exp.ple.head_offsets", ple_off, 2);
+    uint64_t off = 0;
+    for (int i = 0; i < g.n; i++) {
+        tg_wr_str(f, g.t[i].name);
+        tg_wr_u32(f, (uint32_t)g.t[i].ndims);
+        for (int d = 0; d < g.t[i].ndims; d++) tg_wr_u64(f, g.t[i].ne[d]);
+        tg_wr_u32(f, (uint32_t)g.t[i].type);
+        tg_wr_u64(f, off);
+        off += (uint64_t)((g.t[i].nbytes + 31u) & ~(size_t)31u);
+    }
+    tg_pad32(f);
+    for (int i = 0; i < g.n; i++) {
+        fwrite(g.t[i].data, 1, g.t[i].nbytes, f);
+        tg_pad32(f);
+        free(g.t[i].data);
+    }
+    free(g.t);
+    fclose(f);
+    return 1;
+}
+
+static void t_gguf_upload_at(void *dev, size_t cap, const void *w, int fmt, int I, int O) {
+    if (fmt < 100) return;
+    int64_t rb = gq_row_bytes(fmt - 100, I);
+    if (rb > 0 && (size_t)rb * (size_t)O <= cap) memcpy(dev, w, (size_t)rb * (size_t)O);
+}
+static Q38CChain *t_srv_ch;
+static Model *t_srv_m;
+static int t_srv_n;
+static int t_serve_layer1(unsigned v) { return q38cc_dm_serve(t_srv_ch, t_srv_m, 1, t_srv_n, v); }
+static int t_layer_has_graph(const Q38CChain *ch, int i) {
+    if (!ch || !ch->gr) return 0;
+    for (int s = 0; s < Q38G_SEGS; s++)
+        for (int k = 0; k < Q38G_WAYS; k++)
+            if (ch->gr[((size_t)i * Q38G_SEGS + s) * Q38G_WAYS + k].exec) return 1;
+    return 0;
+}
+
+/* run the tiny block-typed GGUF through q38_forward (3-token prompt + 6 decode steps), returning
+ * all 7 steps' logits (7 * 64 floats) and optional chain stats; host_l1=1 evicts layer 1's expert 3,
+ * move_mid=1 bumps fg_scratch_at after decode step 2 */
+static int t_gguf_dm_run(const char *dir, int graph_on, int host_l1, int move_mid, float *logits_out,
+                         int *dm_ok, int *g_on_out, int *l_gr, unsigned long long *caps, unsigned long long *laps,
+                         unsigned long long *eagers, int *part_out) {
+    char gp[256]; snprintf(gp, sizeof gp, "%s/tiny.gguf", dir);
+    if (gguf_open(&g_q38gg, gp)) return 0;
+    g_q38_gguf = 1; g_q38_a_direct = 1; g_q38_dn_tiled = 1; g_q38_gguf_tier = 0;
+    setenv("COLI_CUDA", "1", 1); setenv("COLI_CUDA_CHAIN", "1", 1);
+    setenv("Q38_CC_GRAPH", graph_on ? "1" : "0", 1);
+    if (host_l1) setenv("COLI_CUDA_CHAIN_PROMOTE", "0", 1); else unsetenv("COLI_CUDA_CHAIN_PROMOTE");
+    Model m; model_init(&m, dir, 4, 8);
+    m.max_t = 32; ensure_kv(&m);
+    q38_tier_start(&m, 4);
+    q38_trunk_cpu_int8(&m);
+    if (g_q38_gguf_tier) q38_tier_warm(&m, 0);
+    if (host_l1) {   /* evict layer 1's expert 3 before q38cc_setup and hold it on the host */
+        pthread_mutex_lock(&G.mx);
+        res_set(qs(1, 3), 0); qs(1, 3)->aslot = 0;
+        for (int i = 0; i < 4; i++) for (int e = 0; e < 4; e++) if (qs(i, e)->resident) qs(i, e)->heat = 1u << 20;
+        G.budget[0] = G.used[0];
+        pthread_mutex_unlock(&G.mx);
+    }
+    Q38CChain *ch = q38cc_setup(&m, 1);
+    g_cuda_chain = ch != NULL;
+    if (dm_ok) *dm_ok = ch && ch->ok && ch->dm_on && ch->dm_fmt == QT_GGUF;
+    if (g_on_out) *g_on_out = ch ? ch->g_on : 0;
+    if (host_l1 && ch) { t_srv_ch = ch; t_srv_m = &m; fake_wait_hook = t_serve_layer1; }
+    static const int prompt[3] = {1, 2, 3};
+    int tok = 3, pos = 0;
+    t_srv_n = 3;
+    float *lg = q38_forward(&m, prompt, 3, pos, 1, NULL);
+    pos += 3;
+    if (lg && logits_out) memcpy(logits_out, lg, 64 * sizeof(float));
+    int best = 0; for (int v = 1; lg && v < 64; v++) if (lg[v] > lg[best]) best = v;
+    free(lg); tok = best;
+    for (int step = 0; step < 6; step++) {
+        if (move_mid && step == 3) fg_scratch_at += 64;   /* simulate a prompt growing bd_xq_scratch */
+        t_srv_n = 1;
+        lg = q38_forward(&m, &tok, 1, pos, 1, NULL);
+        pos++;
+        if (lg && logits_out) memcpy(logits_out + (size_t)(step + 1) * 64, lg, 64 * sizeof(float));
+        best = 0; for (int v = 1; lg && v < 64; v++) if (lg[v] > lg[best]) best = v;
+        free(lg); tok = best;
+    }
+    if (ch) {
+        if (caps) *caps = ch->g_capture;
+        if (laps) *laps = ch->g_launch;
+        if (eagers) *eagers = ch->g_eager;
+        if (l_gr) for (int i = 0; i < 4; i++) l_gr[i] = t_layer_has_graph(ch, i);
+        if (part_out && ch->dm_part) for (int i = 0; i < 4; i++) part_out[i] = ch->dm_part[i];
+    }
+    fake_wait_hook = NULL; t_srv_ch = NULL; t_srv_m = NULL;
+    g_cuda_chain = 0;
+    q38_model_free(&m);
+    qt_shutdown();
+    cc_shutdown();
+    gguf_close(&g_q38gg); memset(&g_q38gg, 0, sizeof g_q38gg);
+    g_q38_gguf = 0; g_q38_gguf_tier = 0;
+    unsetenv("Q38_CC_GRAPH"); unsetenv("COLI_CUDA_CHAIN_PROMOTE");
+    return ch != NULL;
+}
+
+static void t_gguf_dm_graph(void) {
+    printf(" tiny block-typed qwen38 GGUF: dm_on + Q38_CC_GRAPH=1\n");
+    const char *dir = "./q38_tiny_gguf_tmp";
+    if (!t_make_tiny_gguf(dir)) { tk(0, "created tiny block-typed qwen38 GGUF fixture"); return; }
+    fg_install();
+    const int be0 = fake_block_elems;
+    fake_block_elems = 32;
+    fake_upload_at_hook = t_gguf_upload_at;
+
+    /* 1. all experts on the card: in-frame routed experts captured & replayed, 100% parity with Q38_CC_GRAPH=0 */
+    float lg0[7 * 64], lg1[7 * 64];
+    int dm0 = 0, dm1 = 0, go0 = 0, go1 = 0, lgr[4] = {0};
+    unsigned long long c1 = 0, r1 = 0, e1 = 0;
+    unsigned long long rt0 = fg_route_rec, mo0 = fg_moe_rec, br0 = fg_breaks;
+    int ok0 = t_gguf_dm_run(dir, 0, 0, 0, lg0, &dm0, &go0, NULL, NULL, NULL, NULL, NULL);
+    int ok1 = t_gguf_dm_run(dir, 1, 0, 0, lg1, &dm1, &go1, lgr, &c1, &r1, &e1, NULL);
+    tk(ok0 && ok1 && dm0 && dm1 && !go0 && go1, "GGUF dm_on active for both runs, graphs enabled only with Q38_CC_GRAPH=1");
+    tk(c1 > 0 && r1 > 0 && fg_route_rec > rt0 && fg_moe_rec > mo0 && fg_breaks == br0,
+       "in-frame router and block-typed routed experts captured and replayed without breaking");
+    tk(lgr[0] && lgr[1] && lgr[2] && lgr[3], "all four layers (DeltaNet, QSA, PLE) captured segment graphs");
+    tk(!memcmp(lg0, lg1, sizeof lg0), "Q38_CC_GRAPH=1 matches Q38_CC_GRAPH=0 bit-for-bit across prompt and decode");
+
+    /* 2. graph_scratch invalidation: continuous move, mid-run move, and missing graph_scratch refusal */
+    unsigned long long c2 = 0, r2 = 0;
+    fg_scratch_moves = 1;
+    int ok2 = t_gguf_dm_run(dir, 1, 0, 0, lg1, &dm1, &go1, NULL, &c2, &r2, NULL, NULL);
+    fg_scratch_moves = 0;
+    tk(ok2 && dm1 && go1 && c2 == 0 && r2 == 0 && !memcmp(lg0, lg1, sizeof lg0),
+       "graph_scratch moving before every segment: 0 captures/replays, bit-for-bit parity");
+    unsigned long long c3 = 0, r3 = 0, e3 = 0;
+    int ok3 = t_gguf_dm_run(dir, 1, 0, 1, lg1, &dm1, &go1, NULL, &c3, &r3, &e3, NULL);
+    tk(ok3 && dm1 && go1 && c3 > c1 && e3 > e1 && r3 < r1 && !memcmp(lg0, lg1, sizeof lg0),
+       "graph_scratch moved mid-run: stale graphs invalidated and re-captured, bit-for-bit parity");
+    fake_chain_table.graph_scratch = NULL;
+    int go_no_sc = 1;
+    int ok_no_sc = t_gguf_dm_run(dir, 1, 0, 0, lg1, &dm1, &go_no_sc, NULL, NULL, NULL, NULL, NULL);
+    fake_chain_table.graph_scratch = fg_scratch_of;
+    tk(ok_no_sc && dm1 && !go_no_sc && !memcmp(lg0, lg1, sizeof lg0),
+       "missing graph_scratch on GGUF: Q38_CC_GRAPH=1 refused cleanly, bit-for-bit parity");
+
+    /* 3. pend_v layer-after-hosted fallback: layer 1 hosted -> layers 1 and 2 op-by-op, layers 0 and 3 graphed */
+    int part[4] = {0}, lgr_h[4] = {0};
+    unsigned long long ch1 = 0, rh1 = 0, w0 = fg_waits;
+    br0 = fg_breaks;
+    int okh0 = t_gguf_dm_run(dir, 0, 1, 0, lg0, &dm0, &go0, NULL, NULL, NULL, NULL, NULL);
+    int okh1 = t_gguf_dm_run(dir, 1, 1, 0, lg1, &dm1, &go1, lgr_h, &ch1, &rh1, NULL, part);
+    tk(okh0 && okh1 && dm0 && dm1 && go1 && part[1] && !part[0] && !part[2] && !part[3],
+       "layer 1 hosted (expert 3 on host), layers 0, 2, 3 all on card");
+    tk(fg_waits > w0 && fg_breaks == br0 && ch1 > 0 && rh1 > 0,
+       "host share served via wait_host, graphs captured and replayed without breaking");
+    tk(lgr_h[0] && !lgr_h[1] && !lgr_h[2] && lgr_h[3],
+       "pend_v fallback: layers 0 and 3 graphed, hosted layer 1 and layer-after-hosted 2 ran op-by-op");
+    tk(!memcmp(lg0, lg1, sizeof lg0), "hosted + pend_v fallback matches Q38_CC_GRAPH=0 bit-for-bit");
+
+    fake_upload_at_hook = NULL;
+    fake_block_elems = be0;
+    fg_uninstall();
+
+    char p[256];
+    snprintf(p, sizeof p, "%s/tiny.gguf", dir); remove(p);
+    snprintf(p, sizeof p, "%s/gguf.json", dir); remove(p);
+    snprintf(p, sizeof p, "%s/config.json", dir); remove(p);
+#ifdef _WIN32
+    _rmdir(dir);
+#else
+    rmdir(dir);
+#endif
 }
 
 int main(void) {
@@ -692,6 +1129,8 @@ int main(void) {
         G.on = on0; G.nl = nl0; G.wfmt = wf0; G_gtg = gtg0; G_gtd = gtd0;
         fake_chain_table.size = sz0;
     }
+
+    t_gguf_dm_graph();
 
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }
     printf("OK test_qwen38_cuda_chain: Qwen3.8's chain on the card gives the oracle's tokens\n");

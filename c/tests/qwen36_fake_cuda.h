@@ -111,8 +111,10 @@ void *coli_cuda_pipe_alloc(int device, size_t bytes) { (void)device; return fake
 void coli_cuda_pipe_free(int device, void *p) { (void)device; free(p); }
 /* an arena's slot: the fake keeps the host bytes as an upload would */
 static int fake_upload_at;
+static void (*fake_upload_at_hook)(void *dev, size_t cap, const void *w, int fmt, int I, int O) = NULL;
 int coli_cuda_tensor_upload_at(ColiCudaTensor **t, void *dev, size_t cap, const void *w, int fmt, int I, int O, int device) {
-    (void)dev; (void)cap; fake_upload_at++;
+    if (fake_upload_at_hook && dev && w) { fake_upload_at_hook(dev, cap, w, fmt, I, O); w = dev; }
+    fake_upload_at++;
     return upload_common(t, w, NULL, fmt, I, O, device, 0);
 }
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *t) { return t ? (size_t)t->I * (size_t)t->O : 0; }
@@ -681,7 +683,7 @@ static int fcc_wait_host(CcBuf *flag, size_t word, unsigned v) {
     fake_chain_ops++; return 1;
 }
 static int fcc_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs) {
-    if (!t || !t->w || !t->sc) return 0;
+    if (!t || !t->w || (!t->sc && t->fmt < 100)) return 0;
     *w = t->w; *sc = t->sc; if (gs) *gs = t->gs; return 1;
 }
 static int fcc_pick(CcBuf *logits, CcBuf *out, int n) {
