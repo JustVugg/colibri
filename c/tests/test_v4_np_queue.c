@@ -1,6 +1,8 @@
-/* Depth-1 next-layer prefetcher queue policy, gating, router thread, and
- * V4_PREFETCH_NO_CREDIT (deepseek_v4.c, block unit + hot store):
+/* Next-layer prefetcher queue policy, token-start, depth-2, gating, router
+ * thread, and V4_PREFETCH_NO_CREDIT (deepseek_v4.c, block unit + hot store):
  *   - Default replace vs V4_NEXT_PREFETCH_KEEP (replace/prune/reset, stale)
+ *   - V4_NEXT_PREFETCH_TOKSTART (leading hash layers queued at token start)
+ *   - V4_NEXT_PREFETCH_DEPTH=2 / V4_NEXT_PREFETCH_K2 (L+2 prediction + KEEP)
  *   - Gating (V4_NP_MIN_CONF, V4_NP_TOKEN_MB): confidences, admission, budget
  *   - Depth-1 router worker (unbiased and biased bf16 gate)
  *   - Reader work on a tiny 7-expert safetensors fixture store
@@ -17,7 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 
-void coli_v4_np_test_setup(int keep, int stats);
+void coli_v4_np_test_setup(int keep, int tokstart, int stats);
+void coli_v4_np_test_depth(int depth, int k2);
 void coli_v4_np_test_set_forward(uint32_t forward);
 void coli_v4_np_test_issue(ColiExpertStore *store, int layer, const int *experts, int count,
                            int mode, uint32_t stamp);
@@ -26,6 +29,7 @@ void coli_v4_np_test_predict(ColiExpertStore *store, const ColiDeepSeekV4Config 
 int coli_v4_np_test_queue(int *layers, int *experts, uint32_t *stamps, int max);
 void coli_v4_np_test_stats(unsigned long long *queue_stats, int layer, int *n,
                            uint32_t *stamp, int *ids);
+void coli_v4_np_test_pred2(int layer, int *n, uint32_t *stamp, int *ids);
 void coli_v4_np_test_gate(float min_conf, double token_mb);
 int coli_v4_np_test_admit(float conf, uint32_t stamp, uint64_t bytes);
 void coli_v4_np_test_gate_stats(unsigned long long *gate_stats, uint32_t *stamp,
@@ -39,7 +43,7 @@ void coli_v4_np_test_work(ColiExpertStore *store, ColiExpertKey key, int rank, f
                           uint32_t stamp);
 
 enum { APPEND, REPLACE, PRUNE, RESET };   /* = V4_NP_APPEND.. in the unit */
-enum { QUEUED, DROPPED, KEPT, STALE, FULL, NQ };   /* = V4_NPQ_* */
+enum { QUEUED, DROPPED, KEPT, STALE, TOKSTART, FULL, NQ };   /* = V4_NPQ_* */
 enum { ADMITTED, GATED_CONF, GATED_BUDGET, BYTES, NG };   /* = V4_NPG_* */
 #define BUCKETS 10   /* = V4_NP_CONF_BUCKETS */
 
@@ -119,7 +123,7 @@ static unsigned long long counter(int which) {
 
 static void test_default_replace(void) {
     /* KEEP off: replace wipes every unstarted read, append keeps them */
-    coli_v4_np_test_setup(0, 1);
+    coli_v4_np_test_setup(0, 0, 1);
     coli_v4_np_test_set_forward(5);
     int a[8] = {1, 2, 3, 4, 5, 6, 7, 8}, b[6] = {9, 10, 11, 12, 13, 14};
     coli_v4_np_test_issue(STORE, 3, a, 8, REPLACE, 5);
@@ -145,7 +149,7 @@ static void test_default_replace(void) {
 }
 
 static void test_keep(void) {
-    coli_v4_np_test_setup(1, 1);
+    coli_v4_np_test_setup(1, 0, 1);
     coli_v4_np_test_set_forward(7);
     int d1[8] = {20, 21, 22, 23, 24, 25, 26, 27}, d2[6] = {30, 31, 32, 33, 34, 35};
     int n1[8] = {40, 41, 42, 43, 44, 45, 46, 47};
@@ -190,7 +194,7 @@ static void test_keep(void) {
 /* Gating: confidences in the queue and the published guess, and the
  * used/guessed histogram (hash layers left out). */
 static void test_conf(void) {
-    coli_v4_np_test_setup(0, 1);
+    coli_v4_np_test_setup(0, 0, 1);
     coli_v4_np_test_gate(0.0f, 0.0);
     coli_v4_np_test_set_forward(40);
     int guess[4] = {10, 11, 12, 13};
@@ -297,7 +301,7 @@ static void test_router(int experts, int biased, uint32_t forward) {
              "layers.5.ffn.gate.bias");
     layers[5].data[1] = gate_bias;
     config.n_routed_experts = experts;
-    coli_v4_np_test_setup(0, 1);
+    coli_v4_np_test_setup(0, 0, 1);
     coli_v4_np_test_gate(0.0f, 0.0);
     coli_v4_np_test_router(8);
     coli_v4_np_test_set_forward(forward);
@@ -517,14 +521,170 @@ static void test_no_credit(void) {
     CHECK(rmdir(dir) == 0, "%s left behind", dir);
 }
 
+static void test_tokstart(void) {
+    coli_v4_np_test_setup(0, 1, 1);   /* token start implies KEEP */
+    coli_v4_np_test_set_forward(20);
+    int old[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    coli_v4_np_test_issue(STORE, 42, old, 8, REPLACE, 20);   /* last forward's leftovers */
+    int token = 9;
+    coli_v4_np_token_start(STORE, &config, token);
+    CHECK(!strcmp(shape(), "0:6 1:6 2:6"), "token start queue: %s", shape());
+    Queue q = snap();
+    for (int i = 0; i < q.n; i++) {
+        CHECK(q.stamp[i] == 21, "token start stamp %u", q.stamp[i]);
+        CHECK(q.expert[i] == expert_of(q.layer[i], token, i % TOPK), "token start expert");
+    }
+    unsigned long long qs[NQ];
+    int n, ids[16];
+    uint32_t stamp;
+    for (int l = 0; l < 3; l++) {
+        coli_v4_np_test_stats(qs, l, &n, &stamp, ids);
+        CHECK(n == TOPK && stamp == 21 && ids[0] == expert_of(l, token, 0),
+              "token start publish layer %d: n %d stamp %u", l, n, stamp);
+    }
+    CHECK(qs[TOKSTART] == 18, "tokstart counter %llu", qs[TOKSTART]);
+    /* the forward starts: layer 0 routes; predicting 1 drops layer 0's unstarted
+     * reads and does not queue layer 1's list again */
+    coli_v4_np_test_set_forward(21);
+    coli_v4_np_test_predict(STORE, &config, 0, input, token);
+    CHECK(!strcmp(shape(), "1:6 2:6"), "after layer 0: %s", shape());
+    coli_v4_np_test_predict(STORE, &config, 1, input, token);
+    CHECK(!strcmp(shape(), "2:6"), "after layer 1: %s", shape());
+    /* layer 2 routes; 3 is gate-routed (no gate tensor here: nothing published) */
+    coli_v4_np_test_predict(STORE, &config, 2, input, token);
+    CHECK(!strcmp(shape(), ""), "after layer 2: %s", shape());
+    /* the same layers again in this forward (a prefill row, say) with another
+     * token: the lists are no longer marked, so they are queued */
+    coli_v4_np_test_predict(STORE, &config, 0, input, token + 1);
+    CHECK(!strcmp(shape(), "1:6"), "unmarked layer 1: %s", shape());
+    q = snap();
+    CHECK(q.expert[0] == expert_of(1, token + 1, 0), "unmarked layer 1 is the new token's");
+    /* next token start: a different token, leftovers dropped */
+    coli_v4_np_token_start(STORE, &config, token + 2);
+    CHECK(!strcmp(shape(), "0:6 1:6 2:6"), "second token start: %s", shape());
+    coli_v4_np_test_set_forward(22);
+    /* a token mismatch (another forward on another token) queues normally */
+    coli_v4_np_test_predict(STORE, &config, 0, input, token + 3);
+    q = snap();
+    CHECK(q.n == 12 && q.layer[0] == 1 && q.expert[0] == expert_of(1, token + 3, 0) &&
+          q.layer[6] == 2, "token mismatch: %s", shape());
+    /* out-of-vocabulary token: nothing queued, nothing dropped */
+    int before = snap().n;
+    coli_v4_np_token_start(STORE, &config, VOCAB + 5);
+    CHECK(snap().n == before, "bad token start changed the queue");
+}
+
+static void test_tokstart_off(void) {
+    /* prefetch on, token start off: token start is a no-op, the hash publish
+     * at layer 0 replaces as before */
+    coli_v4_np_test_setup(0, 0, 0);
+    coli_v4_np_test_set_forward(30);
+    coli_v4_np_token_start(STORE, &config, 4);
+    CHECK(!strcmp(shape(), ""), "token start off queued: %s", shape());
+    coli_v4_np_test_set_forward(31);
+    coli_v4_np_test_predict(STORE, &config, 0, input, 4);
+    CHECK(!strcmp(shape(), "1:6"), "hash publish: %s", shape());
+    coli_v4_np_test_predict(STORE, &config, 1, input, 4);
+    CHECK(!strcmp(shape(), "2:6"), "hash publish replaces: %s", shape());
+}
+
+static uint16_t gate2[256 * 64];
+static void test_depth2(void) {
+    const int experts = 256, k1 = 6, k2 = 4;
+    float logit1[256], logit2[256];
+    memset(gate, 0, sizeof gate);
+    memset(gate2, 0, sizeof gate2);
+    for (int r = 0; r < experts; r++) {
+        logit1[r] = (float)((r * 73) % 256 - 128) / 32.0f;
+        logit2[r] = (float)((r * 131 + 17) % 256 - 128) / 32.0f;
+        uint32_t b1, b2;
+        memcpy(&b1, &logit1[r], 4);
+        memcpy(&b2, &logit2[r], 4);
+        gate[r * 64] = (uint16_t)(b1 >> 16);
+        gate2[r * 64] = (uint16_t)(b2 >> 16);
+    }
+    memset(hidden, 0, sizeof hidden);
+    hidden[0] = 1.0f;
+    layers[5].plan.tensor_count = 1;
+    snprintf(layers[5].plan.tensors[0].name, sizeof layers[5].plan.tensors[0].name,
+             "layers.5.ffn.gate.weight");
+    layers[5].data[0] = gate;
+    layers[6].plan.tensor_count = 1;
+    snprintf(layers[6].plan.tensors[0].name, sizeof layers[6].plan.tensors[0].name,
+             "layers.6.ffn.gate.weight");
+    layers[6].data[0] = gate2;
+    config.n_routed_experts = experts;
+
+    coli_v4_np_test_setup(1, 0, 1);
+    coli_v4_np_test_gate(0.0f, 0.0);
+    coli_v4_np_test_router(k1);
+    coli_v4_np_test_depth(2, k2);
+    coli_v4_np_test_set_forward(70);
+    coli_v4_np_test_predict(STORE, &config, 4, hidden, 0);
+
+    float conf[16];
+    int got = 0;
+    for (int waited = 0; waited < 5000 && (got = coli_v4_np_test_confs(conf, 16)) < k1 + k2; waited++)
+        usleep(1000);
+    Queue q = snap();
+    CHECK(got == k1 + k2 && !strcmp(shape(), "5:6 6:4"),
+          "depth2 queue: n %d %s", got, shape());
+
+    int n2 = 0, ids2[16];
+    uint32_t stamp2 = 0;
+    coli_v4_np_test_pred2(6, &n2, &stamp2, ids2);
+    CHECK(n2 == k2 && stamp2 == 70, "depth2 pred2: n=%d stamp=%u", n2, stamp2);
+
+    /* Expected top-k2 for layer 6 (unbiased) */
+    int order2[6];
+    float score2[6], top2 = 0.0f;
+    for (int i = 0; i < TOPK; i++) {
+        int best = -1;
+        float best_s = 0.0f;
+        for (int r = 0; r < experts; r++) {
+            int taken = 0;
+            for (int j = 0; j < i; j++) taken |= order2[j] == r;
+            float s = sqrtf(fmaxf(logit2[r], 0.0f) + log1pf(expf(-fabsf(logit2[r]))));
+            if (!taken && (best < 0 || s > best_s)) {
+                best = r;
+                best_s = s;
+            }
+        }
+        order2[i] = best;
+        score2[i] = best_s;
+        top2 += best_s;
+    }
+    if (got == k1 + k2 && n2 == k2) {
+        for (int i = 0; i < k2; i++) {
+            CHECK(q.layer[k1 + i] == 6 && q.expert[k1 + i] == order2[i] &&
+                  ids2[i] == order2[i], "depth2 rank %d: q=%d pred2=%d want=%d",
+                  i, q.expert[k1 + i], ids2[i], order2[i]);
+            CHECK(fabsf(conf[k1 + i] - score2[i] / top2) < 1e-5f,
+                  "depth2 conf %d: %g want %g", i, conf[k1 + i], score2[i] / top2);
+        }
+    }
+
+    /* KEEP=1: when layer 5 routes, layer 5's unstarted reads are pruned while
+     * layer 6's depth-2 reads stay queued until layer 6's depth-1 replaces them. */
+    coli_v4_np_test_issue(STORE, 6, NULL, 0, PRUNE, 70);
+    CHECK(!strcmp(shape(), "6:4"), "depth2 keep after layer 5 prune: %s", shape());
+
+    layers[5].plan.tensor_count = 0;
+    layers[6].plan.tensor_count = 0;
+    coli_v4_np_test_depth(1, 4);
+}
+
 int main(void) {
     setup_layers();
     test_default_replace();
     test_keep();
+    test_tokstart();
+    test_tokstart_off();
     test_conf();
     test_budget();
     test_router(256, 0, 50);
     test_router(256, 1, 52);
+    test_depth2();
     test_work();
     test_no_credit();
     if (failures) {

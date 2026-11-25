@@ -6474,7 +6474,7 @@ static int v4_views_fetch_host(ColiExpertStore *store, ColiExpertView *views,
 }
 #endif
 
-/* ==== V4_NEXT_PREFETCH: depth-1 next-layer expert prefetch ====
+/* ==== V4_NEXT_PREFETCH: next-layer expert prefetch ====
  * Decode reads a layer's missing experts only after that layer has routed, so
  * the drives idle while compute runs and compute idles while they read.
  * Right after layer L routes, run layer L+1's router on L's MoE input (exact
@@ -6484,9 +6484,15 @@ static int v4_views_fetch_host(ColiExpertStore *store, ColiExpertView *views,
  * L+1's real input.
  *   V4_NEXT_PREFETCH=1        enable prefetch (default 0)
  *   V4_NEXT_PREFETCH_K=n      experts predicted per layer (default 6, max 16)
+ *   V4_NEXT_PREFETCH_DEPTH=2  also guess layer L+2 from layer L's input
+ *                             (V4_NEXT_PREFETCH_K2 experts, default 4)
  *   V4_NEXT_PREFETCH_THREADS  background readers (default 2, max 8)
+ *   V4_NEXT_PREFETCH_TOKSTART=1  at the start of a decode forward, queue the
+ *                             leading hash layers' experts (tid2eid of token);
+ *                             implies V4_NEXT_PREFETCH_KEEP=1
  *   V4_NEXT_PREFETCH_KEEP=1   a newer guess drops only stale unstarted reads
- *                             instead of wiping the whole queue
+ *                             instead of wiping the whole queue (keeps later
+ *                             layers' token-start and depth-2 reads)
  *   V4_NEXT_PREFETCH_VRAM=n   also upload the n best guesses to the VRAM
  *                             mirror cache (default 0 = RAM only)
  *   V4_NEXT_PREFETCH_AVX2=1   run the predictor's gate GEMV in AVX2+FMA
@@ -6514,7 +6520,13 @@ static struct {
 } v4_np = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, {{0}}, 0, 0, 0};
 static int v4_np_mode = -1;     /* bit 0 prefetch, bit 1 stats */
 static int v4_np_k = 6, v4_np_threads = 2, v4_np_vram = 0;
-static int v4_np_keep, v4_np_avx2;
+static int v4_np_depth = 1, v4_np_k2 = 4;
+static int v4_np_tokstart, v4_np_keep, v4_np_avx2;
+/* Token start's lists: queued for forward `stamp` on `token`, one bit per
+ * layer, cleared when v4_np_predict reaches that layer (avoids re-queuing). */
+static uint32_t v4_np_tokstart_stamp;
+static int v4_np_tokstart_token = -1;
+static unsigned v4_np_tokstart_mask;
 /* Gating: V4_NP_MIN_CONF, V4_NP_TOKEN_MB in bytes (0 = unlimited). */
 static float v4_np_min_conf;
 static uint64_t v4_np_token_bytes;
@@ -6529,18 +6541,20 @@ static void v4_np_at_exit(void);
 static unsigned long long v4_np_conf_hist[V4_NP_CONF_BUCKETS][2];
 enum { V4_NP_APPEND, V4_NP_REPLACE, V4_NP_PRUNE, V4_NP_RESET };
 static int v4_np_decode;
-enum { V4_NPQ_QUEUED, V4_NPQ_DROPPED, V4_NPQ_KEPT, V4_NPQ_STALE, V4_NPQ_FULL, V4_NPQ_COUNT };
+enum { V4_NPQ_QUEUED, V4_NPQ_DROPPED, V4_NPQ_KEPT, V4_NPQ_STALE, V4_NPQ_TOKSTART,
+       V4_NPQ_FULL, V4_NPQ_COUNT };
 static unsigned long long v4_np_qstat[V4_NPQ_COUNT];
 static unsigned long long v4_np_route_ns, v4_np_route_calls, v4_np_route_refined,
                           v4_np_route_vector;
 static unsigned long long v4_np_fresh_hits, v4_np_fresh_total, v4_np_fresh_layers,
-                          v4_np_fresh_missing;
+                          v4_np_fresh_missing, v4_np_fresh2_hits, v4_np_fresh2_total;
 static int v4_np_pred[V4_NP_LAYERS][V4_NP_MAXK];
 static float v4_np_pred_conf[V4_NP_LAYERS][V4_NP_MAXK];
 static int v4_np_pred_n[V4_NP_LAYERS];
 static unsigned long long v4_np_hits, v4_np_total, v4_np_layers;
 static uint32_t v4_np_forward;
-static uint32_t v4_np_stamp[V4_NP_LAYERS];
+static uint32_t v4_np_stamp[V4_NP_LAYERS], v4_np_stamp2[V4_NP_LAYERS];
+static int v4_np_pred2[V4_NP_LAYERS][V4_NP_MAXK], v4_np_pred2_n[V4_NP_LAYERS];
 
 static void v4_np_init(void) {
     if (v4_np_mode >= 0) return;
@@ -6551,13 +6565,20 @@ static void v4_np_init(void) {
     if (k && atoi(k) >= 1 && atoi(k) <= V4_NP_MAXK) v4_np_k = atoi(k);
     if (threads && atoi(threads) >= 1 && atoi(threads) <= 8)
         v4_np_threads = atoi(threads);
+    const char *depth = getenv("V4_NEXT_PREFETCH_DEPTH");
+    const char *k2 = getenv("V4_NEXT_PREFETCH_K2");
+    if (depth && atoi(depth) == 2) v4_np_depth = 2;
+    if (k2 && atoi(k2) >= 1 && atoi(k2) <= V4_NP_MAXK) v4_np_k2 = atoi(k2);
     const char *vram = getenv("V4_NEXT_PREFETCH_VRAM");
     if (vram && *vram && atoi(vram) >= 0) v4_np_vram = atoi(vram);
+    const char *tokstart = getenv("V4_NEXT_PREFETCH_TOKSTART");
     const char *keep = getenv("V4_NEXT_PREFETCH_KEEP");
     const char *avx2 = getenv("V4_NEXT_PREFETCH_AVX2");
     int mode = (prefetch && atoi(prefetch) ? 1 : 0) | (stats && atoi(stats) ? 2 : 0);
     if (mode & 1) {
-        v4_np_keep = keep && atoi(keep) != 0;
+        v4_np_tokstart = tokstart && atoi(tokstart) != 0;
+        /* a default replace at layer 0 would wipe token start's layer-2 reads */
+        v4_np_keep = v4_np_tokstart || (keep && atoi(keep) != 0);
         const char *min_conf = getenv("V4_NP_MIN_CONF");
         const char *token_mb = getenv("V4_NP_TOKEN_MB");
         if (min_conf && atof(min_conf) > 0.0) v4_np_min_conf = fminf((float)atof(min_conf), 1.0f);
@@ -6571,10 +6592,12 @@ static void v4_np_init(void) {
 #endif
     v4_np_mode = mode;
     if (v4_np_mode)
-        fprintf(stderr, "v4_next_prefetch prefetch=%d stats=%d k=%d threads=%d\n",
-                v4_np_mode & 1, (v4_np_mode >> 1) & 1, v4_np_k, v4_np_threads);
-    if (v4_np_mode && (keep || avx2))
-        fprintf(stderr, "v4_next_prefetch keep=%d avx2=%d\n", v4_np_keep, v4_np_avx2);
+        fprintf(stderr, "v4_next_prefetch prefetch=%d stats=%d k=%d threads=%d depth=%d k2=%d\n",
+                v4_np_mode & 1, (v4_np_mode >> 1) & 1, v4_np_k, v4_np_threads,
+                v4_np_depth, v4_np_k2);
+    if (v4_np_mode && (tokstart || keep || avx2))
+        fprintf(stderr, "v4_next_prefetch tokstart=%d keep=%d avx2=%d\n",
+                v4_np_tokstart, v4_np_keep, v4_np_avx2);
     if (v4_np_gating)
         fprintf(stderr, "v4_next_prefetch min_conf=%g token_mb=%.4g: a guess below the "
                         "confidence or past its forward's budget moves no bytes\n",
@@ -6814,7 +6837,7 @@ static void v4_np_score_fresh(const ColiDeepSeekV4LayerWeights *weights,
         layer >= V4_NP_LAYERS)
         return;
     uint32_t current = __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED);
-    int n1 = 0, hits = 0;
+    int n1 = 0, n2 = 0, hits = 0, hits2 = 0;
     if (__atomic_load_n(&v4_np_stamp[layer], __ATOMIC_ACQUIRE) == current) {
         n1 = v4_np_pred_n[layer];
         if (n1 > V4_NP_MAXK) n1 = V4_NP_MAXK;
@@ -6823,9 +6846,21 @@ static void v4_np_score_fresh(const ColiDeepSeekV4LayerWeights *weights,
             for (int j = 0; j < n1; j++)
                 if (v4_np_pred[layer][j] == expert_ids[i]) { hits++; break; }
     }
+    if (__atomic_load_n(&v4_np_stamp2[layer], __ATOMIC_ACQUIRE) == current) {
+        n2 = v4_np_pred2_n[layer];
+        if (n2 > V4_NP_MAXK) n2 = V4_NP_MAXK;
+        if (n2 < 0) n2 = 0;
+        for (int i = 0; i < selected; i++)
+            for (int j = 0; j < n2; j++)
+                if (v4_np_pred2[layer][j] == expert_ids[i]) { hits2++; break; }
+    }
     v4_np_fresh_hits += (unsigned long long)hits;
     v4_np_fresh_total += (unsigned long long)selected;
     if (!n1) v4_np_fresh_missing++;
+    if (n2) {
+        v4_np_fresh2_hits += (unsigned long long)hits2;
+        v4_np_fresh2_total += (unsigned long long)selected;
+    }
     if (++v4_np_fresh_layers % 2000) return;
     unsigned long long q[V4_NPQ_COUNT];
     pthread_mutex_lock(&v4_np.mutex);
@@ -6835,15 +6870,17 @@ static void v4_np_score_fresh(const ColiDeepSeekV4LayerWeights *weights,
     unsigned long long vector = __atomic_load_n(&v4_np_route_vector, __ATOMIC_RELAXED);
     double ns = (double)__atomic_load_n(&v4_np_route_ns, __ATOMIC_RELAXED);
     double refined = (double)__atomic_load_n(&v4_np_route_refined, __ATOMIC_RELAXED);
-    fprintf(stderr, "v4_next_predict_fresh recall=%.1f%% notready=%.1f%% "
+    fprintf(stderr, "v4_next_predict_fresh recall=%.1f%% notready=%.1f%% depth2=%.1f%% "
                     "route_ms=%.3f avx2=%llu refined=%.1f queued=%llu "
-                    "dropped=%llu kept=%llu stale=%llu full=%llu layers=%llu\n",
+                    "dropped=%llu kept=%llu stale=%llu tokstart=%llu full=%llu layers=%llu\n",
             100.0 * (double)v4_np_fresh_hits / (double)v4_np_fresh_total,
             100.0 * (double)v4_np_fresh_missing / (double)v4_np_fresh_layers,
+            v4_np_fresh2_total ? 100.0 * (double)v4_np_fresh2_hits /
+                                 (double)v4_np_fresh2_total : 0.0,
             calls ? ns / (double)calls * 1e-6 : 0.0, vector,
             vector ? refined / (double)vector : 0.0,
             q[V4_NPQ_QUEUED], q[V4_NPQ_DROPPED], q[V4_NPQ_KEPT], q[V4_NPQ_STALE],
-            q[V4_NPQ_FULL], v4_np_fresh_layers);
+            q[V4_NPQ_TOKSTART], q[V4_NPQ_FULL], v4_np_fresh_layers);
 }
 
 #define V4_NP_SELF_CHECK 16
@@ -6897,15 +6934,15 @@ static struct {
     pthread_cond_t ready;
     int started, pending;
     ColiExpertStore *store;
-    const ColiDeepSeekV4LayerWeights *following;
-    int next, n, d, k;
+    const ColiDeepSeekV4LayerWeights *following, *after;
+    int next, n, d, k, k2;
     float scale;
     float *input;
     size_t capacity;
     uint32_t stamp;
     int topk;
 } v4_np_router = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
-                  0, 0, NULL, NULL, 0, 0, 0, 0, 0.0f, NULL, 0, 0, 0};
+                  0, 0, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0.0f, NULL, 0, 0, 0};
 
 static void *v4_np_router_worker(void *argument) {
     (void)argument;
@@ -6918,8 +6955,10 @@ static void *v4_np_router_worker(void *argument) {
         v4_np_router.pending = 0;
         ColiExpertStore *store = v4_np_router.store;
         const ColiDeepSeekV4LayerWeights *following = v4_np_router.following;
+        const ColiDeepSeekV4LayerWeights *after = v4_np_router.after;
         int next = v4_np_router.next, n = v4_np_router.n;
-        int d = v4_np_router.d, k = v4_np_router.k, topk = v4_np_router.topk;
+        int d = v4_np_router.d, k = v4_np_router.k, k2 = v4_np_router.k2;
+        int topk = v4_np_router.topk;
         int deep = k > topk ? k : topk;
         float scale = v4_np_router.scale;
         uint32_t stamp = v4_np_router.stamp;
@@ -6945,10 +6984,27 @@ static void *v4_np_router_worker(void *argument) {
         const float *bias = value(following, "ffn.gate.bias", NULL);
         int indices[V4_NP_MAXK];
         float route_weights[V4_NP_MAXK], conf[V4_NP_MAXK];
-        if (gate && v4_np_route(route_weights, indices, hidden,
-                                scratch, gate, bias, n, d, deep, scale) == 0) {
+        if (gate && deep <= n && v4_np_route(route_weights, indices, hidden,
+                                             scratch, gate, bias, n, d, deep, scale) == 0) {
             v4_np_confs(conf, route_weights, k, topk);
             v4_np_publish_w(store, next, indices, conf, k, stamp, 1);
+        }
+        if (after && (v4_np_mode & 1)) {
+            const uint16_t *gate2 = value(after, "ffn.gate.weight", NULL);
+            const float *bias2 = value(after, "ffn.gate.bias", NULL);
+            int deep2 = k2 > topk ? k2 : topk;
+            if (gate2 && deep2 <= n &&
+                v4_np_route(route_weights, indices, hidden,
+                            scratch, gate2, bias2, n, d, deep2, scale) == 0) {
+                v4_np_confs(conf, route_weights, k2, topk);
+                if (next + 1 < V4_NP_LAYERS) {
+                    memcpy(v4_np_pred2[next + 1], indices,
+                           (size_t)k2 * sizeof(*indices));
+                    v4_np_pred2_n[next + 1] = k2;
+                    __atomic_store_n(&v4_np_stamp2[next + 1], stamp, __ATOMIC_RELEASE);
+                }
+                v4_np_issue_w(store, next + 1, indices, conf, k2, V4_NP_APPEND, stamp);
+            }
         }
     }
     return NULL;
@@ -6974,6 +7030,12 @@ static void v4_np_predict(ColiExpertStore *store,
         if (!table || token < 0 || token >= config->vocab_size ||
             topk > V4_NP_MAXK)
             return;
+        /* token start queued this very list for this forward already */
+        if (next < 32 && (v4_np_tokstart_mask & (1u << next)) &&
+            v4_np_tokstart_stamp == stamp && v4_np_tokstart_token == token) {
+            v4_np_tokstart_mask &= ~(1u << next);
+            return;
+        }
         int indices[V4_NP_MAXK];
         for (int i = 0; i < topk; i++)
             indices[i] = (int)table[(size_t)token * topk + i];
@@ -7004,10 +7066,18 @@ static void v4_np_predict(ColiExpertStore *store,
     memcpy(v4_np_router.input, input, (size_t)d * sizeof(float));
     v4_np_router.store = store;
     v4_np_router.following = following;
+    v4_np_router.after = NULL;
+    if (v4_np_depth == 2 && next + 1 < config->num_hidden_layers &&
+        next + 1 < V4_NP_LAYERS && next + 1 < g_v4_next_nlayers &&
+        g_v4_next_ready[next + 1] &&
+        !g_v4_next_layers[next + 1].plan.uses_hash_router &&
+        v4_np_k2 <= n)
+        v4_np_router.after = &g_v4_next_layers[next + 1];
     v4_np_router.next = next;
     v4_np_router.n = n;
     v4_np_router.d = d;
     v4_np_router.k = v4_np_k;
+    v4_np_router.k2 = v4_np_k2;
     v4_np_router.topk = topk > V4_NP_MAXK ? V4_NP_MAXK : topk;
     v4_np_router.scale = config->routed_scaling_factor;
     v4_np_router.stamp = stamp;
@@ -7016,15 +7086,62 @@ static void v4_np_predict(ColiExpertStore *store,
     pthread_mutex_unlock(&v4_np_router.mutex);
 }
 
+/* V4_NEXT_PREFETCH_TOKSTART: a decode forward on `token` is about to start
+ * (target_token_impl, before the embedding). The hash-routed layers route by
+ * token id alone (tid2eid), so their experts are known now and go to the
+ * readers while the embedding and layer 0's attention run: layer 0 gets a
+ * prefetch at all, layers 1-2 one layer more of lead. What is still queued
+ * belongs to the previous forward, whose layers have all routed: it goes. The
+ * lists carry the coming forward's stamp, and v4_np_predict does not queue
+ * them again. Decode thread. */
+void coli_v4_np_token_start(ColiExpertStore *store, const ColiDeepSeekV4Config *config,
+                            int token) {
+    if (v4_np_mode < 0) v4_np_init();
+    if (!v4_np_tokstart || !store || !config || !g_v4_next_layers || !g_v4_next_ready)
+        return;
+    int topk = config->num_experts_per_tok;
+    if (token < 0 || token >= config->vocab_size || topk < 1 || topk > V4_NP_MAXK) return;
+    uint32_t stamp = __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED) + 1;
+    unsigned mask = 0;
+    for (int l = 0; l < config->num_hidden_layers && l < g_v4_next_nlayers &&
+                    l < V4_NP_LAYERS && l < 32; l++) {
+        if (!g_v4_next_ready[l] || !g_v4_next_layers[l].plan.uses_hash_router) break;
+        const int64_t *table = value(&g_v4_next_layers[l], "ffn.gate.tid2eid", NULL);
+        if (!table) break;
+        int indices[V4_NP_MAXK];
+        for (int i = 0; i < topk; i++)
+            indices[i] = (int)table[(size_t)token * topk + i];
+        v4_np_publish_ex(store, l, indices, topk, stamp, 0);
+        v4_np_issue_ex(store, l, indices, topk, mask ? V4_NP_APPEND : V4_NP_RESET, stamp);
+        mask |= 1u << l;
+    }
+    if (mask && v4_np_mode > 0 && (v4_np_mode & 2)) {
+        pthread_mutex_lock(&v4_np.mutex);
+        v4_np_qstat[V4_NPQ_TOKSTART] += (unsigned long long)topk * __builtin_popcount(mask);
+        pthread_mutex_unlock(&v4_np.mutex);
+    }
+    v4_np_tokstart_stamp = stamp;
+    v4_np_tokstart_token = token;
+    v4_np_tokstart_mask = mask;
+}
+
 #ifdef COLI_V4_NP_TEST
-void coli_v4_np_test_setup(int keep, int stats) {
+void coli_v4_np_test_setup(int keep, int tokstart, int stats) {
     v4_np_mode = 1 | (stats ? 2 : 0);
-    v4_np_keep = keep;
+    v4_np_keep = keep || tokstart;
+    v4_np_tokstart = tokstart;
+    v4_np_tokstart_mask = 0;
+    v4_np_depth = 1;
+    v4_np_k2 = 4;
     pthread_mutex_lock(&v4_np.mutex);
     v4_np.started = 1;
     v4_np.head = v4_np.tail = 0;
     memset(v4_np_qstat, 0, sizeof v4_np_qstat);
     pthread_mutex_unlock(&v4_np.mutex);
+}
+void coli_v4_np_test_depth(int depth, int k2) {
+    v4_np_depth = depth == 2 ? 2 : 1;
+    if (k2 >= 1 && k2 <= V4_NP_MAXK) v4_np_k2 = k2;
 }
 void coli_v4_np_test_set_forward(uint32_t forward) {
     __atomic_store_n(&v4_np_forward, forward, __ATOMIC_RELAXED);
@@ -7059,6 +7176,12 @@ void coli_v4_np_test_stats(unsigned long long *queue_stats, int layer, int *n,
     *n = v4_np_pred_n[layer];
     if (*n > 0 && *n <= V4_NP_MAXK)
         memcpy(ids, v4_np_pred[layer], (size_t)(*n) * sizeof(*ids));
+}
+void coli_v4_np_test_pred2(int layer, int *n, uint32_t *stamp, int *ids) {
+    *stamp = __atomic_load_n(&v4_np_stamp2[layer], __ATOMIC_ACQUIRE);
+    *n = v4_np_pred2_n[layer];
+    if (*n > 0 && *n <= V4_NP_MAXK)
+        memcpy(ids, v4_np_pred2[layer], (size_t)(*n) * sizeof(*ids));
 }
 void coli_v4_np_test_gate(float min_conf, double token_mb) {
     pthread_mutex_lock(&v4_np.mutex);
@@ -19283,6 +19406,9 @@ static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **ne
                         const ColiDeepSeekV4Config *config,
                         ColiExpertStore *experts, int token, int position,
                         char *error, size_t error_size) {
+    /* V4_NEXT_PREFETCH_TOKSTART: queue leading hash-routed layers' exact
+     * experts before the embedding lookup (no-op when disabled). */
+    coli_v4_np_token_start(experts, config, token);
     float *state = *state_ptr, *next = *next_ptr;
     if (load_embedding(state, index, config, token)) return -1;
     int first_layer = 0;

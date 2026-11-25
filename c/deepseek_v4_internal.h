@@ -890,6 +890,10 @@ extern int g_v4_next_nlayers;
 void coli_v4_expert_lookup_set_prefetch(int on);
 int coli_v4_expert_store_resident(ColiExpertStore *store, ColiExpertKey key);
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
+/* V4_NEXT_PREFETCH_TOKSTART (block unit): a decode forward on `token` starts;
+ * queue the leading hash-routed layers' exact tid2eid experts early. */
+void coli_v4_np_token_start(ColiExpertStore *store, const ColiDeepSeekV4Config *config,
+                            int token);
 /* The compressor's and the indexer's views (the Vulkan dense chain, the
  * CUDA fused layer's state mirror). */
 typedef struct { float *kv, *score; int rows, projection, ratio, head_dim, rotate_fp4; } ColiV4CompressorView;
