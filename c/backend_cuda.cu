@@ -74,6 +74,8 @@ struct ColiCudaTensor {
     int gs;                    /* quant group size; 0 = per-row scales (#334) */
     int ng;                    /* number of scale groups per row = ceil(I/gs) for fmt=4 */
     int row_words;             /* fmt >= 100 (a GGUF's blocks): a row's 32-bit words, zero-padded */
+    float out_scale;           /* fmt >= 100: the matrix's per-tensor scale (a GGUF's <name>.scale) on each output;
+                                * 0 (calloc's) = none (coli_cuda_tensor_set_out_scale) */
     size_t scale_count;        /* scale elements: ue8m0 bytes for fmt=7, floats otherwise */
     int tracked;
     int weights_owned;
@@ -2124,7 +2126,21 @@ static inline int bd_mmq_takes(const DeviceContext *ctx, const ColiCudaTensor *t
 /* cuda_chain.cu's: x unchanged since this thread's last matmul on the stream (bd_xq_quant keeps its quantization) */
 extern "C" void coli_cuda_bd_x_same(int on) { g_bd_x_same = on; }
 static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st);
+/* the factor on t's outputs: its .scale, 1 without one */
+static inline float bd_oscale(const ColiCudaTensor *t) { return t->out_scale != 0.f ? t->out_scale : 1.f; }
+static int bd_tensor_gemv_body(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st, int *ys_done);
+/* A matrix with a per-tensor scale (e.g. NVFP4 GGUF projections): its products as without it,
+ * then each output times the scale once -- inside the float GEMV's store (NVFP4's decode form), else one
+ * epilogue kernel on the stream after the product. A matrix without one runs exactly as before. */
 static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
+    int done = 0;
+    if (!bd_tensor_gemv_body(ctx, t, y, x, S, st, &done)) return 0;
+    const float s = bd_oscale(t);
+    if (s == 1.f || done) return 1;
+    bd_oscale_launch(y, (long long)S * t->O, s, st);
+    return cuda_ok(cudaGetLastError(), "block scale launch");
+}
+static int bd_tensor_gemv_body(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st, int *ys_done) {
     const bd_u32 *tab = bd_table(ctx);
     if (!tab || ((uintptr_t)x & 15)) return 0;
     /* the float form for every type and every row count: COLI_CUDA_BD_FLOAT=1 (tests), or
@@ -2142,8 +2158,16 @@ static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
         return cuda_ok(cudaGetLastError(), "block mmq launch");
 #endif
     if (!exact && S > BD_GEMV_MAX_S && bd_tensor_gemm(ctx, t, y, x, S, st)) return 1;
-    if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, exact, st)) return 0;
+    if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, exact, st,
+                        bd_oscale(t), ys_done)) return 0;
     return cuda_ok(cudaGetLastError(), "block gemv launch");
+}
+/* t's per-tensor scale (fmt >= 100 only, finite and not 0; 1 clears it). 0 when not taken: the
+ * caller keeps the matrix on the host, whose product applies it */
+extern "C" int coli_cuda_tensor_set_out_scale(ColiCudaTensor *t, float s) {
+    if (!t || t->fmt < 100 || !(s == s) || s == 0.f || s > 3.0e38f || s < -3.0e38f) return 0;
+    t->out_scale = s == 1.f ? 0.f : s;
+    return 1;
 }
 /* a block-format tensor in device memory the caller owns (an arena's slot of cap bytes):
  * coli_cuda_tensor_free leaves the memory, and its bytes are counted where it was allocated */
@@ -4907,7 +4931,7 @@ extern "C" int coli_cuda_tensor_gemm_hcmix_async(ColiCudaTensor *t, float *mixed
     static int on = -1;   /* COLI_CUDA_HCMIX=0: the matmul and the mix apart */
     if (on < 0) { const char *e = getenv("COLI_CUDA_HCMIX"); on = !(e && *e == '0'); }
     DeviceContext *ctx = find_ctx(t->device);
-    if (!on || !select_ctx(ctx) || t->fmt < 100) return -1;
+    if (!on || !select_ctx(ctx) || t->fmt < 100 || bd_oscale(t) != 1.f) return -1;   /* a scale before the sigmoid: apart */
     int tt = hcm_type(t->fmt, t->I);
     if (tt == 22 || tt == 42 || tt == 16 || tt == 17 || tt == 18 || tt == 6 || tt == 7) tt = 0;   /* hcm_gemm's dense types alone */
     if (tt == 21 && !bd_table(ctx)) tt = 0;
@@ -5453,6 +5477,8 @@ extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu
         on = dec && !(b && *b == '0');
     }
     if (fault_injected() || !tg || !tu || !y_dev || !x_dev || S < 1 || tg->fmt < 100 || ((uintptr_t)x_dev & 15)) return 0;
+    /* a scale on either matrix sits inside the silu: the two matmuls (each scaled) and the caller's SwiGLU */
+    if (bd_oscale(tg) != 1.f || bd_oscale(tu) != 1.f) return 0;
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
     /* rows bd_mmg_k takes: the two matmuls apart on it (the caller's), the bits of the GEMVs and the product */
     if (bd_mmq_takes(find_ctx(tg->device), tg, S) && bd_mmq_takes(find_ctx(tu->device), tu, S)) return 0;
@@ -5485,6 +5511,7 @@ extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *id
     const bd_u32 *tab = select_ctx(ctx) ? bd_table(ctx) : nullptr;
     if (!tab || !bd_gemv_rows_launch(y_dev, x_dev, (const bd_u32 *)t->weights, tab, ids_dev, t->fmt, t->I, t->O, t->row_words, n,
                                      ctx->smem_optin, (cudaStream_t)stream)) return 0;
+    bd_oscale_launch(y_dev, n, bd_oscale(t), (cudaStream_t)stream);   /* the listed rows' outputs, scaled as the whole GEMV's */
     return cuda_ok(cudaGetLastError(), "block rows gemv launch");
 }
 /* f32 rows with few outputs for a prompt chunk's rows (Qwen3.8's gated residuals: inject, 4

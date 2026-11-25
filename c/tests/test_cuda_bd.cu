@@ -15,7 +15,11 @@
  *     two GEMVs and the elementwise product;
  *   - the tensor cores' integer steps (bd_mmg_launch, sm_80 on) of 1 to 8 rows, each row the bits
  *     of the GEMV's same row alone; again with x's quantization kept (g_bd_x_same), and after
- *     another x at the same address without it.
+ *     another x at the same address without it;
+ *   - a matrix with a per-tensor scale (coli_cuda_tensor_set_out_scale: a GGUF's <name>.scale,
+ *     e.g. NVFP4 projections) at 1 to 40 rows: each output the unscaled product's bits
+ *     times the scale, a scale of 1 the unscaled bits, against qwen36's matmul_d (ref_matmul_d), the
+ *     SwiGLU's one pass refused, a draft's rows the whole product's (check_scaled).
  * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows. Build from c/:
  *   gcc -O2 -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
  *   nvcc -O2 -std=c++17 -arch=native tests/test_cuda_bd.cu tests/cuda_bd_ref.o -o tests/test_cuda_bd */
@@ -35,6 +39,7 @@ long ref_row_bytes(int t, int n);
 int ref_block_bytes(int t);
 int ref_block_elems(int t);
 const char *ref_name(int t);
+int ref_matmul_d(int t, const uint8_t *W, const float *x, int S, int I, int O, float gs, float *y);
 }
 
 static int fails;
@@ -758,6 +763,120 @@ static void check_xq_forget(void) {
     free(w); free(x); free(x2); free(want); free(got);
 }
 
+/* A block tensor with a per-tensor scale: the backend's products on S rows, through the
+ * float GEMV's store (NVFP4), the epilogue after the integer GEMV and the tensor cores' steps (Q8_0,
+ * Q4_K), and after the f16 tiles (40 rows): each output fl(unscaled * gs), bit for bit; a scale of 1
+ * the unscaled bits; against matmul_d's GQ_EXACT form within the GEMV's tolerance (the float form
+ * 2e-5 of the terms' magnitude, the integer forms' quantized x 2e-2). BENCH=1: the scaled NVFP4 GEMV
+ * against the unscaled at the 27B's shapes, a decode step's row. */
+static void check_scaled(int t, int I, int O, int bench) {
+    const long rb = ref_row_bytes(t, I);
+    const int bb = ref_block_bytes(t), fmt = 100 + t, SM = 40;
+    const float gs = 3.2949e-4f;   /* a typical NVFP4 projection's 1 / global scale */
+    if (rb <= 0 || I % ref_block_elems(t)) return;
+    uint8_t *w = (uint8_t *)malloc((size_t)O * rb);
+    for (int o = 0; o < O; o++) {
+        uint8_t *r = w + (size_t)o * rb;
+        for (long i = 0; i < rb; i++) r[i] = (uint8_t)rnd();
+        for (long k = 0; k + bb <= rb; k += bb) bd_fix(t, r + k);
+    }
+    float *x = (float *)malloc((size_t)SM * I * 4), *y0 = (float *)malloc((size_t)SM * O * 4), *y1 = (float *)malloc((size_t)SM * O * 4);
+    float *ref = (float *)malloc((size_t)SM * O * 4), *deq = (float *)malloc((size_t)I * 4);
+    for (int i = 0; i < SM * I; i++) x[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f;
+    float *xd, *yd, *ydu; int *idd;
+    cudaMalloc(&xd, (size_t)SM * I * 4); cudaMalloc(&yd, (size_t)SM * O * 4); cudaMalloc(&ydu, (size_t)SM * O * 4); cudaMalloc(&idd, 64 * sizeof(int));
+    cudaMemcpy(xd, x, (size_t)SM * I * 4, cudaMemcpyHostToDevice);
+    ColiCudaTensor *tu = NULL, *ts = NULL, *t1 = NULL;
+    int ok = coli_cuda_tensor_upload(&tu, w, NULL, fmt, I, O, 0) && coli_cuda_tensor_upload(&ts, w, NULL, fmt, I, O, 0) &&
+             coli_cuda_tensor_upload(&t1, w, NULL, fmt, I, O, 0) && coli_cuda_tensor_set_out_scale(ts, gs) && coli_cuda_tensor_set_out_scale(t1, 1.f);
+    if (!ok) { printf("FAIL %s [%d x %d]: a scaled tensor was refused\n", ref_name(t), O, I); fails++; goto out; }
+    for (int S : {1, 3, 8, SM}) {
+        int okm = coli_cuda_tensor_gemm_async(tu, ydu, xd, S, NULL) && coli_cuda_tensor_gemm_async(ts, yd, xd, S, NULL) &&
+                  cudaDeviceSynchronize() == cudaSuccess;
+        cudaMemcpy(y0, ydu, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(y1, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+        long bad = 0;
+        for (long i = 0; i < (long)S * O; i++) { float p = y0[i] * gs; if (memcmp(&p, &y1[i], 4)) bad++; }
+        okm = okm && coli_cuda_tensor_gemm_async(t1, yd, xd, S, NULL) && cudaDeviceSynchronize() == cudaSuccess;
+        cudaMemcpy(ref, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+        const int one_same = !memcmp(ref, y0, (size_t)S * O * 4);
+        /* matmul_d's GQ_EXACT form, against the terms' magnitude */
+        double worst = 0;
+        if (ref_matmul_d(t, w, x, S, I, O, gs, ref)) okm = 0;
+        for (int o = 0; o < O && okm; o++) {
+            ref_dequant(t, w + (size_t)o * rb, deq, I);
+            for (int s = 0; s < S; s++) {
+                double mag = 0;
+                for (int i = 0; i < I; i++) mag += fabs((double)deq[i] * x[(size_t)s * I + i]);
+                double e = fabs((double)y1[(size_t)s * O + o] - ref[(size_t)s * O + o]) / (mag * gs + 1e-12);
+                if (!(e <= worst)) worst = e;
+            }
+        }
+        const double tol = S > BD_GEMV_MAX_S ? 1e-2 : bdi_has(t) || bd_mmq_has(t) ? 2e-2 : 2e-5;
+        if (!okm || bad || !one_same || !(worst <= tol)) {
+            printf("FAIL %s [%d x %d] scaled, %d rows: %s, %ld outputs not fl(unscaled x scale), scale 1 %s, %.3g of matmul_d's\n", ref_name(t), O, I, S,
+                   okm ? "ran" : "a launch failed", bad, one_same ? "the unscaled bits" : "NOT the unscaled bits", worst);
+            fails++;
+        } else printf("%-8s [%6d x %5d] scaled, %2d rows: fl(unscaled x scale) bit for bit, scale 1 unchanged, within %.2g of matmul_d's\n",
+                      ref_name(t), O, I, S, worst);
+    }
+    check_ok(!coli_cuda_tensor_glu_async(ts, ts, yd, xd, 1, NULL), "  the SwiGLU's one pass refuses a scaled gate or up (the caller's two matmuls)");
+    {   /* a draft's rows of the scaled matrix: the whole product's (the types with the rows' form) */
+        int ids[16];
+        for (int j = 0; j < 16; j++) ids[j] = (int)(rnd() % (unsigned)O);
+        cudaMemcpy(idd, ids, sizeof ids, cudaMemcpyHostToDevice);
+        if (coli_cuda_tensor_gemv_rows_async(ts, idd, yd, xd, 16, NULL) && cudaDeviceSynchronize() == cudaSuccess) {
+            coli_cuda_tensor_gemm_async(ts, ydu, xd, 1, NULL); cudaDeviceSynchronize();
+            cudaMemcpy(y0, ydu, (size_t)O * 4, cudaMemcpyDeviceToHost); cudaMemcpy(y1, yd, 16 * 4, cudaMemcpyDeviceToHost);
+            int same = 1;
+            for (int j = 0; j < 16; j++) same &= !memcmp(&y1[j], &y0[ids[j]], 4);
+            check_ok(same, "  a draft's 16 rows of the scaled matrix: the whole product's bits");
+        }
+    }
+    if (bench) {
+        double best[2] = {1e9, 1e9};
+        for (int k = 0; k < 2; k++) for (int r = 0; r < 5; r++) {
+            cudaDeviceSynchronize(); double t0 = now();
+            for (int j = 0; j < 40; j++) coli_cuda_tensor_gemm_async(k ? ts : tu, yd, xd, 1, NULL);
+            cudaDeviceSynchronize(); double dt = (now() - t0) / 40;
+            if (dt < best[k]) best[k] = dt;
+        }
+        printf("  BENCH %-8s [%6d x %5d] one row: %.1f us unscaled, %.1f us scaled\n", ref_name(t), O, I, best[0] * 1e6, best[1] * 1e6);
+    }
+out:
+    if (tu) coli_cuda_tensor_free(tu);
+    if (ts) coli_cuda_tensor_free(ts);
+    if (t1) coli_cuda_tensor_free(t1);
+    cudaFree(xd); cudaFree(yd); cudaFree(ydu); cudaFree(idd);
+    free(w); free(x); free(y0); free(y1); free(ref); free(deq);
+}
+/* coli_cuda_tensor_set_out_scale takes block tensors and finite nonzero scales only */
+static void ck_scale_refusals(void) {
+    ColiCudaTensor *tf = NULL;
+    float w[64 * 2], one[2] = {1.f, 1.f};
+    for (int i = 0; i < 128; i++) w[i] = 0.01f * (float)(i % 7);
+    int ok = coli_cuda_tensor_upload(&tf, w, one, 0, 64, 2, 0);
+    check_ok(ok && !coli_cuda_tensor_set_out_scale(tf, 0.5f), "  an f32 tensor takes no per-tensor scale");
+    if (tf) coli_cuda_tensor_free(tf);
+    check_ok(!coli_cuda_tensor_set_out_scale(NULL, 0.5f), "  nor a NULL one");
+}
+/* the per-tensor scale at the 27B's widths: NVFP4 (the float form's store), Q8_0 and Q4_K (the integer
+ * GEMV's and the tensor cores' epilogue), and 40 rows (the f16 tiles, then the epilogue) */
+static void run_scaled(int bench) {
+    const int sshape[][2] = {{5120, 2048}, {17408, 512}, {5120, 6144}};
+    for (int t : {40, 8, 12}) for (auto &sh : sshape) check_scaled(t, sh[0], sh[1], bench);
+    ck_scale_refusals();
+    {   /* a block tensor: 0 and NaN refused, 1 taken */
+        ColiCudaTensor *tb = NULL;
+        uint8_t row[36 * 1];
+        for (int i = 0; i < 36; i++) row[i] = (uint8_t)(0x30 + i);
+        int ok = coli_cuda_tensor_upload(&tb, row, NULL, 140, 64, 1, 0);
+        check_ok(ok && !coli_cuda_tensor_set_out_scale(tb, 0.f) && !coli_cuda_tensor_set_out_scale(tb, nanf("")) &&
+                 coli_cuda_tensor_set_out_scale(tb, 1.f), "  a block tensor: a scale of 0 or NaN refused, 1 taken");
+        if (tb) coli_cuda_tensor_free(tb);
+    }
+}
+
 int main(void) {
     int devs[1] = {0};
     if (!coli_cuda_init(devs, 1)) { printf("SKIP: no CUDA device\n"); return 0; }
@@ -781,6 +900,13 @@ int main(void) {
             if (sscanf(tok, "%d:%d:%d", &tg, &td, &S) == 3) bench_moe(tg, td, S, 10, 512, 2560, 640, 10);
         }
         free(spec); cudaFree(g_tab);
+        printf(fails ? "FAILED: %d\n" : "OK\n", fails);
+        return fails != 0;
+    }
+    /* SCALED_ONLY=1: the per-tensor scale's checks alone (BENCH=1 times them too) */
+    if (getenv("SCALED_ONLY") && *getenv("SCALED_ONLY") == '1') {
+        run_scaled(bench);
+        cudaFree(g_tab);
         printf(fails ? "FAILED: %d\n" : "OK\n", fails);
         return fails != 0;
     }
@@ -829,6 +955,7 @@ int main(void) {
             check_xq_forget();
         } else printf("mmq: SKIP (compute capability %d, the tensor cores' integer steps need 8)\n", major);
     }
+    run_scaled(bench);
     if (bench) {
         printf("BENCH (rows of x: 1 2 3 4)\n");
         const int bt[] = {12, 14, 8, 17, 22, 16, 21, 23, 11, 10};

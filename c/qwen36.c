@@ -2413,12 +2413,52 @@ static int qdw_gq_fmt(const QW *w) {
         const int be = coli_cuda_block_elems(100 + w->wf16);
         return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + w->wf16 : 0;
     }
-    if (!g_gguf || !(w->gq || w->gq_gone) || w->gs != 1.f) return 0;
+    if (!g_gguf || !(w->gq || w->gq_gone)) return 0;
     const int r = gq_r16_base(w->gq_type), t = r >= 0 ? r : w->gq_type, be = coli_cuda_block_elems(100 + t);
     return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + t : 0;
 #else
     (void)w; return 0;
 #endif
+}
+/* the factor on w's outputs the device applies: a block matrix's .scale, 1 for any other form
+ * (a 16-bit matrix has its scale in its values, load_t_n) */
+static float qdw_gs(const QW *w) { return w->gq || w->gq_gone ? w->gs : 1.f; }
+static size_t qdw_gq_bytes(const QW *w);
+static const void *qdw_gq_rows(const QW *w, int fmt, uint8_t **rows);
+/* A GGUF DeltaNet layer's in_proj on device dev: qkv's rows then z's as one tensor where both have
+ * one type and one scale, else (unsloth's two types, NVFP4's two scales) two tensors, each the
+ * file's blocks with its own scale. -1 not a GGUF's blocks (the caller's int8 path), 0 not placed
+ * (the CPU's), 1 one tensor, 2 two; *vram grows by what went up. */
+static int q36_dnproj_place_gguf(Model *m, int i, int dev, double *vram) {
+    const QW *qkv = &m->L[i].dn_qkv, *zw = &m->L[i].dn_z;
+    const int O_qkv = m->c.dn_conv_dim, O_z = m->c.dn_vheads * m->c.dn_vdim, Of = O_qkv + O_z, Hd = m->c.hidden;
+    const int gf = qdw_gq_fmt(qkv), gz = qdw_gq_fmt(zw);
+    const float sq = qdw_gs(qkv), sz = qdw_gs(zw);
+    if (!gf || !gz) return -1;
+    int r = 0;
+    if (gf == gz && sq == sz) {   /* a GGUF's blocks: qkv's rows, then z's */
+        const size_t rb = (size_t)gq_row_bytes(gf - 100, Hd);
+        Q36Rows s; const QtRows *rs = q36_gq_stream(&s, qkv, zw, gf);
+        uint8_t *ra = NULL, *rz = NULL, *cat = rs ? NULL : malloc(rb * Of);
+        const void *a = rs ? NULL : qdw_gq_rows(qkv, gf, &ra), *z = rs ? NULL : qdw_gq_rows(zw, gf, &rz);
+        if (rs || (cat && a && z)) {
+            if (!rs) { memcpy(cat, a, rb * O_qkv); memcpy(cat + rb * O_qkv, z, rb * O_z); }
+            if (qt_dnproj_init_fmt(i, cat, rs, NULL, gf, Hd, Of, dev, sq)) { r = 1; *vram += (double)rb * Of; }
+        }
+        free(ra); free(rz); free(cat);
+        if (r) { q36_gq_drop((QW *)qkv); q36_gq_drop((QW *)zw); }
+        return r;
+    }
+    const size_t rq = (size_t)gq_row_bytes(gf - 100, Hd), rzb = (size_t)gq_row_bytes(gz - 100, Hd);
+    Q36Rows sqs, szs;
+    const QtRows *rq_s = q36_gq_stream(&sqs, qkv, NULL, gf), *rz_s = q36_gq_stream(&szs, zw, NULL, gz);
+    uint8_t *ra = NULL, *rz = NULL;
+    const void *a = rq_s ? NULL : qdw_gq_rows(qkv, gf, &ra), *z = rz_s ? NULL : qdw_gq_rows(zw, gz, &rz);
+    if ((a || rq_s) && (z || rz_s) && qt_dnproj_init_fmt(i, a, rq_s, NULL, gf, Hd, O_qkv, dev, sq) &&
+        qt_dnproj_z_init_fmt(i, z, rz_s, gz, Hd, O_z, dev, sz)) { r = 2; *vram += (double)rq * O_qkv + (double)rzb * O_z; }
+    free(ra); free(rz);
+    if (r) { q36_gq_drop((QW *)qkv); q36_gq_drop((QW *)zw); }
+    return r;
 }
 static size_t qdw_gq_bytes(const QW *w) {
     const int fmt = qdw_gq_fmt(w);
@@ -2445,7 +2485,7 @@ static int qdw_place(const QW *w, int dev){
         const int fmt = qdw_gq_fmt(w);
         Q36Rows s; const QtRows *r = fmt ? q36_gq_stream(&s, w, NULL, fmt) : NULL;
         uint8_t *rows = NULL; const void *src = fmt && !r ? qdw_gq_rows(w, fmt, &rows) : NULL;
-        int h = src || r ? qt_dense_init_fmt(src, r, NULL, fmt, w->I, w->O, dev) : -1;
+        int h = src || r ? qt_dense_init_fmt(src, r, NULL, fmt, w->I, w->O, dev, qdw_gs(w)) : -1;
         free(rows);
         if (h >= 0) q36_gq_drop((QW *)w);   /* the device's copy is the one read from here on */
         return h >= 0 ? h + 1 : 0;
@@ -12573,7 +12613,7 @@ int main(int argc, char **argv) {
             const int fmt = qdw_gq_fmt(&m.lm_head);
             Q36Rows s; const QtRows *r = q36_gq_stream(&s, &m.lm_head, NULL, fmt);
             uint8_t *rows = NULL; const void *src = r ? NULL : qdw_gq_rows(&m.lm_head, fmt, &rows);
-            const int up = (src || r) && qt_lmhead_init_fmt(src, r, NULL, fmt, m.lm_head.I, m.lm_head.O);
+            const int up = (src || r) && qt_lmhead_init_fmt(src, r, NULL, fmt, m.lm_head.I, m.lm_head.O, qdw_gs(&m.lm_head));
             free(rows);
             if (up) q36_gq_drop(&m.lm_head);
         }
@@ -12592,34 +12632,8 @@ int main(int argc, char **argv) {
                 if (dev == QT_PLACE_CPU) continue;
                 const int8_t *q1 = m.L[i].dn_qkv.q, *q2 = m.L[i].dn_z.q;
                 const float *s1 = m.L[i].dn_qkv.sc, *s2 = m.L[i].dn_z.sc;
-                const int gf = qdw_gq_fmt(&m.L[i].dn_qkv), gz = qdw_gq_fmt(&m.L[i].dn_z);
-                if (!q1 && gf && gf == gz) {   /* a GGUF's blocks: qkv's rows, then z's */
-                    const size_t rb = (size_t)gq_row_bytes(gf - 100, Hd);
-                    Q36Rows s; const QtRows *r = q36_gq_stream(&s, &m.L[i].dn_qkv, &m.L[i].dn_z, gf);
-                    uint8_t *ra = NULL, *rz = NULL, *cat = r ? NULL : malloc(rb * Of);
-                    const void *a = r ? NULL : qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = r ? NULL : qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
-                    int up = 0;
-                    if (r || (cat && a && z)) {
-                        if (!r) { memcpy(cat, a, rb * O_qkv); memcpy(cat + rb * O_qkv, z, rb * O_z); }
-                        if ((up = qt_dnproj_init_fmt(i, cat, r, NULL, gf, Hd, Of, dev))) { placed++; vram += (double)rb * Of; }
-                    }
-                    free(ra); free(rz); free(cat);
-                    if (up) { q36_gq_drop(&m.L[i].dn_qkv); q36_gq_drop(&m.L[i].dn_z); }
-                    continue;
-                }
-                if (!q1 && gf && gz) {   /* two types (unsloth's mixes): two tensors, each the file's blocks */
-                    const size_t rq = (size_t)gq_row_bytes(gf - 100, Hd), rzb = (size_t)gq_row_bytes(gz - 100, Hd);
-                    Q36Rows s, sz;
-                    const QtRows *r = q36_gq_stream(&s, &m.L[i].dn_qkv, NULL, gf), *rzs = q36_gq_stream(&sz, &m.L[i].dn_z, NULL, gz);
-                    uint8_t *ra = NULL, *rz = NULL;
-                    const void *a = r ? NULL : qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = rzs ? NULL : qdw_gq_rows(&m.L[i].dn_z, gz, &rz);
-                    const int up = (a || r) && (z || rzs) && qt_dnproj_init_fmt(i, a, r, NULL, gf, Hd, O_qkv, dev) &&
-                                   qt_dnproj_z_init_fmt(i, z, rzs, gz, Hd, O_z, dev);
-                    if (up) { placed++; split++; vram += (double)rq * O_qkv + (double)rzb * O_z; }
-                    free(ra); free(rz);
-                    if (up) { q36_gq_drop(&m.L[i].dn_qkv); q36_gq_drop(&m.L[i].dn_z); }
-                    continue;
-                }
+                const int gg = q1 ? -1 : q36_dnproj_place_gguf(&m, i, dev, &vram);
+                if (gg >= 0) { placed += gg > 0; split += gg == 2; continue; }
                 if (!q1 || !q2) continue;      /* dense-i8 off: CPU path stands */
                 int8_t *qf = malloc((size_t)Of * Hd);
                 float  *sf = malloc((size_t)Of * sizeof(float));
@@ -12637,7 +12651,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[dnp] %d DeltaNet-Projektionen auf GPU (%.2f GB VRAM)\n",
                         placed, vram / 1073741824.0);
             if (split)
-                fprintf(stderr, "[dnp] %d of them as two tensors, qkv and z in the file's two types\n", split);
+                fprintf(stderr, "[dnp] %d of them as two tensors, qkv and z in the file's two types or scales\n", split);
         }
         /* The rest of the trunk, wherever the placer put it: out_proj,
          * attention projections, shared expert. Handles live in the Layer. */

@@ -144,15 +144,18 @@ int  qt_dn_gpu_step(int layer, const float *x, float *out, const float *egh, con
 int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
 /* The same three with the tensor's format: 1 int8 rows (scales sc), 100 + ggml type a GGUF's
  * blocks as the file has them (sc NULL: the backend's block formats, coli_cuda_block_elems);
- * a block format's rows from rows instead of w where rows is not NULL. */
-int  qt_dense_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int device);
-int  qt_lmhead_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O);
-int  qt_dnproj_init_fmt(int layer, const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int device);
-/* A GGUF whose qkv and z rows have different ggml types (unsloth's dynamic mixes, in about
- * half of a Qwen3.8-27B's DeltaNet layers): qt_dnproj_init_fmt takes qkv's rows alone and this
- * z's, each in its own type, on the same device; qt_dnproj_matmul_batch still answers qkv ++ z.
+ * a block format's rows from rows instead of w where rows is not NULL.
+ * gs: a GGUF matrix's per-tensor scale (its <name>.scale, 1 without one) on every output, set on
+ * the device's tensor (coli_cuda_tensor_set_out_scale); a backend that cannot take it leaves the
+ * matrix on the CPU. */
+int  qt_dense_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int device, float gs);
+int  qt_lmhead_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, float gs);
+int  qt_dnproj_init_fmt(int layer, const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int device, float gs);
+/* A GGUF whose qkv and z rows have different ggml types or scales (unsloth's dynamic mixes, or
+ * NVFP4 per-tensor scales): qt_dnproj_init_fmt takes qkv's rows alone and this
+ * z's, each in its own type and scale, on the same device; qt_dnproj_matmul_batch still answers qkv ++ z.
  * A failure takes the layer's qkv off the device too: one without the other is no projection. */
-int  qt_dnproj_z_init_fmt(int layer, const void *w, const QtRows *rows, int fmt, int I, int O, int device);
+int  qt_dnproj_z_init_fmt(int layer, const void *w, const QtRows *rows, int fmt, int I, int O, int device, float gs);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
@@ -371,10 +374,10 @@ static inline int  qt_dn_gpu_set_state(int a,const float*b,const float*c){(void)
 static inline int  qt_dn_gpu_get_state(int a,float*b,float*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_dn_gpu_step(int a,const float*b,float*c,const float*d,const float*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
-static inline int  qt_dense_init_fmt(const void*a,const QtRows*r,const float*b,int c,int d,int e,int f){(void)a;(void)r;(void)b;(void)c;(void)d;(void)e;(void)f;return -1;}
-static inline int  qt_lmhead_init_fmt(const void*a,const QtRows*r,const float*b,int c,int d,int e){(void)a;(void)r;(void)b;(void)c;(void)d;(void)e;return 0;}
-static inline int  qt_dnproj_init_fmt(int a,const void*b,const QtRows*r,const float*c,int d,int e,int f,int g){(void)a;(void)b;(void)r;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
-static inline int  qt_dnproj_z_init_fmt(int a,const void*b,const QtRows*r,int c,int d,int e,int f){(void)a;(void)b;(void)r;(void)c;(void)d;(void)e;(void)f;return 0;}
+static inline int  qt_dense_init_fmt(const void*a,const QtRows*r,const float*b,int c,int d,int e,int f,float g){(void)a;(void)r;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return -1;}
+static inline int  qt_lmhead_init_fmt(const void*a,const QtRows*r,const float*b,int c,int d,int e,float f){(void)a;(void)r;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
+static inline int  qt_dnproj_init_fmt(int a,const void*b,const QtRows*r,const float*c,int d,int e,int f,int g,float h){(void)a;(void)b;(void)r;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
+static inline int  qt_dnproj_z_init_fmt(int a,const void*b,const QtRows*r,int c,int d,int e,int f,float g){(void)a;(void)b;(void)r;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_count(void){return 0;}

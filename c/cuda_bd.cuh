@@ -1587,7 +1587,10 @@ __global__ static void __launch_bounds__(256) bd_gemv_rows_i8_k(float *__restric
 __host__ __device__ inline size_t bd_gemv_f_smem(int I, int nr) { return (size_t)nr * (size_t)(bd_x4(I / 4) + 1) * 16; }
 template <int NR>
 __global__ static void __launch_bounds__(256) bd_gemv_f_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
-        const bd_u32 *__restrict__ tab, int fmt, int I, int O, int rowWords, int S, int nr) {
+        const bd_u32 *__restrict__ tab, int fmt, int I, int O, int rowWords, int S, int nr, float ys) {
+    /* ys, the matrix's .scale (1: none), in a register from the start: read from the parameter at the
+     * store, ptxas (CUDA 13.5, sm_120) spilled 4 bytes in bd_gemv_f_k<4> at its 80 registers; so none */
+    const float ysc = __shfl_sync(0xffffffffu, ys, 0);
     COLI_PDL_WAIT();
     extern __shared__ float4 bd_smf[];
     int s0 = (int)blockIdx.y * nr, nrow = min(nr, S - s0);
@@ -1647,7 +1650,7 @@ __global__ static void __launch_bounds__(256) bd_gemv_f_k(float *__restrict__ y,
         for (int r = 0; r < NR; r++) if (r < nrow) {
             float v = acc[r];
             for (int off = 16; off > 0; off >>= 1) v += bd_shfl_xor(v, off);
-            if (lane == 0) y[(size_t)(s0 + r) * O + o] = v;
+            if (lane == 0) y[(size_t)(s0 + r) * O + o] = v * ysc;   /* the matrix's .scale after the sum (x 1 exact: the same bits) */
         }
     }
 }
@@ -1874,7 +1877,7 @@ static int bd_gemv_rows_i8_launch(float *y, const float *x, const bd_u32 *W, con
     return 1;
 }
 static int bd_gemv_f_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, int fmt, int I, int O, int rowWords, int S,
-                            size_t smem_max, cudaStream_t st) {
+                            size_t smem_max, cudaStream_t st, float ys = 1.f) {
     int nr = S < BD_GEMV_NR ? S : BD_GEMV_NR;
     while (nr > 1 && bd_gemv_f_smem(I, nr) > smem_max) nr--;
     size_t sm = bd_gemv_f_smem(I, nr);
@@ -1885,11 +1888,11 @@ static int bd_gemv_f_launch(float *y, const float *x, const bd_u32 *W, const bd_
     if (nr > 1) {
         static unsigned raised;   /* past 48 KiB a kernel asks for it, once a device */
         bd_smem_raise((const void *)bd_gemv_f_k<BD_GEMV_NR>, sm, smem_max, &raised);
-        coli_launch(bd_gemv_f_k<BD_GEMV_NR>, g, 256, sm, st, y, x, W, tab, fmt, I, O, rowWords, S, nr);
+        coli_launch(bd_gemv_f_k<BD_GEMV_NR>, g, 256, sm, st, y, x, W, tab, fmt, I, O, rowWords, S, nr, ys);
     } else {
         static unsigned raised;
         bd_smem_raise((const void *)bd_gemv_f_k<1>, sm, smem_max, &raised);
-        coli_launch(bd_gemv_f_k<1>, g, 256, sm, st, y, x, W, tab, fmt, I, O, rowWords, S, 1);
+        coli_launch(bd_gemv_f_k<1>, g, 256, sm, st, y, x, W, tab, fmt, I, O, rowWords, S, 1, ys);
     }
     return 1;
 }
@@ -1925,8 +1928,12 @@ static inline int bd_glu_launch(float *y, const float *x, const bd_u32 *Wg, cons
         default: return 0;
     }
 }
+/* ys: the matrix's per-tensor scale (a GGUF's <name>.scale, e.g. 1 / global scale), applied to
+ * each output after its sum where the float form runs (*ys_done = 1); the other forms leave it to the caller's
+ * epilogue (bd_oscale_launch). ys == 1 writes the bits it always wrote. */
 static int bd_gemv_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, int fmt, int I, int O, int rowWords, int S,
-                          size_t smem_max, int force_float, cudaStream_t st) {
+                          size_t smem_max, int force_float, cudaStream_t st, float ys = 1.f, int *ys_done = nullptr) {
+    if (ys_done) *ys_done = 0;
     if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100]) return 0;
     if (!force_float) switch (fmt - 100) {
 #define BD_I8_CASE(t) case t: return bd_gemv_i8_launch<t>(y, x, W, tab, I, O, rowWords, S, smem_max, st);
@@ -1936,6 +1943,17 @@ static int bd_gemv_launch(float *y, const float *x, const bd_u32 *W, const bd_u3
         default: break;
     }
     if (!force_float && fmt == 130 && bd_gemv_bf16_launch(y, x, W, I, O, rowWords, S, st)) return 1;
-    return bd_gemv_f_launch(y, x, W, tab, fmt, I, O, rowWords, S, smem_max, st);
+    if (!bd_gemv_f_launch(y, x, W, tab, fmt, I, O, rowWords, S, smem_max, st, ys)) return 0;
+    if (ys_done) *ys_done = 1;
+    return 1;
+}
+/* y[0 .. n) *= s: the epilogue of a scaled matrix (a GGUF's <name>.scale) on the forms that do not apply it */
+__global__ static void bd_oscale_k(float *__restrict__ y, long long n, float s) {
+    COLI_PDL_WAIT();
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] *= s;
+}
+static inline void bd_oscale_launch(float *y, long long n, float s, cudaStream_t st) {
+    if (s != 1.f && n > 0) bd_oscale_k<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(y, n, s);
 }
 #endif
