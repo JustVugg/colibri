@@ -22,6 +22,11 @@ static int child(int c, const char *dir){
     return 0;
 }
 int main(int argc, char **argv){
+#ifdef _WIN32
+    (void)argc; (void)argv; (void)child;
+    printf("test_colibri_read_trust: skipped on Windows (each case runs in a child process)\n");
+    return 0;
+#else
     if (argc == 4 && !strcmp(argv[1], "--child")) return child(atoi(argv[2]), argv[3]);
     int fails = 0;
     for (int c = 0; c < 2; c++) {
@@ -36,4 +41,5 @@ int main(int argc, char **argv){
     if (fails) { printf("test_colibri_read_trust: %d failure(s)\n", fails); return 1; }
     printf("OK test_colibri_read_trust: right-sized tensor loads, short tensor refused before a config-sized read\n");
     return 0;
+#endif
 }

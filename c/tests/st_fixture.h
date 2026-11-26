@@ -7,7 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#ifndef _WIN32   /* the cases run in a child process: POSIX only (the tests skip on Windows) */
 #include <sys/wait.h>
+#include <unistd.h>
+#endif
 typedef struct { const char *name, *dtype; int64_t numel, nbytes; } FxT;
 static int fx_write(const char *dir, const FxT *t, int n){
     char hdr[8192], path[512]; int len = 0; int64_t off = 0;
@@ -25,6 +28,7 @@ static int fx_write(const char *dir, const FxT *t, int n){
     for (int64_t i = 0; i < off; i++) fputc(0x3c, f);   /* 0x3c3c3c3c = 0.0115f */
     return fclose(f);
 }
+#ifndef _WIN32
 /* Run `self --child <c> <dir>`; returns the exit code and fills `log` with stderr. */
 static int fx_child(const char *self, int c, const char *dir, char *log, size_t cap){
     char err[600], cmd[1600];
@@ -39,6 +43,7 @@ static int fx_child(const char *self, int c, const char *dir, char *log, size_t 
 static void fx_cleanup(const char *dir){
     char p[600]; snprintf(p, sizeof p, "%s/model.safetensors", dir); remove(p); rmdir(dir);
 }
+#endif
 /* A refusal is exit 1 naming the tensor, with no sanitizer report: ASan also
  * exits 1, so the exit code alone cannot tell a refusal from a heap overflow. */
 static int fx_refused(int got, const char *log, const char *tensor){
