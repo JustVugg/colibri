@@ -350,6 +350,10 @@ HANDLERS = {"detect_hardware": tool_detect_hardware, "recommend_models": tool_re
 # ---------------------------------------------------------------- protocol
 
 
+def _reject_json_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
 class Server:
     def __init__(self, out=None):
         self.out = out or sys.stdout
@@ -374,7 +378,8 @@ class Server:
         if not line:
             return
         try:
-            message = json.loads(line.decode("utf-8") if isinstance(line, bytes) else line)
+            message = json.loads(line.decode("utf-8") if isinstance(line, bytes) else line,
+                                 parse_constant=_reject_json_constant)
         except (ValueError, RecursionError):
             self.error(None, PARSE_ERROR, "parse error")
             return
