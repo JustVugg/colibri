@@ -1464,6 +1464,117 @@ __global__ static void grouped_down_f8w(float *y,const float *x,const GroupDesc 
     }
 }
 
+/* fmt=8 groups on the tensor cores (COLI_CUDA_F8_TC=1, off by default). A prompt chunk's expert
+ * has tens of rows (2048 rows, the top 10 of 512 experts: 40 on average), and the warp kernels
+ * above read the expert's weights once for every 4 of them. Here a block takes a tile of
+ * F8TC_R rows by F8TC_O outputs of one expert: each chunk of F8TC_K inputs of the tile's weights
+ * decoded once into shared memory as half (the e4m3 byte times its 128x128 block's scale, one
+ * scale for the whole chunk: the tile's 128 outputs are a block's, the chunk inside one), the
+ * rows as half, the products summed in float on 16x16x16 WMMA tiles, four warps of 32 outputs
+ * each. DUAL: the gate's and the up's tiles together, silu(g)*u written to gate as the warp
+ * kernels write it (up untouched); else down. Not the warp kernels' bits: rows and weights pass
+ * through half, as the chain's hcm_moe's do. The caller checks the shapes (inputs a multiple of
+ * F8TC_K, the weights on 4-byte boundaries). */
+#define F8TC_R 32
+#define F8TC_O 128
+#define F8TC_K 64
+#define F8TC_LD (F8TC_K + 8)    /* a row of the shared tiles in halves: 144 bytes, off the banks' stride */
+#define F8TC_OLD (F8TC_O + 4)   /* the epilogue's rows in floats */
+template<int DUAL>
+__global__ static void __launch_bounds__(128) grouped_f8_tc(float *out, const float *x, const GroupDesc *desc, int K, int O) {
+#if __CUDA_ARCH__ >= 700 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    using namespace nvcuda;
+    const int c = blockIdx.y, o0 = blockIdx.x * F8TC_O, r0 = blockIdx.z * F8TC_R;
+    const GroupDesc d = desc[c];
+    if (r0 >= d.rows || o0 >= O) return;   /* the whole block: before any barrier */
+    const int warp = threadIdx.x >> 5, t = threadIdx.x;
+    constexpr int WB = (DUAL ? 2 : 1) * F8TC_O * F8TC_LD * 2, EB = (DUAL ? 2 : 1) * F8TC_R * F8TC_OLD * 4;
+    __shared__ float slut[256];
+    __shared__ __align__(32) __half xs[F8TC_R * F8TC_LD];
+    __shared__ __align__(32) unsigned char wbuf[WB > EB ? WB : EB];
+    __half *wa = (__half *)wbuf, *wb = wa + F8TC_O * F8TC_LD;
+    for (int i = t; i < 256; i += 128) slut[i] = c_e4m3[i];
+    const uint8_t *A = (const uint8_t *)(DUAL ? d.g : d.d), *B = (const uint8_t *)d.u;
+    const float *As = DUAL ? d.gs : d.ds, *Bs = d.us;
+    const int nbk = (K + 127) >> 7, ob = o0 >> 7, nr = d.rows - r0 < F8TC_R ? d.rows - r0 : F8TC_R;
+    const float *xr = x + (size_t)(d.offset + r0) * K;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> ca[2][2], cb[2][2];
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) { wmma::fill_fragment(ca[i][j], 0.f); wmma::fill_fragment(cb[i][j], 0.f); }
+    __syncthreads();
+    for (int k0 = 0; k0 < K; k0 += F8TC_K) {
+        for (int q = t; q < F8TC_R * F8TC_K / 4; q += 128) {   /* the rows, four floats at a time, past nr zeros */
+            const int r = q / (F8TC_K / 4), k = (q % (F8TC_K / 4)) * 4;
+            const float4 v = r < nr ? *(const float4 *)(xr + (size_t)r * K + k0 + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+            __half2 *dst = (__half2 *)(xs + r * F8TC_LD + k);
+            dst[0] = __floats2half2_rn(v.x, v.y); dst[1] = __floats2half2_rn(v.z, v.w);
+        }
+        const float sa = As[(size_t)ob * nbk + (k0 >> 7)], sb = DUAL ? Bs[(size_t)ob * nbk + (k0 >> 7)] : 0.f;
+        for (int q = t; q < F8TC_O * F8TC_K / 4; q += 128) {   /* the weights, four bytes at a time, times the block's scale */
+            const int o = q / (F8TC_K / 4), k = (q % (F8TC_K / 4)) * 4, go = o0 + o;
+            uint32_t a4 = 0, b4 = 0;
+            if (go < O) { a4 = *(const uint32_t *)(A + (size_t)go * K + k0 + k); if (DUAL) b4 = *(const uint32_t *)(B + (size_t)go * K + k0 + k); }
+            const float ma = go < O ? sa : 0.f, mb = go < O ? sb : 0.f;
+            __half2 *da = (__half2 *)(wa + o * F8TC_LD + k);
+            da[0] = __floats2half2_rn(slut[a4 & 255] * ma, slut[(a4 >> 8) & 255] * ma);
+            da[1] = __floats2half2_rn(slut[(a4 >> 16) & 255] * ma, slut[a4 >> 24] * ma);
+            if (DUAL) {
+                __half2 *db = (__half2 *)(wb + o * F8TC_LD + k);
+                db[0] = __floats2half2_rn(slut[b4 & 255] * mb, slut[(b4 >> 8) & 255] * mb);
+                db[1] = __floats2half2_rn(slut[(b4 >> 16) & 255] * mb, slut[b4 >> 24] * mb);
+            }
+        }
+        __syncthreads();
+        for (int kk = 0; kk < F8TC_K; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa[2];
+            for (int i = 0; i < 2; i++) wmma::load_matrix_sync(fa[i], xs + (i * 16) * F8TC_LD + kk, F8TC_LD);
+            for (int j = 0; j < 2; j++) {
+                const int oc = warp * 32 + j * 16;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fb, wa + oc * F8TC_LD + kk, F8TC_LD);
+                for (int i = 0; i < 2; i++) wmma::mma_sync(ca[i][j], fa[i], fb, ca[i][j]);
+                if (DUAL) {
+                    wmma::load_matrix_sync(fb, wb + oc * F8TC_LD + kk, F8TC_LD);
+                    for (int i = 0; i < 2; i++) wmma::mma_sync(cb[i][j], fa[i], fb, cb[i][j]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    float *ea = (float *)wbuf, *eb = ea + F8TC_R * F8TC_OLD;   /* the weights' tiles are free: the sums through them */
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
+        wmma::store_matrix_sync(ea + (i * 16) * F8TC_OLD + warp * 32 + j * 16, ca[i][j], F8TC_OLD, wmma::mem_row_major);
+        if (DUAL) wmma::store_matrix_sync(eb + (i * 16) * F8TC_OLD + warp * 32 + j * 16, cb[i][j], F8TC_OLD, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int q = t; q < nr * F8TC_O; q += 128) {
+        const int r = q / F8TC_O, oc = q % F8TC_O, go = o0 + oc;
+        if (go >= O) continue;
+        float v = ea[r * F8TC_OLD + oc];
+        if (DUAL) { const float u = eb[r * F8TC_OLD + oc]; v = (v / (1.f + expf(-v))) * u; }
+        out[(size_t)(d.offset + r0 + r) * O + go] = v;
+    }
+#else
+    (void)out; (void)x; (void)desc; (void)K; (void)O;
+#endif
+}
+/* COLI_CUDA_F8_TC=1: an fmt=8 group with an expert of COLI_CUDA_F8_TC_MIN_ROWS rows or more (16)
+ * through grouped_f8_tc, where the card has the tensor cores (7.0) and the shapes fit */
+static int f8_tc_take(const DeviceContext *ctx, const GroupDesc *host, int count, int I, int D, int max_rows) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    (void)ctx; (void)host; (void)count; (void)I; (void)D; (void)max_rows; return 0;
+#else
+    /* read at each group, as COLI_CUDA_TC_INT4 is: a group's launch costs far more than two getenv */
+    const char *e = std::getenv("COLI_CUDA_F8_TC");
+    const int on = e && *e == '1';
+    e = std::getenv("COLI_CUDA_F8_TC_MIN_ROWS");
+    const int min_rows = e && *e ? (std::atoi(e) > 0 ? std::atoi(e) : 1) : 16;
+    if (!on || !ctx || ctx->compute_major < 7 || max_rows < min_rows || D % F8TC_K || I % F8TC_K || !host) return 0;
+    for (int c = 0; c < count; c++)
+        if (((size_t)host[c].g | (size_t)host[c].u | (size_t)host[c].d) & 3) return 0;
+    return 1;
+#endif
+}
+
 /* fmt=7 (MXFP4) expert groups: one WARP owns one (expert, output row) and its
  * lanes take the row's 32-input groups in turn (16 bytes of e2m1 nibbles and one
  * ue8m0 byte each), each decoded once for a tile of up to 4 activation rows. As
@@ -2952,7 +3063,13 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
  * behavior where cuda_fp8.h is absent (HIP); experimental until the
  * 256-value sweep certifies it bit-identical on the target silicon. */
 static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
-                            int max_rows,int count){
+                            int max_rows,int count,const GroupDesc *host){
+    if(f8_tc_take(ctx,host,count,I,D,max_rows)){   /* COLI_CUDA_F8_TC: the tensor cores' tiles */
+        const unsigned rz=(unsigned)((max_rows+F8TC_R-1)/F8TC_R);
+        grouped_f8_tc<1><<<dim3((unsigned)((I+F8TC_O-1)/F8TC_O),(unsigned)count,rz),128,0,ctx->stream>>>(ctx->gate,ctx->x,dev,D,I);
+        grouped_f8_tc<0><<<dim3((unsigned)((D+F8TC_O-1)/F8TC_O),(unsigned)count,rz),128,0,ctx->stream>>>(ctx->y,ctx->gate,dev,I,D);
+        return;
+    }
     int mode=f8_warp_mode();
     if(mode){
         dim3 hg((unsigned)((I+7)/8),(unsigned)count),og((unsigned)((D+7)/8),(unsigned)count);
@@ -3120,7 +3237,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
         if(!e8_group_launch(ctx,dev,I,D,max_rows,count,total)) return 0;
     }else if(all_f8){
         /* fp8-e4m3 groups: silu fused in the dual epilogue, like the w4/g4 duals. */
-        f8_group_launch(ctx,dev,I,D,max_rows,count);
+        f8_group_launch(ctx,dev,I,D,max_rows,count,host);
     }else if(all_mx4){
         mx4_group_launch(ctx,dev,I,D,count);
     }else if(tc){
@@ -3320,7 +3437,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     }else if(all_f8){
         /* fp8-e4m3 groups on the async decode path: same launch helper as the
          * sync dispatch, silu fused in the dual epilogue. */
-        f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count);
+        f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count,host);
     }else if(all_mx4){
         mx4_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,count);
     }else if(group_moe_ok(host,count,D,I)){
