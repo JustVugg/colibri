@@ -107,8 +107,9 @@ __global__ static void ccg_relattn_k(const float *q, const float *kc, const floa
     __syncthreads();
     float m = -3.0e38f, l = 0.f, acc0 = 0.f, acc1 = 0.f;
     if (part) {
-        const int z = (int)blockIdx.z, b0 = z * 128;
-        if (b0 < n) ccg_relattn_tile(kc, vc, kvs, relp, p, qs, rs, pe, red, pt, kvh, qpos, t0, n, ts, b0, tid, m, l, acc0, acc1);
+        const int z = (int)blockIdx.z, stride = (int)gridDim.z * 128;
+        for (int b0 = z * 128; b0 < n; b0 += stride)
+            ccg_relattn_tile(kc, vc, kvs, relp, p, qs, rs, pe, red, pt, kvh, qpos, t0, n, ts, b0, tid, m, l, acc0, acc1);
         float *pp = part + (((long)s * p.H + h) * gridDim.z + z) * (p.hd + 2);
         if (tid == 0) { pp[0] = m; pp[1] = l; }
         if (tid < p.hd) pp[2 + tid] = acc0;
