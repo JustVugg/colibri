@@ -64,6 +64,9 @@ typedef struct {
     uint32_t *dm_ent; CcExpert *dm_tabh; float *dm_esch;
     size_t dm_esc_off;
     CcBuf *dm_tab, *dm_ids, *dm_w, *dm_hid, *dm_y, *kvl;
+    int pf_rows;
+    CcBuf *pf_ids, *pf_w, *pf_hid, *pf_y;      /* prefill in-frame grouped MoE buffers */
+    int kv_dev_lo, kv_dev_hi;                  /* lazy KV sync range [lo, hi) on device from full-GPU prefill */
     unsigned long long dm_layers, dm_reads;
     float *host_routed;
     unsigned long long forwards;
@@ -172,9 +175,10 @@ static void ink2cc_free_own(Model *m, Ink2CuChain *ch) {
     }
     for (int v = 0; v < ch->NS; v++) { cc_free(ch->kc[v]); cc_free(ch->vc[v]); ch->kc[v] = ch->vc[v] = NULL; }
     ch->t_lm = NULL;
-    CcBuf **dm[] = {&ch->dm_tab, &ch->dm_ids, &ch->dm_w, &ch->dm_hid, &ch->dm_y, &ch->kvl};
+    CcBuf **dm[] = {&ch->dm_tab, &ch->dm_ids, &ch->dm_w, &ch->dm_hid, &ch->dm_y, &ch->kvl,
+                    &ch->pf_ids, &ch->pf_w, &ch->pf_hid, &ch->pf_y};
     for (size_t k = 0; k < sizeof dm / sizeof dm[0]; k++) { cc_free(*dm[k]); *dm[k] = NULL; }
-    ch->dm_read = 0; ch->dm_state = -1;
+    ch->dm_read = 0; ch->dm_state = -1; ch->pf_rows = 0;
     cc_free(ch->rings); ch->rings = NULL;
     cc_free(ch->prm); ch->prm = NULL;
     ch->max_t = 0; ch->hostK = NULL;
@@ -369,11 +373,12 @@ static int ink2cc_bufs(Ink2CuChain *ch, Model *m, int rows) {
              cc_reserve(&ch->lz, r * (size_t)c->loop_r * 4, CC_DEV) && cc_reserve(&ch->lf, r * D * 4, CC_DEV) &&
              cc_reserve(&ch->lgv, r * D * 4, CC_DEV)));
 }
-/* Prompt rows per chunk: COLI_CUDA_CHAIN_ROWS (1 to 8192), else 1024, as OLMoE's CUDA chain. */
+/* Prompt rows per chunk: COLI_CUDA_CHAIN_ROWS (1 to 8192), default 4096 for Inkling-2-Mini
+ * so each grouped MoE expert receives ~256 rows/chunk (enabling BM=256 tiles & 4x fewer weight reads vs 1024). */
 static int ink2cc_chunk_rows(Ink2CuChain *ch, Model *m) {
     (void)ch; (void)m;
     const char *e = getenv("COLI_CUDA_CHAIN_ROWS");
-    int r = e && *e ? atoi(e) : 1024;
+    int r = e && *e ? atoi(e) : 4096;
     return r < 1 ? 1 : r > 8192 ? 8192 : r;
 }
 /* the K/V mirrors at the host's layout, made again when the host's cache was */
@@ -408,6 +413,27 @@ static void ink2cc_host_wrote(Model *m, int zero) {
     Ink2CuChain *ch = ink2cc_of(m);
     if (!ch || !ch->ok) return;
     ch->cs_where = INK2CC_HOST; ch->host_zero = zero;
+    ch->kv_dev_lo = ch->kv_dev_hi = 0;
+}
+static void ink2cc_sync_kv(Model *m) {
+    Ink2CuChain *ch = ink2cc_of(m);
+    if (!ch || !ch->ok || ch->kv_dev_lo >= ch->kv_dev_hi || cc_lost()) return;
+    Cfg *c = &m->c;
+    for (int v = 0; v < ch->NS; v++) {
+        if (!ch->kc[v] || !ch->vc[v] || !m->K || !m->K[v] || !m->V || !m->V[v]) continue;
+        int cap = ch->cap[v], hd = L_HD(c, v), KV = L_KV(c, v);
+        int lo = ch->kv_dev_hi - cap > ch->kv_dev_lo ? ch->kv_dev_hi - cap : ch->kv_dev_lo;
+        for (int t = lo; t < ch->kv_dev_hi; ) {
+            int row = t % cap, run = ch->kv_dev_hi - t < cap - row ? ch->kv_dev_hi - t : cap - row;
+            for (int h = 0; h < KV; h++) {
+                size_t off = ((size_t)h * cap + row) * hd;
+                cc_read(ch->kc[v], off, m->K[v] + off, (size_t)run * hd * sizeof(float));
+                cc_read(ch->vc[v], off, m->V[v] + off, (size_t)run * hd * sizeof(float));
+            }
+            t += run;
+        }
+    }
+    ch->kv_dev_lo = ch->kv_dev_hi = 0;
 }
 static void ink2cc_cpu_step(Model *m, int pos_base, int S) {
     Ink2CuChain *ch = ink2cc_of(m);
@@ -525,7 +551,7 @@ static int ink2cc_attention(Ink2CuChain *ch, Model *m, int i, int v, int sep, in
         rv[(s - s0) * KV + h] = (CcRegion){dst, vs + src, (size_t)hd};
     }
     ok = cc_copy_regions(ch->kc[v], ch->kvs, rk, nr) && cc_copy_regions(ch->vc[v], ch->kvs, rv, nr) &&
-         cc_copy(kvdst, ko, ch->kvs, 0, (size_t)n * kvo) && cc_copy(kvdst, ko + vstride, ch->kvs, vs, (size_t)n * kvo);
+         (!kvdst || (cc_copy(kvdst, ko, ch->kvs, 0, (size_t)n * kvo) && cc_copy(kvdst, ko + vstride, ch->kvs, vs, (size_t)n * kvo)));
     free(rk);
     return ok && cc_matmul(ch->t_o[i], ch->ctx, 0, ch->a, 0, n);
 }
@@ -626,12 +652,25 @@ static int ink2cc_dm_table(Ink2CuChain *ch, Model *m) {
     }
     return any;
 }
-/* The step's buffers and table, 1 when a layer of it may run its experts here: a decode step's rows,
- * not with TOPP (its kept ranks are the host's), ROUTE_TRACE, cache routing on the host or a
- * backend without CC_INK2_MOE */
+/* Reserve prefill in-frame MoE buffers for `rows` (> CC_MOE_FRAME_ROWS) without touching decode buffers. */
+static int ink2cc_dmoe_pf_reserve(Ink2CuChain *ch, Model *m, int rows) {
+    if (rows <= ch->pf_rows && ch->pf_ids && ch->pf_w && ch->pf_hid && ch->pf_y) return 1;
+    Cfg *c = &m->c; const int D = c->hidden, I = c->moe_inter, E = c->n_experts, K = c->topk;
+    const size_t hid_bytes = cc_moe_hid_floats(rows, K, D, I, E) * sizeof(float);
+    if (!cc_reserve(&ch->pf_ids, (size_t)ch->NS * (size_t)rows * K * sizeof(int), CC_DOWN) ||
+        !cc_reserve(&ch->pf_w, (size_t)rows * K * sizeof(float), CC_DEV) ||
+        !cc_reserve(&ch->pf_hid, hid_bytes, CC_DEV) ||
+        !cc_reserve(&ch->pf_y, (size_t)rows * D * sizeof(float), CC_DEV))
+        return 0;
+    ch->pf_rows = rows;
+    return 1;
+}
+/* The step's buffers and table, 1 when a layer of it may run its experts here: both decode rows
+ * and full-GPU prefill chunks (when all layers are VRAM-resident fmt=4), not with TOPP, ROUTE_TRACE,
+ * shared experts or a backend without CC_INK2_MOE */
 static int ink2cc_dmoe(Ink2CuChain *ch, Model *m, int rows) {
     Cfg *c = &m->c; const int L = c->n_layers, E = c->n_experts, K = c->topk;
-    if (ch->dm_state < 0 || rows > CC_MOE_FRAME_ROWS || (g_topp > 0.f && g_topp < 1.f) || rt_fp || c->n_shared > 0) return 0;
+    if (ch->dm_state < 0 || (g_topp > 0.f && g_topp < 1.f) || rt_fp || c->n_shared > 0) return 0;
     if (ch->dm_state == 0) {
         ch->dm_state = -1;
         if (!ink2cc_dm_wanted() || !(cc_ink2_caps() & CC_INK2_MOE) || !cc_moe_ready() || !cut_ready() || cut_devices() > 1 ||
@@ -654,15 +693,24 @@ static int ink2cc_dmoe(Ink2CuChain *ch, Model *m, int rows) {
         }
         ch->dm_state = 1;
     }
-    return ink2cc_dm_table(ch, m);
+    if (!ink2cc_dm_table(ch, m)) return 0;
+    if (rows > CC_MOE_FRAME_ROWS) {
+        for (int i = 0; i < L; i++) if (!ch->dm_on[i] || ch->dm_fmt[i] != 4) return 0;
+        return ink2cc_dmoe_pf_reserve(ch, m, rows);
+    }
+    return 1;
 }
 /* after the frame: a step whose experts ran there (layer i, state layer v), its K/V rows into the
  * host's cache and its books, as moe_ex and ink_vk_moe keep them */
 static void ink2cc_dmoe_done(Ink2CuChain *ch, Model *m, int i, int v, int n, int pb) {
     const int K = m->c.topk;
-    const size_t reg = (size_t)2 * CC_MOE_FRAME_ROWS * ch->kvo_max;
-    ink2cc_kv_down(ch, m, v, n, pb, (const float *)cc_ptr(ch->kvl) + (size_t)v * reg, reg / 2);
-    const int *ids = (const int *)cc_ptr(ch->dm_ids) + (size_t)v * CC_MOE_FRAME_ROWS * K;
+    const int pf = n > CC_MOE_FRAME_ROWS;
+    if (!pf) {
+        const size_t reg = (size_t)2 * CC_MOE_FRAME_ROWS * ch->kvo_max;
+        ink2cc_kv_down(ch, m, v, n, pb, (const float *)cc_ptr(ch->kvl) + (size_t)v * reg, reg / 2);
+    }
+    const int *ids = pf ? ((const int *)cc_ptr(ch->pf_ids) + (size_t)v * ch->pf_rows * K)
+                        : ((const int *)cc_ptr(ch->dm_ids) + (size_t)v * CC_MOE_FRAME_ROWS * K);
     m->ereq += (uint64_t)n * K; m->euse += (uint64_t)n * K;
     for (int j = 0; j < n * K; j++) {
         if (ids[j] < 0) continue;
@@ -679,15 +727,28 @@ static void ink2cc_dmoe_done(Ink2CuChain *ch, Model *m, int i, int v, int n, int
  * was lost). 1 = taken. */
 static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit) {
     if (!g_cu_chain) return 0;
-    if (g_cu_chain == 2 && S <= 2) return 0;   /* prompts only: decode on the CPU */
-    if (m->mux_rows) return 0;
+    if (g_cu_chain == 2 && S <= 2) { ink2cc_sync_kv(m); return 0; }   /* prompts only: decode on the CPU */
+    if (m->mux_rows) { ink2cc_sync_kv(m); return 0; }
     Ink2CuChain *ch = ink2cc_setup(m);
-    if (!ch || ch->failed) return 0;
+    if (!ch || ch->failed) { ink2cc_sync_kv(m); return 0; }
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, E = c->n_experts, K = c->topk, blkn = c->res_block > 0 ? c->res_block : 1;
     int mirror_ok = ink2cc_mirror(ch, m);
-    int CH = mirror_ok ? ink2cc_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
-    if (!mirror_ok || pos_base + S > m->max_t || !ink2cc_scratch(ch, m, rows) ||
-        (want_x && !cc_reserve(&ch->xd, (size_t)rows * D * sizeof(float), CC_DOWN))) {
+    int CH = mirror_ok ? ink2cc_chunk_rows(ch, m) : 1;
+    int nchunks = CH > 0 ? (S + CH - 1) / CH : 1;
+    int rows = nchunks > 1 ? (S + nchunks - 1) / nchunks : S;
+    int scr_ok = 0;
+    if (mirror_ok && pos_base + S <= m->max_t) {
+        for (;;) {
+            if (ink2cc_scratch(ch, m, rows) && (!want_x || cc_reserve(&ch->xd, (size_t)rows * D * sizeof(float), CC_DOWN))) {
+                scr_ok = 1;
+                break;
+            }
+            if (rows <= 256 || rows <= ch->rows) break;
+            rows = (rows + 1) / 2;
+            if (rows < 256) rows = 256;
+        }
+    }
+    if (!scr_ok) {
         fprintf(stderr, "[CUDA] inkling2 chain: device memory for %d rows refused; per-matrix path\n", rows);
         ink2cc_free_own(m, ch);
         ch->failed = 1;
@@ -730,7 +791,7 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
             } else i = v = st - (lp ? (c->loop_p - 1) * (le - ls) : 0);
             Layer *l = &m->L[i]; Ink2Layer *x2 = l->x2;
             int local = c->local[i];
-            if (pending) ok = ink2cc_join(ch, m, pi, pv, n, prev_dev ? ch->dm_y : ch->routed);
+            if (pending) ok = ink2cc_join(ch, m, pi, pv, n, prev_dev ? (n > CC_MOE_FRAME_ROWS ? ch->pf_y : ch->dm_y) : ch->routed);
             const int dl = dmoe && ch->dm_on[i];   /* its experts here, no wait */
             const int msg = lp && pass > 0;   /* a later pass: this layer's four messages */
             if (ok && lp && i == ls) {
@@ -771,10 +832,10 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
             ok = ok && ink2cc_norm(iq, ch->prm, ch->o_n1[i], ch->nq, n, D, c->eps);
             if (sep) ok = ok && ink2cc_norm(ik, ch->prm, local ? ch->o_n1[i] : ch->o_n2[i], ch->nk, n, D, c->eps) &&
                               ink2cc_norm(iv, ch->prm, local ? ch->o_n1[i] : ch->o_n3[i], ch->nv, n, D, c->eps);
-            {   /* the step's K/V rows: kvd for the host's step after this frame, kvl's region when the frame goes on */
+            {   /* the step's K/V rows: kvd for the host's step after this frame, kvl for decode in-frame, lazy GPU-only for prefill */
                 const size_t reg = (size_t)2 * CC_MOE_FRAME_ROWS * ch->kvo_max;
-                ok = ok && (dl ? ink2cc_attention(ch, m, i, v, sep, n, pb, ch->kvl, (size_t)v * reg, reg / 2)
-                               : ink2cc_attention(ch, m, i, v, sep, n, pb, ch->kvd, 0, (size_t)R * ch->kvo_max)) &&
+                CcBuf *kvdst = dl ? (n > CC_MOE_FRAME_ROWS ? NULL : ch->kvl) : ch->kvd;
+                ok = ok && ink2cc_attention(ch, m, i, v, sep, n, pb, kvdst, dl ? (size_t)v * reg : 0, dl ? reg / 2 : (size_t)R * ch->kvo_max) &&
                      ink2cc_sconv(ch, ch->a, 0, n, D, 2, i, v, c);
             }
             /* a block boundary keeps this layer's input stream as a block state and starts the
@@ -796,15 +857,21 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
                  ink2cc_norm(ch->hq, ch->prm, ch->o_post[i], ch->nq, n, D, c->eps) &&
                  cc_matmul(ch->t_router[i], ch->nq, 0, ch->lg, 0, n);
             if (dl) {   /* Inkling-2's routing and SiTU-GLU experts here (moe_ex's), and on */
-                const int ko = v * CC_MOE_FRAME_ROWS * K;
-                CcRoute rp = {n, E, K, 1, 0, E, (int)ch->o_rb[i], 1, ko, K, ko, K, 1, 1, 1, 1.f, c->route_scale * l->rgs, 0.f};
+                const int pf = n > CC_MOE_FRAME_ROWS;
+                const int ko = pf ? v * ch->pf_rows * K : v * CC_MOE_FRAME_ROWS * K;
+                const int wo = pf ? 0 : ko;
+                CcBuf *b_ids = pf ? ch->pf_ids : ch->dm_ids;
+                CcBuf *b_w   = pf ? ch->pf_w   : ch->dm_w;
+                CcBuf *b_hid = pf ? ch->pf_hid : ch->dm_hid;
+                CcBuf *b_y   = pf ? ch->pf_y   : ch->dm_y;
+                CcRoute rp = {n, E, K, 1, 0, E, (int)ch->o_rb[i], 1, ko, K, wo, K, 1, 1, 1, 1.f, c->route_scale * l->rgs, 0.f};
                 CcMoe mp = {0};
                 mp.S = n; mp.K = K; mp.D = D; mp.I = c->moe_inter; mp.fmt = ch->dm_fmt[i]; mp.gs = ch->dm_gs[i]; mp.act = 1; mp.parts = 3;
-                mp.t_off = i * E; mp.x_row = D; mp.i_off = ko; mp.i_row = K; mp.w_off = ko; mp.w_row = K; mp.y_row = D; mp.h_off = -1;
+                mp.t_off = i * E; mp.x_row = D; mp.i_off = ko; mp.i_row = K; mp.w_off = wo; mp.w_row = K; mp.y_row = D; mp.h_off = -1;
                 mp.E = E; mp.fmt_d = ch->dm_fmtd[i];
                 mp.esc_off = m->L[i].xgsc ? (int)ch->dm_esc_off : 0; mp.act_a = c->gate_cap; mp.act_b = c->up_cap;
-                ok = ok && cc_route(ch->lg, ch->prm, ch->dm_ids, ch->dm_w, &rp) &&
-                     cc_moe(ch->dm_tab, ch->nq, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
+                ok = ok && cc_route(ch->lg, ch->prm, b_ids, b_w, &rp) &&
+                     cc_moe(ch->dm_tab, ch->nq, b_ids, b_w, b_hid, b_y, NULL, &mp);
                 if (ok) { dq[2 * ndq] = i; dq[2 * ndq + 1] = v; ndq++; }
                 pending = 1; pi = i; pv = v; prev_dev = 1;
                 continue;
@@ -829,7 +896,7 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
             ok = cc_begin();
             pending = 1; pi = i; pv = v; prev_dev = 0;
         }
-        if (ok && pending) ok = ink2cc_join(ch, m, pi, pv, n, prev_dev ? ch->dm_y : ch->routed);
+        if (ok && pending) ok = ink2cc_join(ch, m, pi, pv, n, prev_dev ? (n > CC_MOE_FRAME_ROWS ? ch->pf_y : ch->dm_y) : ch->routed);
         /* the output's mix of the block states and the last stream: the rows the final norm reads */
         ok = ok && ink2cc_mix(ch, ch->x, B, ch->o_outq, ch->hq, n, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->hq, 0, (size_t)n * D);
@@ -846,6 +913,10 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
         m->t_attn += now_s() - t0;
         if (!ok) goto lost;
         for (int k = 0; k < ndq; k++) ink2cc_dmoe_done(ch, m, dq[2 * k], dq[2 * k + 1], n, pb);
+        if (ndq > 0 && n > CC_MOE_FRAME_ROWS) {
+            if (ch->kv_dev_lo >= ch->kv_dev_hi) { ch->kv_dev_lo = pb; ch->kv_dev_hi = pb + n; }
+            else { if (pb < ch->kv_dev_lo) ch->kv_dev_lo = pb; if (pb + n > ch->kv_dev_hi) ch->kv_dev_hi = pb + n; }
+        }
         ndq = 0;
         const float *csd = (const float *)cc_ptr(ch->csd);
         for (int i = 0; i < ch->NS; i++) for (int b = 0; b < 4; b++)

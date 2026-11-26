@@ -88,6 +88,7 @@ struct CcCtx {
     /* host_up: the copies' marks, a ring of CC_UP_MARKS events on the copy stream */
     cudaEvent_t up_ev[CC_UP_MARKS]; unsigned up_seq, up_made; cudaEvent_t up_after;
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
+    float *conv_tmp; size_t conv_tmp_bytes;   /* 2D parallel sconv/dconv scratch (cuda_inkc.cuh) */
     /* the scratch a resize retired: freed once a later frame has been waited for (a stream
      * sync here could wait on a cc_wait_host kernel whose host side comes after this frame) */
     float *adec_old[4]; int adec_n_old;
@@ -3344,11 +3345,13 @@ static void cc_shutdown(void) {
             if (c->up_made) { for (int i = 0; i < CC_UP_MARKS; i++) cudaEventDestroy(c->up_ev[i]); cudaEventDestroy(c->up_after); }
             c->up_made = 0; c->up_seq = 0;
             if (c->adec) cudaFree(c->adec);
+            if (c->conv_tmp) cudaFree(c->conv_tmp);
             cc_adec_reap(c);
         }
         if (c->device_profile) (void)coli_cuda_enable_qwen36(c->device, 0);
         c->pend_norm = 0; c->device_profile = c->qx_warmed = 0;
         c->adec = nullptr; c->adec_bytes = 0;
+        c->conv_tmp = nullptr; c->conv_tmp_bytes = 0;
         (void)cudaGetLastError();
         c->ev_down = c->ev_down_done = nullptr;
         c->down_seq = c->down_joined = 0;
@@ -4612,8 +4615,8 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
     if ((p->parts & 2) && (!w || !y || (p->h_off >= 0 && !hy))) return 0;
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;
     if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
-    /* CC_INK2_MOE's (a decode step's rows; the scales' pairs inside the table's buffer): refused here, not a lost device */
-    if (p->act < 0 || p->act > 1 || p->esc_off < 0 || ((p->act || p->esc_off) && LS > CC_MOE_FRAME_ROWS) ||
+    /* CC_INK2_MOE: act 1 & esc_off supported on prompt chunks for fmt=4 (Tensor-Core grouped MoE); other formats decode only */
+    if (p->act < 0 || p->act > 1 || p->esc_off < 0 || ((p->act || p->esc_off) && p->fmt != 4 && LS > CC_MOE_FRAME_ROWS) ||
         (p->act == 1 && !(p->act_a > 0.f && p->act_b > 0.f)) ||
         (p->esc_off && (p->esc_off % 8 || p->E < 1 || (size_t)p->esc_off + (size_t)(p->t_off + p->E) * 8 > tab->bytes))) return 0;
     if (LS > CC_MOE_FRAME_ROWS && p->E < 1) return 0;
