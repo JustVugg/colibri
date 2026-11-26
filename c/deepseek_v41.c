@@ -4690,6 +4690,14 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
 #ifdef COLI_VULKAN
 #include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
+/* the Vulkan chain holds the trunk: a forward runs its layers there, never on the CUDA chain */
+static int v41_vk_trunk(void) {
+#ifdef COLI_VULKAN
+    return g_v41c && g_v41c->ok;
+#else
+    return 0;
+#endif
+}
 #ifdef COLI_CUDA
 #include "deepseek_v41_cuchain.h" /* a prompt's layers on the CUDA chain (COLI_CUDA_CHAIN) */
 #endif
@@ -6541,7 +6549,7 @@ static size_t v41_cu_dense_bytes(const Model *m) {
 static size_t v41_tier_chain_bytes(Model *m) {
 #ifdef COLI_CUDA
     const char *e = getenv("COLI_CUDA_CHAIN");
-    if (xt_cuda() && m->gguf && !(e && *e == '0') && g_v41_mux_slots <= 1) return v41u_plan_bytes(m, m->c.max_positions);
+    if (xt_cuda() && m->gguf && !(e && *e == '0') && g_v41_mux_slots <= 1 && !v41_vk_trunk()) return v41u_plan_bytes(m, m->c.max_positions);
 #endif
     (void)m;
     return 0;
@@ -6793,6 +6801,42 @@ static int v41_gguf_report(Model *m, const char *snap) {
     return 0;
 }
 
+#ifdef COLI_CUDA
+/* The routed experts on the CUDA tier (cu_tier.h through xtier.h); a GGUF's dense matrices go
+ * there too as far as their budget goes (cu_dense.h), unless the Vulkan chain holds the trunk:
+ * then every forward runs there, so the CUDA side keeps no dense copies and the tier no room
+ * for the CUDA chain (v41_tier_chain_bytes). Returns 1 when the tier is on. */
+static int v41_cu_tier_open(Model *m, const char *snap, int cap) {
+    static int tried;
+    if (tried) return xt_cuda() && cut_ready();
+    tried = 1;
+    int dev = 0;
+    if (!coli_cuda_init(&dev, 1)) {
+        fprintf(stderr, "[CUDA] deepseek_v41: no CUDA device, the routed experts stay on the CPU\n");
+        return 0;
+    }
+    g_v41_cu = 1;
+    xt_use_cuda(1);
+    g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0), v41_vk_trunk() ? 0 : v41_cu_dense_bytes(m));
+    vk_tier_start(m, snap, cap);
+    if (!cut_ready()) { xt_use_cuda(0); g_v41_cu = 0; g_cud.on = 0; return 0; }
+    return 1;
+}
+#endif
+/* A build with both backends, CUDA asked for (COLI_CUDA=1), a GGUF: the Vulkan device runs the
+ * dense chain and the routed experts go to the CUDA tier on the same card, which serves them
+ * faster than Vulkan's. V41_TIER=vulkan keeps them on Vulkan's tier, and so does a CUDA tier that
+ * does not start. */
+static int v41_experts_on_cuda(const Model *m) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    const char *cu = getenv("COLI_CUDA"), *t = getenv("V41_TIER");
+    return m->gguf && cu && atoi(cu) && !(t && !strcmp(t, "vulkan")) && cut_wanted() && m->c.n_routed > 0;
+#else
+    (void)m;
+    return 0;
+#endif
+}
+
 int main(int argc, char **argv) {
 #if defined(COLI_CUDA) && defined(COLI_VULKAN)
     {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
@@ -6802,8 +6846,8 @@ int main(int argc, char **argv) {
         const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
         if (cu && atoi(cu) && !(vk && *vk)) {
             setenv("COLI_VULKAN", "1", 1);
-            fprintf(stderr, "[CUDA] deepseek_v41: a build with Vulkan runs on it, the same card, its dense chain and expert tier "
-                            "(COLI_VULKAN=0 keeps the CUDA tier)\n");
+            fprintf(stderr, "[CUDA] deepseek_v41: a build with Vulkan runs its dense chain on it, the same card; the routed "
+                            "experts on the CUDA tier for a GGUF (V41_TIER=vulkan: Vulkan's tier; COLI_VULKAN=0: the CUDA tier alone)\n");
         }
     }
 #endif
@@ -6888,27 +6932,20 @@ int main(int argc, char **argv) {
             : "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower");
     v41c_start(&m);              /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
     coli_vk_window_trunk_ask();  /* trunk-first: the mapped-weights window asked around the trunk, before the tier sizes itself */
+#ifdef COLI_CUDA
+    if (g_vk_ready && v41_experts_on_cuda(&m) && v41_cu_tier_open(&m, snap, cap))
+        atexit(coli_vk_shutdown);   /* vk_tier_start registers it with Vulkan's tier; before the chain's, which goes first */
+    else
+#endif
     vk_tier_start(&m, snap, cap);
     v41c_atexit();               /* after the tier's: the chain goes before the device */
     if (g_vk_ready && !vkt_ready() && !coli_vk_dense())
         coli_vk_dense_decide("deepseek_v41", 0, 1);   /* no tier after all: the trunk to the device */
 #endif
 #ifdef COLI_CUDA
-    {   /* COLI_CUDA=1 with no Vulkan tier: the CUDA device opens for the routed experts, the same
-         * tier (cu_tier.h) holds them, and a GGUF's dense matrices go there too as far as their
-         * budget goes (cu_dense.h), which the tier leaves them */
+    {   /* COLI_CUDA=1 with no Vulkan tier: the CUDA device opens for the routed experts (v41_cu_tier_open) */
         const char *cu = getenv("COLI_CUDA");
-        int dev = 0;
-        if (cu && atoi(cu) && !vkt_ready() && c->n_routed > 0 && cut_wanted()) {
-            if (!coli_cuda_init(&dev, 1)) fprintf(stderr, "[CUDA] deepseek_v41: no CUDA device, the routed experts stay on the CPU\n");
-            else {
-                g_v41_cu = 1;
-                xt_use_cuda(1);
-                g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0), v41_cu_dense_bytes(&m));
-                vk_tier_start(&m, snap, cap);
-                if (!cut_ready()) { xt_use_cuda(0); g_v41_cu = 0; g_cud.on = 0; }
-            }
-        }
+        if (cu && atoi(cu) && !vkt_ready() && c->n_routed > 0 && cut_wanted()) v41_cu_tier_open(&m, snap, cap);
     }
 #endif
 

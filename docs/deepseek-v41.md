@@ -454,6 +454,7 @@ and costs the contention. Anything that tries again has to start from that.
 | `COLI_DISK_WEIGHTS` | unset (startup probe) | the split ratio, one positive weight per drive (`1,1` for an even pair). Unset measures each drive with the engine's own access pattern. |
 | `V41_DIRECT` | 1 | read experts with `O_DIRECT` instead of through the page cache. `0` is the buffered arm and the escape hatch; the two paths return identical bytes. |
 | `COLI_VULKAN` | off | `VK=1` build: the trunk on the Vulkan device and the backbone's routed experts on the shared expert tier (see "Vulkan" below; `COLI_VK_DENSE`, `COLI_VK_TIER*` in [ENVIRONMENT.md](ENVIRONMENT.md#vulkan-any-gpu-with-a-vulkan-12-driver)). With the tier on, the expert history `COLI_USAGE` is kept. |
+| `V41_TIER` | `cuda` for a GGUF under `COLI_CUDA=1` | where a GGUF's routed experts go in a build with both backends (`VK=1 CUDA=1`) while the Vulkan device runs the dense chain: the CUDA tier on the same card, or `vulkan` for Vulkan's tier (where they also go when the CUDA tier does not start). On an RTX 4070 Ti with unsloth's UD-Q2_K_XL (`--ram 28`), the CUDA tier decoded at 3.15-3.16 tok/s and read a 650-token prompt in 46 s, Vulkan's at 2.58-2.60 tok/s and in 65 s. With the chain on Vulkan the CUDA side keeps no dense copies and no chain buffers, so the tier has that room. |
 | `V41_ENGRAM_ROWS` | 65536 | rows of engram cache per table. The traffic is Zipfian: common 2-grams repeat constantly, so a small cache absorbs most of it. 65536 rows is 64 MB per table on the released head_dim. |
 | `V41_INDEX_OWNER` | unset | each layer scores against its own owner's index keys (see above). Changes the model's behaviour. |
 | `V41_MOE_BLOCK` | 1024 | how many prompt positions the CPU path routes together. The experts a block asks for are read once for all of its rows, so a bigger block re-reads fewer experts across a prompt: on unsloth's UD-Q2_K_XL in a build without a GPU backend, a 650-token prompt read 885 GB in blocks of 32 and 164 GB in one block, and prefilled in 82 s instead of 250 s. The bits do not move. When the CUDA or Vulkan tier streams the prompt it already takes the whole step at once and this does nothing. The scratch is about 160 KB a row on V4.1; the ceiling is 16384. |
@@ -503,6 +504,8 @@ after every forward), so rollbacks, prefix reuse and a lost device need nothing 
 Off by default on an integrated GPU (not measured on a V4.1 checkpoint); on the tiny
 fixtures every configuration gives the CPU's tokens (`tests/vulkan_engines.sh
 deepseek-chain`, `deepseek-chain-sanitize`).
+
+In a build with both backends (`VK=1 CUDA=1`, what `coli setup` builds on an NVIDIA card) under `COLI_CUDA=1`, the Vulkan device runs the dense chain and a GGUF's routed experts go to the CUDA tier on the same card (`V41_TIER`), which serves them faster than Vulkan's tier; the chain takes every forward, so the CUDA side holds neither dense copies nor the CUDA chain's buffers. `V41_TIER=vulkan` keeps the experts on Vulkan's tier, `COLI_VULKAN=0` runs the CUDA tier alone.
 
 ### Trunk-first placement (a discrete card with Resizable BAR)
 
