@@ -1357,7 +1357,7 @@ static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos
                 }
                 double t0 = now_s();
                 ok = ok && vkc_submit(1);
-                m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0;
+                m->timers.seconds[Q38_TM_DEV_WAIT] += now_s() - t0;
                 if (!ok) return -1;
                 if (want_streams && i == hi - 1) memcpy(hyper_h + (size_t)c0 * W, vkc_ptr(ch->hypd), (size_t)n * W * 4);   /* the frame is done */
                 if (dl) q38c_dmoe_done(ch, m, i, i + 1, n, pb);
@@ -1452,7 +1452,7 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
             ok = ok && vkc_submit(0);
             if (ok) vkt_stream_prefetch(i, n);
             ok = ok && vkc_finish();
-            m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0;
+            m->timers.seconds[Q38_TM_DEV_WAIT] += now_s() - t0;
             if (!ok) break;
             if (dmoe) q38c_dmoe_done(ch, m, from, i, n, pb);   /* the layers before it in this frame */
             from = i + 1; prev_dev = 0;
@@ -1481,7 +1481,7 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
         }
         double t0 = now_s();
         ok = ok && vkc_submit(1);
-        m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0;
+        m->timers.seconds[Q38_TM_DEV_WAIT] += now_s() - t0;
         if (!ok) goto lost;
         if (dmoe) q38c_dmoe_done(ch, m, from, hi, n, pb);
         if (want_streams) memcpy(hyper_h + (size_t)c0 * W, vkc_ptr(ch->hypd), (size_t)n * W * 4);
