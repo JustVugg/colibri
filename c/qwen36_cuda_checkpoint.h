@@ -4,6 +4,7 @@
 #define QWEN36_CUDA_CHECKPOINT_H
 
 #include "evidence_digest.h"
+#include "gguf.h"
 #include <inttypes.h>
 #include <time.h>
 #ifdef _WIN32
