@@ -1210,6 +1210,14 @@ static void q38_spec_report(const Model *m, const Q38Spec *sp, const char *scope
 
 static Q38Spec g_q38_run_spec;   /* generate()'s, reported by main() */
 
+/* DUMP=<path>: every logits row a token is sampled from, appended as raw float32 (vocab a
+ * row), as qwen36 and colibri.c write it; it used to be the last row only. */
+static FILE *g_dump = NULL; static int g_dump_init = 0; static long g_dump_rows = 0;
+static void dump_logits(const float *lo, int n) {
+    if (!g_dump_init) { g_dump_init = 1; const char *p = getenv("DUMP"); if (p && *p) g_dump = fopen(p, "wb"); }
+    if (g_dump) { fwrite(lo, sizeof(float), (size_t)n, g_dump); fflush(g_dump); g_dump_rows++; }
+}
+
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Cfg *c = &m->c;
     /* Same ceiling serve_one() enforces. Past max_position_embeddings the RoPE
@@ -1228,6 +1236,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     *sp = q38_spec_begin(m, prompt, np);   /* Q38_MTP=1, COLI_LOOKUP=1: drafts, every token still the argmax below */
     int len = np, picked = -1;
     for (int s = 0; s < n_new; s++) {
+        dump_logits(logit, c->vocab);
         int best = picked;   /* the step's own pick (greedy), else the scan */
         if (best < 0) {
             best = 0; float bv = logit[0];
@@ -1248,7 +1257,8 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         free(logit); out[len++] = best;
         if (m->draft_vocab) draft_vocab_count_token(m->draft_vocab, best);
         /* the steps' own picks (greedy), the last token's logits kept: a verify that reaches it has them */
-        sp->greedy = !g_capture_last_logit || n_new - 1 - s > Q38_SPEC_ROWS;
+        /* DUMP: every row's logits, none of them picked on the card without them */
+        sp->greedy = !(getenv("DUMP") && *getenv("DUMP")) && (!g_capture_last_logit || n_new - 1 - s > Q38_SPEC_ROWS);
         logit = q38_spec_step(m, sp, best, len - 1, n_new - 1 - s);
         picked = logit ? sp->next_tok : -1;
     }
@@ -1283,23 +1293,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
 }
 
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    if (a->len < 1 || (uint64_t)a->len > SIZE_MAX / sizeof(int)) {
-        fprintf(stderr, "ref.json: invalid array length for \"%s\"\n", key); exit(1);
-    }
-    int *r = malloc((size_t)a->len * sizeof(int));
-    if (!r) { fprintf(stderr, "ref.json: OOM reading \"%s\"\n", key); exit(1); }
-    for (int i = 0; i < a->len; i++) {
-        jval *v = a->kids[i];
-        if (!v || v->t != J_NUM || !isfinite(v->num) || v->num < 0 ||
-            v->num > INT_MAX || floor(v->num) != v->num) {
-            fprintf(stderr, "ref.json: %s[%d] must be a non-negative integer\n", key, i);
-            exit(1);
-        }
-        r[i] = (int)v->num;
-    }
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 1, 1, 0);
 }
 
 static jval *read_reference_logits(jval *root,int vocab){
@@ -1493,23 +1487,8 @@ static int sample_prob_desc(const void *a, const void *b){
     if(x->p!=y->p) return x->p>y->p?-1:1;
     return (x->id>y->id)-(x->id<y->id);
 }
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
- * (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V){
-    static int dump=-1;
-    if(dump<0)dump=getenv("COLI_LOGIT_DUMP")?1:0;
-    if(!dump)return;
-    int id[5]={-1,-1,-1,-1,-1};float v[5]={-3e38f,-3e38f,-3e38f,-3e38f,-3e38f};
-    for(int t=0;t<V;t++){
-        const float x=lo[t];
-        for(int k=0;k<5;k++)if(x>v[k]){for(int j=4;j>k;j--){v[j]=v[j-1];id[j]=id[j-1];}v[k]=x;id[k]=t;break;}
-    }
-    fprintf(stderr,"[LOGITS]");
-    for(int k=0;k<5;k++)fprintf(stderr," %d:%.6f",id[k],v[k]);
-    fprintf(stderr,"\n");
-}
 static int serve_sample(const float *lo, int V, float temp, float top_p){
-    serve_logit_dump(lo, V);
+    coli_logit_dump(lo, V);
     if(temp<=0.f) return argmax_first(lo, V);
     float *p=malloc((size_t)V*sizeof(float)); SampleProb *head=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!p||!head){ fprintf(stderr,"OOM sampling\n"); exit(1); }
@@ -3210,6 +3189,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
             if(control==3)cancelled=1;
         }
         if(cancelled||stopped)break;
+        dump_logits(lo, m->c.vocab);
         int tk = picked>=0 ? picked : serve_sample(lo, m->c.vocab, q->temp, q->top_p);
         char lptail[1024]; lptail[0]=0;
         if(q->logprobs>0) coli_logprob_tail(lptail,sizeof lptail,lo,m->c.vocab,tk,q->logprobs);
@@ -3403,6 +3383,7 @@ static void q38_mux_finish(Model *m,Q38MuxReq *r){
  * with the token when the request goes on, 0 when it ended. */
 static int q38_mux_pick(Model *m,Q38MuxReq *r,const int *eos_ids,int n_eos,int *tk_out){
     if(r->cancel||r->stop||r->gen>=r->q.max_tok){q38_mux_finish(m,r);return 0;}
+    dump_logits(r->lo,m->c.vocab);
     int tk=serve_sample(r->lo,m->c.vocab,r->q.temp,r->q.top_p);
     char lptail[1024];lptail[0]=0;
     if(r->q.logprobs>0)coli_logprob_tail(lptail,sizeof lptail,r->lo,m->c.vocab,tk,r->q.logprobs);
@@ -3616,7 +3597,8 @@ int main(int argc, char **argv) {
     { const char *seed = getenv("SEED");
       srand(seed && *seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)(time(NULL) ^ (unsigned)getpid())); }
     const char *snap = getenv("SNAP");
-    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    if (!snap || !*snap) snap = getenv("COLI_MODEL");   /* the launcher's name for it, as colibri.c takes it */
+    if (!snap || !*snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     {   /* a model directory made by tools/gguf_import.py: gguf.json names llama.cpp's
          * qwen4exp GGUF, read in place (qwen38_core.h, "GGUF mode") */
         char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
@@ -3862,7 +3844,8 @@ int main(int argc, char **argv) {
     q38_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the tier sizes its budget */
 #endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
-    g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
+    /* the last row exact for the oracle and for DUMP (an MTP run's last logits are the plain run's) */
+    g_capture_last_logit=ref_logits!=NULL||(getenv("DUMP")&&*getenv("DUMP"));
     if(is_ref){g_q38_mtp_oracle=full;g_q38_mtp_oracle_n=nfull;}   /* Q38_MTP_FORCE=accept|mixed */
     int64_t hist = q38_telemetry_init(snap, &m);
     if (g_q38_gguf_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
@@ -3957,15 +3940,10 @@ int main(int argc, char **argv) {
     generate(&m, prompt, np, n_new, out);
     double dt = now_s() - t;
 
-    /* DUMP=<path>: write last-token logits (raw float32, vocab) for a torch-free
-     * cosine comparison against tools/_ref_dn.py --dump. */
-    if (g_last_logit && getenv("DUMP")) {
-        const char *dp = getenv("DUMP");
-        FILE *df = fopen(dp && *dp ? dp : "qwen38_logits.f32", "wb");
-        if (df) { fwrite(g_last_logit, sizeof(float), (size_t)m.c.vocab, df); fclose(df);
-                  fprintf(stderr, "[dump] wrote %d logits -> %s\n", m.c.vocab, dp && *dp ? dp : "qwen38_logits.f32"); }
-        else fprintf(stderr, "[dump] cannot open %s\n", dp ? dp : "qwen38_logits.f32");
-    }
+    /* DUMP=<path>: the rows went out as they were sampled (dump_logits); say how many */
+    if (g_dump) { fclose(g_dump); g_dump = NULL;
+                  fprintf(stderr, "[dump] wrote %ld rows of %d logits -> %s\n", g_dump_rows, m.c.vocab, getenv("DUMP")); }
+    else if (getenv("DUMP") && *getenv("DUMP") && g_dump_init) fprintf(stderr, "[dump] cannot open %s\n", getenv("DUMP"));
 
     int ref_match = 0,ref_numeric_match=1;
     if (is_ref) {

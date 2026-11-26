@@ -39,10 +39,10 @@ C = len(cats)
 
 
 def specialists(cat, exclude):
-    """Top-K experts by lift for `cat`, computed WITHOUT the excluded run."""
+    """Top-K experts by lift for `cat`, excluding one (category, prompt) globally."""
     share = defaultdict(lambda: defaultdict(float))
     for c in cats:
-        used = [i for i in idxs[c] if not (c == cat and i == exclude)]
+        used = [i for i in idxs[c] if (c, i) != exclude]
         for i in used:
             for k, n in runs[(c, i)].items():
                 share[k][c] += n / max(1, tot[(c, i)]) / len(used)
@@ -64,7 +64,7 @@ hits = 0
 trials = 0
 for c in cats:
     for h in idxs[c]:
-        sets = {cc: specialists(cc, h if cc == c else None) for cc in cats}
+        sets = {cc: specialists(cc, (c, h)) for cc in cats}
         held = runs[(c, h)]
         htot = max(1, tot[(c, h)])
         scores = {cc: sum(held.get(k, 0) for k in sets[cc]) / htot for cc in cats}

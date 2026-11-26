@@ -64,6 +64,10 @@ static int qwen36_max_ctx(void) {
 }
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>   /* the preload workers' own priority (q36_preload_worker) */
+#endif
 #include <unistd.h>
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
@@ -1304,6 +1308,8 @@ typedef struct {
     kv_prefix kvp;
     float *attn_sc;            /* [attn_sc_thr * kv_cap] score rows, one per thread */
     int attn_sc_thr;
+    float *attn_sc_grp;        /* reusable grouped-GQA score scratch [threads * gq * len] */
+    size_t attn_sc_grp_cap;
     double dense_load_s;
     uint32_t *freq;
     int freq_token_count, hot_pinned, hot_n, warmup_tokens, token_count;
@@ -1421,6 +1427,15 @@ static struct { int l, e; } pilot_q[4096];
 static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
+static _Thread_local int tl_loader_thread = 0;   /* set on PILOT pool threads: their loads stay single-threaded */
+
+/* PAR_LOAD=0 turns off the parallel expert loads added for small-RAM streaming (default on):
+ * a token's / a prefill chunk's missed experts are read from disk concurrently instead of
+ * one pread at a time, so the drive sees a queue depth of up to PF_CHUNK (default 8). The
+ * maths and the token ids are unchanged: only the order in which misses are served differs. */
+static int par_load_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("PAR_LOAD"); on = !(e && *e == '0'); } return on; }
+static int pf_chunk(void) { static int n = -1; if (n < 0) { const char *e = getenv("PF_CHUNK"); n = e ? atoi(e) : 8; if (n < 1) n = 1; if (n > 64) n = 64; } return n; }
+static int pilot_threads(void) { static int n = -1; if (n < 0) { const char *e = getenv("PILOT_THREADS"); n = e ? atoi(e) : 1; if (n < 1) n = 1; if (n > 16) n = 16; } return n; }
 static int g_wide  = 1;
 /* CACHE_ROUTE family, same names and defaults as the GLM engine (docs/CACHE_ROUTE.md). */
 static int   g_cache_route = 0;
@@ -1431,6 +1446,8 @@ static float g_route_alpha = 1.f;
 static int   g_route_agree = 0;
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
+static int pilot_enqueue(Model *m, int layer, int eid);
+static int pf_ahead_on(void);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
@@ -1529,12 +1546,15 @@ static int slot_victim(const LCache *lc, int layer, int allow_pinned) {
 static void ensure_pilot_worker_started(Model *m) {
     if (!pilot_m) {
         pilot_m = m;
-        pthread_t t;
-        if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
-            fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
-            exit(1);
+        const int nw = pilot_threads();
+        for (int i = 0; i < nw; i++) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
+                fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
+                exit(1);
+            }
+            pthread_detach(t);
         }
-        pthread_detach(t);
     }
 }
 
@@ -1592,7 +1612,7 @@ static void tm_report(void){
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
 }
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 #include "kv16.h"
@@ -2397,6 +2417,11 @@ struct ColiCudaTensor;
 int coli_cuda_tensor_upload_rows(struct ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int row0, int n);
 int coli_cuda_host_register(void *p, size_t bytes);
 void coli_cuda_host_unregister(void *p);
+void coli_cuda_ledger_step(void);
+/* Ledger (ledger_map.h): one generated token; inert without LEDGER_OUT */
+static void q36_ledger_token(void) { coli_cuda_ledger_step(); }
+#else
+static void q36_ledger_token(void) {}
 #endif
 /* a GGUF matrix the loader left in the file (gq_gone 2), read as the tier uploads it (q36_gq_stream) */
 typedef struct { QtRows r; const QW *w[2]; int O0; } Q36Rows;   /* rows [0, O0) of w[0], then w[1]'s */
@@ -5321,7 +5346,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
                 ng[k] = ht[k] != ft[k] ? rows[k] / 16 : 0;
                 if (!ng[k]) memcpy(dst + ho[k], b + fo[k], (size_t)fb[k]);
             }
-            #pragma omp parallel for schedule(static) if (!omp_in_parallel())
+            #pragma omp parallel for schedule(static) if (!omp_in_parallel() && !tl_loader_thread)
             for (int j = 0; j < ng[0] + ng[1] + ng[2]; j++) {
                 const int k = j < ng[0] ? 0 : j < ng[0] + ng[1] ? 1 : 2, g = j - (k > 0 ? ng[0] : 0) - (k > 1 ? ng[1] : 0);
                 const int64_t fr = gq_row_bytes(ft[k], cols[k]), hr = gq_row_bytes(ht[k], cols[k]);
@@ -5950,10 +5975,34 @@ static void ehit_mark(Model *m, int layer, int eid){
 }
 /* hold=1 marks the slot busy before the lock drops, so nothing can evict it
  * between this lookup and the caller's slot_release. */
+/* ---- Background preload (Q36_PRELOAD=1) -----------------------------------
+ * A cache with a slot for every expert still fills on demand: an expert's
+ * first use reads and unpacks it on the engine's thread, in the middle of a
+ * token. Measured on 2x Xeon E5-2670 with every expert in the page cache:
+ * the routed-expert phase fell from 455 to 57 ms/token over the first ~700
+ * tokens of a fresh server and was still falling. With Q36_PRELOAD=1, loader
+ * threads fill the free slots of every layer at startup, in file order, at
+ * low priority, while the server already answers. They only take free slots
+ * (never evict), and an expert is loaded once: the engine waits for a preload
+ * of the expert it wants (g_pl_busy), and the loaders skip the one the engine
+ * is reading (g_pl_engine). Placement only: the bytes a slot holds are
+ * load_expert_merged's either way. q36_preload_start says where it runs. */
+#define Q36_PL_MAX 16
+static int g_pl_on = 0, g_pl_threads = 0;
+static struct { int layer, eid; } g_pl_busy[Q36_PL_MAX], g_pl_engine = { -1, -1 };   /* under g_pilot_mx */
+static int pl_busy_locked(int layer, int eid) {
+    for (int i = 0; i < g_pl_threads; i++) if (g_pl_busy[i].layer == layer && g_pl_busy[i].eid == eid) return 1;
+    return 0;
+}
 static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
+    while (g_pl_on && pl_busy_locked(layer, eid)) {   /* a loader is reading this very expert: take its copy */
+        pthread_mutex_unlock(&g_pilot_mx);
+        usleep(100);
+        pthread_mutex_lock(&g_pilot_mx);
+    }
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
@@ -5997,6 +6046,7 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
         if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
+    g_pl_engine.layer = layer; g_pl_engine.eid = eid;
     pthread_mutex_unlock(&g_pilot_mx);
     double t_read0 = now_s();
     load_expert_merged(m, layer, eid, s);
@@ -6004,8 +6054,88 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     pthread_mutex_lock(&g_pilot_mx);
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
+    g_pl_engine.layer = -1; g_pl_engine.eid = -1;
     if (hold) slot_hold(s);
     *out = s; pthread_mutex_unlock(&g_pilot_mx);
+}
+static Model *g_pl_m; static int g_pl_next = 0, g_pl_done = 0, g_pl_loaded = 0; static double g_pl_t0;
+static void *q36_preload_worker(void *arg) {
+    int me = (int)(intptr_t)arg; Model *m = g_pl_m; Cfg *c = &m->c;
+#if defined(__linux__) && defined(CPU_SETSIZE)   /* as omp_tune.h: only where the including source asked for the GNU names */
+    {   /* the engine's thread is bound to one core (OMP_PROC_BIND): do not inherit that, and stay out of its way */
+        cpu_set_t all; CPU_ZERO(&all);
+        long n = sysconf(_SC_NPROCESSORS_ONLN); if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+        for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
+        sched_setaffinity(0, sizeof all, &all);
+#ifdef SYS_gettid
+        setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+#endif
+    }
+#endif
+#ifdef _OPENMP
+    omp_set_num_threads(1);   /* load_expert_merged's parallel loops: no second team beside the engine's */
+#endif
+    const int total = c->n_layers * c->n_experts;
+    for (;;) {
+        int w = __atomic_fetch_add(&g_pl_next, 1, __ATOMIC_ACQ_REL);
+        if (w >= total) break;
+        int layer = w / c->n_experts, eid = w % c->n_experts;
+        if (c->dense_layer && c->dense_layer[layer]) continue;
+        LCache *lc = &m->cache[layer];
+        pthread_mutex_lock(&g_pilot_mx);
+        if (lc->n >= lc->cap || slot_indexed(m, layer, eid) || pl_busy_locked(layer, eid) ||
+            (g_pl_engine.layer == layer && g_pl_engine.eid == eid)) { pthread_mutex_unlock(&g_pilot_mx); continue; }
+        Slot *s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s);
+        cache_hide(m, layer, s); s->used = 0;          /* never used yet: the first to go if the cache must evict */
+        g_pl_busy[me].layer = layer; g_pl_busy[me].eid = eid;
+        pthread_mutex_unlock(&g_pilot_mx);
+        load_expert_merged(m, layer, eid, s);
+        pthread_mutex_lock(&g_pilot_mx);
+        cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid];
+        g_pl_busy[me].layer = -1; g_pl_busy[me].eid = -1; g_pl_loaded++;
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
+    if (__atomic_add_fetch(&g_pl_done, 1, __ATOMIC_ACQ_REL) == g_pl_threads)
+        fprintf(stderr, "[qwen36] preload: %d experts loaded in %.1f s, RSS %.2f GB\n", g_pl_loaded, now_s() - g_pl_t0, rss_gb());
+    return NULL;
+}
+static void q36_preload_start(Model *m) {
+    const char *e = getenv("Q36_PRELOAD");
+    if (!e || *e != '1' || m->c.n_experts == 0) return;
+    {   /* the CPU's cache of a safetensors container only: what was measured. A device tier keeps
+         * pointers into the slots or copies of them, the Metal graph reads its own records, PILOT's
+         * worker loads experts itself, and a GGUF's slots take another path through the loader. */
+        int dev = qt_ready();
+#ifdef COLI_VULKAN
+        dev = dev || g_vk_ready;
+#endif
+        if (dev || QWEN_GRAPH(m) || g_pilot || g_gguf) {
+            fprintf(stderr, "[qwen36] preload: Q36_PRELOAD=1 is for the CPU expert cache of a safetensors container (no device tier, no PILOT): off\n");
+            return;
+        }
+    }
+    int nt = getenv("Q36_PRELOAD_THREADS") ? atoi(getenv("Q36_PRELOAD_THREADS")) : 4;
+    if (nt < 1) nt = 1; if (nt > Q36_PL_MAX) nt = Q36_PL_MAX;
+    for (int i = 0; i < Q36_PL_MAX; i++) { g_pl_busy[i].layer = -1; g_pl_busy[i].eid = -1; }
+    /* The slots' buffers are allocated here, on the engine's thread, and the loaders only fill
+     * them. A loader that allocates takes the buffer from its own thread's malloc arena, and with
+     * four loaders that cost the routed experts 5 ms a token for as long as the server ran (41.3
+     * against 36.3 ms, three runs each on 2x Xeon E5-2670; one or two loaders, or one arena, did
+     * not show it, and neither page migration nor the buffers' alignment explains it). Untouched
+     * memory is address space only: a slot the loaders never reach costs nothing. */
+    for (int l = 0; l < m->c.n_layers; l++) {
+        if (m->c.dense_layer && m->c.dense_layer[l]) continue;
+        LCache *lc = &m->cache[l];
+        for (int i = lc->n; i < lc->cap; i++) slot_ensure_allocated(m, &lc->slots[i]);
+    }
+    g_pl_m = m; g_pl_t0 = now_s();
+    pthread_mutex_lock(&g_pilot_mx); g_pl_threads = nt; g_pl_on = 1; pthread_mutex_unlock(&g_pilot_mx);
+    fprintf(stderr, "[qwen36] preload: filling the expert cache in the background (%d threads, Q36_PRELOAD=0 to skip)\n", nt);
+    for (int i = 0; i < nt; i++) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, q36_preload_worker, (void *)(intptr_t)i) != 0) { __atomic_add_fetch(&g_pl_done, 1, __ATOMIC_ACQ_REL); continue; }
+        pthread_detach(t);
+    }
 }
 static void expert_get(Model *m, int layer, int eid, Slot **out) { expert_fetch(m, layer, eid, out, 0); }
 /* expert_get for a caller that computes from the slot after the lock drops:
@@ -6187,6 +6317,216 @@ static inline void mrope_at(const Model *m, int p, int pos3[3]) {
     } else pos3[0] = pos3[1] = pos3[2] = p + m->rope_delta;
 }
 
+/* Grouped GQA attention core: share each K/V row read and float16 conversion
+ * across a group of gq query heads that map to the same KV head. Every head
+ * runs the exact same lane dot-products, softmax, and FMA axpy order as the
+ * per-head loop, so every output bit is unchanged. */
+static inline void attention_task(const Model *m, const Layer *l, int layer,
+                                  const float *query, const float *k, const float *vv,
+                                  int S, int pos_base, int win, int ring,
+                                  int gq, int nsub, int kv16, int sc_stride,
+                                  float *sc, float *ctx, int it) {
+    const Cfg *c = &m->c;
+    const int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, kvd = c->k_head_dim;
+    const int q_per_kv = H / KV;
+    const float scale = 1.f / sqrtf((float)hd);
+    const Q36Row *mr = m->mux_rows;
+    const int s = (S - 1) - it / (KV * nsub);
+    const int r = it % (KV * nsub);
+    const int kvh = r / nsub;
+    const int h0 = kvh * q_per_kv + (r % nsub) * gq;
+    const int qpos = mr ? mr[s].pos : pos_base + s;
+    const void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+    /* a sliding-window layer (Flint) sees the window's rows, its own included */
+    const int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+    const int len = qpos + 1 - t0;
+    /* from tb on, the step's own rows (a ring's, from the scratch): a multiplexed
+     * row's is itself, the others' from pos_base */
+    const int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
+    const int tc = tb < qpos + 1 ? tb : qpos + 1;
+    const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
+    const float *qbase = query + ((int64_t)s*H + h0)*hd;
+    float *cbase = ctx + ((int64_t)s*H + h0)*hd;
+    const int64_t ss = sc_stride;
+
+    /* 1. QK scores: cache rows [t0, tc) then scratch rows [tc, qpos] */
+    if (kv16) {
+        if (gq == 1) {
+            for (int t = t0; t < tc; t++)
+                sc[t - t0] = kv16_dot_lanes(qbase, (const uint16_t *)Kl + q36_kv_at(m, layer, kvh, t), kvd) * scale;
+        } else {
+            for (int t = t0; t < tc; t++) {
+                const int j = t - t0;
+                const uint16_t *krow16 = (const uint16_t *)Kl + q36_kv_at(m, layer, kvh, t);
+                int g = 0;
+                for (; g + 1 < gq; g += 2) {
+                    float d2[2];
+                    kv16_dot_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow16, kvd);
+                    sc[(int64_t)g*ss + j]       = d2[0] * scale;
+                    sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+                }
+                if (g < gq) sc[(int64_t)g*ss + j] = kv16_dot_lanes(qbase + (int64_t)g*hd, krow16, kvd) * scale;
+            }
+        }
+    } else {
+        for (int t = t0; t < tc; t++) {
+            const int j = t - t0;
+            const float *krow = (const float *)Kl + q36_kv_at(m, layer, kvh, t);
+            int g = 0;
+            for (; g + 1 < gq; g += 2) {
+                float d2[2];
+                dot_f32_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow, kvd);
+                sc[(int64_t)g*ss + j]       = d2[0] * scale;
+                sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+            }
+            if (g < gq) sc[(int64_t)g*ss + j] = dot_f32_lanes(qbase + (int64_t)g*hd, krow, kvd) * scale;
+        }
+    }
+    for (int t = tc; t <= qpos; t++) {
+        const int j = t - t0;
+        const float *krow = Kb + (int64_t)(t - sp0)*KV*kvd;
+        int g = 0;
+        for (; g + 1 < gq; g += 2) {
+            float d2[2];
+            dot_f32_lanes_x2(d2, qbase + (int64_t)g*hd, qbase + (int64_t)(g + 1)*hd, krow, kvd);
+            sc[(int64_t)g*ss + j]       = d2[0] * scale;
+            sc[(int64_t)(g + 1)*ss + j] = d2[1] * scale;
+        }
+        if (g < gq) sc[(int64_t)g*ss + j] = dot_f32_lanes(qbase + (int64_t)g*hd, krow, kvd) * scale;
+    }
+
+    /* 2. Softmax (+ optional Flint sinks) and zero output accumulators */
+    for (int g = 0; g < gq; g++) {
+        float *scg = sc + (int64_t)g*ss;
+        if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
+            float mx = l->sinks[h0 + g];
+            for (int j = 0; j < len; j++) if (scg[j] > mx) mx = scg[j];
+            float sum = expf(l->sinks[h0 + g] - mx);
+            for (int j = 0; j < len; j++) { scg[j] = expf(scg[j] - mx); sum += scg[j]; }
+            float inv = 1.f / sum;
+            for (int j = 0; j < len; j++) scg[j] *= inv;
+        } else softmax_row(scg, len);
+        float *cx = cbase + (int64_t)g*hd;
+        for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+    }
+
+    /* 3. PV accumulation: cache rows [t0, tc) then scratch rows [tc, qpos] */
+    if (kv16) {
+        if (gq == 1) {
+            for (int t = t0; t < tc; t++)
+                kv16_axpy(cbase, sc[t - t0], (const uint16_t *)Vl + q36_kv_at(m, layer, kvh, t), kvd);
+        } else {
+            for (int t = t0; t < tc; t++) {
+                const int j = t - t0;
+                const uint16_t *vrow16 = (const uint16_t *)Vl + q36_kv_at(m, layer, kvh, t);
+                int g = 0;
+                for (; g + 3 < gq; g += 4)
+                    kv16_axpy_x4(cbase + (int64_t)g*hd, cbase + (int64_t)(g + 1)*hd,
+                                 cbase + (int64_t)(g + 2)*hd, cbase + (int64_t)(g + 3)*hd,
+                                 sc[(int64_t)g*ss + j], sc[(int64_t)(g + 1)*ss + j],
+                                 sc[(int64_t)(g + 2)*ss + j], sc[(int64_t)(g + 3)*ss + j], vrow16, kvd);
+                for (; g + 1 < gq; g += 2)
+                    kv16_axpy_x2(cbase + (int64_t)g*hd, cbase + (int64_t)(g + 1)*hd,
+                                 sc[(int64_t)g*ss + j], sc[(int64_t)(g + 1)*ss + j], vrow16, kvd);
+                if (g < gq) kv16_axpy(cbase + (int64_t)g*hd, sc[(int64_t)g*ss + j], vrow16, kvd);
+            }
+        }
+    } else {
+        for (int t = t0; t < tc; t++) {
+            const int j = t - t0;
+            const float *vrow = (const float *)Vl + q36_kv_at(m, layer, kvh, t);
+            for (int g = 0; g < gq; g++) {
+                float a = sc[(int64_t)g*ss + j];
+                float *cx = cbase + (int64_t)g*hd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+            }
+        }
+    }
+    for (int t = tc; t <= qpos; t++) {
+        const int j = t - t0;
+        const float *vrow = Vb + (int64_t)(t - sp0)*KV*kvd;
+        for (int g = 0; g < gq; g++) {
+            float a = sc[(int64_t)g*ss + j];
+            float *cx = cbase + (int64_t)g*hd;
+            for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+        }
+    }
+}
+
+static void attention_scores_ctx(Model *m, Layer *l, int layer,
+                                 const float *query, const float *k, const float *vv,
+                                 int S, int pos_base, int win, int ring, float *ctx) {
+    Cfg *c = &m->c;
+    const int H = c->q_heads, KV = c->kv_heads;
+    const int q_per_kv = H / KV;
+    const Q36Row *mr = m->mux_rows;
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+    if (threads < 1) threads = 1;
+#endif
+    int gq = q_per_kv;
+    {
+        int64_t want = S == 1 ? (int64_t)threads : (int64_t)4 * threads;
+        while (gq > 1 && (int64_t)S * KV * (q_per_kv / gq) < want) {
+            int d = gq - 1;
+            while (d > 1 && q_per_kv % d) d--;
+            gq = d;
+        }
+        /* For single-token decode, grouping fewer than 4 heads does not beat
+         * the single-head static loop's contiguous score stream. */
+        if (S == 1 && gq < 4) gq = 1;
+    }
+    const int nsub = q_per_kv / gq;
+    const int kv16 = q36_kv16();
+    int max_len = 0;
+    for (int s = 0; s < S; s++) {
+        int qpos = mr ? mr[s].pos : pos_base + s;
+        int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+        int len = qpos + 1 - t0;
+        if (len > max_len) max_len = len;
+    }
+    /* Pad row stride away from 4 KB multiples to prevent L1 set-aliasing across heads. */
+    int sc_stride = (max_len + 15) & ~15;
+    if (sc_stride < 16) sc_stride = 16;
+    if ((sc_stride & 1023) == 0) sc_stride += 16;
+    size_t per_thr = (size_t)gq * (size_t)sc_stride;
+    if (gq > 1) {
+        size_t need = (size_t)threads * per_thr;
+        if (need > m->attn_sc_grp_cap) {
+            free(m->attn_sc_grp);
+            m->attn_sc_grp = falloc((int64_t)need);
+            m->attn_sc_grp_cap = need;
+        }
+    }
+    const int nitems = S * KV * nsub;
+    if (S == 1) {
+        #pragma omp parallel for schedule(static)
+        for (int it = 0; it < nitems; it++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *sc = gq == 1 ? m->attn_sc + (int64_t)tid * m->kv_cap
+                                : m->attn_sc_grp + (size_t)tid * per_thr;
+            attention_task(m, l, layer, query, k, vv, S, pos_base, win, ring,
+                           gq, nsub, kv16, sc_stride, sc, ctx, it);
+        }
+    } else {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int it = 0; it < nitems; it++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *sc = gq == 1 ? m->attn_sc + (int64_t)tid * m->kv_cap
+                                : m->attn_sc_grp + (size_t)tid * per_thr;
+            attention_task(m, l, layer, query, k, vv, S, pos_base, win, ring,
+                           gq, nsub, kv16, sc_stride, sc, ctx, it);
+        }
+    }
+}
+
 /* Gated Attention (GQA) matching HF Qwen3_5MoeAttention:
  *  - q_proj outputs query(head_dim) ++ attn_output_gate(head_dim); k/v are head_dim.
  *  - per-head q/k RMSNorm (weight [head_dim], 1.0+weight).
@@ -6200,7 +6540,6 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int qdim = c->q_head_dim;                  /* per-head q total (query+gate) */
     int q_out = H * qdim;                      /* q_proj output dim */
     int kv_out = KV * kvd;                     /* k/v_proj output dim */
-    int q_per_kv = H / KV;
     int rotary = c->rotary_dim;
     /* HF always chunks q_proj output into query(head_dim) ++ gate(head_dim),
      * regardless of the attn_output_gate config flag -- so split whenever the
@@ -6257,7 +6596,6 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* the step's K and V as the cache keeps them (float16, q36_kv16), before anything reads them:
      * a row reads the same numbers from here as from the cache */
     if (q36_kv16()) { kv16_round(k, (int64_t)S*KV*kvd); kv16_round(vv, (int64_t)S*KV*kvd); }
-    float scale = 1.f / sqrtf((float)hd);
     const int win = c->win_layer && c->win_layer[layer] ? c->window : 0;
     /* A sliding layer's ring (q36_kv_rows): the step's own rows are read from k/vv, where
      * the cache would have them, and go into the ring after the scores; written first, the
@@ -6285,47 +6623,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     float *ctx = falloc((int64_t)S*H*hd);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int hh = 0; hh < H; hh++) {
-        for (int s = 0; s < S; s++) {
-            int kvh = hh / q_per_kv;
-            int qpos = mr ? mr[s].pos : pos_base + s;
-            const void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
-            const float *qv = query + ((int64_t)s*H + hh)*hd;
-            int tid = 0;
-#ifdef _OPENMP
-            tid = omp_get_thread_num();
-#endif
-            float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
-            /* a sliding-window layer (Flint) sees the window's rows, its own included */
-            int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
-            /* from tb on, the step's own rows (a ring's, from the scratch): a multiplexed
-             * row's is itself, the others' from pos_base */
-            int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
-            const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
-            for (int t = t0; t <= qpos; t++) {
-                float acc = t < tb ? q36_kv_dot(qv, Kl, q36_kv_at(m, layer, kvh, t), kvd)
-                                   : dot_f32_lanes(qv, Kb + (int64_t)(t - sp0)*KV*kvd, kvd);
-                sc[t] = acc * scale;
-            }
-            if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
-                float mx = l->sinks[hh];
-                for (int t = t0; t <= qpos; t++) if (sc[t] > mx) mx = sc[t];
-                float sum = expf(l->sinks[hh] - mx);
-                for (int t = t0; t <= qpos; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
-                float inv = 1.f / sum;
-                for (int t = t0; t <= qpos; t++) sc[t] *= inv;
-            } else softmax_row(sc + t0, qpos + 1 - t0);
-            float *cx = ctx + ((int64_t)s*H + hh)*hd;
-            for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
-            for (int t = t0; t <= qpos; t++) {
-                float a = sc[t];
-                if (t < tb) { q36_kv_axpy(cx, a, Vl, q36_kv_at(m, layer, kvh, t), kvd); continue; }
-                const float *vrow = Vb + (int64_t)(t - sp0)*KV*kvd;
-                for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
-            }
-        }
-    }
+    attention_scores_ctx(m, l, layer, query, k, vv, S, pos_base, win, ring, ctx);
     if (ring)   /* the step's rows into the ring: its last `ring` (an earlier one would be overwritten here) */
         for (int s = !mr && S > ring ? S - ring : 0; s < S; s++) {
             int t = mr ? mr[s].pos : pos_base + s;
@@ -6909,7 +7207,11 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (gq_act_set(pax, x, 1, D)) return -1;
     const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D), rbd = gq_row_bytes(gx->hd, I);
     const int gI = I / u, gD = D / u;
-    for (int k = 0; k < n; k++) q36_gq_expert_acquire(&store, layer, ids[k], &ev[k]);   /* leased: the PILOT worker may not evict them mid-matmul */
+    /* the token's misses read concurrently (expert_fetch loads outside its lock, as the PILOT worker
+     * does), each leased until the step is done: a PILOT load (the lookahead's or the next layer's)
+     * picks its victim among the slots nobody computes from, so it cannot take one of these */
+    #pragma omp parallel for schedule(dynamic, 1) if (par_load_on() && n > 1)
+    for (int k = 0; k < n; k++) q36_gq_expert_acquire(&store, layer, ids[k], &ev[k]);
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * 2 * gI; r++) {
         int k = r / (2 * gI), rr = (r % (2 * gI)) * u;
@@ -6932,7 +7234,12 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         gq_rows_u(Y + (int64_t)k * D + o, u, &one, (const uint8_t *)ev[k].down.data + (int64_t)o * rbd, gx->hd, I);
     }
     for (int k = 0; k < n; k++) coli_expert_release(&store, &ev[k]);
-    /* accumulate in expert-id order, as the general path does: same sums, same bits */
+    /* accumulate in expert-id order, as moe_gq_run's row path below does (it walks the experts
+     * e = 0..E-1): the same sums in the same order, so a decode step's logits are those of the
+     * row path bit for bit (measured: 64 tokens of Qwen3.6 UD-Q4_K_M, GQ_NODECODE=0 against 1,
+     * identical dumps). The planar-int4 and int8 paths (expert_ffn.h's xf_moe_run, moe_ex) and
+     * the device chains sum a token's experts in RANK order instead; a GGUF container and an
+     * int4 container therefore round the MoE sum differently, each consistently. */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
     for (int a = 1; a < n; a++) { int v = ord[a], b = a; while (b > 0 && ids[ord[b - 1]] > ids[v]) { ord[b] = ord[b - 1]; b--; } ord[b] = v; }
     for (int j = 0; j < n; j++) {
@@ -6962,10 +7269,26 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
      * file's rows by eight where moe_gq_decode does: a row's bits are then a plain step's (#2874) */
     const int f8 = S <= GQ_EXACT_ROWS && moe_gq_unit(gx, D, I) == 8;
     ColiExpertStore store = q36_gq_expert_store(m);
-    for (int e = 0; e < E; e++) {
+    /* the experts this chunk needs, in order; misses of the next PF_CHUNK of them are read
+     * concurrently before their compute (bounded well below cap so nothing prefetched is
+     * evicted before it is used: prefetched slots carry the newest LRU clocks) */
+    int *need = malloc(sizeof(int) * (size_t)E), nn = 0;
+    for (int e = 0; e < E; e++) if (cnt[e + 1] - cnt[e]) need[nn++] = e;
+    int pf = pf_chunk(); { int capl = m->cache[layer].cap; if (pf > capl / 2) pf = capl / 2 > 0 ? capl / 2 : 1; }
+    const int ahead = pf_ahead_on() && m->is_queued != NULL;
+    if (ahead) ensure_pilot_worker_started(m);
+    for (int i0 = 0; i0 < nn; i0 += pf) {
+        const int i1 = i0 + pf < nn ? i0 + pf : nn;
+        if (par_load_on() && i1 - i0 > 1) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int i = i0; i < i1; i++) { Slot *t; expert_get(m, layer, need[i], &t); }
+        }
+        if (ahead) { const int j1 = i1 + pf < nn ? i1 + pf : nn; for (int j = i1; j < j1; j++) pilot_enqueue(m, layer, need[j]); }
+    for (int ii = i0; ii < i1; ii++) {
+        const int e = need[ii];
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
-        ColiExpertView ev; q36_gq_expert_acquire(&store, layer, e, &ev);   /* as moe_gq_decode */
+        ColiExpertView ev; q36_gq_expert_acquire(&store, layer, e, &ev);   /* leased: the lookahead's PILOT loads may not evict it mid-matmul */
         const uint8_t *wg = ev.gate.data, *wu = ev.up.data, *wd = ev.down.data;
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
         const int ex = f8 && !gq_act_set(&act, X, n, D);
@@ -7000,6 +7323,8 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
         }
     }
+    }
+    free(need);
     gq_act_free(&act); gq_act_free(&ah);
     free(cnt); free(tok); free(wt); free(fill); free(X); free(G); free(U); free(Y);
 }
@@ -8484,6 +8809,22 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S,
     return logit;
 }
 
+/* queue (layer, eid) for the prefetch pool unless resident or already queued; returns 1 if queued */
+static int pilot_enqueue(Model *m, int layer, int eid) {
+    Cfg *c = &m->c; const int gidx = layer * c->n_experts + eid;
+    pthread_mutex_lock(&g_pilot_mx);
+    if (slot_indexed(m, layer, eid) || m->is_queued[gidx]) { pthread_mutex_unlock(&g_pilot_mx); return 0; }
+    m->is_queued[gidx] = 1;
+    pthread_mutex_unlock(&g_pilot_mx);
+    unsigned w2 = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
+    unsigned r2 = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+    if (w2 - r2 < 4096) { pilot_q[w2 & 4095].l = layer; pilot_q[w2 & 4095].e = eid; __atomic_store_n(&pilot_w, w2 + 1, __ATOMIC_RELEASE); return 1; }
+    pthread_mutex_lock(&g_pilot_mx); m->is_queued[gidx] = 0; pthread_mutex_unlock(&g_pilot_mx);
+    return 0;
+}
+/* PF_AHEAD=0 turns off the prefill lookahead: while a chunk of experts computes, the pool reads the next chunk */
+static int pf_ahead_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("PF_AHEAD"); on = !(e && *e == '0'); } return on; }
+
 static void pilot_realload(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
     pthread_mutex_lock(&g_pilot_mx);
@@ -8510,13 +8851,15 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
 static void *pilot_worker(void *arg) {
     (void)arg;
+    tl_loader_thread = 1;
     while (1) {
         unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
         unsigned w = __atomic_load_n(&pilot_w, __ATOMIC_ACQUIRE);
         if (r == w) { sleep_ms(1); continue; }
+        /* several workers (PILOT_THREADS) share the ring: claim the entry before reading it */
+        if (!__atomic_compare_exchange_n(&pilot_r, &r, r + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
         int layer = pilot_q[r & 4095].l, eid = pilot_q[r & 4095].e;
         pilot_realload(pilot_m, layer, eid);
-        __atomic_store_n(&pilot_r, r + 1, __ATOMIC_RELEASE);
     }
     return NULL;
 }
@@ -8593,10 +8936,23 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
     free(logits);
 }
 
-/* When DUMP=<path> is set, generate() copies the last-token logits here so main()
- * can write them to <path> (raw float32, length = vocab). Lets a torch-free
- * cosine comparison against tools/_ref_dn.py's numpy logits validate the port. */
-static float *g_last_logit = NULL;
+/* DUMP=<path>: every logits row a token is sampled from, appended to <path> as raw float32
+ * (vocab floats a row), as colibri.c's dump_logits writes them: generate()'s rows (the
+ * prompt's last position first, then each step's) and serve's (each request's rows in
+ * turn). It used to hold the last row only, which left a torch-free comparison one
+ * position to look at and nothing of the path there (#I4 of the audit). The file is
+ * opened at the first row and closed at exit, with a line saying how many rows it got. */
+static FILE *g_dump = NULL; static int g_dump_init = 0; static long g_dump_rows = 0;
+static void dump_logits(const float *lo, int n) {
+    if (!g_dump_init) { g_dump_init = 1; const char *p = getenv("DUMP"); if (p && *p) g_dump = fopen(p, "wb"); }
+    if (g_dump) { fwrite(lo, sizeof(float), (size_t)n, g_dump); fflush(g_dump); g_dump_rows++; }
+}
+/* At the end of an argv run: close the file and say how many rows it got (or that it never opened). */
+static void dump_close(int vocab) {
+    if (g_dump) { fclose(g_dump); g_dump = NULL;
+                  fprintf(stderr, "[dump] wrote %ld rows of %d logits -> %s\n", g_dump_rows, vocab, getenv("DUMP")); }
+    else if (getenv("DUMP") && *getenv("DUMP") && g_dump_init) fprintf(stderr, "[dump] cannot open %s\n", getenv("DUMP"));
+}
 
 /* Zero the DeltaNet recurrent state so a new request doesn't inherit the
  * previous conversation's hidden state. Must be called at the start of every
@@ -9899,17 +10255,12 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Q36Spec *sp = &g_q36_run_spec;
     q36_spec_begin(m, sp, prompt, np);   /* COLI_LOOKUP=1: drafts, every token still the argmax below */
     for (int s = 0; s < n_new; s++) {
+        dump_logits(logit, c->vocab);
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         if (s == 0 && g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* record TTFT */
         if (g_stream) { stream_token(best); fflush(stdout); }
-        if (s == n_new - 1) {
-            if (getenv("DUMP")) {
-                g_last_logit = malloc((size_t)c->vocab * sizeof(float));
-                memcpy(g_last_logit, logit, (size_t)c->vocab * sizeof(float));
-            }
-            free(logit); out[len++] = best; break;
-        }
+        if (s == n_new - 1) { free(logit); out[len++] = best; break; }
         free(logit); out[len++] = best;
         { extern double g_tm_step; double _s0 = tm_now();
           logit = q36_spec_step(m, sp, best, len - 1, n_new - 1 - s);
@@ -9954,12 +10305,105 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     return scored;
 }
 
+#include "argmax_first.h"
+/* DEBUG_LOGITS=1 under TF: a mismatched position's top five logits and its top1-top2 gap
+ * (colibri.c's dump_top5_logits), so a near tie shows as the small gap it is and not as a
+ * bare token mismatch. */
+static void tf_top5(int pos, const float *lo, int V, int expected, int got) {
+    int idx[5]; float val[5];
+    for (int k = 0; k < 5; k++) { idx[k] = -1; val[k] = -INFINITY; }
+    for (int i = 0; i < V; i++) { float v = lo[i];
+        for (int k = 0; k < 5; k++) if (v > val[k]) {
+            for (int j = 4; j > k; j--) { val[j] = val[j-1]; idx[j] = idx[j-1]; }
+            val[k] = v; idx[k] = i; break; } }
+    double gap = idx[1] >= 0 ? (double)(val[0] - val[1]) : 0.0;
+    fprintf(stderr, "[LOGITS] pos=%d top1-top2 gap=%.3e | expected=%d (%.5f)  got=%d (%.5f) | top5:",
+            pos, gap, expected, (expected >= 0 && expected < V) ? (double)lo[expected] : 0.0,
+            got, (got >= 0 && got < V) ? (double)lo[got] : 0.0);
+    for (int k = 0; k < 5 && idx[k] >= 0; k++) fprintf(stderr, " %d:%.5f", idx[k], (double)val[k]);
+    fprintf(stderr, "\n");
+}
+
+#define Q36_TF_ROWS 256   /* rows of logits held at once (256 x vocab floats) */
+
+/* TF=1 on a .json reference: teacher forcing, colibri.c's forward_all for this engine. The
+ * reference's full_ids go through the model as a prompt, Q36_TF_ROWS rows at a time, every
+ * row's logits read out (step_ex's nlogits): the argmax at position s is the engine's
+ * prediction for full_ids[s+1], the prompt's positions included, which the greedy oracle
+ * never looks at. Each position is compared with the reference's tf_pred (the torch model's
+ * argmax over one forward of the whole sequence; tools/make_qwen36_tiny.py --emit-ref and
+ * tools/make_qwen36_oracle.py write it): a mismatch fails the run, ORACLE_TF_MAX_MISMATCHES
+ * of them allowed. A reference without tf_pred gets its predictions printed and fails too,
+ * as colibri's does: nothing was validated. DUMP takes every row as it is read; DEBUG_LOGITS=1
+ * prints a mismatched position's top five. Returns the exit status. */
+static int tf_run(Model *m, const int *full, int nfull, const int *tf, int ntf) {
+    Cfg *c = &m->c; int V = c->vocab;
+    if (nfull > QWEN36_ATTN_MAX_CTX) {
+        fprintf(stderr, "[ctx] %d tokens exceed the %d-token ceiling\n", nfull, QWEN36_ATTN_MAX_CTX);
+        exit(1);
+    }
+    if (tf && ntf != nfull) {
+        fprintf(stderr, "[tf] tf_pred has %d entries, full_ids %d: not the same sequence\n", ntf, nfull);
+        return 1;
+    }
+    int allowed = 0;
+    { const char *a = getenv("ORACLE_TF_MAX_MISMATCHES");
+      if (a && *a) {
+          char *end = NULL; long v = strtol(a, &end, 10);
+          if (end == a || *end || v < 0 || v >= nfull) {
+              fprintf(stderr, "[tf] ORACLE_TF_MAX_MISMATCHES must be an integer in [0,%d)\n", nfull);
+              return 1;
+          }
+          allowed = (int)v;
+      } }
+    int dbg = tf && getenv("DEBUG_LOGITS") && *getenv("DEBUG_LOGITS");
+    m->max_t = nfull;
+    reset_recurrent(m);
+    ensure_kv(m);
+    m->kv_len = 0;
+    int *pred = malloc((size_t)nfull * sizeof(int));
+    if (!pred) { fprintf(stderr, "[tf] out of memory\n"); return 1; }
+    int finite = 1, mism = 0;
+    double t0 = now_s();
+    for (int at = 0; at < nfull; at += Q36_TF_ROWS) {
+        int S = nfull - at < Q36_TF_ROWS ? nfull - at : Q36_TF_ROWS;
+        float *lo = step_ex(m, full + at, S, at, S);
+        for (int r = 0; r < S; r++) {
+            const float *row = lo + (int64_t)r * V; int s = at + r;
+            dump_logits(row, V);
+            int ok = 1; for (int v = 0; v < V; v++) if (!isfinite(row[v])) { ok = 0; break; }
+            if (!ok) {
+                fprintf(stderr, "[tf] non-finite logits at position %d\n", s);
+                finite = 0; pred[s] = -1; continue;
+            }
+            pred[s] = argmax_first(row, V);
+            if (tf && pred[s] != tf[s]) {
+                mism++;
+                fprintf(stderr, "[tf] mismatch pos=%d expected=%d got=%d\n", s, tf[s], pred[s]);
+                if (dbg) tf_top5(s, row, V, tf[s], pred[s]);
+            }
+        }
+        free(lo);
+    }
+    double dt = now_s() - t0;
+    int rc;
+    if (!tf) {
+        printf("TF pred  : "); for (int s = 0; s < nfull; s++) printf("%d ", pred[s]); printf("\n");
+        fprintf(stderr, "[tf] the reference has no tf_pred: %d predictions and nothing to compare them with "
+                        "(tools/make_qwen36_tiny.py --emit-ref and tools/make_qwen36_oracle.py write it)\n", nfull);
+        rc = 1;
+    } else {
+        printf("TEACHER-FORCING: %d/%d positions match the reference | %.1f pos/s\n", nfull - mism, nfull, nfull / dt);
+        if (mism) fprintf(stderr, "[tf] %d/%d mismatches, %d allowed%s\n", mism, nfull, allowed,
+                          dbg ? "" : " (DEBUG_LOGITS=1 for the top five logits of each)");
+        rc = (!finite || mism > allowed) ? 1 : 0;
+    }
+    free(pred);
+    return rc;
+}
+
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 1, 0, INT_MIN);
 }
 
 #ifndef QWEN36_NO_MAIN
@@ -10670,6 +11114,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
     unsigned char sbuf[16]; int sbn=0;
     Q36Spec spec; q36_spec_begin(m, &spec, ids, np);   /* COLI_LOOKUP=1: drafts, every token still sampled from the exact logits */
     for(int s=0;s<q->max_tok;s++){
+        dump_logits(lo, m->c.vocab);
         int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
         /* La coda si calcola PRIMA della free: dopo, lo non c'e piu. */
         char lptail[1024]; lptail[0]=0;
@@ -10684,7 +11129,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
             unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
             if(cn>0) serve_data(q->id,(char*)chunk,cn);
         }
-        gen++;
+        gen++; q36_ledger_token();
         if(s == 0) q36_pes_commit(m);   /* the first token is out; the state is still the prompt's end */
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -11176,6 +11621,7 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
 static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, int *tk_out){
     if (r->stop) r->limited = 0;
     if (r->cancel || r->stop || r->gen >= r->q.max_tok) { q36_mux_finish(m, r); return 0; }
+    dump_logits(r->lo, m->c.vocab);
     int tk = serve_sample(r->lo, m->c.vocab, r->q.temp, r->q.top_p);
     char lptail[1024]; lptail[0] = 0;
     if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, m->c.vocab, tk, r->q.logprobs);
@@ -11187,7 +11633,7 @@ static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, i
         unsigned char chunk[256]; int cn = 0; utf8_drain(r->sbuf, &r->sbn, tmp, tn, chunk, &cn);
         if (cn > 0) serve_data(r->q.id, (char *)chunk, cn);
     }
-    r->gen++;
+    r->gen++; q36_ledger_token();
 #ifdef COLI_CUDA
     if (g_q36_mcv) q36_mtp_vocab_step(tk);   /* the draft vocabulary counts it, as a lone request's */
 #endif
@@ -11208,6 +11654,7 @@ static void q36_mux_settle(Model *m, Q36MuxReq *r, int slot, const float *hid, c
     if (r->dn) {
         const float *row = r->lo;
         while (acc < r->dn && !r->stop && !r->cancel && r->gen + acc + 1 < r->q.max_tok) {
+            dump_logits(row, V);
             const int t = serve_sample(row, V, r->q.temp, r->q.top_p);
             int end = t != r->d[acc];
             for (int e = 0; e < n_eos && !end; e++) end = t == eos_ids[e];
@@ -11837,7 +12284,8 @@ int main(int argc, char **argv) {
     { const char *seed = getenv("SEED");
       srand(seed && *seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)(time(NULL) ^ (unsigned)getpid())); }
     const char *snap = getenv("SNAP");
-    if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
+    if (!snap || !*snap) snap = getenv("COLI_MODEL");   /* the launcher's name for it, as colibri.c takes it */
+    if (!snap || !*snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
     static char gguf_path[4096], mmproj_path[4096], mtp_path[4096]; int gguf_dir = 0;
     {   /* a model directory made by tools/gguf_import.py: gguf.json names the file */
         char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
@@ -11982,6 +12430,7 @@ int main(int argc, char **argv) {
 
 
     int is_ref = 0;
+    jval *ref_root = NULL;       /* the parsed reference (TF reads its tf_pred) */
     jval *ref_image = NULL;      /* {"grid_h", "grid_w", "patches": [...]}: one image for the oracle */
     int rplen = (int)strlen(refpath);
     if (rplen>=5 && strcmp(refpath+rplen-5, ".json")==0) is_ref = 1;
@@ -12025,6 +12474,7 @@ int main(int argc, char **argv) {
         fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
         buf=malloc(n+1); if (fread(buf,1,n,f)!=(size_t)n) {} buf[n]=0; fclose(f);
         jval *ref = json_parse(buf, &arena);
+        ref_root = ref;
         ref_image = ref ? json_get(ref, "image") : NULL;
         prompt = read_int_array(ref,"prompt_ids",&np);
         full   = read_int_array(ref,"full_ids",&nfull);
@@ -12463,8 +12913,31 @@ int main(int argc, char **argv) {
     }
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
         if (!g_tok) { fprintf(stderr, "[serve] tokenizer.json required (put in SNAP or set TOK)\n"); return 1; }
+        q36_preload_start(&m);
         serve_loop(&m);
         return 0;
+    }
+
+    if (is_ref && getenv("TF") && *getenv("TF")) {
+        /* teacher forcing: every position's argmax against the reference's tf_pred */
+        int ntf = 0; int *tf = NULL;
+        if (ref_root && json_get(ref_root, "tf_pred")) tf = read_int_array(ref_root, "tf_pred", &ntf);
+        int rc = tf_run(&m, full, nfull, tf, ntf);
+        dump_close(m.c.vocab);
+        double tot = m.hits + m.miss;
+        printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
+               (unsigned long long)m.hits, (unsigned long long)m.miss);
+        route_footer(stdout, &m);
+        printf("PEAK RSS: %.2f GB\n", rss_gb());
+#ifdef COLI_CUDA
+        q36cc_report(&m);
+#endif
+#ifdef COLI_VULKAN
+        vk_report();
+        q36c_report(&m);
+        vk_tier_turn(&m, "run");
+#endif
+        free(tf); free(buf); free(arena); return rc;
     }
 
     if (is_ref && getenv("PPL") && atoi(getenv("PPL")) == 1) {
@@ -12514,15 +12987,8 @@ int main(int argc, char **argv) {
     generate(&m, prompt, np, n_new, out);
     double dt = now_s() - t;
 
-    /* DUMP=<path>: write last-token logits (raw float32, vocab) for a torch-free
-     * cosine comparison against tools/_ref_dn.py --dump. */
-    if (g_last_logit) {
-        const char *dp = getenv("DUMP");
-        FILE *df = fopen(dp && *dp ? dp : "qwen36_logits.f32", "wb");
-        if (df) { fwrite(g_last_logit, sizeof(float), (size_t)m.c.vocab, df); fclose(df);
-                  fprintf(stderr, "[dump] wrote %d logits -> %s\n", m.c.vocab, dp && *dp ? dp : "qwen36_logits.f32"); }
-        else fprintf(stderr, "[dump] cannot open %s\n", dp ? dp : "qwen36_logits.f32");
-    }
+    /* DUMP=<path>: the rows went out as they were sampled (dump_logits); say how many */
+    dump_close(m.c.vocab);
 
     int ref_match = 0;
     if (is_ref) {
@@ -12636,6 +13102,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
         free(cache->slot_by_expert); free(cache->slots);
     }
     free(model->attn_sc);
+    free(model->attn_sc_grp); model->attn_sc_grp = NULL; model->attn_sc_grp_cap = 0;
     free(model->seen); free(model->is_queued); free(model->is_pinned);
     free(model->momentum_logits); free(model->freq);
     free(model->DN_conv); free(model->DN_rec); free(model->dn_dev_fresh); free(model->dn_host_stale);

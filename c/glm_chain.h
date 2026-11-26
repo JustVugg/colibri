@@ -136,7 +136,6 @@ static int g_glmc_fit2_on;
 static int g_glmc_dev;        /* the device glmc_tensor uploads a new matrix to */
 static GlmChain *glmc_of(Model *m, int d) { return (GlmChain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *glmc_name(const GlmChain *ch) { return ch && ch->d ? "colibri dev2" : "colibri"; }
-static int glmc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 /* The device's copy of a resident QT, uploaded once (the per-matrix path's own copy
  * when COLI_VK_DENSE put it there); f32 goes up as the backend's fmt 10. NULL: no
@@ -375,7 +374,7 @@ static void glmc_fit_plan(Model *m) {
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n0, with that device's free memory, its pipelines up now */
     int n0 = g_glmc_fit.n;
-    if (vkc_fit_partial(&g_glmc_fit) && n0 > 0 && n0 < L && glmc_dev2_wanted() && !c->ml4 && getenv("COLI_VK_DEV2") &&
+    if (vkc_fit_partial(&g_glmc_fit) && n0 > 0 && n0 < L && vkc_dev2_wanted() && !c->ml4 && getenv("COLI_VK_DEV2") &&
         coli_vk_dev2_open_env()) {
         vkc_device(1);
         int n2 = vkc_fit("colibri dev2", L - n0, lb + n0, mb + n0, fixed, 0, &g_glmc_fit2);

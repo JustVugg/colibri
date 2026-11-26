@@ -74,6 +74,7 @@
 #include "st.h"
 #include "ggml_view.h"
 #include "quant.h"
+#include "fp8_format.h"
 #include "tok.h"
 #include "omp_tune.h"
 #ifdef COLI_METAL
@@ -111,6 +112,7 @@ static size_t g_g53_cud;    /* the room the dense matrices take there (cud_open)
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
 #include "decode_batch.h"   /* coli_submit_ext, coli_logprob_tail: canale logprobs */
+#include "serve_codec.h"    /* the request frames, as the sibling engines read them */
 #include "pin_pool.h"       /* piu scatti annidati dello stato */
 #include <time.h>
 #ifndef _WIN32
@@ -982,6 +984,60 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
 #endif
 }
 
+/* --- FP8 e4m3 native checkpoint (Sage-S2.1-Flash-FP8, the GLM-5.2-FP8 layout) -----
+ * Weights are F8_E4M3 bytes and the block scales are F32 under `name_scale_inv`, one
+ * scale per FP8_BLOCK x FP8_BLOCK tile: the dequant is quant.h's, w[o,i] =
+ * e4m3_decode(byte) * scale[o/128][i/128]. This engine has no fmt=8 matmul yet
+ * (its Mat formats are f32, int8 row and int4 gs64), so the bytes are dequantized
+ * once at load into f32 and the existing GLM53_BITS path quantizes them: correctness
+ * first, and the f32 peak is one tensor, not the model. Returns a freshly malloc'd
+ * buffer of numel floats, or NULL after saying why. */
+static float *glm53_load_fp8_f32(GModel *m, const char *name, st_tensor *t) {
+    char sc[544];
+    st_tensor *s;
+    uint8_t *w;
+    float *scale, *out;
+    int64_t rows, cols, nr, ncol, r, i;
+    if (t->rank != 2) { fprintf(stderr, "%s: FP8 weight of rank %d\n", name, t->rank); return NULL; }
+    rows = t->shape[0]; cols = t->shape[1];
+    if (rows <= 0 || cols <= 0 || t->nbytes != rows * cols) {
+        fprintf(stderr, "%s: %lld bytes cannot hold %lld x %lld e4m3\n", name,
+                (long long)t->nbytes, (long long)rows, (long long)cols);
+        return NULL;
+    }
+    snprintf(sc, sizeof sc, "%s_scale_inv", name);
+    s = st_find(&m->S, sc);
+    if (!s || s->dtype != 2) {
+        fprintf(stderr, "%s: FP8 needs '%s' as F32 block scales\n", name, sc);
+        return NULL;
+    }
+    nr = (rows + FP8_BLOCK - 1) / FP8_BLOCK;
+    ncol = (cols + FP8_BLOCK - 1) / FP8_BLOCK;
+    if (s->numel != nr * ncol) {
+        fprintf(stderr, "%s: %lld scales, %lld x %lld needed for 128x128 blocks\n", name,
+                (long long)s->numel, (long long)nr, (long long)ncol);
+        return NULL;
+    }
+    w = (uint8_t *)malloc((size_t)t->nbytes);
+    scale = (float *)malloc((size_t)s->numel * sizeof(float));
+    out = (float *)malloc((size_t)rows * cols * sizeof(float));
+    if (!w || !scale || !out) {
+        free(w); free(scale); free(out);
+        fprintf(stderr, "OOM on %s\n", name);
+        return NULL;
+    }
+    st_read_raw(&m->S, name, w, 1);
+    st_read_f32_cap(&m->S, sc, scale, s->numel, 1);
+    for (r = 0; r < rows; r++) {
+        const float *row_scale = scale + (r / FP8_BLOCK) * ncol;
+        for (i = 0; i < cols; i++)
+            out[(size_t)r * cols + i] = e4m3_decode(w[(size_t)r * cols + i]) * row_scale[i / FP8_BLOCK];
+    }
+    free(w);
+    free(scale);
+    return out;
+}
+
 /* rows x columns e' la forma con cui il forward usa la matrice, contata dalla
  * config: mm() scrive w->rows valori per token e ne legge w->columns. Presa
  * dall'header senza confronto, una riga in piu' scriveva oltre il buffer
@@ -1077,6 +1133,25 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
         st_read_raw(&m->S, name, packed, 1);
         st_read_f32_cap(&m->S, scales, step, qs->numel, 1);
         mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64; mat.resident = 1;
+#ifdef COLI_VULKAN
+        if (!(mat.vk_name = strdup(name))) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+#endif
+        return mat;
+    }
+
+    if (t->dtype == 4) {                  /* F8_E4M3 native: dequant at load, then quantize */
+        if (t->rank != 2) { fprintf(stderr, "%s: rank %d, expected 2\n", name, t->rank); exit(1); }
+        if (t->shape[0] != rows || t->shape[1] != columns) {
+            fprintf(stderr, "%s: %lld x %lld, the config needs %lld x %lld\n", name,
+                    (long long)t->shape[0], (long long)t->shape[1],
+                    (long long)rows, (long long)columns);
+            exit(1);
+        }
+        float *buffer = glm53_load_fp8_f32(m, name, t);
+        if (!buffer) { fprintf(stderr, "cannot dequantize FP8 %s\n", name); exit(1); }
+        mat.rows = (int)rows;
+        mat.columns = (int)columns;
+        mat = quantize_loaded(buffer, mat.rows, mat.columns);
 #ifdef COLI_VULKAN
         if (!(mat.vk_name = strdup(name))) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
 #endif
@@ -4538,23 +4613,8 @@ static int compare_by_probability(const void *a, const void *b) {
 }
 
 /* Temperatura piu' nucleus. Con temperatura nulla e' argmax e basta. */
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
- * (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V) {
-    static int dump = -1;
-    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
-    if (!dump) return;
-    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
-    for (int t = 0; t < V; t++) {
-        const float x = lo[t];
-        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
-    }
-    fprintf(stderr, "[LOGITS]");
-    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
-    fprintf(stderr, "\n");
-}
 static int sample_token(const float *logits, int vocab) {
-    serve_logit_dump(logits, vocab);
+    coli_logit_dump(logits, vocab);
     if (g_temp <= 1e-4f) return argmax(logits, vocab);
     static float *probability = NULL;
     static int *order = NULL;
@@ -4962,86 +5022,67 @@ static void serve_data_lp(unsigned long long id, const char *text, int n,
 }
 
 /* Una richiesta intera, o 0 su EOF. Il payload si legge a byte contati, non a
- * righe: puo' contenerne. */
-static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
-    char header[512];
-    if (!fgets(header, sizeof(header), stdin)) return 0;
+ * righe: puo' contenerne.
+ *
+ * The frames go through serve_codec.h, as for the sibling engines, with this engine's
+ * numeric request ids and its limits (an image up to 256 MiB, a prompt up to 16 MiB, the
+ * second checked once the payload is consumed). A frame the stream cannot be trusted after
+ * -- a payload that does not end on its newline, a short read, a refused SUBMIT or IMAGE
+ * header -- comes back as BAD_FRAME, which the callers answer, and the session then ends:
+ * every later read is end of input, as on Kimi K3 and OLMoE, instead of reading the rest of
+ * the stream as commands. A DECIDE (no decision head here) is consumed and skipped. */
+#define GLM53_MAX_PROMPT_BYTES (1u << 24)
+static const ColiServeWireProfile g53_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 28,
+    .require_exact_lf = 1,
+};
+static int g53_input_lost;   /* the session ends: nothing after this frame is read */
+
+static int serve_read_req(FILE *in, ServeReq *q, char *verb, size_t verb_size) {
     memset(q, 0, sizeof(*q));
-    if (sscanf(header, "%15s", verb) != 1) { verb[0] = 0; return 1; }
-    if (!strcmp(verb, "STOP") || !strcmp(verb, "CANCEL")) {
-        sscanf(header, "%*s %llu", &q->id);
+    if (g53_input_lost) return 0;
+    ColiServeCommand c; memset(&c, 0, sizeof c);
+    const ColiServeReadResult r = coli_serve_read_command(in, &g53_wire, &c);
+    if (r == COLI_SERVE_READ_EOF) return 0;
+    uint64_t id = 0;
+    const int numeric = coli_serve_parse_u64(c.id, &id);
+    q->id = numeric ? (unsigned long long)id : 0;
+    const int framed = c.kind == COLI_SERVE_COMMAND_SUBMIT || c.kind == COLI_SERVE_COMMAND_IMAGE;
+    if (r == COLI_SERVE_READ_BAD_FRAME || r == COLI_SERVE_READ_NOMEM ||
+        (r == COLI_SERVE_READ_BAD_REQUEST && (framed || c.kind == COLI_SERVE_COMMAND_DECIDE)) ||
+        (r == COLI_SERVE_READ_OK && framed && !numeric) ||
+        (r == COLI_SERVE_READ_OK && c.kind == COLI_SERVE_COMMAND_SUBMIT && c.payload_bytes > GLM53_MAX_PROMPT_BYTES)) {
+        coli_serve_command_dispose(&c);
+        g53_input_lost = 1;
+        snprintf(verb, verb_size, "BAD_FRAME");
         return 1;
     }
-    if (!strcmp(verb, "IMAGE")) {
-        unsigned long long id; int bytes, grid_h, grid_w;
-        if (sscanf(header, "IMAGE %llu %d %d %d", &id, &bytes, &grid_h, &grid_w) != 4 ||
-            bytes < 0 || bytes > (1 << 28) || grid_h < 1 || grid_w < 1) {
-            strcpy(verb, "BAD_FRAME");
-            return 1;
-        }
+    if (r != COLI_SERVE_READ_OK || !numeric) { coli_serve_command_dispose(&c); snprintf(verb, verb_size, "?"); return 1; }
+    switch (c.kind) {
+    case COLI_SERVE_COMMAND_STOP: snprintf(verb, verb_size, "STOP"); return 1;
+    case COLI_SERVE_COMMAND_CANCEL: snprintf(verb, verb_size, "CANCEL"); return 1;
+    case COLI_SERVE_COMMAND_IMAGE:
         pending_clear();
-        float *patches = malloc((size_t)bytes);
-        if (!patches || fread(patches, 1, (size_t)bytes, stdin) != (size_t)bytes) {
-            free(patches);
-            strcpy(verb, "BAD_FRAME");
-            return 1;
-        }
-        (void)fgetc(stdin);                       /* il '\n' di chiusura */
-        g_pending.id = id;
-        g_pending.patches = patches;
-        g_pending.bytes = (size_t)bytes;
-        g_pending.grid_h = grid_h;
-        g_pending.grid_w = grid_w;
-        q->id = id;
+        g_pending.id = q->id;
+        g_pending.bytes = (size_t)c.payload_bytes;
+        g_pending.grid_h = c.grid_h;
+        g_pending.grid_w = c.grid_w;
+        g_pending.patches = (float *)coli_serve_command_take_payload(&c);
+        snprintf(verb, verb_size, "IMAGE");
+        return 1;
+    case COLI_SERVE_COMMAND_SUBMIT:
+        q->slot = c.slot; q->max_tokens = c.max_tokens; q->temp = c.temperature; q->top_p = c.top_p;
+        q->logprobs = c.logprobs; q->pin = c.pin;
+        q->plen = (int)c.payload_bytes;
+        q->payload = (char *)coli_serve_command_take_payload(&c);
+        snprintf(verb, verb_size, "SUBMIT");
+        return 1;
+    default:
+        coli_serve_command_dispose(&c);
+        snprintf(verb, verb_size, "?");
         return 1;
     }
-    if (strcmp(verb, "SUBMIT")) return 1;
-    int header_used = 0;
-    if (sscanf(header, "SUBMIT %llu %d %d %d %f %f%n", &q->id, &q->slot, &q->plen,
-               &q->max_tokens, &q->temp, &q->top_p, &header_used) != 6) {
-        strcpy(verb, "BAD_FRAME");
-        return 1;
-    }
-    /* Chiavi facoltative dopo i sei campi posizionali (logprobs=k, pin=1): le
-     * legge lo stesso parser degli altri motori, cosi la modalita jev si
-     * chiede allo stesso modo ovunque. Una richiesta che non ne porta resta
-     * identica a prima, byte per byte. */
-    q->logprobs = 0; q->pin = 0;
-    {
-        const char *rest = header + header_used;
-        while (*rest == ' ') rest++;
-        if (*rest && *rest != '\n') {
-            char tailbuf[256];
-            snprintf(tailbuf, sizeof tailbuf, "%s", rest);
-            for (char *w = tailbuf; *w; w++) if (*w == '\n' || *w == '\r') { *w = 0; break; }
-            ColiSubmit ext; memset(&ext, 0, sizeof ext);
-            if (coli_submit_ext(tailbuf, &ext)) { q->logprobs = ext.logprobs; q->pin = ext.pin; }
-        }
-    }
-    if (q->plen < 0 || q->plen > (1 << 24)) { strcpy(verb, "BAD_FRAME"); return 1; }
-    q->payload = malloc((size_t)q->plen + 1);
-    if (!q->payload) { strcpy(verb, "BAD_FRAME"); return 1; }
-    if (q->plen && fread(q->payload, 1, (size_t)q->plen, stdin) != (size_t)q->plen) {
-        free(q->payload); q->payload = NULL;
-        strcpy(verb, "BAD_FRAME");
-        return 1;
-    }
-    q->payload[q->plen] = 0;
-    int trailing = fgetc(stdin);
-    (void)trailing;                        /* il '\n' di chiusura del frame */
-    /* max_tokens=0 vale solo in modalita jev ("leggi e fermati"), e lo si sa
-     * solo dopo aver letto le chiavi. Il rifiuto sta DOPO che payload e '\n'
-     * sono stati consumati: rifiutare prima lascerebbe i byte del prompt nello
-     * stream e disallineerebbe ogni frame successivo, che e' esattamente il
-     * guaio che il commento di serve_cancel_pending descrive. Questo motore non
-     * passa dal parser condiviso, quindi la regola va ripetuta qui o resta
-     * l'unico ad accettare uno zero che per tutti gli altri e' malformato. */
-    if (q->max_tokens < 1 && !(q->max_tokens == 0 && q->logprobs > 0)) {
-        free(q->payload); q->payload = NULL; q->plen = 0;
-        strcpy(verb, "BAD_FRAME");
-        return 1;
-    }
-    return 1;
 }
 
 /* Cosa ha chiesto il gateway mentre il turno girava: niente, un abort del
@@ -5093,26 +5134,29 @@ enum { SERVE_CTL_NONE = 0, SERVE_CTL_CANCEL = 1, SERVE_CTL_STOP = 2 };
  * Non legge MAI se stdin non e' pronto: una fgets bloccante qui fermerebbe la
  * generazione in attesa di un comando che potrebbe non arrivare mai -- un
  * guasto peggiore di quello che questa funzione cura. */
-static int serve_cancel_pending(unsigned long long id, int *input_eof) {
+static int serve_cancel_read(FILE *in, FILE *out, int (*ready)(void), unsigned long long id, int *input_eof) {
     int cancelled = 0, stopped = 0;
-    while (coli_serve_stdin_ready()) {
+    while (ready()) {
         ServeReq n; char verb[16];
-        if (!serve_read_req(&n, verb, sizeof(verb))) { *input_eof = 1; break; }
+        if (!serve_read_req(in, &n, verb, sizeof(verb))) { *input_eof = 1; break; }
         if (!strcmp(verb, "CANCEL")) {
             if (n.id == id) cancelled = 1;
-            else serve_line("ERROR %llu NOT_FOUND\n", n.id);
+            else { fprintf(out, "ERROR %llu NOT_FOUND\n", n.id); fflush(out); }
         } else if (!strcmp(verb, "STOP")) {
             if (n.id == id) stopped = 1;
         } else if (!strcmp(verb, "SUBMIT")) {
-            serve_line("ERROR %llu SLOT_BUSY\n", n.id);
+            fprintf(out, "ERROR %llu SLOT_BUSY\n", n.id); fflush(out);
             free(n.payload);
         } else if (!strcmp(verb, "BAD_FRAME")) {
-            serve_line("ERROR %llu BAD_FRAME\n", n.id);
+            fprintf(out, "ERROR %llu BAD_FRAME\n", n.id); fflush(out);
         }
         /* IMAGE non risponde niente, come nel ciclo principale. */
     }
     if (cancelled) return SERVE_CTL_CANCEL;
     return stopped ? SERVE_CTL_STOP : SERVE_CTL_NONE;
+}
+static int serve_cancel_pending(unsigned long long id, int *input_eof) {
+    return serve_cancel_read(stdin, stdout, coli_serve_stdin_ready, id, input_eof);
 }
 
 /* La stessa guardata, fra un pezzo di prefill e l'altro.
@@ -5975,7 +6019,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     emap_emit(m);
     for (;;) {
         ServeReq q; char verb[16];
-        if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
+        if (!serve_read_req(stdin, &q, verb, sizeof(verb))) break;   /* EOF: si esce */
         if (!strcmp(verb, "SUBMIT")) {
             /* < 0: stdin e' finito mentre il turno girava. Il turno e' stato
              * servito per intero (e' la regola: "in-flight requests finish

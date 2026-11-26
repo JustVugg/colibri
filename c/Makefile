@@ -543,7 +543,7 @@ endif
 # and any two that each added a test conflicted on that line by construction; #386 hit it
 # twice while being rebased. A first attempt (#731) globbed tests/test_*.c, which was wrong
 # in the other direction: it promoted files that deliberately have no rule (a branch's
-# work-in-progress test, test_fse, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
+# work-in-progress test, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
 # they fail to link. Having a rule is the honest definition of "this is a gate".
 # RULE_NAMES is every `NAME$(EXE):` rule, with its directory; one pass over the
 # Makefile serves both TEST_RULES here and ENGINE_RULES (#1741, end of file).
@@ -577,7 +577,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
-	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
+	test_e8x4g64_loader test_qwenimage_vae test_qwenimage_vision test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 test_int_kernel_exact_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
 TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window test_vk_pcache
@@ -1119,7 +1119,7 @@ libcoli_xdna.so: backend_xdna_helper.cpp
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h qwen36_cuda_profile.h
+cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h ledger_map.h qwen36_cuda_profile.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
@@ -1168,7 +1168,7 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config qwen36_cuda_profile.h
+backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h ledger_map.h .build-config qwen36_cuda_profile.h
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
@@ -1187,7 +1187,7 @@ cu_tier.o: cu_tier.c vk_tier.c vk_tier.h cu_tier.h cu_tier_ops.h .build-config
 	$(CC) $(CFLAGS) -c cu_tier.c -o $@
 
 
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh .build-config $(DSV4_DEEPGEMM_DEP)
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh ledger_map.h .build-config $(DSV4_DEEPGEMM_DEP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
 
@@ -1217,6 +1217,9 @@ deepgemm-fetch $(DEEPGEMM_STAMP):
 # cublasLt64_12.dll alone is hundreds of MB. NO_TC=1, the name
 # Makefile.deepseek-v4 and the loader's advice use, means the same here.
 ifeq ($(NO_TC),1)
+ifeq ($(DSV4_TC),1)
+$(error NO_TC=1 means DSV4_TC=0, but DSV4_TC=1 is set (command line or environment): drop one)
+endif
 DSV4_TC ?= 0
 endif
 DSV4_TC ?= 1
@@ -1227,7 +1230,7 @@ else
 DSV4_DLL_TC =
 DSV4_DLL_LIBS = -lcublasLt -lcudart -lcuda
 endif
-cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh dsv4.def
+cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh ledger_map.h dsv4.def
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
@@ -1696,8 +1699,11 @@ ifneq ($(EXE),)
 .PHONY: qwenimage
 qwenimage: qwenimage$(EXE)
 endif
-qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) qwenimage.c $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS)
+qwenimage$(EXE): qwenimage.c $(QWEN36_METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) qwenimage.c $(QWEN36_METAL_OBJ) $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
+
+tests/bench_qwenimage_metal$(EXE): tests/bench_qwenimage_metal.c $(QWEN36_METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) $< $(QWEN36_METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
 
 # colibri-tui: the terminal interface (docs/tui.md), a client of coli serve. One C file and the
 # chat page's mascot (tui_mascot.h, from tools/make_tui_mascot.py); no OpenMP, no GPU, no
@@ -2069,6 +2075,15 @@ qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
 	$(PYTHON) tests/qwen36_mtp_harness.py --engine ./qwen36$(EXE) --source ./qwen36_tiny_mtp \
 		--model ./qwen36_tiny_mtp_i8 --model ./qwen36_tiny_mtp_i4
 
+# A Basalt .basalt qwen35 pack -> GGUF (tools/convert_basalt_to_gguf.py): the converter
+# on a tiny pack in Basalt's form (tests/basalt_fixture.py), then the converted file on
+# qwen36 (CPU): GGUF_CHECK, MTP drafts, residuals equal to the pack's values. Here the
+# engine part may not skip; test-python runs the same file and skips it when qwen36 is
+# not built.
+.PHONY: basalt-convert-check
+basalt-convert-check: qwen36$(EXE)
+	BASALT_CONVERT_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_convert_basalt_to_gguf
+
 # Speculative decoding with deeper verifies (docs/speculative.md): the MTP head's
 # drafts up to 3 per verify (Q38_MTP_DRAFTS) and prompt-lookup drafts up to 5
 # (COLI_LOOKUP=1, spec_draft.h), on qwen38 and qwen36. tests/test_spec_draft
@@ -2079,7 +2094,7 @@ qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
 # vocabulary (--vocab 128), so a reply resent as text reads back as the ids the
 # engine generated. SPEC_ENV passes more settings to every run (the Vulkan family
 # in tests/vulkan_engines.sh runs the same gates in the dense chain).
-.PHONY: qwen36-tiny-v128-generate qwen36-seed-check spec-drafts-check spec-drafts-run
+.PHONY: qwen36-tiny-v128-generate qwen36-seed-check qwen36-dump-check qwen36-tf-check spec-drafts-check spec-drafts-run
 qwen36-tiny-v128-generate:
 	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny_v128 --ref-mode full --vocab 128 \
 		--emit-ref ./qwen36_tiny_v128/ref_full.json
@@ -2097,6 +2112,16 @@ qwen36-seed-check: qwen36-tiny-v128-generate qwen36$(EXE)
 qwen36-echo-serve-check: qwen36-tiny-v128-generate qwen36$(EXE)
 	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny_v128_c
 	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny64_v128_c
+
+# DUMP on the generated fixture: one row a sampled token, the argmax the token sent, requests append.
+qwen36-dump-check: qwen36-tiny-v128-generate qwen36$(EXE)
+	QWEN36_TINY=./qwen36_tiny_v128_c QWEN36_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_qwen36_dump
+
+# Teacher forcing on the generated fixture: every position's argmax against the reference's
+# tf_pred (the prompt's positions too), DUMP one row a position, a wrong entry fails the run.
+qwen36-tf-check: qwen36-tiny-v128-generate qwen36$(EXE)
+	QWEN36_TINY=./qwen36_tiny_v128_c QWEN36_TINY_REF=./qwen36_tiny_v128/ref_full.json QWEN36_TINY_REQUIRED=1 \
+		$(PYTHON) -m unittest -v tests.test_qwen36_tf
 
 tests/test_spec_draft$(EXE): tests/test_spec_draft.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2432,6 +2457,9 @@ tests/test_dsv41_candidate_ids$(EXE): tests/test_dsv41_candidate_ids.c deepseek_
 tests/test_dsv41_engram_stage$(EXE): tests/test_dsv41_engram_stage.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_dsv41_hc_post_team$(EXE): tests/test_dsv41_hc_post_team.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2454,6 +2482,9 @@ tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_cache_grow_floor$(EXE): tests/test_qwen38_cache_grow_floor.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)
@@ -2487,6 +2518,15 @@ tests/test_qwenimage_encoder$(EXE): tests/test_qwenimage_encoder.c
 qwenimage-encoder-check: tests/test_qwenimage_encoder$(EXE) tests/test_qwenimage_vae$(EXE)
 	$(PYTHON) tools/check_qwenimage_encoder.py
 
+tests/test_qwenimage_vision$(EXE): tests/test_qwenimage_vision.c $(QWEN36_METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) $< $(QWEN36_METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
+
+.PHONY: qwenimage-vision-check
+qwenimage-vision-check: tests/test_qwenimage_vision$(EXE)
+	@set -e; fixture=$$(mktemp -d); trap 'rm -rf "$$fixture"' EXIT; \
+	  $(PYTHON) tools/make_qwenimage_tiny.py "$$fixture" --vision-conditioning && \
+	  ./tests/test_qwenimage_vision$(EXE) "$$fixture"
+
 # Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
 # generazione. Prova che due immagini diverse danno risposte diverse, che e'
 # l'unica domanda a cui una fixture con pesi casuali sa rispondere onestamente.
@@ -2500,6 +2540,10 @@ tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# PLE rows of a chunk read once each, adjacent ones in one read (Q38_PLE_COALESCE): the bits and the read count
+tests/test_qwen38_ple_reads$(EXE): tests/test_qwen38_ple_reads.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c tests/segment_runtime_nocuda.o $(VK_OBJ)
@@ -2621,6 +2665,15 @@ tests/test_gq_rows_exact$(EXE): tests/test_gq_rows_exact.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # Q2_K's fused row kernel against the unpack + gq_dot_i8 path it replaced, to the bit
 tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Grouped GQA attention in qwen36.c against the per-head loop, to the bit; `bench` times both.
+tests/test_qwen36_attn_grouped$(EXE): tests/test_qwen36_attn_grouped.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+# Fused F32/F16/BF16 paths in gq_matmul_f32 and vectorized gq_dequant_row, to the bit
+tests/test_gq_f32_fused$(EXE): tests/test_gq_f32_fused.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Single-region gq_matmul2_act (R16, TILE16_BIAS, F8) against two gq_matmul_act calls, to the bit
+tests/test_gq_matmul2$(EXE): tests/test_gq_matmul2.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The grid types' and Q2_K's row kernels (AVX-512's on a VNNI build, AVX2's otherwise) against
 # the unpack + gq_dot_i8 path, to the bit, one to eight activation rows
@@ -2910,6 +2963,10 @@ tests/test_xf16$(EXE): tests/test_xf16.c
 # the SSE2 i8 expert kernel (no AVX2+FMA) against xf_dot_i8_ref, bit for bit.
 tests/test_xf_sse2_int16$(EXE): tests/test_xf_sse2_int16.c
 	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+# the same source built for Sandy Bridge: the AVX i8 expert kernel (AVX, no AVX2+FMA) against
+# xf_dot_i8_ref, and its fmaf emulation in four lanes and by the short way against fmaf (#2882).
+tests/test_xf_avx_i8$(EXE): tests/test_xf_sse2_int16.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=sandybridge -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
 # coli_fmaf_exact (fma_compat.h) against fmaf, bit for bit, built without FMA where it is the
 # emulation the kernels take there (#2882).
 tests/test_fmaf_exact$(EXE): tests/test_fmaf_exact.c
@@ -3052,6 +3109,10 @@ tests/test_cuda_fmt_guard$(EXE): tests/test_cuda_fmt_guard.c
 tests/test_cuda_lut_gate$(EXE): tests/test_cuda_lut_gate.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# ledger_map.h is C++ (the CUDA backends include it): its test is too
+tests/test_ledger_map$(EXE): tests/test_ledger_map.cpp
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -MMD -MP $< -o $@
+
 tests/test_fp8_load$(EXE): tests/test_fp8_load.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -3069,6 +3130,14 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 
 # CPU-only state-policy regression; independent of model files and GPU flags.
 tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
+
+# glm53's serve request framing, frozen on synthetic frames (no model)
+tests/test_glm53_serve_framing$(EXE): tests/test_glm53_serve_framing.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
+
+# glm53 native FP8 e4m3 load dequant + tiny end-to-end exactness (CPU-only, self-contained)
+tests/test_glm53_fp8_load$(EXE): tests/test_glm53_fp8_load.c glm53.c
 	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
 # Exact sampler order, cumulative mass, selected token and RNG-use regression.
@@ -3533,6 +3602,9 @@ tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c qwen36.c qwen36_tier.
 tests/test_qwen36_cuda_profile$(EXE): tests/test_qwen36_cuda_profile.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_qwen36_ckpt_same_file_win$(EXE): tests/test_qwen36_ckpt_same_file_win.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 # The CUDA dense chain (COLI_CUDA_CHAIN=1, qwen36_cuda_chain.h): logits, state, verify
 # rollback and a lost device against the CPU path, on the fake backend's host-side table.
 tests/test_qwen36_cuda_chain$(EXE): tests/test_qwen36_cuda_chain.c qwen36.c qwen36_tier.c $(VK_OBJ)
@@ -3932,7 +4004,7 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 	fi
 	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
 		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py \
-		image_engine.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
+		image_engine.py audio_dmel.py compaction.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
 		setup_download.py mcp_server.py power.py model_fit.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py tools/iq3xxs_grid.json $(DESTDIR)$(LIBEXECDIR)/tools/
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/ui

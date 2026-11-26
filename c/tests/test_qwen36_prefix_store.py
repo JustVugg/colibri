@@ -59,8 +59,8 @@ class Qwen36PrefixStoreTest(unittest.TestCase):
     def setUpClass(cls):
         cls.dir = Path(tempfile.mkdtemp(prefix="q36ps_"))
         for f in FIXTURE.iterdir():
-            if f.name != "tokenizer.json":
-                os.symlink(f.resolve(), cls.dir / f.name)
+            if f.is_file() and f.name != "tokenizer.json":   # copies: a symlink needs a privilege on Windows
+                shutil.copy2(f, cls.dir / f.name)
         # every id past the bytes gets a text of its own, so a reply sent back is the same ids
         vocab, added = byte_level_vocab(256), []
         for tid in range(256, 320):

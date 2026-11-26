@@ -331,7 +331,7 @@ def recommend(ram_total, disk_free, *, os_name="linux", machine="x86_64",
         rows.append({"entry": entry, "status": status, "reason": reason,
                      "fits": status in ("good", "tight"), "recommended": False})
     if fit is None:   # nothing measured: the CPU alone, with model_fit's assumed RAM bandwidth
-        fit = {"ram": ram_total or 0, "ram_avail": None, "ram_gbs": None, "cards": [], "integrated": None,
+        fit = {"ram": ram_total or 0, "ram_avail": None, "ram_gbs": None, "cpu_gbs": None, "cards": [], "integrated": None,
                "disk": None, "disk_gbs": None}
     return _recommend_measured(rows, fit, backends or {})
 

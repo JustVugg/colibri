@@ -1,0 +1,26 @@
+== C32_1 vram=0 [COLI_CUDA=0] rc=0 abort=0 wall=73s kfd_peak=0MiB over=0MiB card_delta=9MiB generated=200 time_to_first_token=7.669s after_first=63.665s reads=3438 md5=ccbc8dfc avail=57G
+   tok_s=(generated-1)/after_first=199/63.665=3.1257
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=57.39GiB dense=resident(6.23GiB) target_slots=84 target_cache=44.97GiB head=resident-bf16 projected=57.08GiB
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=53061 hits=49623 misses=3438 hit_rate=93.521 bytes=45963804672 target_only=1
+   timing time_to_first_token=7.669s after_first=63.665s
+   v4_direct reads=3438 flock_reads=0 fallbacks=0 payload_bytes=43976491008
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 
+
+== C32_2 vram=0 [COLI_CUDA=0] rc=0 abort=0 wall=74s kfd_peak=0MiB over=0MiB card_delta=27MiB generated=200 time_to_first_token=7.721s after_first=63.391s reads=3443 md5=ccbc8dfc avail=56G
+   tok_s=(generated-1)/after_first=199/63.391=3.1392
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=57.07GiB dense=resident(6.23GiB) target_slots=83 target_cache=44.44GiB head=resident-bf16 projected=56.54GiB
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=53061 hits=49618 misses=3443 hit_rate=93.511 bytes=46030651392 target_only=1
+   timing time_to_first_token=7.721s after_first=63.391s
+   v4_direct reads=3443 flock_reads=0 fallbacks=0 payload_bytes=44040192000
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 
+
+== C32_3 vram=0 [COLI_CUDA=0] rc=0 abort=0 wall=74s kfd_peak=0MiB over=0MiB card_delta=25MiB generated=200 time_to_first_token=7.676s after_first=63.444s reads=3444 md5=ccbc8dfc avail=57G
+   tok_s=(generated-1)/after_first=199/63.444=3.1366
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=56.81GiB dense=resident(6.23GiB) target_slots=83 target_cache=44.44GiB head=resident-bf16 projected=56.54GiB
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=53061 hits=49617 misses=3444 hit_rate=93.509 bytes=46044020736 target_only=1
+   timing time_to_first_token=7.676s after_first=63.444s
+   v4_direct reads=3444 flock_reads=0 fallbacks=0 payload_bytes=44052774912
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 

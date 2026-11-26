@@ -121,7 +121,6 @@ static VkcFit g_g53c_fit2;
 static int g_g53c_fit2_on, g_g53c_dev;
 static G53Chain *g53c_of(int d) { return d ? g_g53c2 : g_g53c; }
 static const char *g53c_name(const G53Chain *ch) { return ch && ch->d ? "glm53 dev2" : "glm53"; }
-static int g53c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 /* A GGUF matrix's device format: its blocks as the file has them (100 + the ggml type; the
  * CPU's rows interleaved by 16 go back to the file's), where the backend has a block form
@@ -366,7 +365,7 @@ static void g53c_fit_plan(GModel *m) {
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n0 (the head stays on the host), with that device's free memory, its pipelines up now */
     int n0 = g_g53c_fit.n;
-    if (vkc_fit_partial(&g_g53c_fit) && n0 > 0 && n0 < L && g53c_dev2_wanted() && getenv("COLI_VK_DEV2") &&
+    if (vkc_fit_partial(&g_g53c_fit) && n0 > 0 && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
         coli_vk_dev2_open_env()) {
         vkc_device(1);
         int n2 = vkc_fit("glm53 dev2", L - n0, lb + n0, mb + n0, fixed, 0, &g_g53c_fit2);

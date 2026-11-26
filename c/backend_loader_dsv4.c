@@ -70,6 +70,8 @@ typedef int             (*fn_activation_device)(const Dsv4CudaActivation *a);
 typedef int             (*fn_decode_state_set)(int device, int token, int position);
 typedef void            (*fn_profiler_start)(void);
 typedef void            (*fn_profiler_stop)(void);
+typedef void            (*fn_ledger_label)(const char *kind, const char *name);
+typedef void            (*fn_ledger_step)(void);
 typedef int             (*fn_graph_begin)(int device);
 typedef Dsv4CudaGraph   *(*fn_graph_end)(int device);
 typedef int             (*fn_graph_end_pair)(int primary, int peer, Dsv4CudaGraph **primary_graph,
@@ -329,6 +331,8 @@ static struct {
     fn_decode_state_set decode_state_set;
     fn_profiler_start  profiler_start;
     fn_profiler_stop   profiler_stop;
+    fn_ledger_label    ledger_label;   /* optional: Ledger's map and window (older DLLs: none) */
+    fn_ledger_step     ledger_step;
     fn_graph_begin     graph_begin;
     fn_graph_end       graph_end;
     fn_graph_end_pair  graph_end_pair;
@@ -664,6 +668,8 @@ static int dsv4_cuda_resolve(const char *dllname){
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
     g_dsv4.mirror_alloc = (fn_mirror_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_alloc");
+    g_dsv4.ledger_label = (fn_ledger_label)GetProcAddress(g_dsv4.dll, "dsv4_cuda_ledger_label");
+    g_dsv4.ledger_step = (fn_ledger_step)GetProcAddress(g_dsv4.dll, "dsv4_cuda_ledger_step");
     g_dsv4.mirror_refill = (fn_mirror_refill)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_refill");
     g_dsv4.mirror_check = (fn_mirror_check)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_check");
     g_dsv4.upload_fence = (fn_upload_fence)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_fence");
@@ -755,6 +761,14 @@ void dsv4_cuda_profiler_start(void){
 
 void dsv4_cuda_profiler_stop(void){
     if(g_dsv4.available && g_dsv4.profiler_stop) g_dsv4.profiler_stop();
+}
+
+void dsv4_cuda_ledger_label(const char *kind, const char *name){
+    if(g_dsv4.available && g_dsv4.ledger_label) g_dsv4.ledger_label(kind, name);
+}
+
+void dsv4_cuda_ledger_step(void){
+    if(g_dsv4.available && g_dsv4.ledger_step) g_dsv4.ledger_step();
 }
 
 int dsv4_cuda_graph_begin(int device){

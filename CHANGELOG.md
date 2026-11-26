@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`coli setup` no longer promises a slow laptop CPU the speed of its RAM.** It estimated a decode on
+  the CPU from the RAM's bandwidth alone, so an i7-1355U laptop (RAM as fast as a desktop's, a third of
+  its compute) was offered Inkling-2-Mini at 11 tok/s where it decodes at 3. The setup now also
+  measures how much the cores compute (under a second) and slows the estimate where they are short.
 - **Vulkan: a long prompt's steps stay on the GPU when the driver refuses their scratch.** On a
   Windows desktop (an RTX PRO 4500 with Qwen3.8) the driver refused memory its budget showed free,
   and every prompt step's experts went to the CPU: a long prompt three times slower. The step now
@@ -26,6 +30,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **qwen36: teacher forcing (`TF=1`), colibri's for this engine.** On a `.json` reference the
+  engine feeds `full_ids` through the model as a prompt, 256 rows at a time, reads every row's
+  logits out and compares each position's argmax with the reference's `tf_pred`, the prompt's
+  positions included, which the greedy oracle never looks at: the prefill path checked apart
+  from the decode. A mismatch is named and exits 1 (`ORACLE_TF_MAX_MISMATCHES` allows some),
+  `DEBUG_LOGITS=1` prints a mismatched position's top five logits and top1-top2 gap, `DUMP`
+  takes one row a position. `tools/make_qwen36_tiny.py --emit-ref` and
+  `tools/make_qwen36_oracle.py` write `tf_pred` (one cache-free forward, the argmax at every
+  position), `c/ref_qwen36.json` carries it, and `make -C c qwen36-tf-check` is the gate on the
+  generated fixture (CI): 21/21 positions, one dump row a position, a wrong entry fails.
+
 - **`COLI_MAX_BODY` sets the gateway's request-body cap** (default 4 MiB, as before), for requests
   with several base64 images. **`COLI_BODY_LINGER_S`** (default off) lets a client that is still
   uploading a body over the cap read the 400 instead of a connection reset.
@@ -34,6 +49,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   instead of running the whole model on the CPU at a fraction of the speed. Default off.
 ### Changed
 
+- **qwen36, qwen38: `DUMP` writes every sampled row, `SNAP` falls back to `COLI_MODEL`.** `DUMP=<path>` used
+  to keep the last token's logits only; it now appends every row a token is sampled from, raw f32,
+  vocab floats a row, as colibri.c's `dump_logits` does, so a comparison sees the whole path, not
+  its end (the CI gates that `cmp` two runs' dumps compare the same rows as before, there are
+  just more of them). Both engines take the model directory from `COLI_MODEL` when `SNAP` is
+  unset, as colibri.c does.
 - **qwen38: a RAM expert cache smaller than a decode step's distinct experts no longer turns
   off the grouped decode and the CUDA chain's in-frame experts.** `q38_moe_decode_grouped`
   takes the distinct experts in waves of at most the cache's slots (each wave loaded, computed

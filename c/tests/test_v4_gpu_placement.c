@@ -35,13 +35,17 @@ int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size) {
 }
 int dsv4_cuda_lost(void) { return 0; }
 int coli_v4_hybrid_enabled(void) { return 0; }
+int coli_v4_hot_split_on(void) { return 0; }
+/* v4_gpu_place (the HIP build) hands the block unit its pick */
+void coli_v4_hot_split_auto(int on) { (void)on; }
 int coli_v4_gpu_resident_first(void) { return 0; }
 void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                        unsigned char *held, int experts);
 /* Backend entries dev gained after #1766's base (the bank-sized mirror reserve,
- * the prefill bank's activations): this test never reaches them. */
-int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
-long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return 0; }
+ * the prefill bank's activations): no bank unless a test sizes one. */
+static int fake_bank_slots;
+int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return fake_bank_slots; }
+long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return fake_bank_slots ? 13LL << 20 : 0; }
 void dsv4_cuda_activation_free(Dsv4CudaActivation *a) { (void)a; }
 int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
 /* fake_free_mb >= 0: a card with that much free, plus 13 MiB for every
@@ -56,6 +60,7 @@ long long dsv4_cuda_mem_free_mb(int device) {
 }
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }
+void dsv4_cuda_ledger_label(const char *kind, const char *name) { (void)kind; (void)name; }
 void dsv4_cuda_proj_batch_release(void) {}
 static int fp4_uploads, fp4_refills;
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
@@ -98,6 +103,8 @@ static int mirror_allocs, mirror_refills, mirror_alloc_ok = 1, mirror_refill_ok 
 static long long mirror_check_weights = -1;
 static const uint8_t *mirror_scales, *mirror_weights;
 static long long mirror_scale_bytes, mirror_weight_bytes, mirror_weight_offset[3];
+/* the sync of the last two-run refill, and whether the uploader thread made it */
+static int mirror_refill_sync = -1, mirror_refill_off_main;
 int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
                            int Og, int Ig, int Od, int Id, int device) {
     assert(Og > 0 && Ig > 0 && Od > 0 && Id > 0);
@@ -116,9 +123,10 @@ int dsv4_cuda_mirror_refill(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTe
                             const uint8_t *scales, long long S, const long long *soff,
                             const uint8_t *weights, long long Wb, const long long *woff,
                             int sync) {
-    (void)sync;
     assert(gate && up && down && scales && weights && soff && woff);
     if (!mirror_refill_ok) return 0;
+    mirror_refill_sync = sync;
+    mirror_refill_off_main = !pthread_equal(pthread_self(), main_thread);
     mirror_scales = scales; mirror_weights = weights;
     mirror_scale_bytes = S; mirror_weight_bytes = Wb;
     for (int k = 0; k < 3; k++) mirror_weight_offset[k] = woff[k];
@@ -645,6 +653,70 @@ static void upload_counts_reset(void) {
     memset(fence_drains, 0, sizeof(fence_drains));
     refill_calls = refill_off_main = 0;
 }
+/* V4_HOT_SPLIT: an expert enters VRAM once it has been used twice, takes free
+ * room first, and then only replaces a mirror of another layer that was used
+ * at most half as often. */
+static ColiExpertView hot_view(int layer, int expert) {
+    ColiExpertView view = upload_view(expert);
+    view.key.layer = layer;
+    return view;
+}
+static void hot_use(int layer, int expert, int times) {
+    for (int i = 0; i < times; i++) coli_v4_gpu_hot_touch(layer, &expert, 1);
+}
+static void test_hot_admission(void) {
+    memset(g_v4_hot_uses, 0, sizeof(g_v4_hot_uses));
+    g_v4_hot_layers_seen = 0;
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(0, 8);
+    cache->first_layer = 0; cache->end_layer = 4;
+    ColiExpertStore store = {0};
+    store.gpu = cache;
+    int tensors = live_tensors;
+    /* used once: stays on the CPU */
+    ColiExpertView view = hot_view(1, 0);
+    hot_use(1, 0, 1);
+    assert(coli_v4_gpu_expert_admit_hot(&store, &view) == -1 && cache->count == 0);
+    /* used twice: free room */
+    hot_use(1, 0, 1);
+    assert(coli_v4_gpu_expert_admit_hot(&store, &view) == 0 && view.gate.gpu);
+    assert(cache->count == 1 && live_tensors == tensors + 3);
+    /* the pick is the most used of the candidates; none used: none */
+    int ids[3] = {5, 6, 7}, candidates[3] = {0, 1, 2};
+    assert(coli_v4_gpu_hot_pick(2, ids, candidates, 3) == -1);
+    hot_use(2, 6, 3); hot_use(2, 7, 1);
+    assert(coli_v4_gpu_hot_pick(2, ids, candidates, 3) == 1);
+    /* a full cache of layer 1: nothing of that layer may be replaced */
+    for (int expert = 1; expert < 8; expert++) {
+        ColiExpertView fill = hot_view(1, expert);
+        hot_use(1, expert, 2);
+        assert(coli_v4_gpu_expert_admit_hot(&store, &fill) == 0);
+    }
+    assert(cache->count == 8);
+    ColiExpertView same = hot_view(1, 20);
+    hot_use(1, 20, 100);
+    assert(coli_v4_gpu_expert_admit_hot(&store, &same) == -1 && !same.gate.gpu);
+    /* from layer 2 the coldest mirror (2 uses) needs 4 uses to go */
+    ColiExpertView other = hot_view(2, 9);
+    hot_use(2, 9, 3);
+    assert(coli_v4_gpu_expert_admit_hot(&store, &other) == -1 && !other.gate.gpu);
+    hot_use(2, 9, 1);
+    hot_use(1, 0, 1);   /* expert 0 is no longer the coldest */
+    assert(coli_v4_gpu_expert_admit_hot(&store, &other) == 0 && other.gate.gpu);
+    assert(cache->count == 8 && live_tensors == tensors + 24);
+    assert(v4_gpu_expert_find(cache, 2, 9) && v4_gpu_expert_find(cache, 1, 0));
+    assert(!v4_gpu_expert_find(cache, 1, 1));
+    /* the counts decay, so that a new subject can take over */
+    uint32_t before = g_v4_hot_uses[2][9];
+    int unused = 200;
+    for (unsigned i = g_v4_hot_layers_seen; i < V4_HOT_HALVE_LAYERS; i++)
+        coli_v4_gpu_hot_touch(3, &unused, 1);
+    assert(g_v4_hot_uses[2][9] == before / 2);
+    /* a capacity below the count of mirrors --vram pays for is the limit */
+    v4_hot_mirrors_cap(&store, 8);
+    assert(cache->capacity == 8 && v4_hot_mirrors(&store) == 8);
+    v4_gpu_expert_mirrors_free(cache);
+    assert(live_tensors == tensors);
+}
 static void test_upload_thread(void) {
     V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(2, 8);
     cache->first_layer = 0; cache->end_layer = 4;
@@ -753,6 +825,60 @@ static void test_upload_thread(void) {
     assert(live_tensors == tensors);
 }
 
+/* The uploader thread with two-run mirrors (V4_MIRROR_BLOCK): the refill's two
+ * copies go where the three-tensor refill's do. A full cache of 8 block
+ * mirrors on device 2, so every attach recycles one in place. */
+static void test_upload_thread_block(void) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(2, 8);
+    cache->first_layer = 0; cache->end_layer = 4;
+    ColiExpertStore store = {0};
+    store.gpu = cache;
+    main_thread = pthread_self();
+    int tensors = live_tensors;
+    setenv("V4_MIRROR_BLOCK", "1", 1);
+    setenv("V4_UPLOAD_THREAD", "1", 1);
+    unsetenv("V4_UPLOAD_FENCE");
+    unsetenv("V4_MIRROR_BLOCK_VERIFY");
+    ColiExpertView view;
+    for (int expert = 0; expert < 8; expert++) {
+        view = block_view(expert, 0);
+        assert(coli_v4_gpu_expert_attach(&store, &view) == 0);
+    }
+    assert(cache->count == 8);
+    /* handed to the uploader: enqueued on the second stream, fenced at the join */
+    memset(fences, 0, sizeof(fences));
+    view = block_view(20, 0);
+    assert(coli_v4_gpu_expert_attach_queued(&store, &view) == 0);
+    coli_v4_gpu_expert_upload_join();
+    assert(view.gate.gpu && mirror_refill_sync == 3 && mirror_refill_off_main && fences[2] == 1);
+    coli_v4_gpu_expert_upload_settle();
+    /* V4_UPLOAD_FENCE=0: the uploader drains the second stream */
+    setenv("V4_UPLOAD_FENCE", "0", 1);
+    view = block_view(21, 0);
+    assert(coli_v4_gpu_expert_attach_queued(&store, &view) == 0);
+    coli_v4_gpu_expert_upload_join();
+    coli_v4_gpu_expert_upload_settle();
+    assert(view.gate.gpu && mirror_refill_sync == 2 && mirror_refill_off_main);
+    unsetenv("V4_UPLOAD_FENCE");
+    /* the verifier reads the mirror back, so an enqueued copy is drained first */
+    setenv("V4_MIRROR_BLOCK_VERIFY", "1", 1);
+    unsigned long long verified = cache->block_verified;
+    view = block_view(22, 0);
+    assert(coli_v4_gpu_expert_attach_queued(&store, &view) == 0);
+    coli_v4_gpu_expert_upload_join();
+    coli_v4_gpu_expert_upload_settle();
+    assert(mirror_refill_sync == 2 && cache->block_verified == verified + 1);
+    unsetenv("V4_MIRROR_BLOCK_VERIFY");
+    /* the inline attach is unchanged: the compute stream, drained, this thread */
+    view = block_view(23, 0);
+    assert(coli_v4_gpu_expert_attach(&store, &view) == 0);
+    assert(mirror_refill_sync == 1 && !mirror_refill_off_main);
+    unsetenv("V4_UPLOAD_THREAD");
+    unsetenv("V4_MIRROR_BLOCK");
+    v4_gpu_expert_mirrors_free(cache);
+    assert(live_tensors == tensors);
+}
+
 /* V4_BANK_MAKE_ROOM: the reserve is the headroom, and a bank about to be
  * created releases the oldest mirrors on its device until it fits. */
 static V4GpuExpertMirrorCache *room_cache(int device, int mirrors, uint64_t first_clock) {
@@ -819,6 +945,41 @@ static void test_bank_make_room(void) {
     assert(live_tensors == start_tensors);
 }
 
+#ifdef COLI_V4_HIP
+/* --vram below 10 GiB keeps the dense mirrors, and the shared experts with
+ * them, in RAM: COLI_CUDA_MOE_BATCH=1 then asks for a bank that cannot run,
+ * so it is not asked for -- no VRAM kept free for it, and the prefill pool
+ * stays on (coli_v4_expert_store_prefill_pool). 10 GiB or more: as asked. */
+static void test_hip_bank_dense_ram(void) {
+    long long bank = v4_reserve_bank_bytes, mirror = v4_reserve_mirror_bytes;
+    ColiV4Engine engine = {0};
+    ColiDeepSeekV4Config config = {.hidden_size = 4096, .moe_intermediate_size = 2048,
+                                   .n_routed_experts = 132};
+    setenv("COLI_CUDA_MOE_BATCH", "1", 1);
+    unsetenv("DSV4_CUDA_VRAM_RESERVE_MB");
+    unsetenv("V4_BANK_MAKE_ROOM");
+    fake_bank_slots = 132;
+    fake_free_mb = 16000; fake_free_tensors = live_tensors;
+    setenv("CUDA_EXPERT_GB", "12", 1);
+    v4_gpu_place(&engine, 0);
+    v4_gpu_mirror_reserve_size(&config, 1);
+    assert(!engine.gpu.dense_ram && coli_v4_gpu_moe_batch_wanted());
+    assert(v4_reserve_bank_bytes == 132 * (13LL << 20));
+    assert(v4_gpu_mirror_reserve_mb(64, NULL) > (132 * 13LL) + COLI_V4_RESERVE_HEADROOM_MB);
+    setenv("CUDA_EXPERT_GB", "5", 1);
+    v4_gpu_place(&engine, 0);
+    v4_gpu_mirror_reserve_size(&config, 1);
+    assert(engine.gpu.dense_ram && !coli_v4_gpu_moe_batch_wanted());
+    assert(v4_reserve_bank_bytes == 0);
+    /* the reserve is --vram's hold (16000 - 5120 MiB), not a bank's */
+    assert(v4_gpu_mirror_reserve_mb(64, NULL) == 16000 - 5120);
+    unsetenv("CUDA_EXPERT_GB");
+    unsetenv("COLI_CUDA_MOE_BATCH");
+    fake_free_mb = -1; fake_bank_slots = 0; g_v4_dense_ram = 0; g_v4_vram_hold_mb = 0;
+    v4_reserve_bank_bytes = bank; v4_reserve_mirror_bytes = mirror;
+}
+#endif
+
 static void test_resident_route(void) {
     V4GpuExpertMirrorCache *cache=v4_gpu_expert_mirrors_create_capacity(0,256);
     cache->first_layer=7; cache->end_layer=8; cache->experts_per_layer=256;
@@ -854,6 +1015,9 @@ static void test_resident_route(void) {
 }
 
 int main(void) {
+#ifdef COLI_V4_HIP
+    test_hip_bank_dense_ram();   /* first: the bank switch is read once */
+#endif
     ColiV4Engine *engine = calloc(1, sizeof(*engine));
     ColiExpertStore store = {0};
     engine->config.num_hidden_layers = 43;
@@ -906,6 +1070,8 @@ int main(void) {
     test_preload();
     test_mirror_block();
     test_upload_thread();
+    test_upload_thread_block();
+    test_hot_admission();
     test_resident_route();
     test_bank_make_room();
     test_wo_decode();

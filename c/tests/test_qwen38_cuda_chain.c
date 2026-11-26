@@ -422,12 +422,12 @@ int main(void) {
          * to miss (dm_part: a chunk takes the host's route there, which waits for no copy and starts
          * none): their pooled experts get no places and no copies, so the copies go from one framed
          * layer to the next (#2764) */
-        enum { L = 4, E = 4, H = 64, IN = 64 };
+        enum { L = 4, E = 4, H = 64, INTER = 64 };   /* not IN: windef.h defines IN as an empty macro on MinGW */
         const size_t sz0 = fake_chain_table.size;
         fake_chain_table.size = sizeof fake_chain_table;   /* the staging's device addresses */
         fcc_init(0);
         Model mm; memset(&mm, 0, sizeof mm);
-        mm.c.layers = L; mm.c.experts = E; mm.c.hidden = H; mm.c.inter = IN;
+        mm.c.layers = L; mm.c.experts = E; mm.c.hidden = H; mm.c.inter = INTER;
         int gtg[L], gtd[L];
         for (int i = 0; i < L; i++) gtg[i] = gtd[i] = GQ_Q8_0;
         const int on0 = G.on, nl0 = G.nl, wf0 = G.wfmt; int *gtg0 = G_gtg, *gtd0 = G_gtd;

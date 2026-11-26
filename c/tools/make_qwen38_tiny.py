@@ -14,7 +14,7 @@ Usage::
 
     python tools/make_qwen38_tiny.py --out ./qwen38_tiny
 
-Requires Transformers 5.16.1, the first release with Qwen4-Exp support.
+Requires Transformers >= 5.16.1, the first release with Qwen4-Exp support.
 """
 
 import argparse
@@ -49,13 +49,18 @@ def _classes():
         from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
     except ImportError as exc:
         sys.exit(
-            f"Missing Qwen4-Exp support. Install transformers=={TRANSFORMERS_VERSION}: {exc}"
+            f"Missing Qwen4-Exp support. Install transformers>={TRANSFORMERS_VERSION}: {exc}"
         )
-    if transformers.__version__ != TRANSFORMERS_VERSION:
+    from packaging.version import Version
+    if Version(transformers.__version__) < Version(TRANSFORMERS_VERSION):
         sys.exit(
-            f"Qwen3.8 fixture generation requires transformers=={TRANSFORMERS_VERSION}; "
+            f"Qwen3.8 fixture generation requires transformers>={TRANSFORMERS_VERSION}; "
             f"found {transformers.__version__}."
         )
+    if transformers.__version__ != TRANSFORMERS_VERSION:
+        # weights and ref.json come from the same run, so the engine gate still holds
+        print(f"note: transformers {transformers.__version__} (fixtures were made with "
+              f"{TRANSFORMERS_VERSION})", file=sys.stderr)
     return transformers, Qwen4ExpForCausalLM, Qwen4ExpTextConfig
 
 
@@ -234,6 +239,21 @@ def _rewrite_shard_fp8(out: Path, packed):
                                   "fixture_note": "routed experts only, as in the release"}
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     print(f"fp8 experts: {len(packed)} matrices rewritten as F8_E4M3 + BF16 weight_scale_inv")
+
+
+def _legacy_layer_types(node):
+    """Rename "indexed_attention" back to "qwen_sparse_attention" in every
+    *layer_types list (layer_types, mtp_layer_types, text_config / mtp nested);
+    True when something changed."""
+    changed = False
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key.endswith("layer_types") and isinstance(value, list) and "indexed_attention" in value:
+                node[key] = ["qwen_sparse_attention" if kind == "indexed_attention" else kind for kind in value]
+                changed = True
+            else:
+                changed |= _legacy_layer_types(value)
+    return changed
 
 
 MTP_SEED_OFFSET = 0x4D5450      # "MTP": the head's weights come from their own stream
@@ -544,6 +564,12 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
     for stale in ("experts-int4g64", "experts-mxfp4", "quark"):
         shutil.rmtree(out / stale, ignore_errors=True)
     model.save_pretrained(str(out), safe_serialization=True)
+    # transformers > 5.16.1 saves the QSA layers as "indexed_attention"; keep the
+    # name qwen38_core.h and family_registry.py read (5.16.1 output is untouched).
+    cfg_path = out / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    if _legacy_layer_types(cfg):
+        cfg_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if geometry:
         # Transformers saves "qwen_sparse_attention"; the release's config.json says
         # "full_attention", and llama.cpp's converter writes the indexer's compress ratio

@@ -218,6 +218,14 @@ def main():
     if a.plan:
         print("\n[--plan] nessuna scrittura. Rilancia senza --plan per convertire.")
         return
+    # Both final publication and opening the temporary file must preserve the
+    # read-only input checkpoint, including existing symlink/hardlink aliases.
+    for destination in (a.out, a.out + ".part"):
+        for shard in shards:
+            source = os.path.join(DIR, shard)
+            if (os.path.realpath(destination) == os.path.realpath(source) or
+                    (os.path.exists(destination) and os.path.samefile(destination, source))):
+                sys.exit(f"[ERR] output path aliases source shard {shard}; choose another --out")
     if free < tot_out * 1.15:
         sys.exit(f"[ERR] spazio insufficiente: servono ~{tot_out*1.15/1e9:.0f} GB")
 
@@ -265,7 +273,11 @@ def main():
                     f.seek(base + o0)
                     left = o1 - o0
                     while left > 0:
-                        chunk = f.read(min(left, 8 << 20)); w.write(chunk); left -= len(chunk)
+                        chunk = f.read(min(left, 8 << 20))
+                        if not chunk:
+                            sys.exit(f"[ERR] short read for {name}: {left} tensor bytes missing")
+                        w.write(chunk)
+                        left -= len(chunk)
             else:
                 R, I = flat2d(shape)
                 packs, scales, errs = [], [], []

@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -51,7 +52,8 @@ class MtpConvert(unittest.TestCase):
                 for name, digest in before.items():
                     self.assertEqual(hashlib.sha256((base / name).read_bytes()).hexdigest(), digest)
                     if name not in ("model-mtp.safetensors", "qwen36_meta.json"):
-                        self.assertTrue((out / name).is_symlink(), name)
+                        link = out / name   # a symlink, or a hard link where the host refuses symlinks
+                        self.assertTrue(link.is_symlink() or os.path.samefile(link, base / name), name)
                 with self.assertRaises(ValueError):
                     append_mtp(args)  # no overwrite, including existing symlinks
                 args.out = str(base)

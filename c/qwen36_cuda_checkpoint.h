@@ -6,7 +6,13 @@
 #include "evidence_digest.h"
 #include <inttypes.h>
 #include <time.h>
-#if defined(__linux__)
+#ifdef _WIN32
+#include <io.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__linux__)
 #include <sys/vfs.h>
 #elif defined(__APPLE__)
 #include <sys/mount.h>
@@ -108,16 +114,40 @@ static long q36_checkpoint_ctime_ns(const struct stat *st) {
 #endif
 }
 
-static int q36_checkpoint_same_file(const struct stat *a, const struct stat *b) {
 #ifdef _WIN32
-    /* Windows' CRT has no inode numbers (st_ino 0) and its fstat leaves st_dev 0 where stat
-     * gives the drive's number: there the same file is the same size and the same times */
-    return a->st_size == b->st_size && a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime;
-#endif
+static int q36_checkpoint_fd_info(int fd, BY_HANDLE_FILE_INFORMATION *out) {
+    intptr_t osf = _get_osfhandle(fd);
+    if (osf == -1) return 0;
+    return GetFileInformationByHandle((HANDLE)osf, out) &&
+        !(out->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int q36_checkpoint_path_info(const char *path, BY_HANDLE_FILE_INFORMATION *out) {
+    HANDLE h = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    BOOL ok = GetFileInformationByHandle(h, out);
+    CloseHandle(h);
+    return ok && !(out->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int q36_checkpoint_same_win_info(const BY_HANDLE_FILE_INFORMATION *a,
+                                        const BY_HANDLE_FILE_INFORMATION *b) {
+    return a->dwVolumeSerialNumber == b->dwVolumeSerialNumber &&
+        a->nFileIndexHigh == b->nFileIndexHigh && a->nFileIndexLow == b->nFileIndexLow &&
+        a->nFileSizeHigh == b->nFileSizeHigh && a->nFileSizeLow == b->nFileSizeLow &&
+        a->ftLastWriteTime.dwHighDateTime == b->ftLastWriteTime.dwHighDateTime &&
+        a->ftLastWriteTime.dwLowDateTime == b->ftLastWriteTime.dwLowDateTime &&
+        a->ftCreationTime.dwHighDateTime == b->ftCreationTime.dwHighDateTime &&
+        a->ftCreationTime.dwLowDateTime == b->ftCreationTime.dwLowDateTime;
+}
+#else
+static int q36_checkpoint_same_file(const struct stat *a, const struct stat *b) {
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size &&
         a->st_mtime == b->st_mtime && q36_checkpoint_mtime_ns(a) == q36_checkpoint_mtime_ns(b) &&
         a->st_ctime == b->st_ctime && q36_checkpoint_ctime_ns(a) == q36_checkpoint_ctime_ns(b);
 }
+#endif
 
 /* Only local filesystems with stable inode numbers and subsecond change times
  * may reuse a digest. The same content check works on any other filesystem. */
@@ -269,6 +299,9 @@ static int q36_checkpoint_matches(const shards *s, const Q36Checkpoint *checkpoi
     for (int i = nshards; i < nfiles; i++) fds[i] = -1;
     char path[2048], cache[2048];
     int ok = 0;
+#ifdef _WIN32
+    BY_HANDLE_FILE_INFORMATION win_before[Q36_CHECKPOINT_NFILES];
+#endif
     for (int i = 0; i < nfiles; i++) {
         const Q36CheckpointFile *file = &checkpoint->files[i];
         if (!q36_checkpoint_path(path, sizeof path, checkpoint->snap, file->name)) goto done;
@@ -280,6 +313,9 @@ static int q36_checkpoint_matches(const shards *s, const Q36Checkpoint *checkpoi
         }
         if (fds[i] < 0 || fstat(fds[i], &before[i]) != 0 || !S_ISREG(before[i].st_mode) ||
             before[i].st_size != file->bytes) goto done;
+#ifdef _WIN32
+        if (!q36_checkpoint_fd_info(fds[i], &win_before[i])) goto done;
+#endif
     }
 
     Q36CheckpointCache old = {{0}}, fresh;
@@ -303,10 +339,16 @@ static int q36_checkpoint_matches(const shards *s, const Q36Checkpoint *checkpoi
         changed |= strcmp(old[i], fresh[i]) != 0;
     }
     for (int i = 0; i < nfiles; i++) {
+        if (!q36_checkpoint_path(path, sizeof path, checkpoint->snap, checkpoint->files[i].name)) goto done;
+#ifdef _WIN32
+        BY_HANDLE_FILE_INFORMATION opened, named;
+        if (!q36_checkpoint_fd_info(fds[i], &opened) || !q36_checkpoint_same_win_info(&win_before[i], &opened) ||
+            !q36_checkpoint_path_info(path, &named) || !q36_checkpoint_same_win_info(&opened, &named)) goto done;
+#else
         struct stat opened, named;
         if (fstat(fds[i], &opened) != 0 || !q36_checkpoint_same_file(&before[i], &opened) ||
-            !q36_checkpoint_path(path, sizeof path, checkpoint->snap, checkpoint->files[i].name) ||
             stat(path, &named) != 0 || !q36_checkpoint_same_file(&opened, &named)) goto done;
+#endif
     }
     if (cache_path && cacheable && changed) q36_checkpoint_cache_write(cache, fresh, nfiles);
     ok = 1;

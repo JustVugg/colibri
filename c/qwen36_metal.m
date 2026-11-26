@@ -644,6 +644,7 @@ int q36_dot_i8(q36_tensor *y, q36_tensor *x, q36_tensor *q, q36_tensor *sc, int 
         if (!g_exact && rows > 8 && out % 32 == 0 && in % 32 == 0 && x->offset % 16 == 0 && y->offset % 8 == 0) {
             /* prompt batches: the matrix units, not bit-identical (q36_dot_i8_mm) */
             id<MTLComputeCommandEncoder> e = q36_encoder(K_DOT_I8_MM);
+            if (!e) return 0;
             q36_bind(e, q, 0); q36_bind(e, sc, 1); q36_bind(e, x, 2); q36_bind(e, y, 3);
             [e setBytes:&a length:sizeof(a) atIndex:4];
             [e setThreadgroupMemoryLength:32 * 32 * F4 atIndex:0];
@@ -659,12 +660,14 @@ int q36_dot_i8(q36_tensor *y, q36_tensor *x, q36_tensor *q, q36_tensor *sc, int 
             int k = per == 4 && vector ? K_DOT_I8_VEC4_ROWS2 + rows - 2 : per == 8 ? K_DOT_I8_R8_ROWS2 + rows - 2
                     : vector ? K_DOT_I8_VEC4_ROWS : K_DOT_I8_R4_ROWS;
             id<MTLComputeCommandEncoder> e = q36_encoder(k);
+            if (!e) return 0;
             q36_bind(e, q, 0); q36_bind(e, sc, 1); q36_bind(e, x, 2); q36_bind(e, y, 3);
             [e setBytes:&a length:sizeof(a) atIndex:4];
             q36_groups(e, (uint64_t)out / per, 1);
             return 1;
         }
         id<MTLComputeCommandEncoder> e = q36_encoder(vector ? K_DOT_I8_VEC4 : four ? K_DOT_I8_R4 : K_DOT_I8);
+        if (!e) return 0;
         q36_bind(e, q, 0); q36_bind(e, sc, 1); q36_bind(e, x, 2); q36_bind(e, y, 3);
         [e setBytes:&a length:sizeof(a) atIndex:4];
         q36_groups(e, (uint64_t)rows * out / (four ? 4 : 1), 1);

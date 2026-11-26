@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "hypothesis": "With COLI_CUDA_MOE_BATCH=1 and COLI_CUDA_MOE_DOUBLE=1 a prompt's expert bank reads every routed expert of every layer once, in the same order on every prompt. The RAM cache keeps one recency list per layer with fewer slots than experts (133 of 256 at --ram 80), so that sweep defeats recency: each read evicts an expert the sweep needs further on, a prompt hits RAM about one read in six, and the experts decode had used are gone when decode starts. Linking the bank's reads at the oldest end of the list while a prompt is read keeps the cache as it was: the prompt hits what RAM holds and decode finds its experts. Only which slot a read reuses changes, so the outputs are the same bits.",
+  "commit": "c38a037b727790332b34eb427dcf8e7c98505aea",
+  "model": "DeepSeek-V4-Flash-0731 architecture, abliterated weights (same shapes), safetensors, native FP8/FP4",
+  "command": "make -C c -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 DEEPGEMM=1 CUDA_HOME=/usr/local/cuda-13.3 ARCH=native; coli serve --ram 80 --ctx 20000 with the environment in config; five requests per service (prompt3k.txt prefixed with 'Request N. ', max_tokens 36, temperature 0); a fresh service per sample set, the arms alternating three times; tok_s = the decode tokens per second of turns 2-5 of each service from the engine's v4_serve_turn line (turn 1 starts from the prewarmed cache and is listed in the evidence)",
+  "prompt_hash": "3def6f25ca23ac992efe343ea4eec2c4a71ffe48dc66a95c93de91014b6923da",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X, 12 cores / 24 threads",
+    "ram": "94 GiB (--ram 80: 133 expert slots per layer, 71.2 GiB of expert cache)",
+    "storage": "Samsung 990 PRO 4TB + 980 PRO 2TB NVMe in one LVM volume, ext4, direct aligned reads",
+    "os": "Ubuntu 26.04.1, Linux 7.0.0-43, gcc 15.2.0, CUDA 13.3, driver 595.91.07, RTX 5080 16 GB"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "V4_RAM_PROMPT_COLD"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "DSV4_CUDA_PIN_CAP_GB": "80",
+      "V4_LAYER_FUSED": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_IDX_FAST": "1",
+      "V4_SERVE_STATS_LOG": "1",
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native, one binary for both arms",
+      "args": "coli serve --model <model> --ram 80 --ctx 20000",
+      "V4_RAM_PROMPT_COLD": "0"
+    },
+    "samples": {
+      "tok_s": [
+        4.533,
+        4.742,
+        4.968,
+        5.511,
+        4.477,
+        4.716,
+        5.035,
+        5.56,
+        4.494,
+        4.694,
+        4.903,
+        5.48
+      ]
+    },
+    "median_tok_s": 4.8225,
+    "quality": {
+      "method": "the five replies' md5 identical across the arm's services and identical to the trial's",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-ram-prompt-cold-2026-11-18/dev_service_turns.txt",
+      "sha256": "c5614402b3b7953bd2345cdfeb34ec81a026b37b3b732e1280237355d675ca78"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "DSV4_CUDA_PIN_CAP_GB": "80",
+      "V4_LAYER_FUSED": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_IDX_FAST": "1",
+      "V4_SERVE_STATS_LOG": "1",
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native, one binary for both arms",
+      "args": "coli serve --model <model> --ram 80 --ctx 20000",
+      "V4_RAM_PROMPT_COLD": "1"
+    },
+    "samples": {
+      "tok_s": [
+        7.055,
+        6.736,
+        6.981,
+        6.766,
+        7.027,
+        6.683,
+        7.016,
+        6.727,
+        6.983,
+        6.636,
+        7.006,
+        6.722
+      ]
+    },
+    "median_tok_s": 6.8735,
+    "quality": {
+      "method": "the five replies' md5 identical across the arm's services and identical to the baseline's; no verify mode: the policy decides only which RAM slot a read reuses, never what is read or computed",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-ram-prompt-cold-2026-11-18/dev_service_turns.txt",
+      "sha256": "c5614402b3b7953bd2345cdfeb34ec81a026b37b3b732e1280237355d675ca78"
+    }
+  },
+  "outcome": "improvement"
+}

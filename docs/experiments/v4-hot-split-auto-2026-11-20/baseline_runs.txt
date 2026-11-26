@@ -1,0 +1,38 @@
+== H4B_1 vram=4 [V4_HOT_SPLIT=0] rc=0 abort=0 wall=143s kfd_peak=4293MiB over=197MiB card_delta=4402MiB generated=200 time_to_first_token=7.885s after_first=131.564s reads=3480 md5=ccbc8dfc avail=53G
+   tok_s=(generated-1)/after_first=199/131.564=1.5126
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=53.87GiB dense=resident(6.23GiB) target_slots=78 target_cache=41.76GiB head=resident-bf16 projected=53.87GiB
+   [DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+   v4_gpu place device=0 budget=4096MiB dense=ram
+   v4_gpu tier=dense-matvec device=0
+   v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=53061 hits=49581 misses=3480 hit_rate=93.442 bytes=46525317120 target_only=1
+   timing time_to_first_token=7.885s after_first=131.564s
+   v4_direct reads=3480 flock_reads=0 fallbacks=0 payload_bytes=44515983360
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 
+
+== H4B_2 vram=4 [V4_HOT_SPLIT=0] rc=0 abort=0 wall=145s kfd_peak=4281MiB over=185MiB card_delta=4765MiB generated=200 time_to_first_token=7.872s after_first=132.667s reads=3483 md5=ccbc8dfc avail=53G
+   tok_s=(generated-1)/after_first=199/132.667=1.5
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=53.99GiB dense=resident(6.23GiB) target_slots=78 target_cache=41.76GiB head=resident-bf16 projected=53.87GiB
+   [DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+   v4_gpu place device=0 budget=4096MiB dense=ram
+   v4_gpu tier=dense-matvec device=0
+   v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=53061 hits=49578 misses=3483 hit_rate=93.436 bytes=46565425152 target_only=1
+   timing time_to_first_token=7.872s after_first=132.667s
+   v4_direct reads=3483 flock_reads=0 fallbacks=0 payload_bytes=44552945664
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 
+
+== H4B_3 vram=4 [V4_HOT_SPLIT=0] rc=0 abort=0 wall=143s kfd_peak=4281MiB over=185MiB card_delta=4309MiB generated=200 time_to_first_token=7.766s after_first=131.327s reads=3479 md5=ccbc8dfc avail=54G
+   tok_s=(generated-1)/after_first=199/131.327=1.5153
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=54.06GiB dense=resident(6.23GiB) target_slots=78 target_cache=41.76GiB head=resident-bf16 projected=53.87GiB
+   [DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+   v4_gpu place device=0 budget=4096MiB dense=ram
+   v4_gpu tier=dense-matvec device=0
+   v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=53061 hits=49582 misses=3479 hit_rate=93.443 bytes=46511947776 target_only=1
+   timing time_to_first_token=7.766s after_first=131.327s
+   v4_direct reads=3479 flock_reads=0 fallbacks=0 payload_bytes=44503400448
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 

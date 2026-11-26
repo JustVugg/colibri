@@ -27,6 +27,7 @@
 #define CG_ADD(a, b) __fadd_rn((a), (b))
 #define CG_SUB(a, b) __fsub_rn((a), (b))
 __global__ void __launch_bounds__(128) ccg_kda_conv_k(const float *in, const float *w, float *win, float *out, CcKdaConv p) {
+    COLI_PDL_WAIT();
     const int c = (int)(blockIdx.x * 128u + threadIdx.x);
     if (c >= p.C) return;
     const int part = c / p.P, j = c - part * p.P;
@@ -53,6 +54,7 @@ __global__ void __launch_bounds__(128) ccg_kda_conv_k(const float *in, const flo
 template <int KD>
 __global__ void __launch_bounds__(128) ccg_kda_rec_k(const float *m, const float *fr, const float *br, const float *gr,
                                                      const float *w, float *st, float *o, CcKdaRec p, int flags) {
+    COLI_PDL_WAIT();
     __shared__ float sq[KD], sk[KD], al[KD], ov[128], scal[2];
     const int h = blockIdx.x, v = threadIdx.x, Pw = p.P;
     const bool own = v < p.VD;
@@ -129,6 +131,7 @@ __global__ void __launch_bounds__(128) ccg_kda_rec_k(const float *m, const float
 template <int KD>
 __global__ void __launch_bounds__(128) ccg_kda_rows_k(const float *m, const float *fr, const float *br, const float *gr,
                                                       const float *w, float *st, float *o, CcKdaRec p, int flags) {
+    COLI_PDL_WAIT();
     __shared__ float bq[CC_KDA_R * KD], bk[CC_KDA_R * KD], ba[CC_KDA_R * KD], bv[CC_KDA_R * 128], bo[CC_KDA_R * 128];
     __shared__ float bqn[CC_KDA_R], bkn[CC_KDA_R], bbeta[CC_KDA_R], bon[CC_KDA_R];
     const int h = blockIdx.x, v = threadIdx.x, Pw = p.P;
@@ -247,6 +250,7 @@ __device__ __forceinline__ float cg_warp_sum(float v) {
 /* mode 0, the core: a block a (head, row), the softmax online over tiles of 64 positions */
 __global__ void __launch_bounds__(256) ccg_mla_core_k(const float *qa, const float *qr, const float *lc, const float *rc, const int *sel,
                                                       float *ob, CcMlaCore p) {
+    COLI_PDL_WAIT();
     __shared__ float qs[1024], qrs[128], sc[64], red[256];
     __shared__ int tp[64];
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, lane = tid & 31, sg = tid >> 5, nsg = 8;
@@ -325,6 +329,7 @@ __global__ void __launch_bounds__(256) ccg_mla_core_k(const float *qa, const flo
 }
 /* modes 1 and 2: a block a segment (g = blockIdx.x + blockIdx.y * gridDim.x) */
 __global__ void __launch_bounds__(256) ccg_mla_rope_k(const float *x, const float *cs, float *y, CcMlaRow p, int copy_rest) {
+    COLI_PDL_WAIT();
     __shared__ float red[256];
     const int g = (int)(blockIdx.x + blockIdx.y * gridDim.x);
     if (g >= p.nseg) return;
@@ -342,6 +347,7 @@ __global__ void __launch_bounds__(256) ccg_mla_rope_k(const float *x, const floa
     if (copy_rest) for (int i = p.rd + tid; i < p.seg_len; i += 256) y[yb + i] = x[xb + i];
 }
 __global__ void __launch_bounds__(256) ccg_mla_lnorm_k(const float *x, const float *prm, float *y, CcMlaRow p) {
+    COLI_PDL_WAIT();
     __shared__ float red[256];
     const int g = (int)(blockIdx.x + blockIdx.y * gridDim.x);
     if (g >= p.nseg) return;
@@ -375,6 +381,7 @@ __global__ void __launch_bounds__(256) ccg_mla_lnorm_k(const float *x, const flo
 /* chain_hgemv.comp on float rows: mode 0 a warp an output row (grid stride), mode 1 a block a
  * (head, row) with x's slice in shared memory and a thread a column */
 __global__ void __launch_bounds__(256) ccg_hgemv_rows_k(const float *x, const float *w, float *y, const float *g, CcHgemv p) {
+    COLI_PDL_WAIT();
     const int s = blockIdx.y, lane = threadIdx.x & 31, nsg = 8, total = p.H * p.n, stride = (int)gridDim.x * nsg;
     for (int og = (int)blockIdx.x * nsg + (int)(threadIdx.x >> 5); og < total; og += stride) {
         const int h = og / p.n, o = og - h * p.n;
@@ -391,6 +398,7 @@ __global__ void __launch_bounds__(256) ccg_hgemv_rows_k(const float *x, const fl
     }
 }
 __global__ void __launch_bounds__(256) ccg_hgemv_trans_k(const float *x, const float *w, float *y, CcHgemv p) {
+    COLI_PDL_WAIT();
     __shared__ float xs[1024];
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x;
     const int xb = p.x_off + s * p.x_row + h * p.x_seg;
@@ -407,6 +415,7 @@ __global__ void __launch_bounds__(256) ccg_hgemv_trans_k(const float *x, const f
 
 /* ---- the k-pooled indexer (chain_dsa.comp modes 1, 2 and 4) ------------------------------- */
 __global__ void __launch_bounds__(256) ccg_dsa_pool_keys_k(const float *kc, const float *gt, const float *prm, float *pk, CcDsaPool p) {
+    COLI_PDL_WAIT();
     const int pp = p.p0 + (int)blockIdx.x, start = pp * p.pool;
     for (int d = threadIdx.x; d < p.ID; d += 256) {
         float mxv = -3.402823466e38f;
@@ -428,6 +437,7 @@ __global__ void __launch_bounds__(256) ccg_dsa_pool_keys_k(const float *kc, cons
  * mode 2's order: the same bits as the selection's own scoring. The dots and the scores, as the
  * pooled keys, round sparse_index.h's steps in its order with nothing contracted into an FMA. */
 __global__ void __launch_bounds__(256) ccg_dsa_pool_scores_k(const float *iq, const float *hw, const float *pk, float *sc, CcDsaPick p) {
+    COLI_PDL_WAIT();
     __shared__ float qs[4096], ws[64], dh[256];
     const int s = blockIdx.y, tid = threadIdx.x;
     const int P = 256 / p.IH > 0 ? 256 / p.IH : 1, nvis = (p.pos_base + s + 1) / p.pool, p0 = (int)blockIdx.x * P;
@@ -462,6 +472,7 @@ __device__ float cg_pool_score(const float *qs, const float *ws, const float *pk
  * equal to it in pool order, ranked by score and then the lower pool */
 __global__ void __launch_bounds__(256) ccg_dsa_pool_select_k(const float *iq, const float *hw, const float *pk, float *sc, int *sel,
                                                              CcDsaPick p, int scored) {
+    COLI_PDL_WAIT();
     __shared__ float qs[4096], ws[64];
     __shared__ unsigned cnt[256], pkey[1024];
     __shared__ int plist[1024];
@@ -585,6 +596,7 @@ static int cc_dsa_pool_select(CcBuf *iq, CcBuf *hw, CcBuf *pk, CcBuf *sc, CcBuf 
  * the head's weight summed over the heads in order, the sum scaled by 1/sqrt(IH). A thread a
  * (position, head) for the dots, then a thread a position joining the heads. */
 __global__ void __launch_bounds__(256) ccg_dsa_scores_k(const float *iq, const float *hw, const float *kc, float *sc, CcDsaSel p) {
+    COLI_PDL_WAIT();
     __shared__ float qs[4096], ws[64], dh[256];
     const int s = blockIdx.y, tid = threadIdx.x, P = 256 / p.IH > 0 ? 256 / p.IH : 1;
     const int nk = p.pos_base + s + 1, t0 = (int)blockIdx.x * P;
@@ -610,6 +622,7 @@ __global__ void __launch_bounds__(256) ccg_dsa_scores_k(const float *iq, const f
  * equal to it, each in position order, as colibri.c's partial select and its two scans leave
  * them; a row whose context is not past topk (and no force) reads every position (-1) */
 __global__ void __launch_bounds__(256) ccg_dsa_select_k(const float *sc, int *sel, CcDsaSel p) {
+    COLI_PDL_WAIT();
     __shared__ unsigned cnt[256];
     const int s = blockIdx.x, tid = threadIdx.x, nk = p.pos_base + s + 1;
     const int lb = s * p.sel_row, sb = s * p.sc_row;
@@ -659,6 +672,7 @@ __device__ __forceinline__ float cg_f16(unsigned h) {
     return s ? -v : v;
 }
 __global__ void __launch_bounds__(256) ccg_hgemv_q8_k(const float *x, const unsigned char *w, float *y, CcHgemv p) {
+    COLI_PDL_WAIT();
     const int s = blockIdx.y, lane = threadIdx.x & 31, nsg = 8, total = p.H * p.n, stride = (int)gridDim.x * nsg;
     const long rb = (long)(p.I / 32) * 34;
     for (int og = (int)blockIdx.x * nsg + (int)(threadIdx.x >> 5); og < total; og += stride) {

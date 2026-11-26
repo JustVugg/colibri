@@ -286,7 +286,7 @@ typedef struct {
 /* ---------- utility ---------- */
 static double now_s(void) { return compat_now_s(); }
 static double rss_gb(void) { return compat_rss_gb(); }
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 static float siluf(float x) { return x / (1.f + expf(-x)); }
 /* A routed expert's activation over its gate and up rows (g <- act(g, u)): SwiGLU, or on
@@ -3757,6 +3757,9 @@ static InkPinState *ink_pin_state_save(Model *m, InkPinState *reuse){
             }
         }
     }
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     for (int j = 0; j < 4; j++)
         for (int i = 0; i < c->n_state; i++)
             memcpy(st->cs[j][i], m->cs[j][i],
@@ -3916,10 +3919,16 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
 
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
 static void ink_seq_swap(Model *m, InkSeq *q) {
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     float **K = m->K, **V = m->V; int len = m->kv_len; kv_prefix p = m->kvp;
     m->K = q->K; m->V = q->V; m->kv_len = q->kv_len; m->kvp = q->kvp;
     q->K = K; q->V = V; q->kv_len = len; q->kvp = p;
     for (int j = 0; j < 4; j++) { float **cs = m->cs[j]; m->cs[j] = q->cs[j]; q->cs[j] = cs; }
+#ifdef COLI_CUDA
+    ink2cc_host_wrote(m, 0);
+#endif
 }
 /* A conversation's state of its own, the shape the Model's has at its max_t. */
 static void ink_seq_alloc(Model *m, InkSeq *q) {
@@ -4205,23 +4214,8 @@ static int pi_desc(const void *a, const void *b) {
     float d = ((const PI*)b)->p - ((const PI*)a)->p;
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
- * (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V) {
-    static int dump = -1;
-    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
-    if (!dump) return;
-    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
-    for (int t = 0; t < V; t++) {
-        const float x = lo[t];
-        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
-    }
-    fprintf(stderr, "[LOGITS]");
-    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
-    fprintf(stderr, "\n");
-}
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
-    serve_logit_dump(logit, n);
+    coli_logit_dump(logit, n);
     int best = 0;
     for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
     if (temp <= 0.f) return best;
@@ -4325,12 +4319,6 @@ static void ink_image_attach(SReq *q) {
     g_ink_img.pix = NULL;
 }
 
-static int stdin_readable(void) {
-    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
-     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
-    return coli_stdin_readable();
-}
-
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
  * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
 static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
@@ -4420,7 +4408,7 @@ typedef struct { double t0, f0, e0, s0, a0; uint64_t h0, m0; } InkReqClock;
  * (prompt_break.h), with the reader its decode loop uses. The multiplexed loop owns its
  * command stream and reads it between steps. */
 static int ink_prompt_poll(ColiPromptBreak *b) {
-    while (!b->control && !b->eof && stdin_readable()) {
+    while (!b->control && !b->eof && coli_stdin_readable()) {
         int r = serve_read_cmd(stdin, stdout, b->id);
         if (r < 0) b->eof = 1;   /* as the decode loop: it stops at its next read */
         else if (r > 0) b->control = 1;
@@ -4452,6 +4440,9 @@ static ColiParkPart *ink_park_parts(Model *m, int *n_out) {
 static void ink_park(Model *m, int np, int max_tok) {
     int n = m->K && g_ink_mux_slots == 1 ? coli_park_rows_for(&g_ink_park, &m->kvp, m->kv_len, np, max_tok, 16) : 0, k = 0;
     if (!n) return;
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     ColiParkPart *p = ink_park_parts(m, &k);
     if (p) coli_park_save(&g_ink_park, &m->kvp, m->kv_len, p, k, n);
     free(p);
@@ -4844,7 +4835,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
                 int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
                 coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
                 gen++; len++;
-                while (stdin_readable()) {
+                while (coli_stdin_readable()) {
                     int r = serve_read_cmd(stdin, stdout, q->id);
                     if (r < 0) { free(ids); return -1; }
                     if (r > 0) { cancelled = 1; limited = 0; }
@@ -4869,7 +4860,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
         if (q->logprobs > 0) coli_serve_write_data_lp(stdout,q->id,buf,(size_t)nb,lptail);
         else coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
         gen++; len++;
-        while (stdin_readable()) {
+        while (coli_stdin_readable()) {
             int r = serve_read_cmd(stdin, stdout, q->id);
             if (r < 0) { free(ids); return -1; }
             if (r > 0) { cancelled = 1; limited = 0; }
@@ -5069,7 +5060,7 @@ static void serve_mux(Model *m, Tok *T) {
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
         /* idle: wait for a command; decoding: take one only when one is there */
-        if (!input_eof && (!active || stdin_readable())) {
+        if (!input_eof && (!active || coli_stdin_readable())) {
             ColiServeCommand command;
             ColiServeReadResult result = coli_serve_read_command(stdin, &inkling_wire, &command);
             if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) input_eof = 1;
@@ -5173,11 +5164,7 @@ static void serve_loop(Model *m, Tok *T) {
 
 /* ---------- ref_inkling.json harness ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { *n_out = 0; return NULL; }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 0, 0, INT_MIN);
 }
 
 #ifndef INKLING_NO_MAIN

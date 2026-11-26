@@ -3,7 +3,7 @@
  *  - named refusal when two indexed shards carry the same tensor name -- the message must
  *    name the tensor and BOTH shard files;
  *  - the same refusal under a HOSTILE tensor name (printf metacharacters including %n,
- *    non-UTF8 bytes, oversized length) -- the message prints attacker-controlled bytes,
+ *    multibyte UTF-8, oversized length) -- the message prints attacker-controlled bytes,
  *    so this asserts they only ever travel as a %s argument, never as format;
  *  - a no-duplicates control (two shards, distinct names, both findable);
  *  - checked malloc on the detector's own scratch table: dup_idx's initial allocation
@@ -164,13 +164,14 @@ static void test_duplicate_name(void) {
  * attacker-controlled string (the tensor name comes straight from the shard header), so
  * the name must only ever travel as a %s ARGUMENT, never as format. This fixture's name
  * carries printf metacharacters (%s/%n/%x -- %n is the one that turns a format-string
- * slip into a write primitive), non-UTF8 bytes, and an oversized-but-valid length; the
+ * slip into a write primitive), multibyte UTF-8, and an oversized-but-valid length; the
  * refusal must still fire cleanly (exit 1, no signal) and render the name verbatim.
  * ================================================================================== */
 static void build_hostile_name(char *out, size_t cap) {
     size_t off = 0;
     off += (size_t)snprintf(out + off, cap - off, "evil.%%s.%%n.%%x.");
-    out[off++] = (char)0x80; out[off++] = (char)0xff; out[off++] = (char)0xc3; out[off++] = '.';
+    /* Keep the format-string diagnostic probe inside a valid UTF-8 header. */
+    memcpy(out + off, "\xC2\x80\xC3\xBF.", 5); off += 5;
     while (off < 200 && off < cap - 1) out[off++] = 'A';   /* oversized, still a legal JSON key */
     out[off] = 0;
 }
@@ -194,8 +195,8 @@ static void test_hostile_name_duplicate(void) {
     run_forked(fn_dup_collision, &exit_code, err, sizeof(err));
     check(exit_code == 1, "hostile: refusal exits(1) cleanly -- no crash, no signal");
     check(strstr(err, "%s.%n.%x") != NULL, "hostile: printf metacharacters render verbatim, not interpreted");
-    { char hb[5] = {(char)0x80, (char)0xff, (char)0xc3, '.', 0};
-      check(strstr(err, hb) != NULL, "hostile: non-UTF8 bytes pass through untouched"); }
+    { const char hb[] = "\xC2\x80\xC3\xBF.";
+      check(strstr(err, hb) != NULL, "hostile: multibyte UTF-8 passes through untouched"); }
     check(strstr(err, hostile) != NULL, "hostile: full oversized name renders verbatim");
     check(strstr(err, "duplicate tensor name") != NULL, "hostile: message still states the reason");
 

@@ -1904,6 +1904,47 @@ class SchedulerTest(unittest.TestCase):
         stats = scheduler.snapshot()
         self.assertEqual((stats["rejected"], stats["timed_out"], stats["completed"]), (0, 0, 2))
 
+    def test_cache_key_avoids_hash_collision_eviction_and_sticks_to_slot(self):
+        # Two distinct conversations that hash to the same prefer slot should not evict
+        # each other when another slot is unused, and each subsequent turn should hit
+        # the exact slot that already holds its prefix.
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=3)
+        with scheduler.admit(prefer=1, cache_key=b"conv-A") as (_, slot_a1):
+            self.assertEqual(slot_a1, 1)
+        with scheduler.admit(prefer=1, cache_key=b"conv-B") as (_, slot_b1):
+            self.assertEqual(slot_b1, 0)  # unused slot instead of evicting conv-A in slot 1
+        with scheduler.admit(prefer=1, cache_key=b"conv-A") as (_, slot_a2):
+            self.assertEqual(slot_a2, 1)  # exact prefix hit
+        with scheduler.admit(prefer=1, cache_key=b"conv-B") as (_, slot_b2):
+            self.assertEqual(slot_b2, 0)  # follows its cached slot instead of prefer=1
+
+    def test_cache_key_evicts_lru_cold_slot_not_lowest_id(self):
+        # Fill all 3 slots, refresh slot 0 so slot 1 becomes the LRU cold slot; a new
+        # conversation must evict slot 1 rather than slot 0 (min(candidates)).
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=3)
+        with scheduler.admit(prefer=0, cache_key=b"k0") as (_, s0):
+            self.assertEqual(s0, 0)
+        with scheduler.admit(prefer=1, cache_key=b"k1") as (_, s1):
+            self.assertEqual(s1, 1)
+        with scheduler.admit(prefer=2, cache_key=b"k2") as (_, s2):
+            self.assertEqual(s2, 2)
+        # Touch k0 (slot 0) so slot 1 is now the least recently used.
+        with scheduler.admit(prefer=0, cache_key=b"k0") as (_, s0_again):
+            self.assertEqual(s0_again, 0)
+        with scheduler.admit(prefer=0, cache_key=b"k3") as (_, s3):
+            self.assertEqual(s3, 1)  # evicts LRU slot 1, preserving hot slot 0
+
+    def test_pinned_slot_clears_previous_cache_key(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=2)
+        with scheduler.admit(prefer=0, cache_key=b"conv-A") as (_, s0):
+            self.assertEqual(s0, 0)
+        # An explicit pinned request overwrites slot 0 without a cache_key.
+        with scheduler.admit(slot=0) as (_, pinned):
+            self.assertEqual(pinned, 0)
+        # conv-A no longer matches slot 0; it prefers the unused slot 1 over hot slot 0.
+        with scheduler.admit(prefer=0, cache_key=b"conv-A") as (_, s_next):
+            self.assertEqual(s_next, 1)
+
     def test_preference_does_not_bypass_older_any_slot_waiter(self):
         scheduler = GenerationScheduler(max_queue=1, capacity=2)
         older = (object(), None)
@@ -3368,6 +3409,200 @@ class EngineRestartTest(unittest.TestCase):
         self.assertEqual(starts, [])
         self.assertIs(server.engine, dead)
         self.assertEqual(dead.closed, 0)       # serve()'s teardown closes it
+
+    def test_stalled_generation_is_reaped_before_replacement(self):
+        def first_token(process, frame):
+            # one DATA frame, then nothing: the CANCEL is never answered
+            if frame.startswith(b"SUBMIT "):
+                process.stdout.feed(b"DATA %s 1\nA\n" % frame.split()[1])
+
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                process = FakeProcess(first_token if cancel else (lambda process, frame: None))
+                env = dict(os.environ, COLI_ENGINE_STALL_TIMEOUT="0.1" if not cancel else "10",
+                           COLI_ENGINE_CANCEL_TIMEOUT="0.1")
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("olmoe", "model", env=env)
+                server = self._server(engine)
+                server.pinned_prefixes[0] = ("old prefix", 3)
+                stopping = threading.Event()
+                errors = []
+                fresh = _DeadableEngine("replacement")
+
+                def generate():
+                    try:
+                        with server.scheduler.admit():
+                            engine.generate("hello", 8, 0.7, 0.9, lambda _: None,
+                                            cancelled=lambda: cancel)
+                    except Exception as error:
+                        errors.append(error)
+
+                def start():
+                    self.assertIsNotNone(process.poll())
+                    self.assertTrue(server.scheduler.paused)
+                    self.assertEqual(server.pinned_prefixes, {})
+                    return fresh
+
+                request = threading.Thread(target=generate, daemon=True)
+                watcher = threading.Thread(target=openai_server.keep_engine,
+                    args=(server, start, stopping, 0.01, (0.01, 0.02), 0.01), daemon=True)
+                request.start()
+                watcher.start()
+                try:
+                    deadline = time.monotonic() + 3
+                    while server.engine is not fresh and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertIs(server.engine, fresh)
+                    request.join(timeout=1)
+                    self.assertFalse(request.is_alive())
+                    self.assertEqual(len(errors), 1)
+                    self.assertEqual(server.scheduler.active, 0)
+                    self.assertFalse(engine.pending)
+                    self.assertIn("cancellation" if cancel else "sent nothing", engine._stall_error)
+                    with server.scheduler.admit():
+                        output = []
+                        server.engine.generate("next request", 8, 0.7, 0.9, output.append)
+                        self.assertEqual("".join(output), "Héllo")
+                        self.assertEqual(len(fresh.calls), 1)
+                finally:
+                    stopping.set()
+                    process.kill()
+                    watcher.join(timeout=2)
+                    request.join(timeout=2)
+                    engine.close()
+
+    def test_stalled_engine_reap_failure_keeps_admission_paused(self):
+        process = FakeProcess(lambda process, frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model")
+        engine._stall_error = "engine cancellation timed out"
+        server = self._server(engine)
+        stopping = threading.Event()
+        starts = []
+
+        def stuck_kill():
+            self.assertTrue(server.scheduler.paused)
+            stopping.set()  # the process does not exit, even after the kill request
+
+        try:
+            with patch.object(process, "kill", side_effect=stuck_kill):
+                openai_server.keep_engine(server, lambda: starts.append(1), stopping,
+                                          0.01, (0.01, 0.02), 0.01)
+            self.assertEqual(starts, [])
+            self.assertTrue(server.scheduler.paused)
+            self.assertIsNone(process.poll())
+            self.assertFalse(engine.alive)
+            self.assertTrue(engine.abort_stalled(engine._stall_error))
+            self.assertIsNotNone(process.poll())
+        finally:
+            process.kill()
+            engine.close()
+
+    def test_stall_timeout_counts_from_the_requests_last_frame(self):
+        process = FakeProcess(lambda process, frame: None)
+        env = dict(os.environ, COLI_ENGINE_STALL_TIMEOUT="60")
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model", env=env)
+        entry = openai_server._Pending()
+        entry.progress_at -= 120   # a long silent prefill, or a long run before this frame
+        stale = entry.progress_at
+        with engine.pending_lock:
+            engine.pending["7"] = entry
+        try:
+            process.stdout.feed(b"ACCEPT 7 4\n")
+            deadline = time.monotonic() + 2
+            while entry.progress_at == stale and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNone(engine.stalled_reason())
+            entry.progress_at -= 120
+            self.assertIn("sent nothing for request 7", engine.stalled_reason())
+        finally:
+            engine.close()
+
+    def test_no_deadline_is_on_unless_set(self):
+        # a day on the prompt, a day between two tokens, a day after a CANCEL: a slow engine
+        # that is working is not the watchdog's to kill until the server says what slow is
+        for unset in (None, "0", ""):
+            with self.subTest(unset=unset):
+                process = FakeProcess(lambda process, frame: None)
+                names = ("COLI_ENGINE_STALL_TIMEOUT", "COLI_ENGINE_DECODE_STALL_TIMEOUT",
+                         "COLI_ENGINE_CANCEL_TIMEOUT")
+                env = {k: v for k, v in os.environ.items() if k not in names}
+                if unset is not None:
+                    env.update(dict.fromkeys(names, unset))
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("olmoe", "model", env=env)
+                entry = openai_server._Pending()
+                entry.progress_at -= 86400
+                with engine.pending_lock:
+                    engine.pending["7"] = entry
+                try:
+                    self.assertIsNone(engine.stalled_reason())
+                    entry.decoding_at = entry.progress_at
+                    self.assertIsNone(engine.stalled_reason())
+                    entry.cancel_at = entry.progress_at
+                    self.assertIsNone(engine.stalled_reason())
+                finally:
+                    engine.close()
+
+    def test_decode_stall_deadline_waits_out_the_prompt_and_bounds_decoding(self):
+        for decode, expected in (("300", "while decoding"), ("0", None)):
+            with self.subTest(decode=decode):
+                process = FakeProcess(lambda process, frame: None)
+                env = {k: v for k, v in os.environ.items()
+                       if k not in ("COLI_ENGINE_STALL_TIMEOUT", "COLI_ENGINE_DECODE_STALL_TIMEOUT")}
+                env["COLI_ENGINE_DECODE_STALL_TIMEOUT"] = decode
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("olmoe", "model", env=env)
+                entry = openai_server._Pending()
+                entry.progress_at -= 86400   # a day reading the prompt is not a stall
+                with engine.pending_lock:
+                    engine.pending["7"] = entry
+                try:
+                    self.assertIsNone(engine.stalled_reason())
+                    process.stdout.feed(b"DATA 7 1\nA\n")
+                    deadline = time.monotonic() + 2
+                    while entry.decoding_at is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertIsNotNone(entry.decoding_at)
+                    self.assertIsNone(engine.stalled_reason())
+                    entry.progress_at -= 301   # past the 300 s between tokens
+                    reason = engine.stalled_reason()
+                    if expected is None:
+                        self.assertIsNone(reason)
+                    else:
+                        self.assertIn(expected, reason)
+                finally:
+                    engine.close()
+
+    def test_cancel_deadline_starts_with_the_first_token(self):
+        process = FakeProcess(lambda process, frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model", env=dict(os.environ, COLI_ENGINE_CANCEL_TIMEOUT="30"))
+        entry = openai_server._Pending()
+        now = time.monotonic()
+        entry.cancel_at = now - 3600   # cancelled during a long prompt: not timed
+        with engine.pending_lock:
+            engine.pending["7"] = entry
+        try:
+            self.assertIsNone(engine.stalled_reason())
+            entry.progress_at = entry.decoding_at = now - 1   # the prompt ended a second ago
+            self.assertIsNone(engine.stalled_reason())
+            entry.decoding_at = now - engine.cancel_timeout - 1
+            self.assertIn("cancellation timed out", engine.stalled_reason())
+        finally:
+            engine.close()
+
+    def test_engine_timeout_settings_reject_unbounded_values(self):
+        for name, values in (("COLI_ENGINE_STALL_TIMEOUT", ("-1", "nan", "inf")),
+                             ("COLI_ENGINE_DECODE_STALL_TIMEOUT", ("-1", "nan", "inf")),
+                             ("COLI_ENGINE_CANCEL_TIMEOUT", ("-1", "nan", "inf"))):
+            for value in values:
+                with self.subTest(name=name, value=value), \
+                     patch("openai_server.subprocess.Popen") as popen:
+                    with self.assertRaises(ValueError):
+                        Engine("olmoe", "model", env=dict(os.environ, **{name: value}))
+                    popen.assert_not_called()
 
     def test_engine_alive_follows_the_process_and_its_reader(self):
         process = FakeProcess(lambda process, frame: None)
