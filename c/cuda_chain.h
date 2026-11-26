@@ -546,6 +546,8 @@ typedef struct ColiCudaChainOps {
     int  (*relattn_pb)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
                        CcBuf *pb, CcBuf *part, int nc, const CcRelAttn *p);
     int  (*ink2_kv_put)(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb, int S, int KV, int hd, int cap, int vs_off);
+    /* Match the current device's complete runtime name, including the edition. */
+    int (*device_named)(const char *name);
 } ColiCudaChainOps;
 #define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
 #define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
@@ -901,6 +903,11 @@ static inline int cc_probe_qwen36_profile(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, probe_qwen36_profile) + sizeof t->probe_qwen36_profile
         && t->probe_qwen36_profile ? t->probe_qwen36_profile() : 0;
+}
+static inline int cc_device_named(const char *name) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, device_named) + sizeof t->device_named &&
+           t->device_named && t->device_named(name);
 }
 static inline void cc_set_kernel_mask(unsigned mask) {
     const ColiCudaChainOps *t = cc_ops();

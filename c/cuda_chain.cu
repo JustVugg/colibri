@@ -3277,17 +3277,24 @@ static int cc_init(int device) {
     g_cur = (int)(c - g_cc);
     return 1;
 }
-static int cc_probe_qwen36_profile_(void) {
-    CcCtx *c = cur();
-    if (!c || !c->up || c->lost) return Q36_GPU_NONE;
-    int profile = Q36_GPU_NONE;
-#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+static int cc_device_properties(CcCtx *c, cudaDeviceProp *prop) {
+    if (!c || !c->up || c->lost) return 0;
+    if (cudaGetDeviceProperties(prop, c->device) == cudaSuccess) return 1;
+    (void)cudaGetLastError();
+    return 0;
+}
+static int cc_device_named_(const char *name) {
     cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, c->device) == cudaSuccess)
-        profile = q36_cuda_device_profile(c->major, c->minor, prop.name, prop.totalGlobalMem);
-    else (void)cudaGetLastError();
+    return name && cc_device_properties(cur(), &prop) && !strcmp(prop.name, name);
+}
+static int cc_probe_qwen36_profile_(void) {
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    CcCtx *c = cur();
+    cudaDeviceProp prop;
+    if (cc_device_properties(c, &prop))
+        return q36_cuda_device_profile(c->major, c->minor, prop.name, prop.totalGlobalMem);
 #endif
-    return profile;
+    return Q36_GPU_NONE;
 }
 static int cc_select_qwen36_profile(int enable) {
     if (!enable) {
@@ -5446,5 +5453,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_probe_qwen36_profile_,
     CC_GRAPH_OPS,
     cc_relattn_pb, cc_ink2_kv_put,
+    cc_device_named_,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

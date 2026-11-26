@@ -36,6 +36,8 @@ enum {
 #define Q36_ALL_FEATURES ((1u << 13) - 1u)
 #define Q36_AVAILABLE_FEATURES ((1u << 13) - 1u)
 
+#define Q36_PRO4000_NAME "NVIDIA RTX PRO 4000 Blackwell"
+
 /* Match the complete device name and compute capability for each profile. */
 static inline int q36_cuda_device_profile(int major, int minor, const char *name,
                                           size_t total_global_mem) {
@@ -47,7 +49,7 @@ static inline int q36_cuda_device_profile(int major, int minor, const char *name
         {Q36_GPU_L4, 8, 9, "NVIDIA L4", "L4", 0, 0},
         {Q36_GPU_A100, 8, 0, "NVIDIA A100-SXM4-40GB", NULL, UINT64_C(38) << 30, UINT64_C(42) << 30},
         {Q36_GPU_3090, 8, 6, "NVIDIA GeForce RTX 3090", NULL, 0, 0},
-        {Q36_GPU_PRO4000, 12, 0, "NVIDIA RTX PRO 4000 Blackwell", "NVIDIA RTX PRO 4000 Blackwell SFF Edition", 0, 0},
+        {Q36_GPU_PRO4000, 12, 0, Q36_PRO4000_NAME, "NVIDIA RTX PRO 4000 Blackwell SFF Edition", 0, 0},
         {Q36_GPU_4090, 8, 9, "NVIDIA GeForce RTX 4090", NULL, 0, 0},
         {Q36_GPU_5090, 12, 0, "NVIDIA GeForce RTX 5090", NULL, 0, 0},
         {Q36_GPU_PRO6000, 12, 0, "NVIDIA RTX PRO 6000 Blackwell Server Edition", NULL, 0, 0},

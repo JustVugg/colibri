@@ -488,6 +488,8 @@ static int record_selector(int on) {
     if (!selector_calls++) selector_request = on;
     return fcc_select_qwen36_profile(on);
 }
+static const char *selector_device_name;
+static int selector_device_named(const char *name) { return !strcmp(selector_device_name, name); }
 static int selector_init_failure(int dev) { (void)dev; return 0; }
 
 static int write_fixture_file(const char *path, const char *contents) {
@@ -643,6 +645,20 @@ static void test_cuda_model_filter(const Model *trunk) {
     fake_device_profile = Q36_GPU_NONE;
     ck(cc_probe_qwen36_profile() == Q36_GPU_NONE && !fake_active_profile && fake_kernel_mask == old_mask,
        "querying another CUDA device leaves the engine on standard dispatch");
+    fake_chain_table.device_named = selector_device_named;
+    selector_device_name = "NVIDIA RTX PRO 4000 Blackwell SFF Edition";
+    fake_device_profile = q36_cuda_device_profile(12, 0, selector_device_name, (size_t)24 << 30);
+    ck(!q36cc_profile_eligible(1) && q36cc_profile_eligible(0), "SFF qualifies only for native INT4");
+    selector_device_name = "NVIDIA RTX PRO 4000 Blackwell";
+    fake_device_profile = q36_cuda_device_profile(12, 0, selector_device_name, (size_t)24 << 30);
+    ck(q36cc_profile_eligible(1) && q36cc_profile_eligible(0), "standard PRO 4000 qualifies for both formats");
+    fake_chain_table.size = offsetof(ColiCudaChainOps, device_named);
+    ck(!q36cc_profile_eligible(1) && q36cc_profile_eligible(0), "older backends cannot identify the PRO 4000 edition for GGUF");
+    fake_chain_table.size = sizeof fake_chain_table;
+    fake_chain_table.device_named = NULL;
+    ck(!q36cc_profile_eligible(1), "missing edition probe keeps the PRO 4000 on default GGUF dispatch");
+    fake_device_profile = Q36_GPU_L4;
+    ck(q36cc_profile_eligible(1), "other eligible GPUs need no edition check");
     fake_device_profile = old_profile;
     fake_chain_table.size = offsetof(ColiCudaChainOps, probe_qwen36_profile);
     selector_calls = 0;

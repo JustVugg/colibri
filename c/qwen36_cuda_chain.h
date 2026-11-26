@@ -401,6 +401,13 @@ static void q36cc_free_own(Q36CChain *ch, Model *m) {
     cc_free(ch->prm); ch->prm = NULL;
 }
 
+static int q36cc_profile_eligible(int gguf) {
+    int profile = cc_probe_qwen36_profile();
+    /* The native INT4 profile also covers the SFF. Only the standard card qualified on GGUF. */
+    if (gguf && profile == Q36_GPU_PRO4000) return cc_device_named(Q36_PRO4000_NAME);
+    return profile != Q36_GPU_NONE;
+}
+
 /* The chain on the device, at startup after the tier placed the trunk: every layer's
  * matrices found on one device, the parameter arena, the chain's own small tensors and
  * the DeltaNet state. NULL = the chain cannot run (the message says why). */
@@ -509,7 +516,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots, const Q36Checkpoint *chec
                               D == 2048 && L == 40 && c->n_experts == 256 && c->topk == 8 && c->inter == 512 &&
                               c->q_heads == 16 && c->kv_heads == 2 && c->head_dim == 256 && c->k_head_dim == 256 &&
                               mux_slots <= 1 && !(draft && *draft) && !(mtp && !strcmp(mtp, "1")) &&
-                              cc_probe_qwen36_profile() &&
+                              q36cc_profile_eligible(g_gguf) &&
                               (g_gguf ? q36_gguf_checkpoint_matches(&g_gg, &q36_gguf_q4_k_xl,
                                                                     checkpoint ? checkpoint->snap : NULL)
                                       : q36_checkpoint_matches(&m->S, checkpoint)));

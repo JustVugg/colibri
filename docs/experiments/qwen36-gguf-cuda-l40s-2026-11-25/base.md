@@ -4,7 +4,7 @@ Model: `unsloth/Qwen3.6-35B-A3B-GGUF@a483e9e6cbd595906af30beda3187c2663a1118c`, 
 
 Baseline: dev `1403453f42ccc843fd73182ca7dd911dc31c5782`, compiled `c/` tree `e38e7411e3fb6617c60cc597f0e1bba7dc4488c5`. Each baseline and trial used the same physical GPU and checkpoint.
 
-The L4, A100 and RTX PRO 6000 measurements used the earlier GGUF implementation. The RTX 3090, RTX PRO 4000 and RTX 5090 measurements preceded the RTX 4090 activation-cache adjustment. The RTX 4090 and L40S measurements include that adjustment. The physical RTX PRO 4000 was the standard edition. The SFF edition shares its profile.
+The L4, A100 and RTX PRO 6000 measurements used the earlier GGUF implementation. The RTX 3090, RTX PRO 4000 and RTX 5090 measurements preceded the RTX 4090 activation-cache adjustment. The RTX 4090 and L40S measurements include that adjustment. The RTX PRO 4000 measurements are from the standard edition. The SFF edition uses the default CUDA path for this GGUF.
 
 ## Timing method
 
