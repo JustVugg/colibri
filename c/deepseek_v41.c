@@ -6824,13 +6824,12 @@ static int v41_cu_tier_open(Model *m, const char *snap, int cap) {
 }
 #endif
 /* A build with both backends, CUDA asked for (COLI_CUDA=1), a GGUF: the Vulkan device runs the
- * dense chain and the routed experts go to the CUDA tier on the same card, which serves them
- * faster than Vulkan's. V41_TIER=vulkan keeps them on Vulkan's tier, and so does a CUDA tier that
- * does not start. */
+ * dense chain and the routed experts stay on Vulkan's tier. V41_TIER=cuda puts them on the CUDA
+ * tier on the same card instead; a CUDA tier that does not start leaves them on Vulkan's. */
 static int v41_experts_on_cuda(const Model *m) {
 #if defined(COLI_CUDA) && defined(COLI_VULKAN)
     const char *cu = getenv("COLI_CUDA"), *t = getenv("V41_TIER");
-    return m->gguf && cu && atoi(cu) && !(t && !strcmp(t, "vulkan")) && cut_wanted() && m->c.n_routed > 0;
+    return m->gguf && cu && atoi(cu) && t && !strcmp(t, "cuda") && cut_wanted() && m->c.n_routed > 0;
 #else
     (void)m;
     return 0;
@@ -6846,8 +6845,8 @@ int main(int argc, char **argv) {
         const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
         if (cu && atoi(cu) && !(vk && *vk)) {
             setenv("COLI_VULKAN", "1", 1);
-            fprintf(stderr, "[CUDA] deepseek_v41: a build with Vulkan runs its dense chain on it, the same card; the routed "
-                            "experts on the CUDA tier for a GGUF (V41_TIER=vulkan: Vulkan's tier; COLI_VULKAN=0: the CUDA tier alone)\n");
+            fprintf(stderr, "[CUDA] deepseek_v41: a build with Vulkan runs on it, the same card, its dense chain and expert tier "
+                            "(V41_TIER=cuda: a GGUF's routed experts on the CUDA tier; COLI_VULKAN=0 keeps the CUDA tier)\n");
         }
     }
 #endif
