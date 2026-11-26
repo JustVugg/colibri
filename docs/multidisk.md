@@ -89,6 +89,30 @@ files, preserves the requested free-space reserve, verifies every shard with
 SHA-256, never deletes an existing mirror shard, and atomically publishes a
 receipt only after the selected mirror is ready.
 
+## Which drives hold the copies
+
+Drives connect to the CPU in different ways, and the connection decides what a
+drive reads while the others read too:
+
+- Some M.2 slots use the CPU's own PCIe lanes. Others go through the chipset,
+  and every device behind the chipset shares one uplink to the CPU. Two NVMe
+  drives behind the chipset can read less together than the sum of each alone.
+- Slots differ in PCIe generation and width (for example 4.0 x4 or 3.0 x2), and
+  some slots share their lanes with another slot or a SATA port.
+- A SATA SSD reads much less than an NVMe drive, and a drive in a USB enclosure
+  is limited by its USB link.
+- A hot drive throttles. Slots differ in airflow and heat sinks.
+
+So the same drive model can deliver different rates in two slots. Where you can,
+put the copies on drives that do not share a link. Weight each drive by what it
+reads while all drives read at the same time, not by what it reads alone. Give a
+drive that throttles a smaller weight. A drive can start to throttle only after
+some minutes of reads, so compare weights over a long run, not a short one. On
+Linux, `readlink -f /sys/block/nvme0n1/device` shows the PCIe path of a drive
+(a root port of the CPU or of the chipset), and `lspci -s <address> -vv` shows
+the negotiated link (`LnkSta`). Then compare the drive sets with the complete
+workload, as described in [Compare against one drive](#compare-against-one-drive).
+
 ## What has been measured
 
 More storage bandwidth does not translate directly into more tokens per second.
