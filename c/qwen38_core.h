@@ -258,6 +258,7 @@ typedef struct {
     uint64_t clock, hits, miss;
     uint64_t expert_weight_reads, expert_scale_reads, expert_pair_reads;
     uint64_t expert_prefetch_ranges, expert_parallel_batches;
+    uint64_t ple_rows_wanted, ple_reads;   /* PLE rows asked for, and the reads that brought them (q38_ple_rows) */
     uint64_t expert_scale_bytes;
     float **DN_rec, **DN_conv;
     /* Q38_DN_GPU=1 (qt_dn_gpu_*): the host arrays above stay canonical; per
@@ -2796,12 +2797,30 @@ static int q38_victim(const LCache *lc,int layer,const uint8_t *protect){
     if(dev>=0){vkt_ram_gave();return dev;}
     return lru;
 }
+/* Whether a layer cache may take one more slab. Under the free-RAM floor the
+ * layer stops growing where it stands (cap = max(n, 1)) and recycles its slots,
+ * so misses stream from disk instead of pushing new slabs into the pagefile. */
+static double g_q38_ram_floor_gb = 1.0;   /* tests raise it to take this path */
+static int q38_cache_grow_ok(LCache *lc) {
+    if(lc->n>=lc->cap)return 0;
+    if(lc->n==0&&lc->cap<=1)return 1;
+    double avail=compat_mem_available_gb();
+    if(avail<=0||avail>=g_q38_ram_floor_gb)return 1;
+    static int said;
+    if(!said){
+        said=1;
+        fprintf(stderr,"[qwen38] RAM: %.2f GB available, under %.1f GB: the expert RAM caches stop growing "
+                       "(each layer keeps the slots it has) and misses stream from disk\n",avail,g_q38_ram_floor_gb);
+    }
+    lc->cap=lc->n>0?lc->n:1;
+    return lc->n<lc->cap;
+}
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
     q38_ehit_mark(m,layer,eid);
     LCache *lc=&m->cache[layer]; int si=lc->by_expert[eid];
     if(si>=0){m->hits++;lc->slots[si].used=++m->clock;return &lc->slots[si];}
     m->miss++; Slot *s;
-    if(lc->n<lc->cap){s=&lc->slots[lc->n++];s->eid=-1;}
+    if(q38_cache_grow_ok(lc)){s=&lc->slots[lc->n++];s->eid=-1;}
     else {
         int victim=q38_victim(lc,layer,NULL);
         s=&lc->slots[victim];if(s->eid>=0)lc->by_expert[s->eid]=-1;
@@ -2852,6 +2871,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     if(!m->expert_parallel_reads)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_DISABLED,layer,0,0);
     LCache *cache=&m->cache[layer];
+    q38_cache_grow_ok(cache);   /* low RAM freezes the cap before the demand set is sized against it */
     if(count>cache->cap)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY,
                                          layer,cache->cap,count);
@@ -2948,26 +2968,63 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     return 1;
 }
 
-static void q38_ple_row(Model *m,int64_t row,float *out) {
-    Cfg *c=&m->c; int p=0;
-    if(m->ple_gg){   /* GGUF: one row of the table's ggml blocks */
-        const gguf_tensor *t=m->ple_gg; int64_t rb=gq_row_bytes(t->type,c->ngram_head_dim);
-        Q38_NEED(row>=0&&row<t->ne[1]&&rb>0,"PLE row out of range: %lld",(long long)row);
-        uint8_t raw[1024]; Q38_NEED(rb<=(int64_t)sizeof raw,"PLE row too wide");
-        q38_gg_read(t,raw,row*rb,rb);
-        if(gq_dequant_row(t->type,raw,out,c->ngram_head_dim)){fprintf(stderr,"GGUF %s: type %s\n",t->name,gq_type_name(t->type));exit(1);}
-        return;
+/* PLE row `row`: its part and the row within it */
+static int q38_ple_locate(const Model *m,int64_t row,int64_t *local) {
+    const Cfg *c=&m->c;
+    if(m->ple_gg){
+        const gguf_tensor *t=m->ple_gg;
+        Q38_NEED(row>=0&&row<t->ne[1],"PLE row out of range: %lld",(long long)row);
+        *local=row;
+        return 0;
     }
+    int p=0;
     while(p+1<m->ple_part_count&&row>=m->ple_part_start[p+1])p++;
     if(p>=m->ple_part_count||row<m->ple_part_start[p]){fprintf(stderr,"PLE row out of range: %lld\n",(long long)row);exit(1);}
-    int64_t local=row-m->ple_part_start[p]; st_tensor *t=m->ple_parts[p]; const char *nm=m->ple_part_names[p];
-    Q38_NEED(c->ngram_head_dim>0&&local>=0&&local<=INT64_MAX/c->ngram_head_dim,
+    *local=row-m->ple_part_start[p];
+    Q38_NEED(c->ngram_head_dim>0&&*local>=0&&*local<=INT64_MAX/c->ngram_head_dim,
              "PLE row byte offset overflows");
+    return p;
+}
+
+/* count adjacent rows of part p from row `local` on, in ONE read, decoded into out (count rows
+ * of ngram_head_dim). Each value is decoded on its own (e4m3 times the scale, ggml block
+ * dequant, or float conversion), so a row's floats are the one-row read's bits wherever it
+ * sits in the run. */
+static void q38_ple_rows(Model *m,int p,int64_t local,int count,float *out) {
+    Cfg *c=&m->c;
+    if(m->ple_gg){   /* GGUF: count adjacent rows of the table's ggml blocks in ONE read */
+        const gguf_tensor *t=m->ple_gg; int64_t rb=gq_row_bytes(t->type,c->ngram_head_dim);
+        Q38_NEED(count>=1&&local>=0&&local<=t->ne[1]-count&&rb>0&&count<=INT64_MAX/rb,
+                 "PLE row run out of range");
+        int64_t nb=(int64_t)count*rb;
+        uint8_t stack[1024],*raw=nb<=(int64_t)sizeof stack?stack:(uint8_t*)malloc((size_t)nb);
+        if(!raw){fprintf(stderr,"OOM PLE rows\n");exit(1);}
+        q38_gg_read(t,raw,local*rb,nb);
+        for(int i=0;i<count;i++)
+            if(gq_dequant_row(t->type,raw+(int64_t)i*rb,out+(int64_t)i*c->ngram_head_dim,c->ngram_head_dim)){
+                fprintf(stderr,"GGUF %s: type %s\n",t->name,gq_type_name(t->type));exit(1);
+            }
+        if(raw!=stack)free(raw);
+        __atomic_fetch_add(&m->ple_reads,1,__ATOMIC_RELAXED);
+        return;
+    }
+    st_tensor *t=m->ple_parts[p]; const char *nm=m->ple_part_names[p];
+    int64_t n=(int64_t)count*c->ngram_head_dim;
+    Q38_NEED(count>=1&&local<=INT64_MAX/c->ngram_head_dim-count,"PLE row run overflows");
     if(t->dtype==4){
-        uint8_t raw[512]; Q38_NEED(c->ngram_head_dim<=(int)sizeof raw,"PLE row too wide");
-        st_read_slice_raw_cap(&m->S,nm,local*c->ngram_head_dim,c->ngram_head_dim,raw,sizeof raw,1);
-        for(int d=0;d<c->ngram_head_dim;d++)out[d]=e4m3_decode(raw[d])*m->ple_weight_scale;
-    } else st_read_slice_f32(&m->S,nm,local*c->ngram_head_dim,c->ngram_head_dim,out,1);
+        uint8_t stack[512],*raw=n<=(int64_t)sizeof stack?stack:(uint8_t*)malloc((size_t)n);
+        if(!raw){fprintf(stderr,"OOM PLE rows\n");exit(1);}
+        st_read_slice_raw_cap(&m->S,nm,local*c->ngram_head_dim,n,raw,n,1);
+        for(int64_t d=0;d<n;d++)out[d]=e4m3_decode(raw[d])*m->ple_weight_scale;
+        if(raw!=stack)free(raw);
+    } else st_read_slice_f32(&m->S,nm,local*c->ngram_head_dim,n,out,1);
+    __atomic_fetch_add(&m->ple_reads,1,__ATOMIC_RELAXED);
+}
+
+static void q38_ple_row(Model *m,int64_t row,float *out) {
+    int64_t local; int p=q38_ple_locate(m,row,&local);
+    __atomic_fetch_add(&m->ple_rows_wanted,1,__ATOMIC_RELAXED);
+    q38_ple_rows(m,p,local,1,out);
 }
 
 static int64_t q38_hash_row(Model *m,int head,int ngram,int64_t cur,int64_t p1,int64_t p2) {
@@ -2976,6 +3033,52 @@ static int64_t q38_hash_row(Model *m,int head,int ngram,int64_t cur,int64_t p1,i
     if(ngram==3)x^=(uint64_t)p2*(uint64_t)m->ple_multipliers[2];
     int64_t sx=(int64_t)x,mod=m->ple_head_vocab[head],r=sx%mod;if(r<0)r+=mod;
     return m->ple_head_offset[head]+r;
+}
+
+/* Q38_PLE_COALESCE (default 1; 0 = one read per (token, head) as before): the
+ * chunk's PLE rows are read once each, and rows adjacent in one part file come in one read
+ * (at most 4 MiB of floats; no gap bytes are read to join two runs). Then every (token,
+ * head) gets its row's floats copied: the same bits as its own read (q38_ple_rows), so the
+ * tokens do not change -- tests/test_qwen38_ple_reads checks the bits and counts the reads.
+ * 0: out of memory, nothing read (the caller reads row by row). */
+typedef struct { int64_t row; int64_t at; } Q38PleRef;
+static int q38_ple_ref_cmp(const void *a,const void *b) {
+    const Q38PleRef *x=(const Q38PleRef*)a,*y=(const Q38PleRef*)b;
+    if(x->row!=y->row)return x->row<y->row?-1:1;
+    return (x->at>y->at)-(x->at<y->at);
+}
+static int q38_ple_coalesced(Model *m,const int64_t *rows,int64_t total,float *buffer) {
+    Cfg *c=&m->c; int64_t dim=c->ngram_head_dim;
+    int64_t run_max=((int64_t)4<<20)/(dim*(int64_t)sizeof(float)); if(run_max<1)run_max=1;
+    Q38PleRef *refs=(Q38PleRef*)malloc((size_t)total*sizeof *refs);
+    int64_t *uniq=(int64_t*)malloc((size_t)total*sizeof *uniq);       /* ref -> its unique row */
+    int64_t *run_first=(int64_t*)malloc((size_t)total*sizeof *run_first);   /* run -> its first unique row */
+    int *run_part=(int*)malloc((size_t)total*sizeof *run_part), *run_n=(int*)malloc((size_t)total*sizeof *run_n);
+    int64_t *run_local=(int64_t*)malloc((size_t)total*sizeof *run_local);
+    float *rowbuf=NULL;
+    if(!refs||!uniq||!run_first||!run_part||!run_n||!run_local)goto fail;
+    for(int64_t i=0;i<total;i++){refs[i].row=rows[i];refs[i].at=i;}
+    qsort(refs,(size_t)total,sizeof *refs,q38_ple_ref_cmp);
+    int64_t nu=0,runs=0,prev_local=0; int prev_part=-1;
+    for(int64_t k=0;k<total;k++){
+        if(k&&refs[k].row==refs[k-1].row){uniq[k]=nu-1;continue;}
+        int64_t local; int p=q38_ple_locate(m,refs[k].row,&local);
+        if(runs&&p==prev_part&&local==prev_local+1&&run_n[runs-1]<run_max)run_n[runs-1]++;
+        else{run_first[runs]=nu;run_part[runs]=p;run_local[runs]=local;run_n[runs]=1;runs++;}
+        prev_part=p;prev_local=local;uniq[k]=nu++;
+    }
+    rowbuf=(float*)malloc((size_t)nu*(size_t)dim*sizeof(float));
+    if(!rowbuf)goto fail;
+    #pragma omp parallel for schedule(dynamic)
+    for(int64_t r=0;r<runs;r++)q38_ple_rows(m,run_part[r],run_local[r],run_n[r],rowbuf+run_first[r]*dim);
+    for(int64_t k=0;k<total;k++)
+        memcpy(buffer+refs[k].at*dim,rowbuf+uniq[k]*dim,(size_t)dim*sizeof(float));
+    __atomic_fetch_add(&m->ple_rows_wanted,(uint64_t)total,__ATOMIC_RELAXED);
+    free(refs);free(uniq);free(run_first);free(run_part);free(run_n);free(run_local);free(rowbuf);
+    return 1;
+fail:
+    free(refs);free(uniq);free(run_first);free(run_part);free(run_n);free(run_local);free(rowbuf);
+    return 0;
 }
 
 
@@ -3056,7 +3159,6 @@ static void q38_ple_prefetch(Model *m,const int *ids,int S) {
     q38_ple_hash_rows(m,ids,S,rows);
 
     int64_t total=(int64_t)S*c->ngram_heads;
-    volatile int failed=0;
     /* Every row asked of the OS first (gguf_advise), then read: read one by one, as many were in
      * flight as the team has threads, and a prompt's rows mostly come from the disk (the GGUF's
      * table is 28.8 GB for Qwen3.8-Flash-Next; a 470-token prompt's 6,941 rows of 90 bytes took
@@ -3068,13 +3170,11 @@ static void q38_ple_prefetch(Model *m,const int *ids,int S) {
         for(int64_t i=0;i<total;i++)
             if(rows[i]>=0&&rows[i]<t->ne[1]) gguf_advise(q38_gg_ctx_of(t),t,rows[i]*rb,rb);
     }
-    #pragma omp parallel for schedule(static)
-    for(int64_t i=0;i<total;i++){
-        if(failed) continue;
-        q38_ple_row(m,rows[i],buffer+i*per_row);
+    if(!q38_env_bool("Q38_PLE_COALESCE",1)||!q38_ple_coalesced(m,rows,total,buffer)){
+        #pragma omp parallel for schedule(static)
+        for(int64_t i=0;i<total;i++)q38_ple_row(m,rows[i],buffer+i*per_row);
     }
     free(rows);
-    if(failed){free(buffer);return;}
     m->ple_pref=buffer; m->ple_pref_rows=S;
 }
 
@@ -6589,6 +6689,9 @@ static void tm_report(const Model *m) {
                 (unsigned long long)m->expert_prefetch_ranges,
                 (unsigned long long)m->expert_parallel_batches,
                 m->expert_scale_bytes/1048576.0);
+    if(q38_tm_enabled()&&m->ple_rows_wanted)
+        fprintf(stderr,"[qwen38 PLE I/O] rows=%llu reads=%llu\n",
+                (unsigned long long)m->ple_rows_wanted,(unsigned long long)m->ple_reads);
 }
 
 static void q38_layer_free(Layer *l) {

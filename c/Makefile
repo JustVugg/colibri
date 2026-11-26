@@ -1217,6 +1217,9 @@ deepgemm-fetch $(DEEPGEMM_STAMP):
 # cublasLt64_12.dll alone is hundreds of MB. NO_TC=1, the name
 # Makefile.deepseek-v4 and the loader's advice use, means the same here.
 ifeq ($(NO_TC),1)
+ifeq ($(DSV4_TC),1)
+$(error NO_TC=1 means DSV4_TC=0, but DSV4_TC=1 is set (command line or environment): drop one)
+endif
 DSV4_TC ?= 0
 endif
 DSV4_TC ?= 1
@@ -2451,6 +2454,9 @@ tests/test_dsv41_candidate_ids$(EXE): tests/test_dsv41_candidate_ids.c deepseek_
 tests/test_dsv41_engram_stage$(EXE): tests/test_dsv41_engram_stage.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_dsv41_hc_post_team$(EXE): tests/test_dsv41_hc_post_team.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2473,6 +2479,9 @@ tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_cache_grow_floor$(EXE): tests/test_qwen38_cache_grow_floor.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)
@@ -2528,6 +2537,10 @@ tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# PLE rows of a chunk read once each, adjacent ones in one read (Q38_PLE_COALESCE): the bits and the read count
+tests/test_qwen38_ple_reads$(EXE): tests/test_qwen38_ple_reads.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c tests/segment_runtime_nocuda.o $(VK_OBJ)
@@ -3120,6 +3133,10 @@ tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
 tests/test_glm53_serve_framing$(EXE): tests/test_glm53_serve_framing.c glm53.c
 	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
+# glm53 native FP8 e4m3 load dequant + tiny end-to-end exactness (CPU-only, self-contained)
+tests/test_glm53_fp8_load$(EXE): tests/test_glm53_fp8_load.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
+
 # Exact sampler order, cumulative mass, selected token and RNG-use regression.
 tests/glm53_nucleus_reference.o: tests/glm53_nucleus_reference.c
 	$(CC) $(NOCUDA_CFLAGS) -c $< -o $@
@@ -3580,6 +3597,9 @@ tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c qwen36.c qwen36_tier.
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_qwen36_cuda_profile$(EXE): tests/test_qwen36_cuda_profile.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_ckpt_same_file_win$(EXE): tests/test_qwen36_ckpt_same_file_win.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 # The CUDA dense chain (COLI_CUDA_CHAIN=1, qwen36_cuda_chain.h): logits, state, verify

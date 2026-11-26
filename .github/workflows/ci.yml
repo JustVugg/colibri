@@ -2418,7 +2418,14 @@ jobs:
           # coli_cuda_dsv4.dll (portable: sm_80/86/89/90/120 + PTX). DSV4_TC=0
           # leaves out the opt-in cuBLASLt path, so neither needs more than the
           # cudart64_12.dll beside it and the driver (#2047).
-          NVCC_APPEND_FLAGS="--threads 0" make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
+          # nvcc's --threads 0 builds the five targets at once; its device link then fails now and
+          # then with "nvlink fatal: Could not read file ...tmpxft..._dlink.reg.c" (batch Z, #3069,
+          # #3077 on 2026-11-24/25, each passing on a rerun). Once more one target at a time.
+          NVCC_APPEND_FLAGS="--threads 0" make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0 || {
+            echo "cuda-dsv4-dll failed with --threads 0; building it again one target at a time"
+            rm -f coli_cuda_dsv4.dll coli_cuda_dsv4.lib coli_cuda_dsv4.exp
+            make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
+          }
           make cuda-dsv4-dg-dll DSV4_TC=0
           for d in coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll; do
             test -f $d || { echo "$d: the target reported success but produced no DLL" >&2; exit 1; }

@@ -381,7 +381,10 @@ def append_mtp(args):
     (out / "qwen36_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     for path in base.iterdir():
         if path.is_file() and path.name not in ("qwen36_meta.json", "model-mtp.safetensors"):
-            (out / path.name).symlink_to(path.resolve())
+            try:
+                (out / path.name).symlink_to(path.resolve())
+            except OSError:   # Windows without the symlink privilege: a hard link, as make_qwen36_qpack_snap.py
+                os.link(path.resolve(), out / path.name)
     print(f"[mtp] {len(keys)} source tensors -> {out / 'model-mtp.safetensors'}; base files linked")
 
 

@@ -90,7 +90,9 @@ __device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, c
  * part (the split, a decode step's rows): block z takes tile z alone, its max, sum and weighted V into
  * part (hd + 2 floats a (row, head, tile)), and ccg_relattn_join_k joins the tiles */
 __global__ static void ccg_relattn_k(const float *q, const float *kc, const float *vc, float *o, const float *kvs,
-                                     const float *r, const float *relp, const float *tau, CcRelAttn p, float *part) {
+                                     const float *r, const float *relp, const float *tau, CcRelAttn p, float *part,
+                                     const int *pb_ptr) {
+    if (pb_ptr) p.pos_base = *pb_ptr;
     const int h = (int)blockIdx.x, s = (int)blockIdx.y, tid = (int)threadIdx.x;
     const int kvh = h / (p.H / p.KVH);
     __shared__ float qs[256], rs[64], pe[128], red[128];
@@ -253,7 +255,7 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
         const size_t pb = (size_t)p->S * p->H * nc * (p->hd + 2) * sizeof(float);
         if (cudaMallocAsync((void **)&part, pb, c->stream) == cudaSuccess) {
             coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o),
-                        fp(kvs), fp(r), fp(relp), fp(tau), *p, part);
+                        fp(kvs), fp(r), fp(relp), fp(tau), *p, part, (const int *)nullptr);
             coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, (const float *)part, fp(tau), fpw(o), *p, nc);
             (void)cudaFreeAsync(part, c->stream);
             return launched(c, "relattn split");
@@ -261,8 +263,49 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
         (void)cudaGetLastError();
     }
     coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o), fp(kvs),
-                fp(r), fp(relp), fp(tau), *p, (float *)nullptr);
+                fp(r), fp(relp), fp(tau), *p, (float *)nullptr, (const int *)nullptr);
     return launched(c, "relattn");
+}
+/* CUDA-Graph-safe relattn + KV scatter reading pos_base from a 1-int device buffer (no host-side pb dependency,
+ * no cudaMallocAsync inside capture). */
+__global__ static void ccg_ink2_kv_put_k(float *kc, float *vc, const float *kvs, const int *pb_ptr,
+                                         int S, int KV, int hd, int cap, int vs_off) {
+    const long idx = (long)(blockIdx.x + blockIdx.y * gridDim.x) * 256 + threadIdx.x;
+    const long kvo = (long)KV * hd;
+    const long total = (long)S * kvo;
+    if (idx >= total) return;
+    const int s = (int)(idx / kvo);
+    const int rem = (int)(idx - (long)s * kvo);
+    const int h = rem / hd;
+    const int d = rem - h * hd;
+    const int pb = *pb_ptr;
+    const long dst = ((long)h * cap + (long)((pb + s) % cap)) * hd + d;
+    kc[dst] = kvs[idx];
+    vc[dst] = kvs[(long)vs_off + idx];
+}
+static int cc_relattn_pb(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
+                         CcBuf *pb_buf, CcBuf *part_buf, int nc, const CcRelAttn *p) {
+    CcCtx *c = live();
+    if (!c || !p || !pb_buf || p->hd > 256 || p->hd < 1 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
+    if (p->S <= 0) return 1;
+    if (part_buf && nc >= 2) {
+        coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o),
+                    fp(kvs), fp(r), fp(relp), fp(tau), *p, fpw(part_buf), (const int *)fp(pb_buf));
+        coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, fp(part_buf), fp(tau), fpw(o), *p, nc);
+        return launched(c, "relattn pb split");
+    }
+    coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o), fp(kvs),
+                fp(r), fp(relp), fp(tau), *p, (float *)nullptr, (const int *)fp(pb_buf));
+    return launched(c, "relattn pb");
+}
+static int cc_ink2_kv_put(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb_buf, int S, int KV, int hd, int cap, int vs_off) {
+    CcCtx *c = live();
+    if (!c || !kc || !vc || !kvs || !pb_buf || KV < 1 || hd < 1 || cap < 1) return 0;
+    if (S <= 0) return 1;
+    const long total = (long)S * KV * hd;
+    dim3 g; cg_grid((total + 255) / 256, &g);
+    coli_launch(ccg_ink2_kv_put_k, g, 256, 0, c->stream, fpw(kc), fpw(vc), fp(kvs), (const int *)fp(pb_buf), S, KV, hd, cap, vs_off);
+    return launched(c, "ink2 kv put");
 }
 static int cc_ink2_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcInk2Mix *p) {
     CcCtx *c = live();
