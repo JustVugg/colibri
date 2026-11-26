@@ -233,7 +233,8 @@ typedef enum {
  * step (q38_forward_rows) parks every conversation here and reads each row's
  * from its Q38Row. */
 typedef struct Q38Seq {
-    float **K, **V, **IK, **DN_rec, **DN_conv;
+    void **K, **V;          /* q38_kv_es() bytes an element (Q38_KV) */
+    float **IK, **DN_rec, **DN_conv;
     int kv_len;
     kv_prefix kvp;
     int64_t *ple_history;
@@ -265,7 +266,8 @@ typedef struct {
      * layer, dn_dev_fresh says the card holds the host's state, dn_host_stale
      * says the card advanced past the host copy (pull before any CPU use). */
     uint8_t *dn_dev_fresh, *dn_host_stale; int dn_dev;
-    float **K, **V, **IK;
+    void **K, **V;          /* q38_kv_es() bytes an element (Q38_KV) */
+    float **IK;
     int kv_len, kv_cap, max_t;
     kv_prefix kvp; /* token identity of the live attention rows, not a snapshot */
     st_tensor *ple_parts[Q38_MAX_PLE_PARTS];
@@ -368,6 +370,33 @@ static Q38Timers q38_tm_delta(const Q38Timers *after,const Q38Timers *before) {
 static double rss_gb(void) { return compat_rss_gb(); }
 
 static inline float *falloc(int64_t n) { return coli_falloc(n); }
+
+/* K and V in float16 (kv16.h): the CPU's rows, the CUDA and Vulkan chains' (CC_EW_F16,
+ * VKC_EW_F16) all hold the same rounded values. When q38_kv16() is active, the host's K and V
+ * banks store float16 (uint16_t, 2 bytes an element: half the K/V host RAM and half the CPU
+ * attention reads) and the CUDA chain's mirrors store halves when the backend supports it.
+ * Q38_KV=f32 keeps float32, f16 uses float16; unset, a served model uses float16 and an argv
+ * run (its .json references are float32) uses float32. The index keys stay float32: they
+ * choose the positions. */
+static int g_q38_kv16=-1;
+static inline int q38_kv16(void){
+    if(g_q38_kv16<0){
+        const char *e=getenv("Q38_KV"),*s=getenv("SERVE");
+        g_q38_kv16=e&&*e?strcmp(e,"f32")!=0:(s&&s[0]=='1');
+    }
+    return g_q38_kv16;
+}
+static inline size_t q38_kv_es(void){ return q38_kv16()?sizeof(uint16_t):sizeof(float); }
+static void *q38_rows_alloc(int64_t n,size_t es){ return falloc((n*(int64_t)es+3)/4); }
+static inline void *q38_kv_at(void *base,int64_t idx){ return (char*)base+idx*(int64_t)q38_kv_es(); }
+static inline void q38_kv_put(int f16,void *base,int64_t idx,const float *src,int64_t n){
+    if(f16) kv16_pack((uint16_t*)base+idx,src,n);
+    else memcpy((float*)base+idx,src,(size_t)n*sizeof(float));
+}
+static inline void q38_kv_get(int f16,float *dst,const void *base,int64_t idx,int64_t n){
+    if(f16) kv16_unpack(dst,(const uint16_t*)base+idx,n);
+    else memcpy(dst,(const float*)base+idx,(size_t)n*sizeof(float));
+}
 
 /* W is row-major [O,I], y=x@W^T. */
 static void q38_matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -1551,8 +1580,8 @@ static void q38_alloc_state(Model *m) {
     m->DN_rec=(float**)calloc((size_t)c->layers,sizeof(float*));
     m->dn_dev_fresh=(uint8_t*)calloc((size_t)c->layers,1); m->dn_host_stale=(uint8_t*)calloc((size_t)c->layers,1); m->dn_dev=0;
     m->DN_conv=(float**)calloc((size_t)c->layers,sizeof(float*));
-    m->K=(float**)calloc((size_t)c->layers+1,sizeof(float*));    /* +1: the MTP head's row */
-    m->V=(float**)calloc((size_t)c->layers+1,sizeof(float*));
+    m->K=(void**)calloc((size_t)c->layers+1,sizeof(void*));    /* +1: the MTP head's row */
+    m->V=(void**)calloc((size_t)c->layers+1,sizeof(void*));
     m->IK=(float**)calloc((size_t)c->layers+1,sizeof(float*));
     if(!m->DN_rec||!m->DN_conv||!m->K||!m->V||!m->IK){fprintf(stderr,"OOM model state metadata\n");exit(1);}
     for(int i=m->range_begin;i<m->range_end;i++) if(!c->is_attn[i]) {
@@ -3523,26 +3552,47 @@ static inline void q38_dot8_x4(float *out,const float *q,int64_t qstride,const f
     for(int g=0;g<4;g++)out[g]=q38_dot8(q+g*qstride,b,n);
 #endif
 }
+/* q38_dot8 / q38_dot8_x4 over a float16 key row (Q38_KV=f16): the same 8 lanes in the same
+ * order and the same reduction tree, so bit-identical to widening b to float and calling
+ * q38_dot8 / q38_dot8_x4. */
+static inline float q38_dot8_h(const float *a,const uint16_t *b,int n){
+#if defined(__AVX2__)&&defined(__FMA__)&&defined(__F16C__)
+    __m256 acc=_mm256_setzero_ps();int i=0;
+    for(;i+8<=n;i+=8)acc=_mm256_fmadd_ps(_mm256_loadu_ps(a+i),_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i))),acc);
+    float l[8];_mm256_storeu_ps(l,acc);
+#else
+    float l[8]={0,0,0,0,0,0,0,0};int i=0;
+    for(;i+8<=n;i+=8)for(int k=0;k<8;k++)l[k]=coli_fmaf(a[i+k],kv16_to(b[i+k]),l[k]);
+#endif
+    float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
+    for(;i<n;i++)r=coli_fmaf(a[i],kv16_to(b[i]),r);
+    return r;
+}
+static inline void q38_dot8_h_x4(float *out,const float *q,int64_t qstride,const uint16_t *b,int n){
+#if defined(__AVX2__)&&defined(__FMA__)&&defined(__F16C__)
+    __m256 a0=_mm256_setzero_ps(),a1=a0,a2=a0,a3=a0;int i=0;
+    const float *q0=q,*q1=q+qstride,*q2=q+2*qstride,*q3=q+3*qstride;
+    for(;i+8<=n;i+=8){
+        const __m256 bv=_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i)));
+        a0=_mm256_fmadd_ps(_mm256_loadu_ps(q0+i),bv,a0);a1=_mm256_fmadd_ps(_mm256_loadu_ps(q1+i),bv,a1);
+        a2=_mm256_fmadd_ps(_mm256_loadu_ps(q2+i),bv,a2);a3=_mm256_fmadd_ps(_mm256_loadu_ps(q3+i),bv,a3);
+    }
+    const __m256 acc[4]={a0,a1,a2,a3};const float *qr[4]={q0,q1,q2,q3};
+    for(int g=0;g<4;g++){
+        float l[8];_mm256_storeu_ps(l,acc[g]);
+        float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
+        for(int k=i;k<n;k++)r=coli_fmaf(qr[g][k],kv16_to(b[k]),r);
+        out[g]=r;
+    }
+#else
+    for(int g=0;g<4;g++)out[g]=q38_dot8_h(q+g*qstride,b,n);
+#endif
+}
 
 typedef struct { float score; int block; } Q38Block;
 static int q38_block_desc(const void *aa,const void *bb){
     const Q38Block *a=(const Q38Block*)aa,*b=(const Q38Block*)bb;
     if(a->score>b->score)return -1;if(a->score<b->score)return 1;return a->block-b->block;
-}
-
-/* K and V rounded to float16 where they are made (kv16.h): the CPU's rows here, the CUDA and
- * Vulkan chains' (CC_EW_F16, VKC_EW_F16), so every backend holds the same values; the host's
- * caches keep them as floats and the CUDA chain's mirrors as halves (cc_attn_h: half the device
- * memory a context takes, the rest for the experts). Q38_KV=f32 keeps float32, f16 rounds;
- * unset, a served model rounds and an argv run (its .json references are float32) does not.
- * The index keys stay float32: they choose the positions. */
-static int g_q38_kv16=-1;
-static inline int q38_kv16(void){
-    if(g_q38_kv16<0){
-        const char *e=getenv("Q38_KV"),*s=getenv("SERVE");
-        g_q38_kv16=e&&*e?strcmp(e,"f32")!=0:(s&&s[0]=='1');
-    }
-    return g_q38_kv16;
 }
 
 static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int pos_base,float *out) {
@@ -3558,17 +3608,17 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
      * ranking, which reads the whole IK[0..pos] prefix.  Guarded on S>1 so
      * decode keeps the serial path it has today. */
     const Q38Row *mr=m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
+    const int kv16=q38_kv16();
     #pragma omp parallel for schedule(static) if(S>1)
     for(int s=0;s<S;s++){
         int pos=mr?mr[s].pos:pos_base+s;
-        float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
+        void *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
         float *IKl=mr?mr[s].seq->IK[layer]:m->IK[layer];
         for(int h=0;h<KVH;h++){
             float *kh=kp+(int64_t)s*KVH*D+(int64_t)h*D,*vh=vp+(int64_t)s*KVH*D+(int64_t)h*D;
             q38_rms0(kh,kh,l->kn,D,c->eps);q38_rope(kh,D,c->rotary_dim,pos,theta);
-            if(q38_kv16()){kv16_round(kh,D);kv16_round(vh,D);}
-            memcpy(Kl+((int64_t)h*m->kv_cap+pos)*D,kh,(size_t)D*sizeof(float));
-            memcpy(Vl+((int64_t)h*m->kv_cap+pos)*D,vh,(size_t)D*sizeof(float));
+            q38_kv_put(kv16,Kl,((int64_t)h*m->kv_cap+pos)*D,kh,D);
+            q38_kv_put(kv16,Vl,((int64_t)h*m->kv_cap+pos)*D,vh,D);
         }
         memcpy(IKl+(int64_t)pos*ID,ip+(int64_t)s*(IQ+1)*ID+(int64_t)IQ*ID,(size_t)ID*sizeof(float));
     }
@@ -3648,7 +3698,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         for(int it=0;it<S*KVH*nsub;it++){
             const int s=it/(KVH*nsub),r=it%(KVH*nsub),kv=r/nsub,h0=kv*G+(r%nsub)*gq;
             const int pos=mr?mr[s].pos:pos_base+s,ns=nsel[s];
-            const float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
+            const void *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
             const int *sel=selected+(int64_t)s*maxsel;
             size_t need=(size_t)gq*(ns>0?ns:1);
             if(need>score_cap){free(score);score=falloc((int64_t)need);score_cap=need;}
@@ -3658,13 +3708,23 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
                 mx[g]=-INFINITY;
             }
             for(int j=0;j<ns;j++){
-                const float *kh=Kl+((int64_t)kv*m->kv_cap+sel[j])*D;
+                int64_t at=((int64_t)kv*m->kv_cap+sel[j])*D;
                 int g=0;
-                for(;g+4<=gq;g+=4){
-                    float d4[4];q38_dot8_x4(d4,qh+(int64_t)g*D,D,kh,D);
-                    for(int e=0;e<4;e++){float a=d4[e];a/=sqrtf((float)D);score[(int64_t)(g+e)*ns+j]=a;if(a>mx[g+e])mx[g+e]=a;}
+                if(kv16){
+                    const uint16_t *kh=(const uint16_t*)Kl+at;
+                    for(;g+4<=gq;g+=4){
+                        float d4[4];q38_dot8_h_x4(d4,qh+(int64_t)g*D,D,kh,D);
+                        for(int e=0;e<4;e++){float a=d4[e];a/=sqrtf((float)D);score[(int64_t)(g+e)*ns+j]=a;if(a>mx[g+e])mx[g+e]=a;}
+                    }
+                    for(;g<gq;g++){float a=q38_dot8_h(qh+(int64_t)g*D,kh,D);a/=sqrtf((float)D);score[(int64_t)g*ns+j]=a;if(a>mx[g])mx[g]=a;}
+                } else {
+                    const float *kh=(const float*)Kl+at;
+                    for(;g+4<=gq;g+=4){
+                        float d4[4];q38_dot8_x4(d4,qh+(int64_t)g*D,D,kh,D);
+                        for(int e=0;e<4;e++){float a=d4[e];a/=sqrtf((float)D);score[(int64_t)(g+e)*ns+j]=a;if(a>mx[g+e])mx[g+e]=a;}
+                    }
+                    for(;g<gq;g++){float a=q38_dot8(qh+(int64_t)g*D,kh,D);a/=sqrtf((float)D);score[(int64_t)g*ns+j]=a;if(a>mx[g])mx[g]=a;}
                 }
-                for(;g<gq;g++){float a=q38_dot8(qh+(int64_t)g*D,kh,D);a/=sqrtf((float)D);score[(int64_t)g*ns+j]=a;if(a>mx[g])mx[g]=a;}
             }
             for(int g=0;g<gq;g++){
                 float *sc=score+(int64_t)g*ns,dn=0.f;
@@ -3672,8 +3732,26 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
                 den[g]=dn;memset(heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D,0,(size_t)D*sizeof(float));
             }
             for(int j=0;j<ns;j++){
-                const float *vh=Vl+((int64_t)kv*m->kv_cap+sel[j])*D;
-                for(int g=0;g<gq;g++){float a=score[(int64_t)g*ns+j]/den[g];float *oh=heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
+                int64_t at=((int64_t)kv*m->kv_cap+sel[j])*D;
+                if(kv16){
+                    const uint16_t *vh=(const uint16_t*)Vl+at;
+                    int g=0;
+                    for(;g+4<=gq;g+=4){
+                        float *oh=heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D;
+                        kv16_axpy_x4(oh,oh+D,oh+2*D,oh+3*D,
+                                     score[(int64_t)g*ns+j]/den[g],score[(int64_t)(g+1)*ns+j]/den[g+1],
+                                     score[(int64_t)(g+2)*ns+j]/den[g+2],score[(int64_t)(g+3)*ns+j]/den[g+3],vh,D);
+                    }
+                    for(;g+2<=gq;g+=2){
+                        float *oh=heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D;
+                        kv16_axpy_x2(oh,oh+D,score[(int64_t)g*ns+j]/den[g],score[(int64_t)(g+1)*ns+j]/den[g+1],vh,D);
+                    }
+                    for(;g<gq;g++)
+                        kv16_axpy(heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D,score[(int64_t)g*ns+j]/den[g],vh,D);
+                } else {
+                    const float *vh=(const float*)Vl+at;
+                    for(int g=0;g<gq;g++){float a=score[(int64_t)g*ns+j]/den[g];float *oh=heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
+                }
             }
             for(int g=0;g<gq;g++){
                 const float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)(h0+g)*2*D;float *oh=heads+(int64_t)s*QH*D+(int64_t)(h0+g)*D;
@@ -5510,9 +5588,10 @@ static void ensure_kv(Model *m) {
     int rows=q38_layer_rows(m);
     if(m->K){for(int i=0;i<rows;i++){free(m->K[i]);free(m->V[i]);free(m->IK[i]);}free(m->K);free(m->V);free(m->IK);}
     /* +1: the MTP head's attention rows at index c.layers */
-    m->K=(float**)calloc((size_t)c->layers+1,sizeof(float*));m->V=(float**)calloc((size_t)c->layers+1,sizeof(float*));m->IK=(float**)calloc((size_t)c->layers+1,sizeof(float*));
+    m->K=(void**)calloc((size_t)c->layers+1,sizeof(void*));m->V=(void**)calloc((size_t)c->layers+1,sizeof(void*));m->IK=(float**)calloc((size_t)c->layers+1,sizeof(float*));
     for(int i=0;i<rows;i++)if(i==c->layers||c->is_attn[i]){
-        m->K[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->V[i]=falloc((int64_t)c->kv_heads*m->max_t*c->head_dim);m->IK[i]=falloc((int64_t)m->max_t*c->idx_dim);
+        int64_t kv=(int64_t)c->kv_heads*m->max_t*c->head_dim;
+        m->K[i]=q38_rows_alloc(kv,q38_kv_es());m->V[i]=q38_rows_alloc(kv,q38_kv_es());m->IK[i]=falloc((int64_t)m->max_t*c->idx_dim);
     }
     m->kv_cap=m->max_t;
     kv_prefix_alloc(&m->kvp,m->kv_cap); /* ensure_kv discards the old rows */
@@ -5722,7 +5801,7 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
  * follows one sequence. */
 static void q38_seq_swap(Model *m,Q38Seq *q) {
 #define Q38_SEQ_SWAP(T,a,b) do{T t_=(a);(a)=(b);(b)=t_;}while(0)
-    Q38_SEQ_SWAP(float**,m->K,q->K); Q38_SEQ_SWAP(float**,m->V,q->V); Q38_SEQ_SWAP(float**,m->IK,q->IK);
+    Q38_SEQ_SWAP(void**,m->K,q->K); Q38_SEQ_SWAP(void**,m->V,q->V); Q38_SEQ_SWAP(float**,m->IK,q->IK);
     Q38_SEQ_SWAP(float**,m->DN_rec,q->DN_rec); Q38_SEQ_SWAP(float**,m->DN_conv,q->DN_conv);
     Q38_SEQ_SWAP(int,m->kv_len,q->kv_len); Q38_SEQ_SWAP(kv_prefix,m->kvp,q->kvp);
     Q38_SEQ_SWAP(int64_t*,m->ple_history,q->ple_history);
@@ -5736,14 +5815,14 @@ static void q38_seq_swap(Model *m,Q38Seq *q) {
 static void q38_seq_free(Model *m,Q38Seq *q);
 static int q38_seq_alloc(Model *m,Q38Seq *q) {
     Cfg *c=&m->c; memset(q,0,sizeof *q);
-    q->K=(float**)calloc((size_t)c->layers+1,sizeof(float*)); q->V=(float**)calloc((size_t)c->layers+1,sizeof(float*));
+    q->K=(void**)calloc((size_t)c->layers+1,sizeof(void*)); q->V=(void**)calloc((size_t)c->layers+1,sizeof(void*));
     q->IK=(float**)calloc((size_t)c->layers+1,sizeof(float*));
     q->DN_rec=(float**)calloc((size_t)c->layers,sizeof(float*)); q->DN_conv=(float**)calloc((size_t)c->layers,sizeof(float*));
     int ok=q->K&&q->V&&q->IK&&q->DN_rec&&q->DN_conv&&kv_prefix_alloc(&q->kvp,m->kv_cap);
     for(int i=0;ok&&i<c->layers;i++){
         if(c->is_attn[i]){
             size_t kv=(size_t)c->kv_heads*m->kv_cap*c->head_dim;
-            q->K[i]=(float*)malloc(kv*sizeof(float)); q->V[i]=(float*)malloc(kv*sizeof(float));
+            q->K[i]=malloc(kv*q38_kv_es()); q->V[i]=malloc(kv*q38_kv_es());
             q->IK[i]=(float*)malloc((size_t)m->kv_cap*c->idx_dim*sizeof(float));
             ok=q->K[i]&&q->V[i]&&q->IK[i];
         } else if(i>=m->range_begin&&i<m->range_end){

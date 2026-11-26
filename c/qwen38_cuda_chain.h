@@ -686,15 +686,27 @@ static int q38cc_bufs(Q38CChain *ch, Model *m, int rows) {
         ok = cc_reserve(&ch->gseg, r * W * F, CC_DEV) && cc_reserve(&ch->nseg, r * W * F, CC_DEV);
     return ok;
 }
-/* n of the host's K or V values from src into a mirror at element at (a float16 mirror takes
- * them as halves: the values the rounding left, exact) */
-static int q38cc_kv_up(const Q38CChain *ch, CcBuf *dst, size_t at, const float *src, size_t n) {
-    if (!ch->kvh) return cc_write(dst, at, src, n * sizeof(float));
-    uint16_t *h = (uint16_t *)malloc(n * sizeof(uint16_t));
-    if (!h) return 0;
-    kv16_pack(h, src, (int64_t)n);
-    int ok = cc_write(dst, at / 2, h, n * sizeof(uint16_t));   /* at even: a head's rows start on whole floats */
-    free(h);
+/* n of the host's K or V values from base[idx..] (float16 when q38_kv16(), else float) into a
+ * mirror at element at (float16 mirror when ch->kvh, else float32 mirror). */
+static int q38cc_kv_up(const Q38CChain *ch, CcBuf *dst, size_t at, const void *base, int64_t idx, size_t n) {
+    const int kv16 = q38_kv16();
+    if (ch->kvh && kv16)   /* host and mirror both float16: direct copy (at even: whole floats) */
+        return cc_write(dst, at / 2, (const uint16_t *)base + idx, n * sizeof(uint16_t));
+    if (!ch->kvh && !kv16)
+        return cc_write(dst, at, (const float *)base + idx, n * sizeof(float));
+    if (ch->kvh) {
+        uint16_t *h = (uint16_t *)malloc(n * sizeof(uint16_t));
+        if (!h) return 0;
+        kv16_pack(h, (const float *)base + idx, (int64_t)n);
+        int ok = cc_write(dst, at / 2, h, n * sizeof(uint16_t));
+        free(h);
+        return ok;
+    }
+    float *f = (float *)malloc(n * sizeof(float));
+    if (!f) return 0;
+    kv16_unpack(f, (const uint16_t *)base + idx, (int64_t)n);
+    int ok = cc_write(dst, at, f, n * sizeof(float));
+    free(f);
     return ok;
 }
 /* every attention layer's mirrors off the card (the host's K/V rows stay canonical) */
@@ -940,7 +952,8 @@ static int q38cc_push_kv(Q38CChain *ch, Model *m, int i, int pos_base) {
     int t0 = ch->kv_valid[i], n = pos_base - t0;
     for (int h = 0; h < KVH && ok; h++) {
         size_t src = ((size_t)h * m->kv_cap + t0) * D, dst = ((size_t)h * ch->cap + t0) * D;
-        ok = q38cc_kv_up(ch, ch->kc[i], dst, m->K[i] + src, (size_t)n * D) && q38cc_kv_up(ch, ch->vc[i], dst, m->V[i] + src, (size_t)n * D);
+        ok = q38cc_kv_up(ch, ch->kc[i], dst, m->K[i], (int64_t)src, (size_t)n * D) &&
+             q38cc_kv_up(ch, ch->vc[i], dst, m->V[i], (int64_t)src, (size_t)n * D);
     }
     ok = ok && cc_write(ch->ik[i], (size_t)t0 * ID, m->IK[i] + (size_t)t0 * ID, (size_t)n * ID * 4);
     ch->kv_valid[i] = pos_base;
@@ -1191,11 +1204,12 @@ static void q38cc_kv_down(Q38CChain *ch, Model *m, int i, int n, int pb) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->head_dim, ID = c->idx_dim;
     if (!q38cc_attn_at(c, i)) return;
     const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * q38cc_kv_stride(ch, c);
+    const int kv16 = q38_kv16();
     for (int s = 0; s < n; s++) {
         for (int h = 0; h < c->kv_heads; h++) {
             size_t dst = ((size_t)h * m->kv_cap + pb + s) * c->head_dim, src = (size_t)s * kvo + (size_t)h * c->head_dim;
-            memcpy(m->K[i] + dst, kv + src, c->head_dim * sizeof(float));
-            memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->head_dim * sizeof(float));
+            q38_kv_put(kv16, m->K[i], (int64_t)dst, kv + src, c->head_dim);   /* rounded on the device: exact */
+            q38_kv_put(kv16, m->V[i], (int64_t)dst, kv + (size_t)ch->rows * kvo + src, c->head_dim);
         }
         memcpy(m->IK[i] + (size_t)(pb + s) * ID, kv + 2 * (size_t)ch->rows * kvo + (size_t)s * ID, ID * sizeof(float));
     }
