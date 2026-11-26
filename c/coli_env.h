@@ -1072,10 +1072,10 @@ static const char *coli_env_suggest(const char *name) {
 
 /* Names we own. An unknown FOO=1 in the environment is not our business, but an
  * unknown COLI_FOO=1 almost certainly is. */
-/* Set by `coli serve` on the engine it starts and read back by coli, which finds a port's engine
- * by its environment, never by an engine: not an unknown variable. */
+/* Set by `coli serve` on the engine it starts and read back by coli, or read only by the
+ * gateway (`openai_server.py`), never by an engine: not an unknown variable. */
 static int coli_env_launcher_only(const char *n) {
-    return !strcmp(n, "COLI_SERVE_PORT");
+    return !strcmp(n, "COLI_SERVE_PORT") || !strcmp(n, "COLI_TOOL_TRACE");
 }
 
 static int coli_env_is_ours(const char *n) {

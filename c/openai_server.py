@@ -1290,6 +1290,44 @@ def _tool_hold():
     return max(len(m) for m in _tool_stream_markers()) - 1
 
 
+_TOOL_TRACE_LOCK = threading.Lock()
+
+
+def _call_openers(text):
+    """How many tool calls `text` opens, counted by the family's per-call marker."""
+    # shortcut: kimi's marker opens a block, not a call; count its calls if K3 is ever traced
+    marker = ("<function=" if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder", "lfm3")
+              else _tool_stream_markers()[-1])
+    return text.count(marker)
+
+
+def _tool_trace(request_id, stream, finish, stats, calls, answer, reasoning):
+    """COLI_TOOL_TRACE=<path.jsonl> (off by default): append one JSON line per chat request
+    with tools, so tool-call failure rates can be counted on real replies and the parsers
+    replayed offline on the same text. A failed write is logged, never raised."""
+    path = os.environ.get("COLI_TOOL_TRACE")
+    if not path:
+        return
+    openers, thought = _call_openers(answer), _call_openers(reasoning)
+    error = (f"{openers} call opener(s), {len(calls)} call(s) parsed" if openers > len(calls)
+             else "call opener only in the reasoning" if thought and not calls else None)
+    line = json.dumps({
+        "ts": round(time.time(), 3), "request_id": request_id, "family": chat_flavor(),
+        "stream": stream, "finish": finish, "length_limited": bool(stats["length_limited"]),
+        "completion_tokens": stats.get("completion_tokens"),
+        "n_calls": len(calls), "names": [c["function"]["name"] for c in calls],
+        "openers": openers, "reasoning_openers": thought, "parse_error": error,
+        "answer_chars": len(answer), "answer": answer[:16384],
+        "reasoning_chars": len(reasoning), "reasoning_tail": reasoning[-2048:],
+    }, ensure_ascii=False)
+    try:
+        with _TOOL_TRACE_LOCK, open(path, "a", encoding="utf-8") as trace:
+            trace.write(line + "\n")
+    except OSError as exc:
+        sys.stderr.write(f"[api] COLI_TOOL_TRACE: cannot append to {path}: {exc}\n")
+        sys.stderr.flush()
+
+
 class ToolTextStream:
     """A streamed answer's text with a tool call's syntax kept out of it, for every family and
     for both API surfaces (/v1/chat/completions and /v1/messages each had this loop).
@@ -9991,6 +10029,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if calls:
                         message["tool_calls"] = calls
                     finish = "tool_calls" if calls else length_finish
+                    _tool_trace(request_id, False, finish, stats, calls, text, reasoning)
                     choice = {"index": 0, "message": message, "logprobs": logprobs_obj,
                               "finish_reason": finish}
                 else:
@@ -10064,7 +10103,11 @@ class APIHandler(BaseHTTPRequestHandler):
                           {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
                 event([choice])
 
+            traced_reasoning = []         # kept only for COLI_TOOL_TRACE
+
             def emit_reasoning(text):     # thinking → reasoning_content deltas (chat only)
+                if tools and os.environ.get("COLI_TOOL_TRACE"):
+                    traced_reasoning.append(text)
                 event([{"index": 0, "delta": {"reasoning_content": text},
                         "logprobs": None, "finish_reason": None}])
 
@@ -10173,6 +10216,8 @@ class APIHandler(BaseHTTPRequestHandler):
                              "arguments": tc["function"]["arguments"]}}]},
                             "logprobs": None, "finish_reason": None}])
                 finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
+                _tool_trace(request_id, True, finish, stats, calls, "".join(raw),
+                            "".join(traced_reasoning))
             else:
                 if splitter is not None:                   # inkling content/marker splitter
                     content_split = splitter
