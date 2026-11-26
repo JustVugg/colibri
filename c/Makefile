@@ -2522,6 +2522,9 @@ tests/test_st_mirror$(EXE): tests/test_st_mirror.c
 tests/test_st_mirror_gguf$(EXE): tests/test_st_mirror_gguf.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_mirror_policy$(EXE): tests/test_mirror_policy.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_st_overlay$(EXE): tests/test_st_overlay.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
