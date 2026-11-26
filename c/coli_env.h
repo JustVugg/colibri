@@ -941,6 +941,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"TRUNK_RESIDENT_LAYERS", CE_INT, CE_COLIBRI, 0, NULL},
     {"URING",                            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"USAGE_SAVE", CE_STR, CE_ALL | CE_COLIBRI | CE_DSV4 | CE_GLM53 | CE_INKLING | CE_KIMI | CE_OLMOE | CE_QWEN38 | CE_QWEN | CE_DSV41 | CE_MIMO, 0, NULL},
+    {"USERPROFILE", CE_STR, 0, 0, NULL},   /* colibri-tui: the home folder on Windows, where ~/colibri-images goes */
     {"V41_DIRECT", CE_BOOL, CE_DSV41, 0, NULL},
     {"V41_DSPARK", CE_BOOL, CE_DSV41, 0, NULL},
     {"V41_DSPARK_GATE", CE_INT, CE_DSV41, 0, NULL},

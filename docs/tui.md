@@ -43,7 +43,14 @@ The release archives carry it next to `coli`.
   context it holds. They live in the TUI's memory: closing it forgets them.
 - **The answer** as it streams, its markdown drawn (bold, code, lists). The
   reasoning is folded behind its time; `ctrl+r` opens it. Under the answer, its
-  tokens, tok/s and seconds.
+  tokens, tok/s and seconds. Each answer has a **copy** button on its first line,
+  and each code block one on its header, which also names the language.
+- **A picture**, when the server runs an image model (Qwen-Image): the message
+  is the prompt, sent to `/v1/images/generations`, and the answer is the
+  picture drawn in half blocks (two pixels a cell, in any 24-bit colour
+  terminal) with its size, seed and steps. The PNG itself, at full size, is
+  saved in `~/colibri-images` (`%USERPROFILE%\colibri-images` on Windows);
+  **open** shows it in the system's viewer, **copy path** copies where it is.
 - **The monitor** (`F2`): the chat page's Overview and Profiling. The model's
   state, the turn in flight (speed now, tokens written, the prompt, tokens per
   step), the engine's CPU and RAM, the last two minutes of tok/s, the last turn's
@@ -96,6 +103,9 @@ choose by hand.
 | ctrl+b | hides the conversations |
 | esc | stops the answer |
 | ctrl+x | drops the files the next message would take |
+| ctrl+y | copies the last answer, whole (a picture's: its file's path) |
+| ctrl+k | copies the last answer's last code block |
+| a click on copy | copies that answer, or that code block |
 | a drag over the text | selects it; the release copies it |
 | page up, page down, the wheel | scroll |
 | ctrl+q | quits |
@@ -110,7 +120,11 @@ the TUI). The files waiting are listed above the input, and the message shows
 their names. Without `coli tui` (`colibri-tui` on its own) plain text files and
 pictures still go; the other documents need the reader.
 
-A drag over the text selects it and the release copies it: to the clipboard on
+The copy buttons and `ctrl+y` / `ctrl+k` copy the text the model wrote: a whole
+answer however long it is, a code block without its fences and with its long
+lines whole. A drag over the text selects the cells on the screen and the release
+copies them: what is on the screen, so a line the screen wrapped comes out as two
+and an answer taller than the window comes out cut. Both go to the clipboard on
 Windows; elsewhere through the terminal (OSC 52, which most terminals and tmux
 take) and through `wl-copy`, `xclip` or `xsel` where one runs, `pbcopy` on
 macOS. On a POSIX terminal shift and a drag still make the terminal's own
@@ -124,6 +138,6 @@ from 90 columns. The mouse picks a conversation and plays with the bird.
 
 ## Not yet
 
-Generated pictures, System One, tools and agents, conversations saved to disk, and
+System One, tools and agents, conversations saved to disk, and
 languages besides English and Italian (`--lang it|en`; the default is the
 system's).
