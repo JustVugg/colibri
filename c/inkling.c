@@ -98,6 +98,16 @@ static int g_ink_dho = 0;       /* COLI_VK_DENSE_HOST: the dense matrices on the
  * device; L = 0 while there is none (the chain off, or one that declines as before). */
 static VkcFit g_inkc_fit;
 #endif
+/* INK2_MTP's drafter on the Vulkan chain (inkling2_mtp.h): the chain stays on with the drafter;
+ * INK2_MTP_CHAIN=0 turns the chains off for the CPU's drafter instead */
+static int g_ink2mc = 0;
+static int ink2mc_wanted(void) {
+#ifdef COLI_VULKAN
+    const char *e = getenv("INK2_MTP_CHAIN"); return !(e && *e == '0');
+#else
+    return 0;
+#endif
+}
 /* The routed-expert tier on either device (xtier.h): Vulkan's (vk_tier.h), or CUDA's
  * (cu_tier.h, the same tier over the CUDA backend) once ink_cu_tier_start chose it. A build
  * without one of them has its stubs, so XT(...) is always defined. */
@@ -1613,11 +1623,15 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
          * COLI_METAL=1: not measured on a Mac yet, so off unless asked */
         const char *im = getenv("INK2_METAL");
         if (!(im && *im == '1')) setenv("COLI_METAL", "0", 1);
-        /* INK2_MTP: the drafter reads the layers' streams on the host, and its verify rolls the
-         * state back, which the dense chains keep a copy of on the device: they stay off */
+        /* INK2_MTP: the CPU's drafter reads the layers' streams on the host, and its verify rolls the
+         * state back, which the dense chains keep a copy of on the device: they stay off, but the
+         * Vulkan chain, which runs the drafter itself (inkling2_mtp.h; INK2_MTP_CHAIN=0: off too) */
         if (ink2m_wanted()) {
-            setenv("COLI_VK_CHAIN", "0", 1); unsetenv("COLI_CUDA_CHAIN");
-            fprintf(stderr, "[inkling2] INK2_MTP: the dense chains off (the drafter reads the layers on the host)\n");
+            setenv("COLI_CUDA_CHAIN", "0", 1);   /* on by default for the Mini now: unset no longer keeps it off */
+            if (!ink2mc_wanted()) {
+                setenv("COLI_VK_CHAIN", "0", 1);
+                fprintf(stderr, "[inkling2] INK2_MTP: the dense chains off (the drafter reads the layers on the host)\n");
+            }
         }
 #if !defined(COLI_CUDA) && !defined(COLI_VULKAN)
         fprintf(stderr, "[inkling2] Inkling-2 runs on the CPU in this build\n");
@@ -1745,6 +1759,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         }
         m->vis = ink2_vision_load(m, snap);
         if (ink2m_wanted()) m->mtp = ink2m_load(m, snap);
+        g_ink2mc = m->mtp && ink2mc_wanted();
     } else if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
         { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }

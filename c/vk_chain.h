@@ -444,7 +444,7 @@ void vkc_relattn_part(VkcBuf *part);
  *                  hd channels), (conv + input) / fc, the state of K-1 inputs a channel in ring */
 typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps, scale; } VkcInk2Mix;
 typedef struct { int nseg, n, per_row, x_off, x_row, has_w, w_off; float thr; } VkcInk2Clip;
-typedef struct { int S, C, K, hd, x_off, x_row, d_off, d_row, st_off, ring_off; float fc; } VkcInk2Dconv;
+typedef struct { int S, C, K, hd, x_off, x_row, d_off, d_row, st_off, ring_off; float fc; int snap; } VkcInk2Dconv;   /* snap > 0: the state after each row s also at ring_off + (s+1)*snap (an MTP verify) */
 int  vkc_ink2_ready(void);
 int  vkc_ink2_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcInk2Mix *p);
 int  vkc_ink2_clip(VkcBuf *x, VkcBuf *prm, const VkcInk2Clip *p);
