@@ -105,6 +105,12 @@ typedef struct {
     CcBuf *outdev, *gpick;   /* a greedy caller's logits on the card and their picks down (q38cc_greedy_ok) */
     unsigned long long greedy_rows;
     CcBuf *gseg, *nseg;               /* a deep verify's PLE rows past its first copy (q38cc_ple) */
+    CcBuf *lgn, *lgnd;                /* Q38_NEXT_PREFETCH: the next layer's router on this MoE input */
+    uint8_t *npf_mark;                /* per expert: 1 guessed, 2 read ahead, 4 routed (=2: 8 confident, 16 in VRAM or RAM) */
+    int npf_at, npf_jobs_n;           /* npf_at: the guessed layer + 1, 0 = none */
+    int npf_mode, npf_max, npf_hold;  /* =2: at most npf_max reads a layer; npf_hold: the read waits for this layer's demand reads */
+    float npf_minp, *npf_p;           /* =2: the router probability a read needs; per expert the rows' highest */
+    Q38ExpertLoadJob *npf_jobs;       /* the read in flight on the loader thread */
     /* the MTP head's layer (index c.layers) on the device (q38cc_mtp_rows): its norms in prm, the
      * embedding rows in (fin), a one per stream (ones), the rows and drafts it ran */
     int mtp_on; size_t o_mtp_emb, o_mtp_hid, o_mtp_mix; CcBuf *fin, *ones;
@@ -2983,6 +2989,148 @@ static void q38cc_dm_books(Q38CChain *ch, Model *m, int n, int pb) {
     }
     if (ch->own && ch->promo_rate > 0) q38cc_promote_books(ch, m, n);
 }
+/* Q38_NEXT_PREFETCH=1 (default off; forwards of up to Q38_SPEC_ROWS rows, decode and verify, on
+ * the host's routed step: not beside the routed experts in the frame): frame A1 of layer i also
+ * runs layer i+1's router on layer i's MoE input; each row's top-k of it guesses layer i+1's
+ * route. The guessed experts neither resident in VRAM nor in layer i+1's RAM cache are read
+ * into that cache by the loader thread while layer i's experts compute, and layer i+1 waits for
+ * that read before its own route uses the cache. Prefetch only: the routes, the values and the
+ * tokens are the switch-off run's.
+ * Q38_NEXT_PREFETCH=2: only the confident guesses are read: router probability (the softmax of
+ * the guessed logits, the rows' highest) of at least Q38_NPF_MIN_P (0.10), at most Q38_NPF_MAX
+ * (4) a layer, the most probable first. A demand read goes first: when layer i has misses to
+ * read, the prefetch waits until layer i's MoE is done; any demand read in flight holds the
+ * records not yet started (q38_npf_turn), and layer i+1's join cancels them instead of
+ * waiting: only records already being read are waited for. */
+static void q38cc_npf_topk(const float *lg, int n, int E, int K, uint8_t *mark, uint8_t bit) {
+    for (int r = 0; r < n; r++) {   /* q38_route_row's order: strict >, the lower index on a tie */
+        const float *x = lg + (size_t)r * E; int pick[Q38_MAX_TOPK];
+        for (int z = 0; z < K; z++) {
+            int best = -1; float bv = -INFINITY;
+            for (int e = 0; e < E; e++) {
+                int used = 0; for (int j = 0; j < z; j++) used |= pick[j] == e;
+                if (!used && x[e] > bv) { bv = x[e]; best = e; }
+            }
+            pick[z] = best; if (best >= 0) mark[best] |= bit;
+        }
+    }
+}
+/* =2: mark (8) at most maxn guesses (1) not in VRAM or RAM (16) whose probability p[e] -- the
+ * softmax of each row's logits lg, the rows' highest -- is at least minp, the highest first */
+static int q38cc_npf_confident(const float *lg, int n, int E, float minp, int maxn, uint8_t *mk, float *p) {
+    for (int e = 0; e < E; e++) p[e] = 0.f;
+    for (int r = 0; r < n; r++) {
+        const float *x = lg + (size_t)r * E; float mx = x[0]; double all = 0;
+        for (int e = 1; e < E; e++) if (x[e] > mx) mx = x[e];
+        for (int e = 0; e < E; e++) all += expf(x[e] - mx);
+        for (int e = 0; e < E; e++) { float q = (float)(expf(x[e] - mx) / all); if (q > p[e]) p[e] = q; }
+    }
+    int k = 0;
+    for (; k < maxn; k++) {
+        int best = -1;
+        for (int e = 0; e < E; e++)
+            if ((mk[e] & (1 | 8 | 16)) == 1 && p[e] >= minp && (best < 0 || p[e] > p[best])) best = e;
+        if (best < 0) break;
+        mk[best] |= 8;
+    }
+    return k;
+}
+/* Q38_NEXT_PREFETCH: 0 off, 1 every guess, 2 the confident ones, after the demand reads
+ * (parsed at open, q38_npf_settings) */
+static int q38cc_npf_env(Q38CChain *ch, const Model *m) {
+    g_q38_npf_prio = m->npf_mode == 2;   /* set between forwards only: no demand read is counted across it */
+    ch->npf_minp = m->npf_minp; ch->npf_max = m->npf_max;
+    return ch->npf_mode = m->npf_mode;
+}
+static int q38cc_npf_bufs(Q38CChain *ch, Model *m, int rows) {
+    int E = m->c.experts;
+    if (!ch->npf_mark && !(ch->npf_mark = (uint8_t *)calloc((size_t)E, 1))) return 0;
+    if (!ch->npf_p && !(ch->npf_p = (float *)calloc((size_t)E, sizeof(float)))) return 0;
+    return cc_reserve(&ch->lgn, (size_t)rows * E * 4, CC_DEV) && cc_reserve(&ch->lgnd, (size_t)rows * E * 4, CC_DOWN);
+}
+/* the read in flight, if any, published into its layer's cache */
+static void q38cc_npf_join(Model *m, Q38CChain *ch) {
+    if (!ch->npf_jobs_n) return;
+    double t0 = now_s();
+    pthread_mutex_lock(&g_q38_ld.mx);
+    if (g_q38_ld.busy && g_q38_ld.pf) { g_q38_ld.stop = 1; pthread_cond_broadcast(&g_q38_ld.cv); }   /* =2: the records not started are dropped */
+    while (g_q38_ld.busy) pthread_cond_wait(&g_q38_ld.cv, &g_q38_ld.mx);
+    pthread_mutex_unlock(&g_q38_ld.mx);
+    q38_tm_add(m, Q38_TM_EXPERT_READ, t0);   /* what the layer waited for it, not the read's own time */
+    int nd = 0;
+    LCache *lc = &m->cache[ch->npf_at - 1];
+    for (int k = 0; k < ch->npf_jobs_n; k++) {
+        Q38ExpertLoadJob *j = &ch->npf_jobs[k];
+        if (j->done) { ch->npf_jobs[nd++] = *j; continue; }
+        /* =2: cancelled before its read, so the slot still holds the expert it displaced: that one is
+         * published again with its LRU stamp; a slot that held none stays empty, the first victim */
+        Slot *s = j->slot;
+        if (j->victim >= 0 && lc->by_expert[j->victim] < 0) {
+            s->eid = j->victim; s->used = j->victim_used; lc->by_expert[j->victim] = (int)(s - lc->slots);
+        } else s->used = 0;
+        ch->npf_mark[j->expert] &= (uint8_t)~2; m->npf_cancel++;
+    }
+    q38_expert_batch_publish(m, ch->npf_at - 1, ch->npf_jobs, nd);
+    free(ch->npf_jobs); ch->npf_jobs = NULL; ch->npf_jobs_n = 0;
+}
+/* layer `layer`'s route (lgd) against its guess; drop = 1: the forward ended before it */
+static void q38cc_npf_score(Model *m, Q38CChain *ch, int layer, int n, int drop) {
+    if (ch->npf_at != layer + 1) return;
+    int E = m->c.experts; uint8_t *mk = ch->npf_mark;
+    if (!drop) q38cc_npf_topk((const float *)cc_ptr(ch->lgd), n, E, m->c.topk, mk, 4);
+    for (int e = 0; e < E; e++) {
+        int g = mk[e] & 1, rd = (mk[e] >> 1) & 1, r = (mk[e] >> 2) & 1;
+        if (!drop) { m->npf_guess += g; m->npf_routed += r; m->npf_hit += g & r; m->npf_issued += rd; m->npf_used += rd & r; }
+        mk[e] = 0;
+    }
+    ch->npf_at = 0;
+}
+static void q38cc_npf_issue(Model *m, Q38CChain *ch, int t, int n) {
+    int E = m->c.experts; LCache *lc = &m->cache[t]; uint8_t *mk = ch->npf_mark;
+    q38cc_npf_topk((const float *)cc_ptr(ch->lgnd), n, E, m->c.topk, mk, 1);
+    ch->npf_at = t + 1;
+    int x4 = q38_layer_int4(m, t), held = 0;
+    if (lc->cap < 1 || g_q38_gguf || (!x4 && (!m->native_fp8 || !q38_prepare_expert_scale_bank(m, t)))) return;   /* no batch reader: counted only */
+    if (ch->npf_mode == 2) {
+        for (int e = 0; e < E; e++) if ((mk[e] & 1) && (lc->by_expert[e] >= 0 || qt_is_resident(t, e))) mk[e] |= 16;
+        if (!q38cc_npf_confident((const float *)cc_ptr(ch->lgnd), n, E, ch->npf_minp, ch->npf_max, mk, ch->npf_p)) return;
+        q38cc_npf_topk((const float *)cc_ptr(ch->lgd), n, E, m->c.topk, mk, 32);   /* layer t-1's route: misses still to read? */
+        for (int e = 0; e < E; e++) {
+            if ((mk[e] & 32) && m->cache[t - 1].by_expert[e] < 0 && !qt_is_resident(t - 1, e)) held = 1;
+            mk[e] &= (uint8_t)~32;
+        }
+    }
+    unsigned char *keep = (unsigned char *)calloc((size_t)lc->cap, 1);
+    Q38ExpertLoadJob *jobs = (Q38ExpertLoadJob *)malloc((size_t)E * sizeof *jobs);
+    if (!keep || !jobs) { free(keep); free(jobs); return; }
+    for (int e = 0; e < E; e++) if ((mk[e] & 1) && lc->by_expert[e] >= 0) keep[lc->by_expert[e]] = 1;   /* guessed and in RAM: kept */
+    int nj = 0;
+    for (int e = 0; e < E; e++) {
+        if (!(mk[e] & 1) || lc->by_expert[e] >= 0 || qt_is_resident(t, e) || (ch->npf_mode == 2 && !(mk[e] & 8))) continue;
+        Q38ExpertLoadJob *j = &jobs[nj];
+        if (!x4 && !q38_native_fp8_expert_tensors(m, t, e, j->weight)) continue;
+        Slot *s;
+        j->victim = -1;
+        if (lc->n < lc->cap) s = &lc->slots[lc->n++];
+        else {
+            int v = q38_victim(lc, t, keep);
+            if (v < 0) break;   /* every slot holds a guess */
+            s = &lc->slots[v]; if (s->eid >= 0) lc->by_expert[s->eid] = -1;
+            j->victim = s->eid; j->victim_used = s->used;   /* given back if the record is cancelled */
+        }
+        s->eid = -1; s->used = ++m->clock; keep[s - lc->slots] = 1;
+        j->expert = e; j->slot = s; j->done = 0; mk[e] |= 2; nj++;
+    }
+    free(keep);
+    if (!nj) { free(jobs); return; }
+    ch->npf_jobs = jobs; ch->npf_jobs_n = nj;
+    if (held) { q38_npf_demand(1); ch->npf_hold = 1; m->npf_held++; }   /* released when layer t-1's MoE returns */
+    if (!q38_loader_start(m, t, jobs, nj, ch->npf_mode == 2)) {   /* no thread: in line */
+        if (held) { q38_npf_demand(-1); ch->npf_hold = 0; }
+        q38_expert_batch_load(m, t, jobs, nj, q38_read_team(), 0);
+    }
+}
+
 /* n rows of streams into hyper: a decode step's, a verify's or a draft's through mapped memory and a
  * copy kernel (cc_copy), not the copy engine, where they waited behind the megabytes of the experts
  * the chain promotes (cc_host_up: a draft's frame up to 12.5 ms late on an RTX PRO 4000); a
@@ -3601,6 +3749,8 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         if (!df_reserve(&g_q38_df, need, m->kv_cap)) { fprintf(stderr, "[dflash] device memory for the drafter's rows refused: drafts off\n"); g_q38_df.on = 0; }
     }
     double w0 = ch->wait_ms, h0 = ch->host_ms;
+    /* Q38_NEXT_PREFETCH: on the host's routed step only (not beside the routed experts in the frame) */
+    int pf = S <= Q38_SPEC_ROWS && E > 0 && !ch->dm_on && q38cc_npf_env(ch, m) && q38cc_npf_bufs(ch, m, rows);
     ch->pc_prompt = q38cc_pc_take(ch, m, S);   /* a short prompt's pooled experts on the CPU */
     pd = q38cc_pd_begin(ch, S); pd_t0 = now_s();
     if (S > Q38CC_DM_ROWS && ch->pool_of) { if (ch->pc_prompt) ch->pc_took++; else ch->pc_staged++; }
@@ -3690,19 +3840,28 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) &&
                  cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H);
             if (ok && pend_v) { ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v); pend_v = 0; }   /* before a wait for the frame */
+            int guess = pf && i + 1 < L;   /* Q38_NEXT_PREFETCH: the next layer's router on this MoE input */
+            ok = ok && (!guess || (cc_matmul(q38cc_t(ch, &m->L[i + 1].router), ch->mixed, 0, ch->lgn, 0, n) &&
+                                   cc_copy(ch->lgnd, 0, ch->lgn, 0, (size_t)n * E)));
             double t0 = now_s();
             ok = ok && cc_submit(1);   /* A1 */
             m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
             if (!ok) break;
+            if (pf) {   /* this layer's read ahead in its cache, then the next layer's started */
+                q38cc_npf_join(m, ch); q38cc_npf_score(m, ch, i, n, 0);
+                if (guess) q38cc_npf_issue(m, ch, i + 1, n);
+            }
             q38cc_kv_down(ch, m, i, n, pb);
             ok = q38cc_frame_begin(ch) && q38cc_shared(ch, m, l, i, n) && cc_submit(0);   /* A2 */
             double t1 = now_s();
             q38_moe_ex(m, l, i, (const float *)cc_ptr(ch->mixd), n, ch->host_routed, (const float *)cc_ptr(ch->lgd), 1);
+            if (ch->npf_hold) { q38_npf_demand(-1); ch->npf_hold = 0; }   /* =2: this layer's demand reads are done */
             memcpy(cc_ptr(ch->routed), ch->host_routed, (size_t)n * H * sizeof(float));
             ch->host_ms += (now_s() - t1) * 1e3;
             ok = ok && q38cc_frame_begin(ch);
             routed = ch->routed; pending = 1;
         }
+        if (pf) { q38cc_npf_join(m, ch); q38cc_npf_score(m, ch, ch->npf_at - 1, n, 1); }   /* a forward cut short: nothing left in flight */
         if (ok) ok = q38cc_moe_apply(ch, m, n, routed);
         if (ok) { q38cc_df_tap(m, ch, L - 1, n, 0); q38cc_df_ctx(m, n, pb); }
         if (ok && want_streams) ok = cc_copy(ch->hypd, 0, ch->hyper, 0, (size_t)n * W);
@@ -3907,6 +4066,16 @@ static void q38cc_report(Model *m) {
                     "%.1f ms of routed experts on the host, %.1f MiB on the device; per decode step %.2f ms waiting, %.2f ms of experts (%llu steps)\n",
             ch->forwards, st.frames, st.ops, st.matmuls, ch->wait_ms, ch->host_ms, st.dev_bytes / 1048576.0,
             ch->dec_n ? ch->dec_wait_ms / ch->dec_n : 0.0, ch->dec_n ? ch->dec_host_ms / ch->dec_n : 0.0, ch->dec_n);
+    if (m->npf_guess)
+        fprintf(stderr, "[chain] qwen38: Q38_NEXT_PREFETCH guessed %llu experts, %llu routed (%.1f %% of the guesses, %.1f %% of "
+                        "%llu routed); read ahead %llu, used %llu, wasted %llu\n",
+                (unsigned long long)m->npf_guess, (unsigned long long)m->npf_hit, 100.0 * m->npf_hit / m->npf_guess,
+                m->npf_routed ? 100.0 * m->npf_hit / m->npf_routed : 0.0, (unsigned long long)m->npf_routed,
+                (unsigned long long)m->npf_issued, (unsigned long long)m->npf_used,
+                (unsigned long long)(m->npf_issued - m->npf_used));
+    if (m->npf_guess && ch->npf_mode == 2)
+        fprintf(stderr, "[chain] qwen38: Q38_NEXT_PREFETCH=2 cancelled %llu records before they started, %llu layers' reads waited for demand reads\n",
+                (unsigned long long)m->npf_cancel, (unsigned long long)m->npf_held);
     if (ch->dm_steps)
         fprintf(stderr, "[chain] qwen38: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes), %llu slots from the host pool\n",
