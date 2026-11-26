@@ -76,7 +76,9 @@ class RegistryEngineAgreementTest(unittest.TestCase):
             with self.subTest(family=family.id):
                 rule = engine_rule(family.engine_artifact)
                 self.assertTrue(rule, f"no Makefile rule for {family.engine_artifact}")
-                has_backend = any(obj in rule for obj in BACKEND_OBJECTS)
+                # $(QWEN36_METAL_OBJ) alone (qwen36_metal.o: the Metal kernels qwenimage's opt-in
+                # projections use, #3074) is no tier backend: qwen36 links $(METAL_OBJ) beside it
+                has_backend = any(obj in rule.replace("$(QWEN36_METAL_OBJ)", "") for obj in BACKEND_OBJECTS)
                 self.assertEqual(
                     has_backend, family.supports_accelerator,
                     f"{family.id}: the build rule "

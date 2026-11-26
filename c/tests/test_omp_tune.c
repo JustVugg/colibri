@@ -140,6 +140,35 @@ static int test_apple_tiers(void)
     return fail;
 }
 
+/* The team from the counts (coli_omp_team_from), with the topology unreadable too (#3038) */
+static int test_team_from(void)
+{
+    struct { int phys, perf, logical, quota, want, bounded; const char *what; } c[] = {
+        {0, 0, 20, 1, 1, 1, "no topology, a quota of one CPU: one thread (#3038)"},
+        {0, 0, 20, 7, 7, 1, "no topology, a quota of seven"},
+        {0, 0, 20, 0, 20, 0, "no topology, no quota: OpenMP's team stands"},
+        {0, 0, 20, 32, 20, 0, "no topology, a quota above the team"},
+        {16, 0, 32, 0, 16, 0, "SMT: the physical cores"},
+        {24, 8, 24, 0, 8, 0, "hybrid: the performance cores"},
+        {48, 0, 96, 7, 7, 1, "a quota of 7.65 on a 48-core host (#2914)"},
+        {16, 0, 8, 0, 8, 0, "a cpuset of 8 on 16 cores: never above OpenMP's team"},
+        {16, 0, 4, 7, 4, 1, "a quota of 7 on a cpuset of 4 stays at the 4"},
+        {8, 8, 8, 0, 8, 0, "one kind of core: every core"},
+    };
+    int fail = 0;
+    for (size_t i = 0; i < sizeof c / sizeof *c; i++) {
+        int bounded = -1;
+        int got = coli_omp_team_from(c[i].phys, c[i].perf, c[i].logical, c[i].quota, &bounded);
+        if (got != c[i].want || bounded != c[i].bounded) {
+            fprintf(stderr, "team from counts: %s: got %d (bounded %d), want %d (bounded %d)\n",
+                    c[i].what, got, bounded, c[i].want, c[i].bounded);
+            fail = 1;
+        }
+    }
+    if (coli_omp_team_from(0, 0, 20, 1, NULL) != 1) { fprintf(stderr, "team from counts: no flag asked for\n"); fail = 1; }
+    return fail;
+}
+
 /* The probe's decision on a table of region times: `slow_from` is the first team size the
  * machine does not give its CPUs (0: every size is fine), `asked` counts the sizes timed. */
 typedef struct { int slow_from; double fast, slow; int asked; } ProbeTable;
@@ -183,7 +212,7 @@ int main(void)
 {
     if (test_apple_tiers()) return 1;
 #ifndef _OPENMP
-    if (test_probe_pick()) return 1;
+    if (test_probe_pick() || test_team_from()) return 1;
     puts("test_omp_tune: ok (OpenMP unavailable; helper is a no-op)");
     return 0;
 #else
@@ -201,6 +230,7 @@ int main(void)
 
     fail |= test_cgroup_cpu_quota_bound();
     fail |= test_probe_pick();
+    fail |= test_team_from();
 
     unsetenv("OMP_NUM_THREADS");
     unsetenv("COLI_NO_OMP_TUNE");

@@ -1779,6 +1779,11 @@ jobs:
           for ref in a b; do
             ./qwenimage --model "$fixture" --ref "$fixture/edit/$ref"
           done
+      - name: Single-reference editing through the CLI and Images API
+        run: |
+          cd c
+          QWENIMAGE_EDIT_TINY="$RUNNER_TEMP/qwenimage-edit" \
+            python3 -m unittest -v tests.test_qwen_image_gateway.RealEngineEditsTest
       - name: The shipping defaults (int8 weights) end to end, and the serve protocol
         run: |
           cd c

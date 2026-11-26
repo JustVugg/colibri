@@ -40,22 +40,47 @@ static float *qi_image_pixels(const uint8_t *rgba, int width, int grid_h, int gr
     return pixels;
 }
 
+enum { QI_IMAGE_PAD, QI_VISION_START, QI_VISION_END, QI_VIDEO_PAD, QI_VISION_MARKERS };
+
+static int qi_image_markers(Te *te, int ids[QI_VISION_MARKERS])
+{
+    const char *names[QI_VISION_MARKERS] = {
+        "<|image_pad|>", "<|vision_start|>", "<|vision_end|>", "<|video_pad|>",
+    };
+    for (int i = 0; i < QI_VISION_MARKERS; i++) {
+        int id = tok_id_of(&te->tok, names[i]);
+        ids[i] = id;
+        if (i == QI_VIDEO_PAD && id < 0) continue;
+        if (id < 0 || id >= te->vocab) return 0;
+        for (int j = 0; j < te->tok.nsp; j++)
+            if (te->tok.sp[j].id == id && strcmp(te->tok.sp[j].str, names[i])) return 0;
+    }
+    const hmap *vocab = &te->tok.vocab;
+    for (int i = 0; i < vocab->cap; i++) {
+        const ment *entry = &vocab->e[i];
+        if (!entry->used) continue;
+        for (int j = 0; j < QI_VISION_MARKERS; j++)
+            if (entry->v == ids[j] && strcmp(entry->k, names[j])) return 0;
+    }
+    return 1;
+}
+
 static int *qi_image_tokens(Te *te, const char *prompt, int slots, int *tokens,
                             int *drop, int *image_start)
 {
+    int marker[QI_VISION_MARKERS];
+    if (!qi_image_markers(te, marker)) return NULL;
     int n;
     int *ids = te_encode_prompt_impl(te, prompt, 1, &n, drop);
-    int pad = tok_id_of(&te->tok, "<|image_pad|>");
-    int start = tok_id_of(&te->tok, "<|vision_start|>");
-    int end = tok_id_of(&te->tok, "<|vision_end|>");
-    int video = tok_id_of(&te->tok, "<|video_pad|>");
+    int pad = marker[QI_IMAGE_PAD], start = marker[QI_VISION_START];
+    int end = marker[QI_VISION_END], video = marker[QI_VIDEO_PAD];
     int at = -1, markers = 0;
     for (int i = 0; i < n; i++) {
         if (ids[i] == pad) at = i;
         if (ids[i] == pad || ids[i] == start || ids[i] == end || ids[i] == video)
             markers++;
     }
-    if (pad < 0 || start < 0 || end < 0 || markers != 3 ||
+    if (markers != 3 ||
         at < 1 || at < *drop || at >= n - 1 || ids[at - 1] != start ||
         ids[at + 1] != end || n - *drop - 1 > QI_MAX_PROMPT_TOKENS ||
         n > 16384 - slots) {
@@ -111,10 +136,7 @@ static int qi_vision_weight(shards *store, const char *prefix, const char *suffi
     snprintf(key, sizeof key, "%s.%s", prefix, suffix);
     st_tensor *t = st_find(store, key);
     int64_t cells = (int64_t)rows * width;
-    int type = t ? st_ggml_type_any(t->dtype) : -1;
-    if (!t || (type != GQ_F32 && type != GQ_F16 && type != GQ_BF16) ||
-        t->rank < 1 || t->shape[0] != rows ||
-        t->nbytes != cells * (type == GQ_F32 ? 4 : 2)) {
+    if (!st_f32_readable(t, cells) || t->rank < 1 || t->shape[0] != rows) {
         if (destination) fprintf(stderr, "[qwenimage] vision tensor %s missing or unsupported\n", key);
         return 0;
     }
@@ -315,6 +337,11 @@ static int qi_image_text_supported(const Te *te)
 static int te_image_supported(Te *te, const char *model)
 {
     if (!qi_image_text_supported(te)) return 0;
+    te_tokenizer(te, model);
+    int tokens, drop, start;
+    int *ids = qi_image_tokens(te, "x", 1, &tokens, &drop, &start);
+    if (!ids) return 0;
+    free(ids);
     QiVision vision = {0};
     te_open(te, model);
     int supported = qi_vision_load(te, model, &vision, 0);

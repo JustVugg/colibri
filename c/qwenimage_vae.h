@@ -135,31 +135,47 @@ static float *qiv_alloc(size_t n){
 
 /* ----------------------------------------------------------------- loading -- */
 
-static float *qiv_read(shards *S, const char *name, int64_t numel, char *err, size_t errn){
+/* A NULL destination checks metadata using the same rules as a load. */
+static int qiv_tensor_load(shards *S, const char *name, int64_t numel, float **out, char *err, size_t errn){
     st_tensor *t = st_find(S, name);
-    if (!t) { snprintf(err, errn, "missing tensor %s", name); return NULL; }
+    if (!t) { snprintf(err, errn, "missing tensor %s", name); return -1; }
     if (t->numel != numel) {
         snprintf(err, errn, "tensor %s has %lld elements, expected %lld", name,
                  (long long)t->numel, (long long)numel);
-        return NULL;
+        return -1;
     }
+    if (!st_f32_readable(t, numel)) {
+        snprintf(err, errn, "tensor %s has unsupported dtype or byte size", name);
+        return -1;
+    }
+    if (!out) return 0;
     float *p = qiv_alloc((size_t)numel);
-    if (!p) { snprintf(err, errn, "out of memory reading %s", name); return NULL; }
+    if (!p) { snprintf(err, errn, "out of memory reading %s", name); return -1; }
     st_read_f32(S, name, p, 1);
+    *out = p;
+    return 0;
+}
+
+static float *qiv_read(shards *S, const char *name, int64_t numel, char *err, size_t errn){
+    float *p = NULL;
+    qiv_tensor_load(S, name, numel, &p, err, errn);
     return p;
 }
 
 static int qiv_load_conv(shards *S, size_t *wbytes, const char *pfx, int cin, int cout, int k, QivConv *c, char *err,
                          size_t errn) {
     char nm[256];
-    c->cin = cin; c->cout = cout; c->k = k;
+    float *w = NULL, *b = NULL;
     snprintf(nm, sizeof nm, "%s.weight", pfx);
-    float *w = qiv_read(S, nm, (int64_t)cout * cin * k * k, err, errn);
-    if (!w) return -1;
+    if (qiv_tensor_load(S, nm, (int64_t)cout * cin * k * k, c ? &w : NULL, err, errn)) return -1;
+    snprintf(nm, sizeof nm, "%s.bias", pfx);
+    if (qiv_tensor_load(S, nm, cout, c ? &b : NULL, err, errn)) { free(w); return -1; }
+    if (!c) return 0;
+    c->cin = cin; c->cout = cout; c->k = k;
     if (k > 1) {
         /* [cout][cin][ky][kx] -> [cout][kx][ky][cin], the order qiv_conv3 reads taps in */
         float *p = qiv_alloc((size_t)cout * cin * k * k);
-        if (!p) { free(w); snprintf(err, errn, "out of memory"); return -1; }
+        if (!p) { free(w); free(b); snprintf(err, errn, "out of memory"); return -1; }
         for (int o = 0; o < cout; o++)
             for (int i = 0; i < cin; i++)
                 for (int ky = 0; ky < k; ky++)
@@ -167,9 +183,6 @@ static int qiv_load_conv(shards *S, size_t *wbytes, const char *pfx, int cin, in
                         p[((size_t)o * k * k + kx * k + ky) * cin + i] = w[((size_t)o * cin + i) * k * k + ky * k + kx];
         free(w); w = p;
     }
-    snprintf(nm, sizeof nm, "%s.bias", pfx);
-    float *b = qiv_read(S, nm, cout, err, errn);
-    if (!b) { free(w); return -1; }
     c->w = w; c->b = b;
     c->m = (QiMat){.fmt = QI_F32, .N = cout, .K = cin * k * k, .w = w};
     *wbytes += ((size_t)cout * cin * k * k + cout) * sizeof(float);
@@ -179,19 +192,19 @@ static int qiv_load_conv(shards *S, size_t *wbytes, const char *pfx, int cin, in
 static int qiv_load_res(shards *S, size_t *wbytes, const char *pfx, int cin, int cout, QivRes *r, char *err,
                         size_t errn) {
     char nm[256];
-    r->cin = cin; r->cout = cout;
+    if (r) { r->cin = cin; r->cout = cout; }
     snprintf(nm, sizeof nm, "%s.norm1.gamma", pfx);
-    if (!(r->g1 = qiv_read(S, nm, cin, err, errn))) return -1;
+    if (qiv_tensor_load(S, nm, cin, r ? &r->g1 : NULL, err, errn)) return -1;
     snprintf(nm, sizeof nm, "%s.norm2.gamma", pfx);
-    if (!(r->g2 = qiv_read(S, nm, cout, err, errn))) return -1;
-    *wbytes += (size_t)(cin + cout) * sizeof(float);
+    if (qiv_tensor_load(S, nm, cout, r ? &r->g2 : NULL, err, errn)) return -1;
+    if (r) *wbytes += (size_t)(cin + cout) * sizeof(float);
     snprintf(nm, sizeof nm, "%s.conv1", pfx);
-    if (qiv_load_conv(S, wbytes, nm, cin, cout, 3, &r->c1, err, errn)) return -1;
+    if (qiv_load_conv(S, wbytes, nm, cin, cout, 3, r ? &r->c1 : NULL, err, errn)) return -1;
     snprintf(nm, sizeof nm, "%s.conv2", pfx);
-    if (qiv_load_conv(S, wbytes, nm, cout, cout, 3, &r->c2, err, errn)) return -1;
+    if (qiv_load_conv(S, wbytes, nm, cout, cout, 3, r ? &r->c2 : NULL, err, errn)) return -1;
     if (cin != cout) {
         snprintf(nm, sizeof nm, "%s.conv_shortcut", pfx);
-        if (qiv_load_conv(S, wbytes, nm, cin, cout, 1, &r->sc, err, errn)) return -1;
+        if (qiv_load_conv(S, wbytes, nm, cin, cout, 1, r ? &r->sc : NULL, err, errn)) return -1;
     }
     return 0;
 }

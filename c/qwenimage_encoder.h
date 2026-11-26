@@ -54,7 +54,8 @@ static int qie_config_int(jval *cfg, const char *name, int fallback) {
                                                                                                          : -1;
 }
 
-static QiVaeEncoder *qie_load(const char *dir) {
+/* The capability probe follows the load path without reading tensor data. */
+static QiVaeEncoder *qie_open(const char *dir, int load) {
     QiVaeEncoder *v = calloc(1, sizeof *v);
     char path[4096], err[512] = "";
     char *text = NULL;
@@ -156,45 +157,61 @@ static QiVaeEncoder *qie_load(const char *dir) {
         snprintf(err, sizeof err, "no safetensors found");
         goto fail;
     }
-    if (qiv_load_conv(&s, &v->wbytes, "encoder.conv_in", v->in_ch, base, 3, &v->conv_in, err, sizeof err)) goto fail;
+    if (qiv_load_conv(&s, &v->wbytes, "encoder.conv_in", v->in_ch, base, 3, load ? &v->conv_in : NULL,
+                      err, sizeof err)) goto fail;
     for (int i = 0; i < v->nblk; i++) {
         QieBlock *b = &v->blk[i];
         char p[160];
         for (int j = 0; j < b->nres; j++) {
             snprintf(p, sizeof p, "encoder.down_blocks.%d.resnets.%d", i, j);
-            if (qiv_load_res(&s, &v->wbytes, p, j ? b->cout : b->cin, b->cout, &b->res[j], err, sizeof err)) goto fail;
+            if (qiv_load_res(&s, &v->wbytes, p, j ? b->cout : b->cin, b->cout, load ? &b->res[j] : NULL,
+                             err, sizeof err)) goto fail;
         }
         if (b->down) {
             snprintf(p, sizeof p, "encoder.down_blocks.%d.downsampler.resample.1", i);
-            if (qiv_load_conv(&s, &v->wbytes, p, b->cout, b->cout, 3, &b->downc, err, sizeof err)) goto fail;
+            if (qiv_load_conv(&s, &v->wbytes, p, b->cout, b->cout, 3, load ? &b->downc : NULL, err, sizeof err)) goto fail;
         }
     }
     for (int i = 0; i < 2; i++) {
         char p[128];
         snprintf(p, sizeof p, "encoder.mid_block.resnets.%d", i);
-        if (qiv_load_res(&s, &v->wbytes, p, cin, cin, &v->mid[i], err, sizeof err)) goto fail;
+        if (qiv_load_res(&s, &v->wbytes, p, cin, cin, load ? &v->mid[i] : NULL, err, sizeof err)) goto fail;
     }
-    v->attn_g = qiv_read(&s, "encoder.mid_block.attentions.0.norm.gamma", cin, err, sizeof err);
-    v->g_out = qiv_read(&s, "encoder.norm_out.gamma", cin, err, sizeof err);
-    if (!v->attn_g || !v->g_out) goto fail;
-    v->wbytes += (size_t)2 * cin * sizeof(float);
-    if (qiv_load_conv(&s, &v->wbytes, "encoder.mid_block.attentions.0.to_qkv", cin, 3 * cin, 1, &v->qkv, err,
-                      sizeof err) ||
-        qiv_load_conv(&s, &v->wbytes, "encoder.mid_block.attentions.0.proj", cin, cin, 1, &v->proj, err, sizeof err) ||
-        qiv_load_conv(&s, &v->wbytes, "encoder.conv_out", cin, 2 * v->z_dim, 3, &v->conv_out, err, sizeof err) ||
-        qiv_load_conv(&s, &v->wbytes, "quant_conv", 2 * v->z_dim, 2 * v->z_dim, 1, &v->quant, err, sizeof err))
+    if (qiv_tensor_load(&s, "encoder.mid_block.attentions.0.norm.gamma", cin, load ? &v->attn_g : NULL, err,
+                        sizeof err) ||
+        qiv_tensor_load(&s, "encoder.norm_out.gamma", cin, load ? &v->g_out : NULL, err, sizeof err)) goto fail;
+    if (load) v->wbytes += (size_t)2 * cin * sizeof(float);
+    if (qiv_load_conv(&s, &v->wbytes, "encoder.mid_block.attentions.0.to_qkv", cin, 3 * cin, 1,
+                      load ? &v->qkv : NULL, err, sizeof err) ||
+        qiv_load_conv(&s, &v->wbytes, "encoder.mid_block.attentions.0.proj", cin, cin, 1,
+                      load ? &v->proj : NULL, err, sizeof err) ||
+        qiv_load_conv(&s, &v->wbytes, "encoder.conv_out", cin, 2 * v->z_dim, 3,
+                      load ? &v->conv_out : NULL, err, sizeof err) ||
+        qiv_load_conv(&s, &v->wbytes, "quant_conv", 2 * v->z_dim, 2 * v->z_dim, 1,
+                      load ? &v->quant : NULL, err, sizeof err))
         goto fail;
     st_destroy(&s);
     json_free(cfg);
     free(text);
     return v;
 fail:
-    fprintf(stderr, "qwenimage encoder: %s\n", err[0] ? err : "out of memory");
+    if (load) fprintf(stderr, "qwenimage encoder: %s\n", err[0] ? err : "out of memory");
     if (opened) st_destroy(&s);
     json_free(cfg);
     free(text);
     qie_free(v);
     return NULL;
+}
+
+static QiVaeEncoder *qie_load(const char *dir) {
+    return qie_open(dir, 1);
+}
+
+static inline int qie_supported(const char *dir, int channels) {
+    QiVaeEncoder *v = qie_open(dir, 0);
+    int supported = v && v->scale == 16 && v->z_dim == channels;
+    qie_free(v);
+    return supported;
 }
 
 /* Stride-2 3x3 convolution with bottom/right padding: ZeroPad2d((0,1,0,1)).

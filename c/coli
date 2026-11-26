@@ -466,13 +466,20 @@ def require_model(model, file="tokenizer.json", engine=None, target="", build="c
 def need_model(model, engine=None):
     # Directory/file checks come FIRST: resolving the family reads config.json,
     # and a missing model dir must say "model not found", not "unsupported model".
-    # An image pipeline keeps its tokenizer in processor/, not at the root.
+    # An image pipeline keeps its tokenizer with the processor, which a GGUF
+    # import may keep in a separate checkpoint.
     require_model(model, file=None)
     tokenizer = "tokenizer.json"
     if is_image_model(model) or is_decision_model(model):
         # a decision checkpoint keeps it in tokenizer/ (Laya)
-        try: tokenizer = resolve_model(model).descriptor.tokenizer_file
-        except (FamilyConfigError, UnknownFamilyError): pass   # engine_for says why, below
+        try:
+            resolved = resolve_model(model)
+            tokenizer = resolved.descriptor.tokenizer_file
+            if resolved.descriptor.modality == "image":
+                from image_engine import image_tokenizer_path
+                tokenizer = image_tokenizer_path(resolved.model_dir, resolved.config)
+        except (FamilyConfigError, UnknownFamilyError):
+            pass   # engine_for says why, below
     require_model(model, file=tokenizer)
     engine = engine or engine_for(model)
     target = resolve_model(model).descriptor.build_target
@@ -1878,6 +1885,8 @@ def run_via_gateway(a, family, engine, prompt):
 def cmd_run(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
+    if getattr(a, "image", None) and family.modality != "image":
+        sys.exit("--image requires a model that supports reference-image editing")
     arch=family.id
     engine=engine_for(a.model)
     need_model(a.model,engine)
@@ -2674,13 +2683,14 @@ class LocalImageBackend:
         self.info = self.engine.info
 
     def generate(self, prompt, width, height, steps, seed, want_preview, on_progress,
-                 on_preview, on_interrupt):
+                 on_preview, on_interrupt, *, reference=None):
         from image_engine import encode_png
         def preview(meta, pixels):
             on_preview(meta.get("width"), meta.get("height"), meta.get("channels", 3), pixels)
         result = self.engine.generate(prompt, width, height, steps, seed, preview=want_preview,
                                       on_progress=on_progress, on_preview=preview,
-                                      interruptible=True, on_interrupt=on_interrupt)
+                                      interruptible=True, on_interrupt=on_interrupt,
+                                      reference=reference)
         result["png"] = encode_png(result["width"], result["height"], result["rgba"], 4)
         return result
 
@@ -2927,7 +2937,8 @@ def image_settings(a, info):
         if problem: sys.exit(f"{C.yel}--seed: {problem}{C.r}")
     return {"width": width, "height": height, "steps": steps, "seed": seed}
 
-def generate_image(backend, prompt, settings, protocol, out=None, stream=None, last=None):
+def generate_image(backend, prompt, settings, protocol, out=None, stream=None, last=None,
+                   *, reference=None):
     """One image: progress, the picture drawn in the terminal, the PNG on disk.
     Returns the saved path, or None when it was cancelled or failed (said).
     `last`, when given, is filled with the PNG and where it went, for /save."""
@@ -2940,10 +2951,11 @@ def generate_image(backend, prompt, settings, protocol, out=None, stream=None, l
     progress = ImageProgress(stream, seed, settings["steps"], previews, protocol)
     progress.start()
     t0 = time.time()
+    options = {"reference": reference} if reference is not None else {}
     try:
         result = backend.generate(prompt, settings["width"], settings["height"],
                                   settings["steps"], seed, previews, progress.progress,
-                                  progress.preview, progress.interrupted)
+                                  progress.preview, progress.interrupted, **options)
     except ImageCancelled:
         progress.stop()
         print(f"  {C.yel}■ cancelled{C.r}\n", file=stream)
@@ -3124,14 +3136,33 @@ def run_image(a, family, engine, prompt):
     """coli run on an image model: one picture, written to --out (or the
     images folder), drawn inline when stdout is a terminal."""
     import term_image
+    from image_engine import (ImageRequestError, MAX_FRAME_BYTES, prepare_edit_reference,
+                              supports_image_edits)
+    inputs = getattr(a, "image", None) or []
+    reference = None
+    if inputs:
+        if len(inputs) != 1:
+            sys.exit("--image accepts one reference image")
+        try:
+            if not os.path.isfile(inputs[0]):
+                raise OSError("expected a regular file")
+            with open(inputs[0], "rb") as handle:
+                data = handle.read(MAX_FRAME_BYTES + 1)
+            if len(data) > MAX_FRAME_BYTES:
+                raise ImageRequestError("The reference image file exceeds 64 MiB.", "image")
+            reference = prepare_edit_reference(data)
+        except (OSError, ImageRequestError) as error:
+            sys.exit(f"--image: {error}")
     backend = start_local_image_backend(a, family, engine)
     try:
+        if reference is not None and not supports_image_edits(backend.info):
+            sys.exit("--image: the image engine does not support reference-image edits")
         settings = image_settings(a, backend.info)
         interactive = sys.stdout.isatty()
         protocol = term_image.detect(query=interactive and sys.stdin.isatty())[0] if interactive else "none"
         stream = sys.stdout if interactive else sys.stderr
         path = generate_image(backend, prompt, settings, protocol, out=getattr(a, "out", None),
-                              stream=stream)
+                              stream=stream, reference=reference)
         if path and not interactive:
             print(path)                            # the one line a script wants
         return 0 if path else 1
@@ -4346,6 +4377,8 @@ def main():
                  ("--seed",dict(type=int,default=None,help="image seed (image models; default: random)")))
     for flag,kw in image_flags: pr.add_argument(flag,**kw)
     pr.add_argument("--out",default=None,help="PNG path for an image model (default: the images folder)")
+    pr.add_argument("--image", action="append", metavar="PATH",
+                    help="one local PNG, JPEG, or WebP reference for an edit-capable image model")
     pc=sub.add_parser("chat", parents=[common])
     for flag,kw in image_flags: pc.add_argument(flag,**kw)
     pc.add_argument("--attach", nargs="?", const="http://127.0.0.1:8000", default=None,

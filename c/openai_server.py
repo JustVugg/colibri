@@ -1290,6 +1290,44 @@ def _tool_hold():
     return max(len(m) for m in _tool_stream_markers()) - 1
 
 
+_TOOL_TRACE_LOCK = threading.Lock()
+
+
+def _call_openers(text):
+    """How many tool calls `text` opens, counted by the family's per-call marker."""
+    # shortcut: kimi's marker opens a block, not a call; count its calls if K3 is ever traced
+    marker = ("<function=" if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder", "lfm3")
+              else _tool_stream_markers()[-1])
+    return text.count(marker)
+
+
+def _tool_trace(request_id, stream, finish, stats, calls, answer, reasoning):
+    """COLI_TOOL_TRACE=<path.jsonl> (off by default): append one JSON line per chat request
+    with tools, so tool-call failure rates can be counted on real replies and the parsers
+    replayed offline on the same text. A failed write is logged, never raised."""
+    path = os.environ.get("COLI_TOOL_TRACE")
+    if not path:
+        return
+    openers, thought = _call_openers(answer), _call_openers(reasoning)
+    error = (f"{openers} call opener(s), {len(calls)} call(s) parsed" if openers > len(calls)
+             else "call opener only in the reasoning" if thought and not calls else None)
+    line = json.dumps({
+        "ts": round(time.time(), 3), "request_id": request_id, "family": chat_flavor(),
+        "stream": stream, "finish": finish, "length_limited": bool(stats["length_limited"]),
+        "completion_tokens": stats.get("completion_tokens"),
+        "n_calls": len(calls), "names": [c["function"]["name"] for c in calls],
+        "openers": openers, "reasoning_openers": thought, "parse_error": error,
+        "answer_chars": len(answer), "answer": answer[:16384],
+        "reasoning_chars": len(reasoning), "reasoning_tail": reasoning[-2048:],
+    }, ensure_ascii=False)
+    try:
+        with _TOOL_TRACE_LOCK, open(path, "a", encoding="utf-8") as trace:
+            trace.write(line + "\n")
+    except OSError as exc:
+        sys.stderr.write(f"[api] COLI_TOOL_TRACE: cannot append to {path}: {exc}\n")
+        sys.stderr.flush()
+
+
 class ToolTextStream:
     """A streamed answer's text with a tool call's syntax kept out of it, for every family and
     for both API surfaces (/v1/chat/completions and /v1/messages each had this loop).
@@ -7320,6 +7358,10 @@ def engine_chats(engine):
     return getattr(engine, "chats", True) is not False
 
 
+# Request-scoped frames that show the engine is still working on that request.
+_PROGRESS_FRAMES = frozenset(("ACCEPT", "DATA", "ECHO", "TOOL", "DECISION"))
+
+
 class _Pending:
     """One in-flight engine request: the queue its frames are delivered on, whether it asked
     for the per-token numeric channel, and any fault the dispatcher has recorded against it.
@@ -7334,9 +7376,12 @@ class _Pending:
     keeps holding it until the engine says the turn is over. Dropping the entry instead
     would free the admission while the engine is still generating, and the next request
     would submit into a pipe nobody is reading."""
-    __slots__ = ("events", "logprob_channel", "failed")
+    __slots__ = ("events", "logprob_channel", "failed", "progress_at", "decoding_at", "cancel_at")
 
     def __init__(self, logprob_channel=False):
+        self.progress_at = time.monotonic()
+        self.decoding_at = None   # the first DATA frame: the prompt is read, tokens follow
+        self.cancel_at = None
         self.events = queue.Queue()
         self.logprob_channel = logprob_channel
         self.failed = None
@@ -7386,6 +7431,20 @@ class Engine:
         self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        # All three are off unless set (0 = off). When one fires the engine is killed and
+        # every request on it fails, and no default is safe for every machine this runs
+        # on: an engine streaming from a slow disk can read a prompt silently for many
+        # minutes and take minutes over one token, and it answers a CANCEL only when the
+        # step it is in ends. A server that knows its model's pace sets them (docs/api.md).
+        self.stall_timeout = float(child_env.get("COLI_ENGINE_STALL_TIMEOUT") or "0")
+        self.decode_stall_timeout = float(child_env.get("COLI_ENGINE_DECODE_STALL_TIMEOUT") or "0")
+        self.cancel_timeout = float(child_env.get("COLI_ENGINE_CANCEL_TIMEOUT") or "0")
+        for name, value in (("COLI_ENGINE_STALL_TIMEOUT", self.stall_timeout),
+                            ("COLI_ENGINE_DECODE_STALL_TIMEOUT", self.decode_stall_timeout),
+                            ("COLI_ENGINE_CANCEL_TIMEOUT", self.cancel_timeout)):
+            if not (math.isfinite(value) and value >= 0):
+                raise ValueError(f"{name} must be finite and not negative")
+        self._stall_error = None
         tune_child_env(child_env, arch)
         decision_head_env(child_env, model)
         # before the cap: the RAM plan reserves the context it is given
@@ -7492,6 +7551,45 @@ class Engine:
         request fails, so an engine whose process outlived its reader counts as gone too."""
         return not self.closed and self.dispatcher_error is None and self.process.poll() is None
 
+    def stalled_reason(self):
+        """A request with no frame for stall_timeout (decode_stall_timeout once it is
+        decoding), or no terminal frame cancel_timeout after CANCEL/STOP once it is
+        decoding; each only when set. Before the first DATA frame an engine may read a CANCEL only when the
+        prompt is done, so the cancel deadline starts there. Timed here, not on stdout,
+        so a blocked pipe write counts too."""
+        with self.pending_lock:
+            if self._stall_error is not None:
+                return self._stall_error
+            now = time.monotonic()
+            for request_id, entry in self.pending.items():
+                decoding = entry.decoding_at is not None
+                if (self.cancel_timeout and entry.cancel_at is not None and decoding
+                        and now - max(entry.cancel_at, entry.decoding_at) >= self.cancel_timeout):
+                    self._stall_error = f"engine cancellation timed out for request {request_id}"
+                    return self._stall_error
+                limit = self.decode_stall_timeout if decoding else self.stall_timeout
+                if limit and now - entry.progress_at >= limit:
+                    self._stall_error = (f"engine sent nothing for request {request_id} "
+                                         f"in {limit:g} s while "
+                                         f"{'decoding' if decoding else 'reading the prompt'}")
+                    return self._stall_error
+        return None
+
+    def abort_stalled(self, reason):
+        """Do not admit work on a replacement until the old process is reaped."""
+        with self.pending_lock:
+            self.closed = True
+        if self.process.poll() is None:
+            try:
+                self.process.kill()
+                self.process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        if self.process.poll() is None:
+            return False
+        self._fail_pending(RuntimeError(reason))
+        return True
+
     @staticmethod
     def _stats(fields):
         if len(fields) < 5 or fields[0] != "STAT":
@@ -7528,6 +7626,11 @@ class Engine:
         silent connection close instead of the 500 engine_error the failure
         actually is. _write_all's own RuntimeError is already the named
         error this raises for an OSError, so it is re-raised as-is."""
+        if frame in ("CANCEL", "STOP"):
+            with self.pending_lock:
+                entry = self.pending.get(request_id)
+                if entry is not None and entry.cancel_at is None:
+                    entry.cancel_at = time.monotonic()
         try:
             with self.write_lock:
                 _write_all(self.process.stdin, data, frame)
@@ -7602,6 +7705,14 @@ class Engine:
         if entry.failed is None:
             entry.failed = error
 
+    def _progressed(self, request_id, decoding):
+        with self.pending_lock:
+            entry = self.pending.get(request_id)
+            if entry is not None:
+                entry.progress_at = time.monotonic()
+                if decoding and entry.decoding_at is None:
+                    entry.decoding_at = entry.progress_at
+
     def _dispatch_stdout(self):
         try:
             while True:
@@ -7612,6 +7723,8 @@ class Engine:
                 if not fields:
                     continue
                 kind = fields[0]
+                if kind in _PROGRESS_FRAMES and len(fields) >= 2:
+                    self._progressed(fields[1], kind == "DATA")
                 if kind == "DATA" and len(fields) >= 3:
                     # 3 fields: the legacy frame. More: the U7a per-token
                     # numeric channel ("DATA <id> <n> <lp> <k> [tid tlp]*k"),
@@ -8391,6 +8504,8 @@ class APIServer(ThreadingHTTPServer):
         if is_image_engine(self.engine):
             info = getattr(self.engine, "info", None) or {}
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
+            if "image_editing" in entry["capabilities"]:
+                entry["image"]["supports_image_edits"] = True
         return entry
 
     def state_seen(self, state, capacity=256):
@@ -8404,11 +8519,17 @@ class APIServer(ThreadingHTTPServer):
                 self._states_seen.popitem(last=False)
         return seen
 
+    def image_edits_available(self):
+        return (image_engine.supports_image_edits(self.engine.info)
+                and image_engine.edit_decoder_available())
+
     def capabilities(self):
         """What the served model does, for /v1/models and /health: an image model
         draws (image_generation); every text engine answers POST /v1/systemone
         (systemone), and a decision engine does only that (decision)."""
         if is_image_engine(self.engine):
+            if self.image_edits_available():
+                return ["image_generation", "image_editing"]
             return ["image_generation"]
         if engine_decides(self.engine) and not engine_chats(self.engine):
             return ["systemone", "decision"]
@@ -8434,7 +8555,10 @@ class APIServer(ThreadingHTTPServer):
         modality). An engine that announced nothing is text: the card under-claims
         rather than promising a picture nobody checked."""
         modalities = ["text"]
-        if family_by_id(ARCH).capabilities.image and getattr(self.engine, "vision", None) is True:
+        if is_image_engine(self.engine):
+            if self.image_edits_available():
+                modalities.append("image")
+        elif family_by_id(ARCH).capabilities.image and getattr(self.engine, "vision", None) is True:
             modalities.append("image")
         return modalities
 
@@ -9054,6 +9178,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                "model", "unsupported_endpoint")
             if path == "/v1/images/generations":
                 self.image_generation(body, request_id)
+            elif path == "/v1/images/edits":
+                self.image_generation(body, request_id, edit=True)
             elif path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
@@ -9546,7 +9672,7 @@ class APIHandler(BaseHTTPRequestHandler):
     # what was actually drawn (the seed above all: without it an image cannot be
     # reproduced). One image at a time through the same scheduler as chat, so
     # the queue, its limits and /metrics mean the same thing for both.
-    def image_generation(self, body, request_id):
+    def image_generation(self, body, request_id, *, edit=False):
         engine = self.server.engine
         if not is_image_engine(engine):
             if not engine_chats(engine):
@@ -9556,8 +9682,16 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
                                 "chat model (POST /v1/chat/completions).",
                            "model", "unsupported_endpoint")
+        if edit:
+            if not image_engine.supports_image_edits(engine.info):
+                raise APIError(400, f"`{self.server.model_id}` does not support reference-image edits.",
+                               "model", "unsupported_endpoint")
+            if not image_engine.edit_decoder_available():
+                raise APIError(503, image_engine.EDIT_DECODER_REQUIRED, None,
+                               "image_decoder_unavailable", "server_error")
         try:
             request = image_engine.image_request(body, engine.info)
+            uploaded = image_engine.edit_image_bytes(body) if edit else None
         except image_engine.ImageRequestError as error:
             raise APIError(400, str(error), error.param, "invalid_value")
         stream = body.get("stream", False)
@@ -9585,15 +9719,19 @@ class APIHandler(BaseHTTPRequestHandler):
             if not engine.alive:
                 raise APIError(503, f"The image engine is not running ({engine.dead or 'exited'}).",
                                None, "engine_unavailable", "server_error")
+            try:
+                reference = image_engine.prepare_edit_reference(uploaded) if edit else None
+            except image_engine.ImageRequestError as error:
+                raise APIError(400, str(error), error.param, "invalid_value") from None
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if stream:
                 self._image_stream(engine, request, request_id, created, queue_headers,
-                                   partial_images)
+                                   partial_images, reference=reference)
                 return
             try:
                 result = engine.generate(request["prompt"], request["width"], request["height"],
                                          request["steps"], request["seed"], preview=False,
-                                         cancelled=self.client_disconnected)
+                                         cancelled=self.client_disconnected, reference=reference)
             except image_engine.ImageCancelled:
                 raise ClientCancelled() from None
             except image_engine.ImageEngineError as error:
@@ -9613,7 +9751,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             "timings": result["timings"]}}
 
     def _image_stream(self, engine, request, request_id, created, queue_headers,
-                      partial_images):
+                      partial_images, *, reference=None):
         """SSE: progress, optional partial images, completed, [DONE].
 
         The 200 is committed on the engine's first frame, not before: an engine
@@ -9622,6 +9760,7 @@ class APIHandler(BaseHTTPRequestHandler):
         import base64
         lock = threading.Lock()
         state = {"started": False, "connected": True, "last": time.monotonic(), "partials": 0}
+        prefix = "image_edit" if reference is not None else "image_generation"
 
         def start():
             if state["started"]:
@@ -9665,7 +9804,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return not state["connected"] or self.client_disconnected()
 
         def on_progress(frame):
-            event("image_generation.progress",
+            event(f"{prefix}.progress",
                   {key: frame.get(key) for key in ("stage", "step", "steps", "elapsed")})
 
         def on_preview(frame, pixels):
@@ -9683,7 +9822,7 @@ class APIHandler(BaseHTTPRequestHandler):
             except (KeyError, TypeError, ValueError) as error:
                 sys.stderr.write(f"[api] {request_id}: unusable PREVIEW frame ({error})\n")
                 return
-            event("image_generation.partial_image",
+            event(f"{prefix}.partial_image",
                   {"b64_json": base64.b64encode(png).decode("ascii"),
                    "partial_image_index": state["partials"]})
             state["partials"] += 1
@@ -9699,7 +9838,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                      request["steps"], request["seed"],
                                      preview=partial_images != 0, on_progress=on_progress,
                                      on_preview=on_preview, cancelled=cancelled,
-                                     on_idle=on_idle)
+                                     on_idle=on_idle, reference=reference)
         except image_engine.ImageCancelled:
             if not state["started"]:
                 raise ClientCancelled() from None
@@ -9719,7 +9858,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                       "code": "engine_error"}})
             write(b"data: [DONE]\n\n")
             return
-        event("image_generation.completed", self._image_payload(result, created))
+        event(f"{prefix}.completed", self._image_payload(result, created))
         write(b"data: [DONE]\n\n")
 
     def _fail(self, error, request_id):
@@ -9916,6 +10055,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if calls:
                         message["tool_calls"] = calls
                     finish = "tool_calls" if calls else length_finish
+                    _tool_trace(request_id, False, finish, stats, calls, text, reasoning)
                     choice = {"index": 0, "message": message, "logprobs": logprobs_obj,
                               "finish_reason": finish}
                 else:
@@ -9989,7 +10129,11 @@ class APIHandler(BaseHTTPRequestHandler):
                           {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
                 event([choice])
 
+            traced_reasoning = []         # kept only for COLI_TOOL_TRACE
+
             def emit_reasoning(text):     # thinking → reasoning_content deltas (chat only)
+                if tools and os.environ.get("COLI_TOOL_TRACE"):
+                    traced_reasoning.append(text)
                 event([{"index": 0, "delta": {"reasoning_content": text},
                         "logprobs": None, "finish_reason": None}])
 
@@ -10098,6 +10242,8 @@ class APIHandler(BaseHTTPRequestHandler):
                              "arguments": tc["function"]["arguments"]}}]},
                             "logprobs": None, "finish_reason": None}])
                 finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
+                _tool_trace(request_id, True, finish, stats, calls, "".join(raw),
+                            "".join(traced_reasoning))
             else:
                 if splitter is not None:                   # inkling content/marker splitter
                     content_split = splitter
@@ -10828,9 +10974,15 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
     is set; serve() runs it on its own thread."""
     while not stopping.wait(watch):
         dead = server.engine
-        if engine_alive(dead):
+        stalled = getattr(dead, "stalled_reason", lambda: None)()
+        if not stalled and engine_alive(dead):
             continue
         server.scheduler.pause()
+        if stalled:
+            print(f"[gateway] {stalled}; retiring the engine", file=sys.stderr)
+            if not dead.abort_stalled(stalled):
+                continue  # retry reaping; never load a second engine over a live one
+
         if stopping.wait(grace):
             return
         cause = (getattr(dead, "dispatcher_error", None) or getattr(dead, "dead", None)

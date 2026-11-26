@@ -118,6 +118,16 @@ static inline int st_dtype_esz(int dtype) {
     }
 }
 
+static inline int st_f32_dtype(int dtype) {
+    return dtype >= 0 && dtype <= 2;
+}
+
+static inline int st_f32_readable(const st_tensor *t, int64_t numel) {
+    if (!t || t->numel != numel || numel < 0 || !st_f32_dtype(t->dtype)) return 0;
+    int esz = st_dtype_esz(t->dtype);
+    return numel <= INT64_MAX / esz && t->nbytes == numel * esz;
+}
+
 /* Nome leggibile, per i messaggi di rifiuto. */
 static inline const char *st_dtype_name(int dtype) {
     switch (dtype) {
@@ -1184,11 +1194,10 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
      * I64 verrebbe letto come mezze-precisioni e produrrebbe numeri plausibili e
      * sbagliati, in silenzio. Con soli i dtype 0/1/2/3 il fallthrough era corretto;
      * dal momento in cui ne esistono altri, non lo e' piu'. */
-    if (t->dtype >= 3) {
+    if (!st_f32_dtype(t->dtype)) {
         fprintf(stderr, "%s: tensor '%s' is %s — not a float tensor; read it with st_read_raw\n",
                 name, name, st_dtype_name(t->dtype)); exit(1); }
-    int esz = st_dtype_esz(t->dtype);
-    if (t->numel < 0 || t->numel > t->nbytes / esz || t->numel * (int64_t)esz != t->nbytes) {
+    if (!st_f32_readable(t, t->numel)) {
         fprintf(stderr, "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or corrupt file)\n",
                 name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
     void *raw = malloc(t->nbytes);

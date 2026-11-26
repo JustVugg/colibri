@@ -543,7 +543,7 @@ endif
 # and any two that each added a test conflicted on that line by construction; #386 hit it
 # twice while being rebased. A first attempt (#731) globbed tests/test_*.c, which was wrong
 # in the other direction: it promoted files that deliberately have no rule (a branch's
-# work-in-progress test, test_fse, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
+# work-in-progress test, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
 # they fail to link. Having a rule is the honest definition of "this is a gate".
 # RULE_NAMES is every `NAME$(EXE):` rule, with its directory; one pass over the
 # Makefile serves both TEST_RULES here and ENGINE_RULES (#1741, end of file).
@@ -1699,8 +1699,11 @@ ifneq ($(EXE),)
 .PHONY: qwenimage
 qwenimage: qwenimage$(EXE)
 endif
-qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) qwenimage.c $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS)
+qwenimage$(EXE): qwenimage.c $(QWEN36_METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) qwenimage.c $(QWEN36_METAL_OBJ) $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
+
+tests/bench_qwenimage_metal$(EXE): tests/bench_qwenimage_metal.c $(QWEN36_METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) $< $(QWEN36_METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
 
 # colibri-tui: the terminal interface (docs/tui.md), a client of coli serve. One C file and the
 # chat page's mascot (tui_mascot.h, from tools/make_tui_mascot.py); no OpenMP, no GPU, no
