@@ -226,6 +226,12 @@ class GenerationScheduler:
         """`slot` pins the request to that slot (a client's `cache_slot`); `prefer` and
         `cache_key` rank free slots for KV prefix reuse: an exact prefix hit wins, then an
         unused slot (preferring `prefer`), then the least recently used slot."""
+        # #2477: a summary (context compaction) is admitted before the request's own
+        # validation runs; an impossible target never takes a ticket or aliases a real slot
+        if slot is not None and (isinstance(slot, bool) or not isinstance(slot, int)
+                                 or not 0 <= slot < self.capacity):
+            raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.capacity - 1}.",
+                           "cache_slot")
         ticket = object()
         entry = (ticket, slot)          # (#B2) remember each waiter's target slot for fair, per-slot admission
         queued_at = time.monotonic()
@@ -9915,19 +9921,9 @@ class APIHandler(BaseHTTPRequestHandler):
             error.status, "api_error" if error.status >= 500 else "invalid_request_error")
         return {"type": "error", "error": {"type": kind, "message": error.message}}
 
-    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None, image=None,
-                   add_generation_prompt=True, compaction=None):
-        # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
-        # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
-        # tool results into `prompt`, so level 2 is the full conversation the engine saw.
-        try:
-            dbg = int(os.environ.get("COLI_DEBUG", "0"))
-        except ValueError:
-            dbg = 0
-        if dbg >= 2:
-            sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
-            sys.stderr.flush()
+    def _generation_request_options(self, body, chat):
+        """The request's generation options, validated, with no work admitted and no engine
+        call (#2477: context compaction summarizes before generation() runs)."""
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
         family = family_by_id(ARCH)
@@ -9939,28 +9935,12 @@ class APIHandler(BaseHTTPRequestHandler):
         engine_k, echo, display_k = logprobs_options(
             body, chat, getattr(self.server.engine, "supports_logprobs_echo", False))
         stop_sequences, ignore_leading_stop = stop_policy(body, chat)
-        # tools and tool_choice come from chat_completion() already processed/filtered
-        if chat and tool_choice == "none":
-            tools = None          # client forbade tools: never surface tool_calls
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
                  not 0 <= cache_slot < self.server.kv_slots)):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
-        prefer_slot = None
-        cache_key = None
-        if cache_slot is None and self.server.kv_slots > 1:
-            # #634: each conversation prefers a stable KV slot so multi-turn reuses its
-            # cached prefix instead of re-prefilling. Only when the request carries a
-            # conversation; raw /v1/completions keeps the scheduler's free-slot pick. A
-            # preference, not a pin: when that slot is busy with another conversation and
-            # another is free, the request takes the free one (its prefix read again)
-            # rather than waiting for the other conversation to end.
-            conversation = body.get("messages")
-            if isinstance(conversation, list) and conversation:
-                cache_key = conversation_cache_key(conversation)
-                prefer_slot = conversation_cache_slot(conversation, self.server.kv_slots)
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
@@ -9978,6 +9958,41 @@ class APIHandler(BaseHTTPRequestHandler):
             # bool("false") is True: a string, number or object would have turned the usage frame on
             raise APIError(400, "`stream_options.include_usage` must be a boolean.", "stream_options.include_usage")
         include_usage = bool(include_usage)
+        return (maximum, temperature, top_p, grammar, engine_k, echo, display_k,
+                stop_sequences, ignore_leading_stop, cache_slot, stream, include_usage)
+
+    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
+                   enable_thinking=False, audio=None, image=None,
+                   add_generation_prompt=True, compaction=None):
+        # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
+        # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
+        # tool results into `prompt`, so level 2 is the full conversation the engine saw.
+        try:
+            dbg = int(os.environ.get("COLI_DEBUG", "0"))
+        except ValueError:
+            dbg = 0
+        if dbg >= 2:
+            sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
+            sys.stderr.flush()
+        (maximum, temperature, top_p, grammar, engine_k, echo, display_k,
+         stop_sequences, ignore_leading_stop, cache_slot, stream, include_usage) = (
+            self._generation_request_options(body, chat))
+        # tools and tool_choice come from chat_completion() already processed/filtered
+        if chat and tool_choice == "none":
+            tools = None          # client forbade tools: never surface tool_calls
+        prefer_slot = None
+        cache_key = None
+        if cache_slot is None and self.server.kv_slots > 1:
+            # #634: each conversation prefers a stable KV slot so multi-turn reuses its
+            # cached prefix instead of re-prefilling. Only when the request carries a
+            # conversation; raw /v1/completions keeps the scheduler's free-slot pick. A
+            # preference, not a pin: when that slot is busy with another conversation and
+            # another is free, the request takes the free one (its prefix read again)
+            # rather than waiting for the other conversation to end.
+            conversation = body.get("messages")
+            if isinstance(conversation, list) and conversation:
+                cache_key = conversation_cache_key(conversation)
+                prefer_slot = conversation_cache_slot(conversation, self.server.kv_slots)
         object_name = "chat.completion" if chat else "text_completion"
         id_prefix = "chatcmpl-" if chat else "cmpl-"
         completion_id = id_prefix + uuid.uuid4().hex
@@ -10404,6 +10419,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(messages, list) or not messages:
             raise APIError(400, "`messages` must be a non-empty array.", "messages")
         compact = compaction_requested(body)
+        if compact:
+            # #2477: a summary is inference too; the request's options are refused (400) before
+            # context pressure sends its earlier messages through the engine
+            self._generation_request_options(body, True)
         render = dict(enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
                       tools=tools, tool_choice=tool_choice, preserve_thinking=preserve_thinking)
         lead, conversation = split_lead(messages)
