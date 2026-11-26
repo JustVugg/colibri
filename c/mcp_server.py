@@ -286,12 +286,18 @@ def _stderr_out(*parts):
     _log(*parts)
 
 
+# Lifecycle tools share one configured server. Serialize their state check and
+# action, while leaving status and optional readiness polling responsive.
+_SERVER_LOCK = threading.Lock()
+
+
 def tool_start(args, notify):
-    cfg = setup_flow.load_config()
-    if not cfg or not setup_flow.config_ready(cfg):
-        raise ToolError("nothing is installed yet (or the install has not finished): call install")
-    status = setup_flow.start_server(cfg, background=True,
-                                     open_browser=bool(args.get("open_browser")), out=_stderr_out)
+    with _SERVER_LOCK:
+        cfg = setup_flow.load_config()
+        if not cfg or not setup_flow.config_ready(cfg):
+            raise ToolError("nothing is installed yet (or the install has not finished): call install")
+        status = setup_flow.start_server(cfg, background=True,
+                                         open_browser=bool(args.get("open_browser")), out=_stderr_out)
     wait = int(args.get("wait_seconds") or 0)
     deadline = time.time() + wait
     while wait and time.time() < deadline and status.get("state") != "ready":
@@ -305,10 +311,11 @@ def tool_start(args, notify):
 
 
 def tool_stop(args, notify):
-    cfg = setup_flow.load_config()
-    if not cfg:
-        raise ToolError("nothing is configured; there is nothing to stop")
-    return setup_flow.stop_server(cfg, out=_stderr_out)
+    with _SERVER_LOCK:
+        cfg = setup_flow.load_config()
+        if not cfg:
+            raise ToolError("nothing is configured; there is nothing to stop")
+        return setup_flow.stop_server(cfg, out=_stderr_out)
 
 
 def tool_status(args, notify):
