@@ -8504,6 +8504,8 @@ class APIServer(ThreadingHTTPServer):
         if is_image_engine(self.engine):
             info = getattr(self.engine, "info", None) or {}
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
+            if "image_editing" in entry["capabilities"]:
+                entry["image"]["supports_image_edits"] = True
         return entry
 
     def state_seen(self, state, capacity=256):
@@ -8517,11 +8519,17 @@ class APIServer(ThreadingHTTPServer):
                 self._states_seen.popitem(last=False)
         return seen
 
+    def image_edits_available(self):
+        return (image_engine.supports_image_edits(self.engine.info)
+                and image_engine.edit_decoder_available())
+
     def capabilities(self):
         """What the served model does, for /v1/models and /health: an image model
         draws (image_generation); every text engine answers POST /v1/systemone
         (systemone), and a decision engine does only that (decision)."""
         if is_image_engine(self.engine):
+            if self.image_edits_available():
+                return ["image_generation", "image_editing"]
             return ["image_generation"]
         if engine_decides(self.engine) and not engine_chats(self.engine):
             return ["systemone", "decision"]
@@ -8547,7 +8555,10 @@ class APIServer(ThreadingHTTPServer):
         modality). An engine that announced nothing is text: the card under-claims
         rather than promising a picture nobody checked."""
         modalities = ["text"]
-        if family_by_id(ARCH).capabilities.image and getattr(self.engine, "vision", None) is True:
+        if is_image_engine(self.engine):
+            if self.image_edits_available():
+                modalities.append("image")
+        elif family_by_id(ARCH).capabilities.image and getattr(self.engine, "vision", None) is True:
             modalities.append("image")
         return modalities
 
@@ -9167,6 +9178,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                "model", "unsupported_endpoint")
             if path == "/v1/images/generations":
                 self.image_generation(body, request_id)
+            elif path == "/v1/images/edits":
+                self.image_generation(body, request_id, edit=True)
             elif path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
@@ -9659,7 +9672,7 @@ class APIHandler(BaseHTTPRequestHandler):
     # what was actually drawn (the seed above all: without it an image cannot be
     # reproduced). One image at a time through the same scheduler as chat, so
     # the queue, its limits and /metrics mean the same thing for both.
-    def image_generation(self, body, request_id):
+    def image_generation(self, body, request_id, *, edit=False):
         engine = self.server.engine
         if not is_image_engine(engine):
             if not engine_chats(engine):
@@ -9669,8 +9682,16 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
                                 "chat model (POST /v1/chat/completions).",
                            "model", "unsupported_endpoint")
+        if edit:
+            if not image_engine.supports_image_edits(engine.info):
+                raise APIError(400, f"`{self.server.model_id}` does not support reference-image edits.",
+                               "model", "unsupported_endpoint")
+            if not image_engine.edit_decoder_available():
+                raise APIError(503, image_engine.EDIT_DECODER_REQUIRED, None,
+                               "image_decoder_unavailable", "server_error")
         try:
             request = image_engine.image_request(body, engine.info)
+            uploaded = image_engine.edit_image_bytes(body) if edit else None
         except image_engine.ImageRequestError as error:
             raise APIError(400, str(error), error.param, "invalid_value")
         stream = body.get("stream", False)
@@ -9698,15 +9719,19 @@ class APIHandler(BaseHTTPRequestHandler):
             if not engine.alive:
                 raise APIError(503, f"The image engine is not running ({engine.dead or 'exited'}).",
                                None, "engine_unavailable", "server_error")
+            try:
+                reference = image_engine.prepare_edit_reference(uploaded) if edit else None
+            except image_engine.ImageRequestError as error:
+                raise APIError(400, str(error), error.param, "invalid_value") from None
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if stream:
                 self._image_stream(engine, request, request_id, created, queue_headers,
-                                   partial_images)
+                                   partial_images, reference=reference)
                 return
             try:
                 result = engine.generate(request["prompt"], request["width"], request["height"],
                                          request["steps"], request["seed"], preview=False,
-                                         cancelled=self.client_disconnected)
+                                         cancelled=self.client_disconnected, reference=reference)
             except image_engine.ImageCancelled:
                 raise ClientCancelled() from None
             except image_engine.ImageEngineError as error:
@@ -9726,7 +9751,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             "timings": result["timings"]}}
 
     def _image_stream(self, engine, request, request_id, created, queue_headers,
-                      partial_images):
+                      partial_images, *, reference=None):
         """SSE: progress, optional partial images, completed, [DONE].
 
         The 200 is committed on the engine's first frame, not before: an engine
@@ -9735,6 +9760,7 @@ class APIHandler(BaseHTTPRequestHandler):
         import base64
         lock = threading.Lock()
         state = {"started": False, "connected": True, "last": time.monotonic(), "partials": 0}
+        prefix = "image_edit" if reference is not None else "image_generation"
 
         def start():
             if state["started"]:
@@ -9778,7 +9804,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return not state["connected"] or self.client_disconnected()
 
         def on_progress(frame):
-            event("image_generation.progress",
+            event(f"{prefix}.progress",
                   {key: frame.get(key) for key in ("stage", "step", "steps", "elapsed")})
 
         def on_preview(frame, pixels):
@@ -9796,7 +9822,7 @@ class APIHandler(BaseHTTPRequestHandler):
             except (KeyError, TypeError, ValueError) as error:
                 sys.stderr.write(f"[api] {request_id}: unusable PREVIEW frame ({error})\n")
                 return
-            event("image_generation.partial_image",
+            event(f"{prefix}.partial_image",
                   {"b64_json": base64.b64encode(png).decode("ascii"),
                    "partial_image_index": state["partials"]})
             state["partials"] += 1
@@ -9812,7 +9838,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                      request["steps"], request["seed"],
                                      preview=partial_images != 0, on_progress=on_progress,
                                      on_preview=on_preview, cancelled=cancelled,
-                                     on_idle=on_idle)
+                                     on_idle=on_idle, reference=reference)
         except image_engine.ImageCancelled:
             if not state["started"]:
                 raise ClientCancelled() from None
@@ -9832,7 +9858,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                       "code": "engine_error"}})
             write(b"data: [DONE]\n\n")
             return
-        event("image_generation.completed", self._image_payload(result, created))
+        event(f"{prefix}.completed", self._image_payload(result, created))
         write(b"data: [DONE]\n\n")
 
     def _fail(self, error, request_id):

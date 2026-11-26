@@ -335,6 +335,40 @@ since the engine draws one image at a time. `GET /v1/models` marks the model
 with `"capabilities": ["image_generation"]` and its size rules;
 `/v1/chat/completions` answers 400 and points to the images endpoint.
 
+## Edit one reference image
+
+Install Pillow in the Python environment that runs `coli`. Pass a PNG,
+JPEG, or WebP reference with `--image`. Colibri resizes it once for the
+text encoder and the DiT. Use the generation options above for output
+size, steps, and seed.
+
+```sh
+coli run --model ~/Models/Qwen-Image-2.1 --image fox.png --size 1024x576 \
+  --seed 42 --out edited.png "Give the fox a blue scarf"
+```
+
+Check `GET /v1/models` for `image_editing`. The server advertises it when
+the model supports edits and the server can import Pillow. Send the
+generation fields to `POST /v1/images/edits` as JSON, plus one `image`
+string containing the file bytes as base64 or an image data URL such as
+`data:image/png;base64,...`. The default body limit is 4 MiB. Set
+`COLI_MAX_BODY` in bytes to change it. Leave `mask` and `strength` out of
+the request.
+
+```sh
+python3 -c 'import base64, json; print(json.dumps({
+    "model": "qwen-image-2.1-colibri",
+    "prompt": "Give the fox a blue scarf",
+    "image": base64.b64encode(open("fox.png", "rb").read()).decode("ascii"),
+    "size": "1024x576",
+    "seed": 42,
+}))' | curl -fsS http://127.0.0.1:8000/v1/images/edits \
+  -H 'Content-Type: application/json' --data-binary @-
+```
+
+Read the PNG from `data[0].b64_json` and the generation metadata from
+`colibri`. Set `"stream": true` for `image_edit.*` events.
+
 ## Timings
 
 Measured on a server with 8 Zen 4 cores (AVX-512, 8 OpenMP threads), 768x512,

@@ -31,6 +31,7 @@ Knobs (environment), all optional:
     QWENIMAGE_STUB_LOAD_DELAY  seconds before READY (default 0)
     QWENIMAGE_STUB_PREVIEW     0 never sends PREVIEW even when asked (default 1)
     QWENIMAGE_STUB_MULTIPLE    the side multiple READY advertises (default 32)
+    QWENIMAGE_STUB_EDITS       1 exercises the reference transport (default 0)
 Prompts containing __stub_error__ get an ERROR, __stub_crash__ kills the
 process in the middle of denoising, __stub_garbage__ writes a stray stdout line
 first: the three failure shapes a front end has to survive.
@@ -228,6 +229,8 @@ class Wire:
 
 def serve(args):
     info = dict(DEFAULTS)
+    if os.environ.get("QWENIMAGE_STUB_EDITS") == "1":
+        info["supports_image_edits"] = True
     try:
         info["multiple"] = max(1, int(os.environ.get("QWENIMAGE_STUB_MULTIPLE", info["multiple"])))
     except ValueError:
@@ -275,6 +278,21 @@ def serve(args):
             wire.line("ERROR", {"id": rid, "message": error})
             continue
         prompt = body["prompt"]
+        if "reference_path" in body:
+            if not info.get("supports_image_edits"):
+                wire.line("ERROR", {"id": rid, "message": "reference edits are disabled"})
+                continue
+            try:
+                expected = body["reference_width"] * body["reference_height"] * 4
+                with open(body["reference_path"], "rb") as reference:
+                    pixels = reference.read(expected + 1)
+                if len(pixels) != expected:
+                    raise ValueError("wrong RGBA size")
+            except (KeyError, OSError, TypeError, ValueError):
+                wire.line("ERROR", {"id": rid, "message": "invalid reference frame"})
+                continue
+            # Make transport visible to tests without pretending to edit.
+            prompt += " [reference " + hashlib.sha256(pixels).hexdigest() + "]"
         width = body.get("width", info["default_width"])
         height = body.get("height", info["default_height"])
         steps = body.get("steps", info["default_steps"])
