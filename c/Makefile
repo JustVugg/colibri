@@ -543,7 +543,7 @@ endif
 # and any two that each added a test conflicted on that line by construction; #386 hit it
 # twice while being rebased. A first attempt (#731) globbed tests/test_*.c, which was wrong
 # in the other direction: it promoted files that deliberately have no rule (a branch's
-# work-in-progress test, test_fse, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
+# work-in-progress test, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
 # they fail to link. Having a rule is the honest definition of "this is a gate".
 # RULE_NAMES is every `NAME$(EXE):` rule, with its directory; one pass over the
 # Makefile serves both TEST_RULES here and ENGINE_RULES (#1741, end of file).

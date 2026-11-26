@@ -978,7 +978,6 @@ static void model_reset_rows(Model *m, int n) {
     m->pos = 0;
     kv_prefix_clear(&m->kvp);
 }
-static void model_reset(Model *m) { model_reset_rows(m, -1); }
 
 static void model_load(Model *m, const char *dir, int cap) {
     Cfg *c = &m->c;
