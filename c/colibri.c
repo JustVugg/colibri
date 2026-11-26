@@ -2685,8 +2685,14 @@ static QT qt_kvb_gguf(Model *m, const char *prefix, int H, int nope, int V, int 
     free(kraw); free(vraw);
     return t;   /* no vk_name: no tensor to read it back from, so it keeps its host copy */
 }
-static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
+/* `want` is the element count the forward pass indexes with (config dims): a shorter tensor
+ * used to load into a buffer of its own size and be read past its end at inference, so it is
+ * refused here, as qwen36's load_t_n and olmoe's load_t do (#1824). want < 0: no count to check
+ * against (a tensor whose use is not pinned to a config dim here). */
+static float *ld(Model *m, const char *name, int64_t want){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0) st_die_missing(&m->S,name);
+    if(want>=0 && n!=want){ fprintf(stderr,"%s: %lld elements, config implies %lld -- refusing\n",
+                                    name,(long long)n,(long long)want); exit(1); }
     float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
     st_read_f32(&m->S,name,p,0); return p;
 }
@@ -2871,7 +2877,7 @@ static void ml4_rope_table(Model *m){
     }
     float ff[128]; int has_ff=0;
     if(st_has(&m->S,"model.rotary_emb.freq_factors") && st_numel(&m->S,"model.rotary_emb.freq_factors")==half){
-        float *f=ld(m,"model.rotary_emb.freq_factors"); memcpy(ff,f,half*sizeof(float)); has_ff=1; }
+        float *f=ld(m,"model.rotary_emb.freq_factors",half); memcpy(ff,f,half*sizeof(float)); has_ff=1; }
     for(int j=0;j<half;j++){
         float pos=powf((float)base,(float)(2*j)/(float)dim);
         double inv=1.0/pos;
@@ -2908,7 +2914,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
         if(m->embed.cud_dense){ m->embed.cud_dense=0; g_cud_dense_bytes-=(size_t)qt_bytes(&m->embed); }
 #endif
         m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
-        m->final_norm = ld(m,"model.norm.weight");
+        m->final_norm = ld(m,"model.norm.weight",D);
     }
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
@@ -2958,24 +2964,24 @@ static void model_init_range(Model *m, const char *snap, int cap,
                     && (i < c->n_layers - g_trunk_resident);
         l->trunk_mmap = mmap_ok;
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
-        l->in_ln=ld(m,P("input_layernorm.weight"));
-        l->post_ln=ld(m,P("post_attention_layernorm.weight"));
+        l->in_ln=ld(m,P("input_layernorm.weight"),D);
+        l->post_ln=ld(m,P("post_attention_layernorm.weight"),D);
         l->rope = c->ml4 && !c->rope_on[i] ? 0 : c->qk_rope;   /* a NoPE layer: its whole key unrotated */
         l->nope = c->qk_head - l->rope;
         if(c->ml4){   /* Mistral-Large-4: the query straight from the input (in q_b), kv_a on a KV source only */
             l->q_b = qt_load_ex(m,P("self_attn.q_proj.weight"), H*c->qk_head, D, dbits,mmap_ok);
             if(c->kv_src[i]==i){
                 l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+l->rope, D, dbits,mmap_ok);
-                l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
+                l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"),c->kv_lora);
             }
-            l->ssm_s = ld(m,P("self_attn.softmax_scaling.scale"));
-            l->ssm_b = ld(m,P("self_attn.softmax_scaling.bias"));
+            l->ssm_s = ld(m,P("self_attn.softmax_scaling.scale"),-1);
+            l->ssm_b = ld(m,P("self_attn.softmax_scaling.bias"),-1);
         } else {
         l->q_a   = qt_load_ex(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits,mmap_ok);
-        l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
+        l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"),c->q_lora);
         l->q_b   = qt_load_ex(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits,mmap_ok);
         l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits,mmap_ok);
-        l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
+        l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"),c->kv_lora);
         }
         if(st_has(&m->S,P("self_attn.kv_b_proj.weight")))
             l->kv_b  = qt_load_ex(m,P("self_attn.kv_b_proj.weight"), H*(l->nope+c->v_head), c->kv_lora, dbits,mmap_ok);
@@ -2999,8 +3005,8 @@ static void model_init_range(Model *m, const char *snap, int cap,
             if(!l->up_proj.mmap_view)   qt_planarize(&l->up_proj);
             if(!l->down_proj.mmap_view) qt_planarize(&l->down_proj);
         } else {
-            l->router=ld(m,P("mlp.gate.weight"));
-            l->router_bias=c->softmax_router ? NULL : ld(m,P("mlp.gate.e_score_correction_bias"));   /* softmax: no bias */
+            l->router=ld(m,P("mlp.gate.weight"),(int64_t)c->n_experts*D);
+            l->router_bias=c->softmax_router ? NULL : ld(m,P("mlp.gate.e_score_correction_bias"),c->n_experts);   /* softmax: no bias */
             int sI=c->moe_inter*c->n_shared;
             l->sh_gate = qt_load_ex(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits,mmap_ok);
             l->sh_up   = qt_load_ex(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits,mmap_ok);
@@ -3049,28 +3055,28 @@ static void model_init_range(Model *m, const char *snap, int cap,
         if(m->has_mtp){
             int i=c->n_layers; Layer *l=&m->mtpL;
             #define PM(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
-            l->in_ln=ld(m,PM("input_layernorm.weight"));
-            l->post_ln=ld(m,PM("post_attention_layernorm.weight"));
+            l->in_ln=ld(m,PM("input_layernorm.weight"),D);
+            l->post_ln=ld(m,PM("post_attention_layernorm.weight"),D);
             l->q_a   = qt_load(m,PM("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
-            l->q_a_ln= ld(m,PM("self_attn.q_a_layernorm.weight"));
+            l->q_a_ln= ld(m,PM("self_attn.q_a_layernorm.weight"),c->q_lora);
             l->q_b   = qt_load(m,PM("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
             l->kv_a  = qt_load(m,PM("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
-            l->kv_a_ln= ld(m,PM("self_attn.kv_a_layernorm.weight"));
+            l->kv_a_ln= ld(m,PM("self_attn.kv_a_layernorm.weight"),c->kv_lora);
             if(st_has(&m->S,PM("self_attn.kv_b_proj.weight")))
                 l->kv_b  = qt_load(m,PM("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
             else { char pre[64]; snprintf(pre,sizeof pre,"model.layers.%d.",i);   /* a GGUF's k_b / v_b */
                 l->kv_b = qt_kvb_gguf(m,pre,H,c->qk_nope,c->v_head,c->kv_lora); }
             l->o     = qt_load(m,PM("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
             l->sparse=1;
-            l->router=ld(m,PM("mlp.gate.weight"));
-            l->router_bias=ld(m,PM("mlp.gate.e_score_correction_bias"));
+            l->router=ld(m,PM("mlp.gate.weight"),(int64_t)c->n_experts*D);
+            l->router_bias=ld(m,PM("mlp.gate.e_score_correction_bias"),c->n_experts);
             int sI=c->moe_inter*c->n_shared;
             l->sh_gate = qt_load(m,PM("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
             l->sh_up   = qt_load(m,PM("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
             l->sh_down = qt_load(m,PM("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
             m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, dbits);
-            m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
-            m->mtp_norm=ld(m,PM("shared_head.norm.weight"));
+            m->enorm=ld(m,PM("enorm.weight"),D); m->hnorm=ld(m,PM("hnorm.weight"),D);
+            m->mtp_norm=ld(m,PM("shared_head.norm.weight"),D);
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
@@ -3116,13 +3122,13 @@ static void model_init_range(Model *m, const char *snap, int cap,
                 if(!c->idx_type[i]) continue;
                 #define PI(s) (snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.indexer." s,i),nm)
                 if(c->ml4){   /* Mistral-Large-4: the indexer's query from the input's LayerNorm, its own SSMax */
-                    m->ix_qnw[i]=ld(m,PI("q_input_norm.weight")); m->ix_qnb[i]=ld(m,PI("q_input_norm.bias"));
-                    m->ix_ssm_s[i]=ld(m,PI("softmax_scaling.scale")); m->ix_ssm_b[i]=ld(m,PI("softmax_scaling.bias"));
+                    m->ix_qnw[i]=ld(m,PI("q_input_norm.weight"),-1); m->ix_qnb[i]=ld(m,PI("q_input_norm.bias"),-1);
+                    m->ix_ssm_s[i]=ld(m,PI("softmax_scaling.scale"),-1); m->ix_ssm_b[i]=ld(m,PI("softmax_scaling.bias"),-1);
                 }
                 m->ix_wq[i]=qt_load(m,PI("wq_b.weight"), c->index_nh*c->index_hd, c->ml4 ? D : c->q_lora, dbits);
                 m->ix_wk[i]=qt_load(m,PI("wk.weight"), c->index_hd, D, dbits);
                 m->ix_wp[i]=qt_load(m,PI("weights_proj.weight"), c->index_nh, D, dbits);
-                m->ix_knw[i]=ld(m,PI("k_norm.weight")); m->ix_knb[i]=ld(m,PI("k_norm.bias"));
+                m->ix_knw[i]=ld(m,PI("k_norm.weight"),c->index_hd); m->ix_knb[i]=ld(m,PI("k_norm.bias"),c->index_hd);
                 #undef PI
             }
             fprintf(stderr,"[DSA] indexer active: top-%d sparse attention beyond %d context tokens\n",
@@ -15839,7 +15845,7 @@ static int glm_edge_engine_open(
                            model->c.vocab, model->c.hidden, io_bits);
     model->lm_head = qt_load(model, "lm_head.weight",
                              model->c.vocab, model->c.hidden, io_bits);
-    model->final_norm = ld(model, "model.norm.weight");
+    model->final_norm = ld(model, "model.norm.weight", model->c.hidden);
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              options->model_dir);
