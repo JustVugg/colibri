@@ -39,6 +39,13 @@ probe failures before trusting the split. See the
 
 A GGUF model (DeepSeek V4.1) works the same way: copy the `.gguf` parts to the other drive and point `COLI_MODEL_MIRROR` at that directory. Because every layer's experts live in one part, splitting the parts across drives does not help, but a mirror does, since each expert is read from whichever copy its hash picks. A GGUF copy is accepted when its size, the header up to the first tensor and 16 sampled blocks of data match the primary, so it does not read everything: check a fresh copy with `cmp` or a checksum.
 
+Kimi K3 (`kimi_k3`) reads its routed experts from the copies too. A layer's
+experts live in one shard, so without a copy one drive reads every miss of a
+layer. With copies, the engine sends the O_DIRECT reads of each batch of misses
+round-robin over the drives by weight, and buffered reads (`K3_DIRECT=0`) by
+the hash. The summary at the end of a run prints the reads of each drive
+(`[K3 MIRROR] reads:`). See [kimi_k3.md](kimi_k3.md#streaming-design).
+
 Missing or divergent mirror shards fall back to the primary. For a smaller
 drive, use the [partial-mirror planner](#partial-mirrors-coli-mirror)
 to stage a usage-ranked subset. `COLI_MODEL_DIRS` is a different layout: it

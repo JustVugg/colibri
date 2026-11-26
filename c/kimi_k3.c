@@ -42,6 +42,17 @@
  *   K3_MMAP=0|1          map prepared U8 + F32 tensors read-only instead of
  *                        copying them to private heap (default 0; CPU-only)
  *   K3_EXPERT_GB=N       routed-expert LRU cache budget (default 8)
+ *   COLI_MODEL_MIRROR=d1;d2  copies of the shards on other drives (st.h checks
+ *                        that each file is equal to the primary's). A layer's
+ *                        routed experts live in one shard, so with one drive
+ *                        only that drive reads, and K3_DIRS cannot spread a
+ *                        layer. With copies, the misses of one batch go to all
+ *                        drives (mirror_policy.h): O_DIRECT reads round-robin
+ *                        by weight, buffered reads (K3_DIRECT=0) one fixed
+ *                        drive per expert. A shard that a copy lacks stays on
+ *                        the primary.
+ *   COLI_DISK_WEIGHTS=a,b,.. one positive weight per drive, the primary first
+ *                        (unset = measured at startup)
  *   COLI_VULKAN=1        (build with `make VK=1 kimi_k3`) the routed experts
  *                        on the shared Vulkan expert tier (vk_tier.c, the
  *                        COLI_VK_TIER* variables), the shared experts where
@@ -107,6 +118,7 @@
 #include "cli_args.h"
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "mirror_policy.h"   /* COLI_MODEL_MIRROR: which drive serves an expert read (#812) */
 #include "ggml_view.h"
 #include "tok.h"
 #include "quant.h"
@@ -270,6 +282,7 @@ typedef struct {
      * file's blocks, and e_slot is the largest layer's. */
     int gx; int *gx_t; int64_t *gx_len;
     uint64_t clock, hits, miss, ebytes;
+    MirrorPolicy mir;                     /* COLI_MODEL_MIRROR copies (mirror_policy.h), zeroed = off */
     double t_attn, t_moe, t_eload, t_head;
     FILE *trace;
     /* A multiplexed decode step (k3_step_rows): row t is the token at
@@ -1137,6 +1150,8 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         fprintf(stderr,"invalid Kimi K3 layer range [%d,%d) for %d layers\n",
                 layer_begin,layer_end,c->n_layers); exit(1); }
     st_init_multi(&m->S,snap,getenv("K3_DIRS"));   /* K3_DIRS: extra shard dirs (multi-drive split) */
+    /* before expert_table_init: its st_no_readahead then reaches the copies too */
+    mirror_setup(&m->mir,&m->S,getenv("COLI_MODEL_MIRROR"),snap,"[K3 MIRROR]");
     m->pfx[0]=0;   /* probe a layer-0 tensor: embed/head live in one of the LAST shards */
     if(!st_has(&m->S,"model.layers.0.input_layernorm.weight")&&
        st_has(&m->S,"language_model.model.layers.0.input_layernorm.weight"))
@@ -1965,7 +1980,19 @@ static void cache_promote(Model *m,int li,Slot *dst,Slot *loaded){
     dst->used=++m->clock;
     cache_index(m,li,dst);
 }
-static void expert_read(Model *m, int li, int eid, Slot *s){
+/* The drive that reads an expert: rep, when every tensor of the expert is on
+ * that copy, else the primary. An expert is one read, so a partial copy never
+ * serves half of it. */
+static int k3_expert_rep(Model *m, const ERef *er, int rep){
+    if(rep<=0) return 0;
+    const int n=m->gx?3:(er->contig?1:6);
+    for(int k=0;k<n;k++) if(er->fd[k]<0||st_fd_rep(&m->S,er->fd[k],rep)<0) return 0;
+    return rep;
+}
+/* rep: the drive to read from (0 = the primary, mirror_policy.h). st_fd_rep and
+ * st_direct_fd_rep give the primary's own descriptors for drive 0, so without a
+ * mirror this read is the same as before. */
+static void expert_read_rep(Model *m, int li, int eid, Slot *s, int rep){
     if(!s->base){
         if(posix_memalign((void**)&s->base,4096,(size_t)m->e_slot+8192)){
             fprintf(stderr,"OOM expert slot\n"); exit(1); }
@@ -1973,15 +2000,18 @@ static void expert_read(Model *m, int li, int eid, Slot *s){
     ERef *er=&m->eref[(int64_t)li*m->c.n_experts+eid];
     int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
     if(er->fd[0]<0){ fprintf(stderr,"[K3] expert L%d E%d missing on disk\n",li,eid); exit(1); }
+    rep=k3_expert_rep(m,er,rep);
     s->li=li;
     if(m->gx){   /* a GGUF's: w1, w3 and w2 from their three tensors, one after the other */
         uint8_t *dst=s->base;
-        for(int k=0;k<3;k++){ st_pread_full(er->fd[k],dst,m->gx_len[3*li+k],er->off[k],"pread expert"); dst+=m->gx_len[3*li+k]; }
+        for(int k=0;k<3;k++){ st_pread_full(st_fd_rep(&m->S,er->fd[k],rep),dst,m->gx_len[3*li+k],er->off[k],"pread expert"); dst+=m->gx_len[3*li+k]; }
+        mirror_count(&m->mir,rep,(int64_t)(dst-s->base));
         s->buf=s->base; s->eid=eid;
         return;
     }
     if(er->contig){
-        int dfd = g_k3_direct ? st_direct_fd(&m->S,er->fd[0]) : -1;
+        int bfd = st_fd_rep(&m->S,er->fd[0],rep);
+        int dfd = g_k3_direct ? st_direct_fd_rep(&m->S,er->fd[0],rep) : -1;
         if(dfd>=0){
             /* aligned window read; sub-4K head/tail slack handled explicitly.
              * The tail past the last aligned block (or past EOF) is fetched
@@ -1993,22 +2023,48 @@ static void expert_read(Model *m, int li, int eid, Slot *s){
             if(fstat(dfd,&sb)==0 && a0+dlen>sb.st_size) dlen=(sb.st_size-a0)&~4095LL;
             if(dlen>0) st_pread_full(dfd,s->base,dlen,a0,"pread expert direct");
             if(dlen<want)
-                st_pread_full(er->fd[0],s->base+dlen,want-dlen,a0+dlen,"pread expert tail");
+                st_pread_full(bfd,s->base+dlen,want-dlen,a0+dlen,"pread expert tail");
             s->buf=s->base+pad;
         } else {
-            st_pread_full(er->fd[0],s->base,m->e_slot,er->off[0],"pread expert");
+            st_pread_full(bfd,s->base,m->e_slot,er->off[0],"pread expert");
             s->buf=s->base;
         }
     } else {
         uint8_t *dst=s->base;
         for(int k=0;k<6;k++){
             if(er->fd[k]<0){ fprintf(stderr,"[K3] expert L%d E%d tensor %d missing on disk\n",li,eid,k); exit(1); }
-            st_pread_full(er->fd[k],dst,sizes[k],er->off[k],"pread expert");
+            st_pread_full(st_fd_rep(&m->S,er->fd[k],rep),dst,sizes[k],er->off[k],"pread expert");
             dst+=sizes[k];
         }
         s->buf=s->base;
     }
+    mirror_count(&m->mir,rep,m->e_slot);
     s->eid=eid;
+}
+/* A read on its own (the history's pins, the tier's warm start): the expert's
+ * fixed drive. */
+static void expert_read(Model *m, int li, int eid, Slot *s){
+    expert_read_rep(m,li,eid,s,mirror_hash(&m->mir,li,eid));
+}
+/* The drive of read q of a batch whose first round-robin slot is `first`
+ * (mirror_take). O_DIRECT reads take turns over the drives, so every drive
+ * carries its share of the batch. Buffered reads keep the expert's fixed
+ * drive: the WILLNEED hint before them went there, and the page cache then
+ * holds one copy of the expert. */
+static int k3_batch_rep(Model *m, int li, int eid, uint64_t first, int q){
+    return g_k3_direct ? mirror_pick(&m->mir,first,q) : mirror_hash(&m->mir,li,eid);
+}
+/* WILLNEED for a buffered read, on the drive that read takes (k3_batch_rep) */
+static void k3_expert_hint(Model *m, int li, int eid){
+    ERef *er=&m->eref[(int64_t)li*m->c.n_experts+eid];
+    int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
+    const int rep=k3_expert_rep(m,er,mirror_hash(&m->mir,li,eid));
+    const int n=m->gx?3:(er->contig?1:6);
+    for(int k=0;k<n;k++){
+        if(er->fd[k]<0) continue;
+        int64_t len=m->gx?m->gx_len[3*li+k]:(er->contig?m->e_slot:sizes[k]);
+        posix_fadvise(st_fd_rep(&m->S,er->fd[k],rep),er->off[k],len,POSIX_FADV_WILLNEED);
+    }
 }
 
 static inline float situf_(float g, float u, float b1, float b2){
@@ -2105,7 +2161,7 @@ static VktExpertSrc k3_vk_src(const Model *m, int li, const uint8_t *b){
  * One batch in flight at a time (the submitter consumes every job before the
  * next submit), so the flags need no generation counter. */
 #define LP_MAX 64
-typedef struct { int li, eid; Slot *s; } LJob;
+typedef struct { int li, eid; Slot *s; int rep; } LJob;   /* rep: the drive (k3_batch_rep) */
 static struct {
     pthread_t th[16]; int nth, started;
     pthread_mutex_t mx; pthread_cond_t cv;
@@ -2125,7 +2181,7 @@ static void *lp_main(void *arg){
         pthread_mutex_unlock(&g_lp.mx);
         if(idx>=g_lp.count) continue;
         LJob *j=&g_lp.job[idx];
-        expert_read(g_lp.m,j->li,j->eid,j->s);
+        expert_read_rep(g_lp.m,j->li,j->eid,j->s,j->rep);
         atomic_store_explicit(&g_lp.ready[idx],1,memory_order_release);
     }
     return NULL;
@@ -2198,16 +2254,21 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
             if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; qof[j]=nmiss; missk[nmiss++]=j; }
         }
         if(nmiss){
+            const uint64_t first=mirror_take(&m->mir,nmiss);
             if(g_k3_pipe && !g_lp.started) lp_start();
             if(g_k3_pipe){
                 for(int q=0;q<nmiss;q++){
                     g_lp.job[q].li=li; g_lp.job[q].eid=uids[base+missk[q]]; g_lp.job[q].s=&m->ws[q];
+                    g_lp.job[q].rep=k3_batch_rep(m,li,g_lp.job[q].eid,first,q);
                 }
                 lp_submit(m,nmiss);
             } else {
                 double t0=now_s();
                 #pragma omp parallel for schedule(dynamic,1)
-                for(int q=0;q<nmiss;q++) expert_read(m,li,uids[base+missk[q]],&m->ws[q]);
+                for(int q=0;q<nmiss;q++){
+                    const int eid=uids[base+missk[q]];
+                    expert_read_rep(m,li,eid,&m->ws[q],k3_batch_rep(m,li,eid,first,q));
+                }
                 m->t_eload+=now_s()-t0;
             }
             m->ebytes+=(uint64_t)nmiss*(uint64_t)m->e_slot;
@@ -2713,9 +2774,10 @@ static int k3_vk_load_batch(void *ctx,int li,const int *e,int n,VktExpertSrc *sr
         if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; miss[nmiss++]=j; }
     }
     if(nmiss){
+        const uint64_t first=mirror_take(&m->mir,nmiss);
         double t0=now_s();
         #pragma omp parallel for schedule(dynamic,1)
-        for(int q=0;q<nmiss;q++) expert_read(m,li,e[miss[q]],&m->ws[q]);
+        for(int q=0;q<nmiss;q++) expert_read_rep(m,li,e[miss[q]],&m->ws[q],k3_batch_rep(m,li,e[miss[q]],first,q));
         m->t_eload+=now_s()-t0;
         m->ebytes+=(uint64_t)nmiss*(uint64_t)m->e_slot;
     }
@@ -2921,11 +2983,7 @@ static float *k3_moe_experts(Model *m, Moe *o, int li, const float *x, const flo
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
                 if(vst.ndev&&!vst.left[uid[j]]) continue;   /* the device computes it: nothing to read */
 #endif
-                ERef *er=&m->eref[(int64_t)li*E+uid[j]];
-                int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
-                if(m->gx){ for(int k2=0;k2<3;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],m->gx_len[3*li+k2],POSIX_FADV_WILLNEED); }
-                else if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
-                else for(int k2=0;k2<6;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],sizes[k2],POSIX_FADV_WILLNEED);
+                k3_expert_hint(m,li,uid[j]);
             }
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
         if(vst.ndev) sd=k3_vk_step(m,o,li,C,x,z,u,nu,uid,pfirst,pcnt,poslist,wlist,gate,up,hz,&vst);
@@ -4976,6 +5034,7 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+    mirror_report(&m.mir,"[K3 MIRROR]");
 #ifdef COLI_VULKAN
     k3_vk_report(&m,"run");
 #endif

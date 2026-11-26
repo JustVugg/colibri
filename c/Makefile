@@ -861,7 +861,8 @@ all: colibri$(EXE)
 # deterministic; ref.json is committed and comes from Moonshot's own modeling
 # code (tools/make_kimi_k3_ref.py, maintainer-run, SHA-256-pinned), so CI
 # needs neither torch nor network.  kimi_k3 builds on every platform, so
-# unlike the V4 targets this needs no support gate.
+# unlike the V4 targets this needs no support gate.  tests/kimi_k3_mirror_check.py
+# reads the routed experts from COLI_MODEL_MIRROR copies and expects the same tokens.
 .PHONY: kimi-k3-tiny-generate kimi-k3-tiny-check
 kimi-k3-tiny-generate:
 	$(PYTHON) tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
@@ -869,6 +870,9 @@ kimi-k3-tiny-generate:
 
 kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 	$(PYTHON) tests/test_kimi_k3_tiny.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/kimi_k3_mirror_check.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 	$(PYTHON) tests/test_kimi_k3_ckpt.py \
