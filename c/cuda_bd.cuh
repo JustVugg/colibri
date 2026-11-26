@@ -1697,6 +1697,109 @@ static int bd_gemv_bf16_launch(float *y, const float *x, const bd_u32 *W, int I,
     else coli_launch(bd_gemv_bf16_k<1>, g, 256, 0, st, y, x, W, I, O, rowWords, S, 1);
     return 1;
 }
+/* Selected rows ids[0..n) of a BF16 matrix (fmt 130) against one row of x: matches bd_gemv_bf16_k<1>. */
+__global__ static void __launch_bounds__(256) bd_gemv_rows_bf16_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
+        const int *__restrict__ ids, int I, int O, int rowWords, int n) {
+    COLI_PDL_WAIT();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, C = I / 8;
+    for (int j = (int)blockIdx.x * 8 + warp; j < n; j += (int)gridDim.x * 8) {
+        const int o = ids[j];
+        if (o < 0 || o >= O) {
+            if (lane == 0) y[j] = -__int_as_float(0x7f800000);
+            continue;
+        }
+        const uint4 *Wr = reinterpret_cast<const uint4 *>(W + (size_t)o * rowWords);
+        float acc = 0.f;
+        for (int c = lane; c < C; c += 32) {
+            const uint4 v = __ldg(Wr + c);
+            const float w0 = __uint_as_float(v.x << 16), w1 = __uint_as_float(v.x & 0xffff0000u), w2 = __uint_as_float(v.y << 16),
+                        w3 = __uint_as_float(v.y & 0xffff0000u), w4 = __uint_as_float(v.z << 16), w5 = __uint_as_float(v.z & 0xffff0000u),
+                        w6 = __uint_as_float(v.w << 16), w7 = __uint_as_float(v.w & 0xffff0000u);
+            const float4 *xr = reinterpret_cast<const float4 *>(x) + 2 * c;
+            const float4 a = __ldg(xr), b = __ldg(xr + 1);
+            acc += w0 * a.x + w1 * a.y + w2 * a.z + w3 * a.w + w4 * b.x + w5 * b.y + w6 * b.z + w7 * b.w;
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += bd_shfl_xor(acc, off);
+        if (lane == 0) y[j] = acc;
+    }
+}
+static int bd_gemv_rows_bf16_launch(float *y, const float *x, const bd_u32 *W, const int *ids, int I, int O, int rowWords, int n, cudaStream_t st) {
+    if (I % 8 || (rowWords & 3) || ((uintptr_t)x & 15) || ((uintptr_t)W & 15)) return 0;
+    int bx = (n + 7) / 8;
+    const int cap = 4 * 2048;
+    if (bx > cap) bx = cap;
+    coli_launch(bd_gemv_rows_bf16_k, dim3((unsigned)bx), 256, 0, st, y, x, W, ids, I, O, rowWords, n);
+    return 1;
+}
+/* Selected rows ids[0..n) for float-decoded block formats (F16, unaligned BF16, Q4_0, Q4_1, etc.). */
+__global__ static void __launch_bounds__(256) bd_gemv_rows_f_k(float *__restrict__ y, const float *__restrict__ x, const bd_u32 *__restrict__ W,
+        const bd_u32 *__restrict__ tab, const int *__restrict__ ids, int fmt, int I, int O, int rowWords, int n) {
+    COLI_PDL_WAIT();
+    extern __shared__ float4 bd_smf[];
+    const int I4 = I / 4;
+    const float4 *x4 = reinterpret_cast<const float4 *>(x);
+    for (int k = threadIdx.x; k < I4; k += blockDim.x) bd_smf[bd_x4(k)] = x4[k];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, units = I / 32;
+    for (int j = (int)blockIdx.x * 8 + warp; j < n; j += (int)gridDim.x * 8) {
+        const int o = ids[j];
+        if (o < 0 || o >= O) {
+            if (lane == 0) y[j] = -__int_as_float(0x7f800000);
+            continue;
+        }
+        const bd_u32 *Wr = W + (size_t)o * rowWords;
+        float acc = 0.f;
+        for (int u = lane; u < units; u += 32) {
+            if (fmt == 101 || fmt == 130) {
+                float wf[32];
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    uint4 v = bd_w4(Wr, 4u * (bd_u32)u + (bd_u32)k);
+                    bd_u32 ww[4] = {v.x, v.y, v.z, v.w};
+                    #pragma unroll
+                    for (int h = 0; h < 4; h++) {
+                        wf[8 * k + 2 * h] = fmt == 101 ? bd_h2f(ww[h]) : __uint_as_float(ww[h] << 16);
+                        wf[8 * k + 2 * h + 1] = fmt == 101 ? bd_h2f(ww[h] >> 16) : __uint_as_float(ww[h] & 0xffff0000u);
+                    }
+                }
+                float a = 0.f;
+                #pragma unroll
+                for (int j4 = 0; j4 < 8; j4++) {
+                    float4 p = bd_smf[bd_x4(8 * u + j4)];
+                    a += wf[4 * j4] * p.x + wf[4 * j4 + 1] * p.y + wf[4 * j4 + 2] * p.z + wf[4 * j4 + 3] * p.w;
+                }
+                acc += a;
+                continue;
+            }
+            int wv[32]; float sA, mA, sB, mB;
+            bdf_decode(fmt, Wr, (bd_u32)u, tab, wv, sA, mA, sB, mB);
+            float a = 0.f, b = 0.f, xa = 0.f, xb = 0.f;
+            #pragma unroll
+            for (int j4 = 0; j4 < 4; j4++) {
+                float4 p = bd_smf[bd_x4(8 * u + j4)], q = bd_smf[bd_x4(8 * u + 4 + j4)];
+                a += (float)wv[4 * j4] * p.x + (float)wv[4 * j4 + 1] * p.y + (float)wv[4 * j4 + 2] * p.z + (float)wv[4 * j4 + 3] * p.w;
+                b += (float)wv[16 + 4 * j4] * q.x + (float)wv[16 + 4 * j4 + 1] * q.y + (float)wv[16 + 4 * j4 + 2] * q.z + (float)wv[16 + 4 * j4 + 3] * q.w;
+                xa += p.x + p.y + p.z + p.w; xb += q.x + q.y + q.z + q.w;
+            }
+            acc += sA * a - mA * xa + sB * b - mB * xb;
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += bd_shfl_xor(acc, off);
+        if (lane == 0) y[j] = acc;
+    }
+}
+static inline void bd_smem_raise(const void *k, size_t sm, size_t smem_max, unsigned *raised);
+static int bd_gemv_rows_f_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, const int *ids, int fmt, int I, int O,
+                                 int rowWords, int n, size_t smem_max, cudaStream_t st) {
+    size_t sm = bd_gemv_f_smem(I, 1);
+    if (sm > smem_max) return 0;
+    int bx = (n + 7) / 8;
+    const int cap = 4 * 2048;
+    if (bx > cap) bx = cap;
+    static unsigned raised;
+    bd_smem_raise((const void *)bd_gemv_rows_f_k, sm, smem_max, &raised);
+    coli_launch(bd_gemv_rows_f_k, dim3((unsigned)bx), 256, sm, st, y, x, W, tab, ids, fmt, I, O, rowWords, n);
+    return 1;
+}
 /* The launch for a block-format matrix (fmt 100 + t, rows of rowWords words at W, I a
  * multiple of 32 and of the type's block) on S rows of x: the integer form where the type
  * has one (each verify's rows a block, up to BD_GEMV_NR), else the float form. smem_max:
@@ -1909,7 +2012,11 @@ static inline int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W,
         BD_R8_CASE(6) BD_R8_CASE(7) BD_R8_CASE(8) BD_R8_CASE(10) BD_R8_CASE(11) BD_R8_CASE(12) BD_R8_CASE(13) BD_R8_CASE(14) BD_R8_CASE(16) BD_R8_CASE(17)
         BD_R8_CASE(18) BD_R8_CASE(19) BD_R8_CASE(20) BD_R8_CASE(21) BD_R8_CASE(22) BD_R8_CASE(23) BD_R8_CASE(29) BD_R8_CASE(42)
 #undef BD_R8_CASE
-        default: return 0;
+        case 30:
+            if (bd_gemv_rows_bf16_launch(y, x, W, ids, I, O, rowWords, n, st)) return 1;
+            return bd_gemv_rows_f_launch(y, x, W, tab, ids, fmt, I, O, rowWords, n, smem_max, st);
+        default:
+            return bd_gemv_rows_f_launch(y, x, W, tab, ids, fmt, I, O, rowWords, n, smem_max, st);
     }
 }
 /* y = silu(x Wg^T) * (x Wu^T) for up to BD_GEMV_MAX_S rows, Wg and Wu of one type and shape (bd_gemv_i8_k's
