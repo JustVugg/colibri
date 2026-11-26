@@ -203,6 +203,8 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_F2_MODE", CE_INT, CE_QWEN, 0, NULL}, /* Prompt attention kernel variant for head dimension 256. Default 0. */
     {"COLI_CUDA_F32G_FAST", CE_INT, CE_QWEN, 0, NULL}, /* FP32 GEMM tile selection for narrow outputs. Default 1. */
     {"COLI_CUDA_F32T", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA_F8_TC", CE_BOOL, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA_F8_TC_MIN_ROWS", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_F8_WARP", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_FLUSH", CE_BOOL, CE_QWEN | CE_QWEN38, 0, NULL},
     {"COLI_CUDA_FUSED_SWIGLU", CE_BOOL, CE_QWEN, 0, NULL}, /* Fuse shared-expert projections with SwiGLU where supported. Defaults to the active profile. */
@@ -679,6 +681,9 @@ static const ColiEnvVar coli_env_table[] = {
     {"INK2_CC_GRAPH",                    CE_BOOL  , CE_INKLING                                      , 0             , NULL},
     {"INK2_METAL",                       CE_BOOL  , CE_INKLING                                      , 0             , NULL},
     {"INK2_MTP",                         CE_BOOL  , CE_INKLING                                      , 0             , NULL},
+    {"INK2_MTP_ADAPT",                   CE_BOOL  , CE_INKLING                                      , 0             , NULL},
+    {"INK2_MTP_CHAIN",                   CE_BOOL  , CE_INKLING                                      , 0             , NULL},
+    {"INK2_MTP_HEAD",                    CE_STR   , CE_INKLING                                      , 0             , NULL},
     {"INK2_MTP_K",                       CE_INT   , CE_INKLING                                      , 0             , NULL},
     {"INK2_MTP_ORACLE",                  CE_BOOL  , CE_INKLING                                      , 0             , NULL},
     {"INK_DENSE_Q4",                     CE_STR   , CE_INKLING                                      , 0             , NULL},

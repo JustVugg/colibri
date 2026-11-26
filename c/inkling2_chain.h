@@ -90,7 +90,17 @@ typedef struct {
     float *host_routed;
     unsigned long long forwards;
     double host_ms;
+    /* INK2_MTP on the chain (inkling2_mtp.h): a verify of vrows rows runs with snap > 0, its
+     * convolutions keeping their states after each row at rings + (s+1)*snap, and leaves every
+     * row's logits (softcapped) in vlog */
+    int snap, vrows; float *vlog;
 } Ink2Chain;
+
+static int ink2mc_capture(Model *m, int k, VkcBuf *x, int n);   /* inkling2_mtp.h */
+static int ink2mc_begin(Model *m, int pb, int n);
+static int ink2mc_commit(Model *m, int n);
+static int ink2mc_save(Model *m, int pb, int n);
+static int ink2mc_prepare(Model *m, int rows);
 
 static void ink2c_fatal(const char *what) {
     fprintf(stderr, "[VK] inkling2 chain: %s -- stopping (COLI_VK_CHAIN=0 keeps the state on the CPU)\n", what);
@@ -301,7 +311,10 @@ static Ink2Chain *ink2c_setup(Model *m) {
     ch->csd_n = 0;   /* the states one after another, the same layout on the device and in the read-back */
     for (int v = 0; v < ch->NS; v++)
         for (int b = 0; b < 4; b++) { ch->o_csd[(size_t)b * ch->NS + v] = ch->csd_n; ch->csd_n += (size_t)ink_cs_cells(c, b, v); }
-    if (!(ch->rings = vkc_buf((ch->csd_n ? ch->csd_n : 1) * sizeof(float), VKC_DEV))) { ink2c_free_own(m, ch); return NULL; }
+    /* INK2_MTP: room for a verify's states after each of its rows (ink2c_sconv's snap) */
+    if (!(ch->rings = vkc_buf((ch->csd_n ? ch->csd_n : 1) * (g_ink2mc ? 1 + VKC_DMOE_ROWS : 1) * sizeof(float), VKC_DEV))) {
+        ink2c_free_own(m, ch); return NULL;
+    }
     ch->cs_where = INK2C_HOST; ch->host_zero = 0;
     ch->ok = 1;
     if (c->loop_p > 1)
@@ -458,7 +471,7 @@ static int ink2c_norm(VkcBuf *x, VkcBuf *w, size_t wo, VkcBuf *y, int rows, int 
 /* a static short convolution through bank `bank` and its scale: (conv + input) / sqrt(K + 1);
  * the taps of weight layer i, the state of state layer v */
 static int ink2c_sconv(Ink2Chain *ch, VkcBuf *x, size_t xo, int n, int C, int bank, int i, int v, const Cfg *c) {
-    VkcSconv p = {0, n, C, c->conv_k, (int)xo, C, (int)ch->o_cw[bank][i], (int)ch->o_csd[(size_t)bank * ch->NS + v], 0, 1.f};
+    VkcSconv p = {0, n, C, c->conv_k, (int)xo, C, (int)ch->o_cw[bank][i], (int)ch->o_csd[(size_t)bank * ch->NS + v], ch->snap, 1.f};
     VkcSconv dv = {2, 0, 0, 0, (int)xo, 0, 0, 0, n * C, (float)sqrt((double)(c->conv_k + 1))};
     return vkc_sconv(x, ch->prm, ch->rings, &p) && vkc_sconv(x, NULL, NULL, &dv);
 }
@@ -466,7 +479,7 @@ static int ink2c_sconv(Ink2Chain *ch, VkcBuf *x, size_t xo, int n, int C, int ba
 static int ink2c_dconv(Ink2Chain *ch, Model *m, int i, int v, int bank, VkcBuf *xin, int n) {
     Cfg *c = &m->c; int KV = L_KV(c, i), hd = L_HD(c, i), K = c->conv_k;
     VkcInk2Dconv p = {n, KV * hd, K, hd, bank ? (int)ch->vs_off : 0, KV * hd, 0, KV * K, (int)ch->o_cw[bank][i],
-                      (int)ch->o_csd[(size_t)bank * ch->NS + v], (float)sqrt((double)(2 * K + 1))};
+                      (int)ch->o_csd[(size_t)bank * ch->NS + v], (float)sqrt((double)(2 * K + 1)), ch->snap};
     return vkc_matmul(ch->t_wp[bank][i], xin, 0, ch->dyn, 0, n) && vkc_ink2_dconv(ch->kvs, ch->dyn, ch->prm, ch->rings, &p);
 }
 /* the attention from nq (and nk, nv on a global layer, or with a loop pass's messages: sep): o_proj's
@@ -621,12 +634,18 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
     vkc_relattn_part(ch->relpart);   /* a decode step's attention split over its positions */
     int *dq = dmoe ? malloc((size_t)2 * c->n_state * sizeof(int)) : NULL, ndq = 0;   /* this frame's in-frame steps (i, v) */
     if (dmoe && !dq) { free(xfin); return 0; }
-    vkc_gemm_rows(-1);
+    if (g_ink2mc && !ink2mc_prepare(m, rows)) {
+        g_ink2mc = 0;
+        fprintf(stderr, "[VK] INK2_MTP: the drafter is off from here on (plain decode)\n");
+    }
+    vkc_gemm_rows(ch->vrows ? 0 : -1);   /* a verify's rows get a decode step's bits */
+    if (ch->vrows && (!g_ink2mc || S != ch->vrows || rows != S || !vkc_reserve(&ch->outd, (size_t)S * c->unpad_vocab * 4, VKC_DOWN) ||
+                      !vkc_reserve(&ch->fin, (size_t)S * D * 4, VKC_DEV))) { free(xfin); free(dq); return 0; }
     for (int c0 = 0; c0 < S; c0 += rows) {
         if (coli_prompt_break()) { free(xfin); free(dq); return 0; }
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0, R = ch->rows;
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
-            !ink2c_push_state(ch, m)) goto lost;
+            !ink2c_push_state(ch, m) || (ch->vrows && !ink2mc_save(m, pb, n)) || (g_ink2mc && !ink2mc_begin(m, pb, n))) goto lost;
         if (dmoe && !vkc_dmoe_upload(&ch->dm)) goto lost;   /* the tier's residents changed: the table again */
         ndq = 0;
         {   /* attention's tau: the global layers' log-length scale, then 1 for the sliding ones */
@@ -656,6 +675,7 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
             Layer *l = &m->L[i]; Ink2Layer *x2 = l->x2;
             int local = c->local[i];
             if (pending) ok = ink2c_join(ch, m, pi, pv, n, prev_dev ? ch->dm.y : ch->routed);
+            if (ok && g_ink2mc) ok = ink2mc_capture(m, st, ch->x, n);   /* the stream after st layer steps */
             const int dl = dmoe && n <= ch->kvl_rows && ink2c_dmoe_on(ch, m, i);   /* its experts here, no wait */
             const int msg = lp && pass > 0;   /* a later pass: this layer's four messages */
             if (ok && lp && i == ls) {
@@ -749,16 +769,19 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
             pending = 1; pi = i; pv = v; prev_dev = 0;
         }
         if (ok && pending) ok = ink2c_join(ch, m, pi, pv, n, prev_dev ? ch->dm.y : ch->routed);
+        if (ok && g_ink2mc) ok = ink2mc_capture(m, steps, ch->x, n);
         /* the output's mix of the block states and the last stream: the rows the final norm reads */
         ok = ok && ink2c_mix(ch, ch->x, B, ch->o_outq, ch->hq, n, D);
+        if (ok && g_ink2mc) ok = ink2mc_capture(m, steps + 1, ch->hq, n) && ink2mc_commit(m, n);
         if (ok && want_x) ok = vkc_copy(ch->xd, 0, ch->hq, 0, (size_t)n * D);
         if (ok && ch->csd_n) ok = vkc_copy(ch->csd, 0, ch->rings, 0, ch->csd_n);   /* the convolution states, for the host */
         int last = c0 + n == S;
-        if (ok && last) {
-            VkcSconv dv = {2, 0, 0, 0, 0, 0, 0, 0, D, c->mup};
-            VkcNorm fp = {1, D, 1, (n - 1) * D, D, D, 0, D, D, (int)ch->o_final, 0, 0, c->eps, 1.f};
+        if (ok && last) {   /* the last row's head; a verify's: every row's, each as a decode step's */
+            const int hr = ch->vrows ? n : 1;
+            VkcSconv dv = {2, 0, 0, 0, 0, 0, 0, 0, hr * D, c->mup};
+            VkcNorm fp = {hr, D, 1, (n - hr) * D, D, D, 0, D, D, (int)ch->o_final, 0, 0, c->eps, 1.f};
             ok = vkc_norm(ch->hq, ch->prm, ch->fin, &fp) && vkc_sconv(ch->fin, NULL, NULL, &dv) &&
-                 vkc_matmul(ch->t_lm, ch->fin, 0, ch->outd, 0, 1);
+                 vkc_matmul(ch->t_lm, ch->fin, 0, ch->outd, 0, hr);
         }
         double t0 = now_s();
         ok = ok && vkc_submit(1);
@@ -771,7 +794,11 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
             memcpy(m->cs[b][i], csd + ch->o_csd[(size_t)b * ch->NS + i], (size_t)ink_cs_cells(c, b, i) * sizeof(float));
         ch->cs_where = INK2C_BOTH; ch->host_zero = 0;
         if (want_x) memcpy(xfin + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
-        if (last) {
+        if (last && ch->vrows) {
+            memcpy(ch->vlog, vkc_ptr(ch->outd), (size_t)n * c->unpad_vocab * sizeof(float));
+            ink2_head_post(c, ch->vlog, (int64_t)n * c->unpad_vocab);
+            memcpy(logit, ch->vlog + (size_t)(n - 1) * c->unpad_vocab, (size_t)c->unpad_vocab * sizeof(float));
+        } else if (last) {
             memcpy(logit, vkc_ptr(ch->outd), (size_t)c->unpad_vocab * sizeof(float));
             ink2_head_post(c, logit, c->unpad_vocab);
         }
