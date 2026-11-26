@@ -142,11 +142,23 @@ static int q36_checkpoint_same_win_info(const BY_HANDLE_FILE_INFORMATION *a,
         a->ftCreationTime.dwHighDateTime == b->ftCreationTime.dwHighDateTime &&
         a->ftCreationTime.dwLowDateTime == b->ftCreationTime.dwLowDateTime;
 }
+
+static int q36_checkpoint_path_matches_fd(const char *path, int fd, const BY_HANDLE_FILE_INFORMATION *before) {
+    BY_HANDLE_FILE_INFORMATION opened, named;
+    return q36_checkpoint_fd_info(fd, &opened) && q36_checkpoint_same_win_info(before, &opened) &&
+        q36_checkpoint_path_info(path, &named) && q36_checkpoint_same_win_info(&opened, &named);
+}
 #else
 static int q36_checkpoint_same_file(const struct stat *a, const struct stat *b) {
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size &&
         a->st_mtime == b->st_mtime && q36_checkpoint_mtime_ns(a) == q36_checkpoint_mtime_ns(b) &&
         a->st_ctime == b->st_ctime && q36_checkpoint_ctime_ns(a) == q36_checkpoint_ctime_ns(b);
+}
+
+static int q36_checkpoint_path_matches_fd(const char *path, int fd, const struct stat *before) {
+    struct stat opened, named;
+    return fstat(fd, &opened) == 0 && q36_checkpoint_same_file(before, &opened) &&
+        stat(path, &named) == 0 && q36_checkpoint_same_file(&opened, &named);
 }
 #endif
 
@@ -272,8 +284,12 @@ static int q36_checkpoint_stamp(char line[Q36_CHECKPOINT_LINE], const Q36Checkpo
 static int q36_gguf_checkpoint_matches(const gguf_ctx *gg, const Q36CheckpointFile *file, const char *snap) {
     if (!snap || gg->n_files != 1 || !gg->fds || !gg->paths || !gg->paths[0]) return 0;
     int fd = gg->fds[0];
-    struct stat before, after, named;
+    struct stat before;
     if (fstat(fd, &before) || !S_ISREG(before.st_mode) || before.st_size != file->bytes) return 0;
+#ifdef _WIN32
+    BY_HANDLE_FILE_INFORMATION win_before;
+    if (!q36_checkpoint_fd_info(fd, &win_before)) return 0;
+#endif
 
     char cache[2048], old[1][Q36_CHECKPOINT_LINE] = {{0}}, fresh[1][Q36_CHECKPOINT_LINE];
     /* SNAP may name an import directory or the GGUF itself. */
@@ -284,8 +300,11 @@ static int q36_gguf_checkpoint_matches(const gguf_ctx *gg, const Q36CheckpointFi
     if (stamp) q36_checkpoint_cache_read(cache, old, 1);
     int hit = stamp && !strcmp(old[0], fresh[0]);
     if (!hit && !q36_checkpoint_digest(fd, file)) return 0;
-    if (fstat(fd, &after) || !q36_checkpoint_same_file(&before, &after) ||
-        stat(gg->paths[0], &named) || !q36_checkpoint_same_file(&after, &named)) return 0;
+#ifdef _WIN32
+    if (!q36_checkpoint_path_matches_fd(gg->paths[0], fd, &win_before)) return 0;
+#else
+    if (!q36_checkpoint_path_matches_fd(gg->paths[0], fd, &before)) return 0;
+#endif
     if (stamp && !hit) q36_checkpoint_cache_write(cache, fresh, 1);
     return 1;
 }
@@ -342,13 +361,9 @@ static int q36_checkpoint_matches(const shards *s, const Q36Checkpoint *checkpoi
     for (int i = 0; i < nfiles; i++) {
         if (!q36_checkpoint_path(path, sizeof path, checkpoint->snap, checkpoint->files[i].name)) goto done;
 #ifdef _WIN32
-        BY_HANDLE_FILE_INFORMATION opened, named;
-        if (!q36_checkpoint_fd_info(fds[i], &opened) || !q36_checkpoint_same_win_info(&win_before[i], &opened) ||
-            !q36_checkpoint_path_info(path, &named) || !q36_checkpoint_same_win_info(&opened, &named)) goto done;
+        if (!q36_checkpoint_path_matches_fd(path, fds[i], &win_before[i])) goto done;
 #else
-        struct stat opened, named;
-        if (fstat(fds[i], &opened) != 0 || !q36_checkpoint_same_file(&before[i], &opened) ||
-            stat(path, &named) != 0 || !q36_checkpoint_same_file(&opened, &named)) goto done;
+        if (!q36_checkpoint_path_matches_fd(path, fds[i], &before[i])) goto done;
 #endif
     }
     if (cache_path && cacheable && changed) q36_checkpoint_cache_write(cache, fresh, nfiles);

@@ -140,6 +140,13 @@ int main(void) {
     ck(!q36_checkpoint_matches(&s_diff, &ckpt),
        "q36_checkpoint_matches rejects fd opened on a distinct file with identical bytes, size, and timestamps");
 
+    char *paths[] = {path_a};
+    gguf_ctx gg = {.n_files = 1, .fds = &fd1, .paths = paths};
+    ck(q36_gguf_checkpoint_matches(&gg, &files[0], dir), "GGUF accepts the named file");
+    gg.fds = &fd_b;
+    ck(!q36_gguf_checkpoint_matches(&gg, &files[0], dir),
+       "GGUF rejects a distinct file with identical bytes, size, and timestamps");
+
     if (fd1 >= 0) close(fd1);
     if (fd2 >= 0) close(fd2);
     if (fd_b >= 0) close(fd_b);
