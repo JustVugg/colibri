@@ -445,32 +445,64 @@ __device__ __forceinline__ void ccg_relattn_tile_hd128(
         float &m, float &l, float &acc0) {
     const int warp = tid >> 5, lane = tid & 31;
     const int cnt = min(128, n - b0);
-    for (int j = warp; j < cnt; j += 4) {
-        const int t = t0 + b0 + j;
-        const float *kr = t < p.pos_base
-            ? kc + p.k_off + ((long)kvh * p.cap + t % p.cap) * 128
-            : kvs + p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * 128;
-        const float4 kv = __ldg(reinterpret_cast<const float4 *>(kr) + lane);
-        float a = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xffffffffu, a, off);
-        const int dist = qpos - t;
-        float bias = 0.f;
-        if (dist < p.ext && p.d_rel > 0) {
-            if (p.d_rel <= 32) {
-                bias = lane < p.d_rel ? rs[lane] * __ldg(relp + p.relp_off + lane * p.ext + dist) : 0.f;
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1) bias += __shfl_xor_sync(0xffffffffu, bias, off);
-            } else {
-                for (int rj = lane; rj < p.d_rel; rj += 32)
-                    bias += rs[rj] * __ldg(relp + p.relp_off + rj * p.ext + dist);
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1) bias += __shfl_xor_sync(0xffffffffu, bias, off);
+    const int t_start = t0 + b0;
+    const int row0 = t_start % p.cap;
+    const bool contig = (t_start + cnt <= p.pos_base) && (row0 + cnt <= p.cap);
+    const long head_off = (long)kvh * p.cap;
+    if (contig) {
+        const bool any_rel = (p.d_rel > 0) && (qpos - (t_start + cnt - 1) < p.ext);
+        for (int j = warp; j < cnt; j += 4) {
+            const float *kr = kc + p.k_off + (head_off + row0 + j) * 128;
+            const float4 kv = __ldg(reinterpret_cast<const float4 *>(kr) + lane);
+            float a = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xffffffffu, a, off);
+            float bias = 0.f;
+            if (any_rel) {
+                const int dist = qpos - (t_start + j);
+                if (dist < p.ext) {
+                    if (p.d_rel <= 32) {
+                        bias = lane < p.d_rel ? rs[lane] * __ldg(relp + p.relp_off + lane * p.ext + dist) : 0.f;
+                        #pragma unroll
+                        for (int off = 16; off > 0; off >>= 1) bias += __shfl_xor_sync(0xffffffffu, bias, off);
+                    } else {
+                        for (int rj = lane; rj < p.d_rel; rj += 32)
+                            bias += rs[rj] * __ldg(relp + p.relp_off + rj * p.ext + dist);
+                        #pragma unroll
+                        for (int off = 16; off > 0; off >>= 1) bias += __shfl_xor_sync(0xffffffffu, bias, off);
+                    }
+                }
             }
+            if (lane == 0) red[j] = ts * (a * p.scale + bias);
         }
-        if (lane == 0) {
-            red[j] = ts * (a * p.scale + bias);
-            pt[j] = t;
+    } else {
+        for (int j = warp; j < cnt; j += 4) {
+            const int t = t_start + j;
+            const float *kr = t < p.pos_base
+                ? kc + p.k_off + (head_off + t % p.cap) * 128
+                : kvs + p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * 128;
+            const float4 kv = __ldg(reinterpret_cast<const float4 *>(kr) + lane);
+            float a = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xffffffffu, a, off);
+            const int dist = qpos - t;
+            float bias = 0.f;
+            if (dist < p.ext && p.d_rel > 0) {
+                if (p.d_rel <= 32) {
+                    bias = lane < p.d_rel ? rs[lane] * __ldg(relp + p.relp_off + lane * p.ext + dist) : 0.f;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) bias += __shfl_xor_sync(0xffffffffu, bias, off);
+                } else {
+                    for (int rj = lane; rj < p.d_rel; rj += 32)
+                        bias += rs[rj] * __ldg(relp + p.relp_off + rj * p.ext + dist);
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) bias += __shfl_xor_sync(0xffffffffu, bias, off);
+                }
+            }
+            if (lane == 0) {
+                red[j] = ts * (a * p.scale + bias);
+                pt[j] = t;
+            }
         }
     }
     __syncthreads();
@@ -494,13 +526,30 @@ __device__ __forceinline__ void ccg_relattn_tile_hd128(
     const float corr = expf(m - mn);
     l = l * corr + sum_e;
     acc0 *= corr;
-    for (int j = 0; j < cnt; j++) {
-        const int t = pt[j];
-        const float w = pe[j];
-        const float *vr = t < p.pos_base
-            ? vc + p.v_off + ((long)kvh * p.cap + t % p.cap) * 128
-            : kvs + p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * 128;
-        acc0 += w * __ldg(vr + tid);
+    if (contig) {
+        const float *vp = vc + p.v_off + (head_off + row0) * 128 + tid;
+        int j = 0;
+        for (; j + 3 < cnt; j += 4) {
+            const float w0 = pe[j], w1 = pe[j + 1], w2 = pe[j + 2], w3 = pe[j + 3];
+            const float v0 = __ldg(vp + (long)j * 128);
+            const float v1 = __ldg(vp + (long)(j + 1) * 128);
+            const float v2 = __ldg(vp + (long)(j + 2) * 128);
+            const float v3 = __ldg(vp + (long)(j + 3) * 128);
+            acc0 += w0 * v0;
+            acc0 += w1 * v1;
+            acc0 += w2 * v2;
+            acc0 += w3 * v3;
+        }
+        for (; j < cnt; j++) acc0 += pe[j] * __ldg(vp + (long)j * 128);
+    } else {
+        for (int j = 0; j < cnt; j++) {
+            const int t = pt[j];
+            const float w = pe[j];
+            const float *vr = t < p.pos_base
+                ? vc + p.v_off + (head_off + t % p.cap) * 128
+                : kvs + p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * 128;
+            acc0 += w * __ldg(vr + tid);
+        }
     }
     m = mn;
     __syncthreads();
