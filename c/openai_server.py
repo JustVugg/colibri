@@ -226,6 +226,12 @@ class GenerationScheduler:
         """`slot` pins the request to that slot (a client's `cache_slot`); `prefer` and
         `cache_key` rank free slots for KV prefix reuse: an exact prefix hit wins, then an
         unused slot (preferring `prefer`), then the least recently used slot."""
+        # #2477: a summary (context compaction) is admitted before the request's own
+        # validation runs; an impossible target never takes a ticket or aliases a real slot
+        if slot is not None and (isinstance(slot, bool) or not isinstance(slot, int)
+                                 or not 0 <= slot < self.capacity):
+            raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.capacity - 1}.",
+                           "cache_slot")
         ticket = object()
         entry = (ticket, slot)          # (#B2) remember each waiter's target slot for fair, per-slot admission
         queued_at = time.monotonic()
@@ -1340,12 +1346,15 @@ class ToolTextStream:
 
     def __init__(self, emit, tools, sideband):
         self.emit = emit
+        self.tools = tools
         self.sideband = sideband
         self.qwen = (QwenToolStream(emit, tools) if chat_flavor() in
                      ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
         self.buf = ""
         self.in_tool = False
         self.hold = _tool_hold()
+        self.raw = []                    # the answer as fed: the GLM form's prose after a call (finish)
+        self.emitted = 0                 # its characters released so far, from the start
 
     def feed(self, chunk):
         if self.qwen is not None:
@@ -1354,6 +1363,7 @@ class ToolTextStream:
         if self.sideband.seen:
             self.emit(chunk)
             return
+        self.raw.append(chunk)
         if self.in_tool:
             return                       # tool markers never reach the client as text
         self.buf += chunk
@@ -1361,21 +1371,35 @@ class ToolTextStream:
         if cut >= 0:
             if cut:
                 self.emit(self.buf[:cut])
+                self.emitted += cut
             self.buf = ""
             self.in_tool = True
             return
         flush = max(0, len(self.buf) - self.hold)
         if flush:
             self.emit(self.buf[:flush])
+            self.emitted += flush
             self.buf = self.buf[flush:]
 
     def finish(self):
-        """The end of the reply: the held tail goes out when no call began. Returns the Qwen
-        form's calls, parsed as they streamed, or None when the caller parses the reply."""
+        """The end of the reply: the held tail goes out when no call began. In the GLM form
+        (GLM-5.2, GLM-5.3) the prose around and after complete calls goes out too, as the
+        parser keeps it (#2469: only the text before the first call reached a streamed
+        reply, all of it a whole one); the streamed prefix is not repeated and the calls'
+        markers and arguments stay out. Returns the Qwen form's calls, parsed as they
+        streamed, the GLM form's from that parse, or None when the caller parses the reply."""
         if self.qwen is not None:
             return self.qwen.finish()
         if not self.in_tool and self.buf:
             self.emit(self.buf)
+        elif self.in_tool and ARCH in ("glm", "glm53") and chat_flavor() not in ("muse", "mistral_large4"):
+            content, calls, _boxes, spans = parse_tool_calls_spans("".join(self.raw), self.tools)
+            for begin, end, target in spans or ():
+                first = max(begin, self.emitted)
+                if first < end:
+                    self.emit(content[target + first - begin:target + end - begin])
+            self.buf = ""
+            return calls                 # the parse the caller would make (one parse, one log line)
         self.buf = ""
         return None
 
@@ -3126,6 +3150,8 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
         parts.append("<|im_start|>system\n" + QWEN3_CODER_SYSTEM)
     if tools:
         parts.append(_qwen3_coder_tool_block(tools))
+        if tool_choice == "required":
+            parts.append(TOOL_CHOICE_REQUIRED_INSTRUCTION)
     if system is not None or tools:
         parts.append("<|im_end|>\n")
     loop = messages[start:]
@@ -9895,19 +9921,9 @@ class APIHandler(BaseHTTPRequestHandler):
             error.status, "api_error" if error.status >= 500 else "invalid_request_error")
         return {"type": "error", "error": {"type": kind, "message": error.message}}
 
-    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None, image=None,
-                   add_generation_prompt=True, compaction=None):
-        # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
-        # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
-        # tool results into `prompt`, so level 2 is the full conversation the engine saw.
-        try:
-            dbg = int(os.environ.get("COLI_DEBUG", "0"))
-        except ValueError:
-            dbg = 0
-        if dbg >= 2:
-            sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
-            sys.stderr.flush()
+    def _generation_request_options(self, body, chat):
+        """The request's generation options, validated, with no work admitted and no engine
+        call (#2477: context compaction summarizes before generation() runs)."""
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
         family = family_by_id(ARCH)
@@ -9919,28 +9935,12 @@ class APIHandler(BaseHTTPRequestHandler):
         engine_k, echo, display_k = logprobs_options(
             body, chat, getattr(self.server.engine, "supports_logprobs_echo", False))
         stop_sequences, ignore_leading_stop = stop_policy(body, chat)
-        # tools and tool_choice come from chat_completion() already processed/filtered
-        if chat and tool_choice == "none":
-            tools = None          # client forbade tools: never surface tool_calls
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
                  not 0 <= cache_slot < self.server.kv_slots)):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
-        prefer_slot = None
-        cache_key = None
-        if cache_slot is None and self.server.kv_slots > 1:
-            # #634: each conversation prefers a stable KV slot so multi-turn reuses its
-            # cached prefix instead of re-prefilling. Only when the request carries a
-            # conversation; raw /v1/completions keeps the scheduler's free-slot pick. A
-            # preference, not a pin: when that slot is busy with another conversation and
-            # another is free, the request takes the free one (its prefix read again)
-            # rather than waiting for the other conversation to end.
-            conversation = body.get("messages")
-            if isinstance(conversation, list) and conversation:
-                cache_key = conversation_cache_key(conversation)
-                prefer_slot = conversation_cache_slot(conversation, self.server.kv_slots)
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
@@ -9958,6 +9958,41 @@ class APIHandler(BaseHTTPRequestHandler):
             # bool("false") is True: a string, number or object would have turned the usage frame on
             raise APIError(400, "`stream_options.include_usage` must be a boolean.", "stream_options.include_usage")
         include_usage = bool(include_usage)
+        return (maximum, temperature, top_p, grammar, engine_k, echo, display_k,
+                stop_sequences, ignore_leading_stop, cache_slot, stream, include_usage)
+
+    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
+                   enable_thinking=False, audio=None, image=None,
+                   add_generation_prompt=True, compaction=None):
+        # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
+        # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
+        # tool results into `prompt`, so level 2 is the full conversation the engine saw.
+        try:
+            dbg = int(os.environ.get("COLI_DEBUG", "0"))
+        except ValueError:
+            dbg = 0
+        if dbg >= 2:
+            sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
+            sys.stderr.flush()
+        (maximum, temperature, top_p, grammar, engine_k, echo, display_k,
+         stop_sequences, ignore_leading_stop, cache_slot, stream, include_usage) = (
+            self._generation_request_options(body, chat))
+        # tools and tool_choice come from chat_completion() already processed/filtered
+        if chat and tool_choice == "none":
+            tools = None          # client forbade tools: never surface tool_calls
+        prefer_slot = None
+        cache_key = None
+        if cache_slot is None and self.server.kv_slots > 1:
+            # #634: each conversation prefers a stable KV slot so multi-turn reuses its
+            # cached prefix instead of re-prefilling. Only when the request carries a
+            # conversation; raw /v1/completions keeps the scheduler's free-slot pick. A
+            # preference, not a pin: when that slot is busy with another conversation and
+            # another is free, the request takes the free one (its prefix read again)
+            # rather than waiting for the other conversation to end.
+            conversation = body.get("messages")
+            if isinstance(conversation, list) and conversation:
+                cache_key = conversation_cache_key(conversation)
+                prefer_slot = conversation_cache_slot(conversation, self.server.kv_slots)
         object_name = "chat.completion" if chat else "text_completion"
         id_prefix = "chatcmpl-" if chat else "cmpl-"
         completion_id = id_prefix + uuid.uuid4().hex
@@ -10048,6 +10083,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     echo=echo, display_k=display_k, prompt_echoes=prompt_echoes,
                     stop_spans=stop_filter.spans, content_spans=content_spans,
                     cache_slot=cache_slot)
+                if generation_stopped():
+                    # The API's stop filter can match in the final allowed token.
+                    # Its observed stop takes precedence over the raw engine cap.
+                    length_finish = "stop"
                 if chat and tools:
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
@@ -10241,7 +10280,8 @@ class APIHandler(BaseHTTPRequestHandler):
                              "type": "function", "function": {"name": tc["function"]["name"],
                              "arguments": tc["function"]["arguments"]}}]},
                             "logprobs": None, "finish_reason": None}])
-                finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
+                finish = "tool_calls" if calls else (
+                    "length" if stats["length_limited"] and not generation_stopped() else "stop")
                 _tool_trace(request_id, True, finish, stats, calls, "".join(raw),
                             "".join(traced_reasoning))
             else:
@@ -10271,7 +10311,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
-                finish = "length" if stats["length_limited"] else "stop"
+                finish = "length" if stats["length_limited"] and not stop_filter.stopped() else "stop"
             # generate() returned, so the prompt was ACCEPTed and start_stream() ran; guard anyway.
             start_stream()
             ka_stop.set()                          # generation done: stop the keepalive pump
@@ -10379,6 +10419,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(messages, list) or not messages:
             raise APIError(400, "`messages` must be a non-empty array.", "messages")
         compact = compaction_requested(body)
+        if compact:
+            # #2477: a summary is inference too; the request's options are refused (400) before
+            # context pressure sends its earlier messages through the engine
+            self._generation_request_options(body, True)
         render = dict(enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
                       tools=tools, tool_choice=tool_choice, preserve_thinking=preserve_thinking)
         lead, conversation = split_lead(messages)
@@ -10449,17 +10493,18 @@ class APIHandler(BaseHTTPRequestHandler):
         """Summarize the conversation before its last exchanges; (new done, new summary),
         or None when there is nothing older left to summarize.
 
-        The summary is asked for after the history the engine already holds (everything
-        before the new user message), rendered as the conversation was, so the engine
-        prefills only the request to summarize. A range too long for that is halved."""
+        Each summary request contains only the prefix that will be replaced, rendered
+        with any summary already accumulated. The selected verbatim tail is excluded.
+        A range too long for the available context is halved."""
         limit = getattr(self.server, "context_limit", None) or 4096
         ratio = getattr(self.server, "tokens_per_char", None) or COMPACT_DEFAULT_RATIO
         start = compaction_tail_start(conversation, done, ratio, int(limit * COMPACT_KEEP_SHARE))
         if start is None:
             return None
-        users = [i for i in range(done, len(conversation))
-                 if isinstance(conversation[i], dict) and conversation[i].get("role") == "user"]
-        end = users[-1]                   # the summary covers everything before the new request
+        # This summary is cached under keys[start] and replaces only that prefix.
+        # Including the retained tail would duplicate it in this turn and leak its
+        # branch-specific facts into any conversation sharing the shorter prefix.
+        end = start
         if end <= done:
             return None
         words = max(80, min(400, limit // 24))

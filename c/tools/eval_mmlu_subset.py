@@ -14,6 +14,10 @@ a fixed seed (HF datasets-server, cached in /tmp, nothing committed).
 Prints per-question lines and a final accuracy; diff two runs for the delta.
 """
 import argparse, json, os, random, re, subprocess, sys, urllib.request
+try:
+    from tools.engine_environment import engine_environment
+except ImportError:
+    from engine_environment import engine_environment
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", required=True)
@@ -24,6 +28,8 @@ ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--cache", default="/tmp/mmlu_subset_cache.json")
 ap.add_argument("--out", default=None)
 args = ap.parse_args()
+if args.n < 1:
+    ap.error("--n must be positive")
 
 # ---- fetch + cache a pool of questions (deterministic subset from it) ----
 if not os.path.exists(args.cache):
@@ -35,6 +41,8 @@ if not os.path.exists(args.cache):
             rows += [x["row"] for x in json.load(r)["rows"]]
     json.dump(rows, open(args.cache, "w"))
 pool = json.load(open(args.cache))
+if args.n > len(pool):
+    ap.error(f"--n requests {args.n} questions but the cached pool contains only {len(pool)}")
 
 rng = random.Random(args.seed)
 by_subj = {}
@@ -56,8 +64,8 @@ def make_prompt(q):
             "<|assistant|><think></think>Answer:")
 
 def run_one(prompt):
-    env = dict(os.environ, SNAP=os.path.expanduser(args.model), PROMPT=prompt,
-               NGEN="2", TEMP="0", DRAFT="0")
+    env = engine_environment(SNAP=os.path.expanduser(args.model), PROMPT=prompt,
+                             NGEN="2", COLI_TEMP="0", TEMP="0", DRAFT="0")
     env.pop("ADAPTER", None)
     if args.adapter: env["ADAPTER"] = args.adapter
     out = subprocess.run([args.binary, "64"], env=env, capture_output=True,

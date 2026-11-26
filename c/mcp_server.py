@@ -259,8 +259,8 @@ def tool_install(args, notify):
         process, log, cmd = _launch_install(args)
     wait = int(args.get("wait_seconds") or 0)
     result = {"job": {"pid": process.pid, "log": log, "command": cmd}}
-    deadline = time.time() + wait
-    while wait and time.time() < deadline:
+    deadline = time.monotonic() + wait
+    while wait and time.monotonic() < deadline:
         code = process.poll()
         state = _current_install_state(process)
         if state.get("phase") == "download" and state.get("total"):
@@ -286,15 +286,24 @@ def _stderr_out(*parts):
     _log(*parts)
 
 
+# Lifecycle tools share one configured server. Serialize their state check and
+# action, while leaving status and optional readiness polling responsive.
+_SERVER_LOCK = threading.Lock()
+
+
 def tool_start(args, notify):
-    cfg = setup_flow.load_config()
-    if not cfg or not setup_flow.config_ready(cfg):
-        raise ToolError("nothing is installed yet (or the install has not finished): call install")
-    status = setup_flow.start_server(cfg, background=True,
-                                     open_browser=bool(args.get("open_browser")), out=_stderr_out)
+    with _SERVER_LOCK:
+        cfg = setup_flow.load_config()
+        if not cfg or not setup_flow.config_ready(cfg):
+            raise ToolError("nothing is installed yet (or the install has not finished): call install")
+        # Match coli start: a source checkout pulled since the last build must not
+        # keep starting the old engine. The helper leaves running/release engines alone.
+        setup_flow.refresh_configured(cfg, out=_stderr_out)
+        status = setup_flow.start_server(cfg, background=True,
+                                         open_browser=bool(args.get("open_browser")), out=_stderr_out)
     wait = int(args.get("wait_seconds") or 0)
-    deadline = time.time() + wait
-    while wait and time.time() < deadline and status.get("state") != "ready":
+    deadline = time.monotonic() + wait
+    while wait and time.monotonic() < deadline and status.get("state") != "ready":
         time.sleep(2.0)
         status = setup_flow.server_status(setup_flow.load_config() or cfg)
         notify(None, None, f"server: {status['state']}")
@@ -305,10 +314,11 @@ def tool_start(args, notify):
 
 
 def tool_stop(args, notify):
-    cfg = setup_flow.load_config()
-    if not cfg:
-        raise ToolError("nothing is configured; there is nothing to stop")
-    return setup_flow.stop_server(cfg, out=_stderr_out)
+    with _SERVER_LOCK:
+        cfg = setup_flow.load_config()
+        if not cfg:
+            raise ToolError("nothing is configured; there is nothing to stop")
+        return setup_flow.stop_server(cfg, out=_stderr_out)
 
 
 def tool_status(args, notify):
@@ -340,6 +350,10 @@ HANDLERS = {"detect_hardware": tool_detect_hardware, "recommend_models": tool_re
 # ---------------------------------------------------------------- protocol
 
 
+def _reject_json_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
 class Server:
     def __init__(self, out=None):
         self.out = out or sys.stdout
@@ -364,7 +378,8 @@ class Server:
         if not line:
             return
         try:
-            message = json.loads(line)
+            message = json.loads(line.decode("utf-8") if isinstance(line, bytes) else line,
+                                 parse_constant=_reject_json_constant)
         except (ValueError, RecursionError):
             self.error(None, PARSE_ERROR, "parse error")
             return
@@ -459,14 +474,16 @@ class Server:
                                  "isError": True})
 
     def serve(self, stream=None):
-        stream = stream or sys.stdin
+        # Decode each complete frame in handle_line. A TextIO decoder can fail
+        # before yielding a line and terminate the session on one malformed byte.
+        stream = stream or getattr(sys.stdin, "buffer", sys.stdin)
         for line in stream:
             self.handle_line(line)
         # stdin closed: let the calls in flight answer (a stop drains its engine)
         # before exiting, within the minute a client gives a server to go.
-        deadline = time.time() + 60
+        deadline = time.monotonic() + 60
         for thread in self.threads:
-            thread.join(timeout=max(0.0, deadline - time.time()))
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def main():

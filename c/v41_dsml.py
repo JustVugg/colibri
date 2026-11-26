@@ -335,7 +335,9 @@ def parse_completion_text(text):
                          "-- treating as plain content\n")
         sys.stderr.flush()
         return text, []
+    # The strict reference separates namespace from name. OpenAI routes by its
+    # function.name, so restore the qualified wire name rather than dropping it.
     shaped = [{"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-               "function": {"name": c["name"], "arguments": c["arguments"]}}
+               "function": {"name": _tool_name_for_encoding(c), "arguments": c["arguments"]}}
               for c in calls]
     return text[:cut], shaped

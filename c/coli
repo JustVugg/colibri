@@ -1323,6 +1323,8 @@ class MDStream:
             line,self.cur=self.cur.split("\n",1)
             self._line(line)
         st=self.cur.lstrip()             # riga parziale: possibile fence? aspetta il newline
+        if self.printed==0 and (not st or st in ("-", "*")):
+            return                        # indentation or a list marker may still follow
         if st and (st.startswith("```") or (len(st)<3 and "```".startswith(st))):
             return
         if st.startswith("#") and self.printed==0:
@@ -2176,6 +2178,21 @@ def server_arch(base, api_key=None, timeout=1.5):
     except Exception:
         return None
 
+def sse_data(lines):
+    """Join an SSE event's data fields before decoding its JSON payload."""
+    data=[]
+    for raw in lines:
+        line=raw.decode("utf-8","replace").rstrip("\r\n")
+        if not line:
+            if data:
+                yield "\n".join(data)
+                data=[]
+            continue
+        field, _, value=line.partition(":")
+        if field=="data":
+            data.append(value[1:] if value.startswith(" ") else value)
+
+
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
 
@@ -2286,16 +2303,18 @@ def chat_attached(a, base, model_id):
         print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
         md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False; think_open=False
-        exact_tokens=None; finish=None
+        exact_tokens=None; finish=None; stream_done=False; stream_error=None
         try:
             with urllib.request.urlopen(req) as r:
-                for raw in r:
-                    line=raw.decode("utf-8","replace").strip()
-                    if not line.startswith("data: "): continue
-                    data=line[6:]
-                    if data=="[DONE]": break
+                for data in sse_data(r):
+                    if data=="[DONE]":
+                        stream_done=True; break
                     try: ev=json.loads(data)
                     except ValueError: continue
+                    if ev.get("error"):
+                        error=ev["error"]
+                        stream_error=error.get("message", "generation failed") if isinstance(error,dict) else str(error)
+                        break
                     usage=ev.get("usage")
                     if isinstance(usage,dict) and isinstance(usage.get("completion_tokens"),int):
                         exact_tokens=usage["completion_tokens"]
@@ -2312,9 +2331,7 @@ def chat_attached(a, base, model_id):
                         if ch.get("finish_reason"): finish=ch["finish_reason"]
                         d=ch.get("delta",{})
                         rtxt=d.get("reasoning_content")
-                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")=="0":
-                            continue              # thinking nascosto: lo spinner resta a girare
-                        if rtxt:
+                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")!="0":
                             # Thinking arrives as its own delta field, and this loop
                             # used to drop it on the floor: `coli run` streamed the
                             # model's reasoning while `coli chat` silently hid it
@@ -2328,7 +2345,7 @@ def chat_attached(a, base, model_id):
                                 think_open=True
                                 sys.stdout.write(f"  {C.dgray}┌ thinking{C.r}\n  {C.dgray}│{C.r} ")
                             sys.stdout.write(C.dim+rtxt.replace("\n","\n  "+C.dgray+"│"+C.r+" "+C.dim)+C.r)
-                            sys.stdout.flush(); continue
+                            sys.stdout.flush()
                         txt=d.get("content")
                         if not txt: continue          # ping/ruolo: non è testo
                         if think_open:
@@ -2359,6 +2376,10 @@ def chat_attached(a, base, model_id):
             think_open=False                      # risposta solo-reasoning): chiudi il riquadro
             sys.stdout.write(f"{C.r}\n  {C.dgray}\u2514\u2500{C.r}\n")
         md.close(); sp.stop()
+        if stream_error:
+            print(f"  {C.yel}[the server ended the response: {stream_error}]{C.r}")
+        elif not interrupted and not stream_done and finish is None:
+            print(f"  {C.yel}[stream closed before the response finished]{C.r}")
         if reply: msgs.append({"role":"assistant","content":"".join(reply)})
         else: msgs.pop()                              # turno vuoto: non sporcare la history
         el=time.time()-t0
@@ -2622,9 +2643,15 @@ def read_document(path, base=None, note=None):
 
 def is_local_base(base):
     """A server address on this machine (loopback names and addresses)."""
+    import ipaddress
     from urllib.parse import urlparse
     host = (urlparse(base).hostname or "").lower()
-    return host in ("localhost", "::1") or host.startswith("127.")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def chat_preload(a, base=None):

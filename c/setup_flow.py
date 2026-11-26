@@ -1501,6 +1501,13 @@ def last_turn_speed(profile):
     return round(tokens / wall, 2) if wall > 0 and tokens else None
 
 
+# The servers this process started in the background, by port: until one writes its
+# pidfile (a slow start can take longer than start_server's wait), its state is
+# "loading", so a second start in the same process (MCP's start, which a lock
+# serializes) does not launch another server beside it.
+_BACKGROUND_STARTS = {}
+
+
 def server_status(cfg):
     port, host = int(cfg["port"]), cfg.get("host", DEFAULT_HOST)
     pid = None
@@ -1509,6 +1516,9 @@ def server_status(cfg):
             pid = int(handle.read().split()[0])
     except (OSError, ValueError, IndexError):
         pid = None
+    started = _BACKGROUND_STARTS.get(port)
+    if pid is None and started is not None and started.poll() is None:
+        pid = started.pid
     alive = _pid_alive(pid)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
     code, health = _get_json(f"http://{shown}:{port}/health", require_colibri=True)
@@ -1600,6 +1610,7 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
         kwargs["start_new_session"] = True
     process = spawn_detached(cmd, **kwargs)
     handle.close()
+    _BACKGROUND_STARTS[int(cfg["port"])] = process
     deadline = time.time() + wait
     while time.time() < deadline and process.poll() is None:
         time.sleep(0.25)
@@ -2153,6 +2164,9 @@ def config_ready(cfg):
 
 
 def cmd_setup(a, ui=None):
+    if a.port is not None and not 1 <= a.port <= 65535:
+        raise SetupError("port must be from 1 to 65535; "
+                         "rerun `coli setup --port PORT`")
     interactive = sys.stdin.isatty() and not a.yes and not a.json
     ui = ui or UI(interactive, quiet=a.json)
     ui.say("colibri setup\n")
