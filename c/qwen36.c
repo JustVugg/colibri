@@ -1338,6 +1338,7 @@ typedef struct {
 #ifdef COLI_CUDA
     void *cchain;              /* the CUDA dense chain's device state (qwen36_cuda_chain.h), NULL until it runs */
 #endif
+    int *greedy_out, greedy_done;   /* Q36_GREEDY_CARD: argmax per logit row on the card (no logits down) */
     /* A speculative verify (prompt lookup, q36_spec_step) copies the DeltaNet state
      * after each of its first snap_rows rows, row r into slot r (0 = no copy), so a
      * draft rejected after row r+1 rolls back by swapping slot r in. snap_slots: the
@@ -8517,9 +8518,10 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
     for (int s = 0; s < S; s++) q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
     tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
+    int chain_took = 0;   /* the Vulkan or CUDA chain ran every layer and final norm/lm_head (or greedy pick) */
     float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
     int stopped = 0;   /* a chain saw the prompt's control between two chunks */
-    (void)chain_logit; (void)stopped;
+    (void)chain_logit; (void)stopped; (void)chain_took;
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
      * back only when the prefill read-out below needs every row. A partial chain
@@ -8544,31 +8546,36 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
             for (int s = 0; s < S; s++)
                 q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
+        else chain_took = 1;
     }
 #endif
 #ifdef COLI_CUDA
     /* COLI_CUDA_CHAIN: the same on the CUDA device (qwen36_cuda_chain.h), every layer */
-    if (g_cuda_chain && !chain_logit && !stopped) {
-        int echo = 0, rows_only = 0;
+    if (g_cuda_chain && !chain_took && !stopped) {
+        int echo = 0, rows_only = 0, prompt_echo = 0;
 #ifndef QWEN36_NO_MAIN
-        echo = g_echo_k > 0 && g_echo_id && S > 1;
+        prompt_echo = g_echo_k > 0 && g_echo_id && S > 1;
+        echo = prompt_echo;
 #endif
         if (g_hidden_sink || g_q36_mtp.on) echo = 1;   /* the head reads every row */
-        chain_logit = falloc((int64_t)nlogits * c->vocab);
+        m->greedy_done = 0;
+        const int card_greedy = !prompt_echo && !g_hidden_sink && !lf && q36cc_greedy_ok(m, S, nlogits);
+        if (!card_greedy) chain_logit = falloc((int64_t)nlogits * c->vocab);
         g_q36_ctl = control;
         chain_n = q36cc_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
         g_q36_ctl = NULL;
         if (!chain_n && control && control->result) {
             free(chain_logit); chain_logit = NULL; stopped = 1;
         } else if (!chain_n) {
-            free(chain_logit); chain_logit = NULL;
+            free(chain_logit); chain_logit = NULL; m->greedy_done = 0;
             q36cc_cpu_step(m, pos_base);
             for (int s = 0; s < S; s++)
                 q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
-        } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
+        } else if (rows_only) { free(chain_logit); chain_logit = NULL; m->greedy_done = 0; }
+        else chain_took = 1;
     }
 #endif
-    if (stopped || (!chain_logit && layers_forward_rows(m, x, S, pos_base, chain_n, lf, control))) {
+    if (stopped || (!chain_took && layers_forward_rows(m, x, S, pos_base, chain_n, lf, control))) {
         /* Some layers (or a chain's first chunks) may have advanced, others not. Neither
          * the previous prefix nor a partially processed prompt describes this state. */
         q36_prefill_abort(m, pos_base, S);
@@ -8628,22 +8635,27 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
         free(erow); free(elog);
     }
 #endif
-    float *last = falloc(D);
-    float *logit;
-    if (chain_logit) logit = chain_logit;   /* the chain ran the final norm and lm_head */
-    else
-    logit = falloc((int64_t)nlogits * c->vocab);
+    float *logit = NULL;
     double _th = tm_now();
-    if (!chain_logit)
-    for (int r = 0; r < nlogits; r++) {
-        float *lr = logit + (int64_t)r * c->vocab;
-        rmsnorm_row(last, x + (int64_t)(S - nlogits + r)*D, m->final_norm, D, c->eps);
-        if (!qt_lmhead_matmul(lr, last, D, c->vocab))
-            matmul_d(lr, last, &m->lm_head, 1, D, c->vocab);
+    if (chain_took && m->greedy_done) {
+        logit = NULL;   /* Q36_GREEDY_CARD: argmax already in m->greedy_out */
+    } else if (chain_logit) {
+        logit = chain_logit;   /* the chain ran the final norm and lm_head */
+        q36_logits_out(c, logit, (int64_t)nlogits * c->vocab);
+    } else {
+        float *last = falloc(D);
+        logit = falloc((int64_t)nlogits * c->vocab);
+        for (int r = 0; r < nlogits; r++) {
+            float *lr = logit + (int64_t)r * c->vocab;
+            rmsnorm_row(last, x + (int64_t)(S - nlogits + r)*D, m->final_norm, D, c->eps);
+            if (!qt_lmhead_matmul(lr, last, D, c->vocab))
+                matmul_d(lr, last, &m->lm_head, 1, D, c->vocab);
+        }
+        q36_logits_out(c, logit, (int64_t)nlogits * c->vocab);
+        free(last);
     }
-    q36_logits_out(c, logit, (int64_t)nlogits * c->vocab);   /* the chain's too */
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
-    free(x); free(last);
+    free(x);
     if (lf) fclose(lf);
     if (m->resident_collecting) {
         int prefill_end = m->first_step;
@@ -9168,6 +9180,9 @@ static void q36_park(Model *m, int np, int max_tok) {
               least = mn && atoi(mn) > 0 ? atoi(mn) : Q36_PARK_MIN, n = np + gen + Q36_PARK_SPEC;
     if ((e && *e == '0') || g_q36_park.on || g_q36_mux_slots != 1 || !m->kvp.fed || m->kvp.tainted ||
         H < least || m->kv_len != H || m->vis_rows || n >= H || !m->K || !m->V) return;
+#ifdef COLI_CUDA
+    q36cc_sync_host(m);   /* Q36_KV_LAZY: pull device-only K/V rows before copying host KV */
+#endif
     const Cfg *c = &m->c; const size_t es = q36_kv_es(), D = (size_t)c->k_head_dim;
     int ok = (g_q36_park.K = calloc((size_t)c->n_layers, sizeof(void *))) != NULL &&
              (g_q36_park.V = calloc((size_t)c->n_layers, sizeof(void *))) != NULL &&
@@ -9387,6 +9402,9 @@ static Q36PsState *q36_ps_state_save(Model *m, size_t *bytes) {
 static void q36_ps_save(Model *m, const int *ids, int P, int with_state) {
     if (!q36_ps_on(m) || P < g_q36_ps.B || m->kvp.tainted || m->kv_len != P) return;
     if (!with_state && q36_ps_needs_state(m)) return;   /* blocks alone serve nothing here */
+#ifdef COLI_CUDA
+    q36cc_sync_host(m);   /* Q36_KV_LAZY: ensure host K/V rows are up to date before snapshotting */
+#endif
     ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts);
     if (!parts) return;
     int np = q36_ps_parts(m, parts);
@@ -9765,6 +9783,7 @@ static void ensure_kv(Model *m){
  * Whether a proposal is drafted is the gate's call (spec_draft.h): the measured
  * acceptance by draft position and the measured cost of a verify by its rows;
  * COLI_SPEC_GATE=0 drafts every proposal in full (tests). */
+#include "argmax_first.h"
 typedef struct {
     int lookup, lookup_max;      /* COLI_LOOKUP: on; COLI_LOOKUP_DRAFTS: drafts per verify, 1..5 */
     int mtp_force, mtp_force_row;
@@ -9779,6 +9798,7 @@ typedef struct {
     int ahead_n, ahead_i, ahead_pos;   /* a verify's rows at ahead_pos.., ahead_i the next to hand out */
     int ids[Q36_SPEC_ROWS];
     float *ahead_logit;
+    int greedy, next_tok, ahead_tok[Q36_SPEC_ROWS];   /* Q36_GREEDY_CARD: argmax per row without logits down */
     uint64_t drafts, accepted, verifies, forwards, tokens;
     int ended_ahead;             /* the generation ended with a verify's rows unconsumed (undone) */
     /* The Metal graph's MTP head (qwen36_graph_mtp_load) drafts, one token a verify. Its confidence (the draft's
@@ -10046,8 +10066,13 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
         int i = sp->ahead_i;
         if (tok == sp->ids[i] && pos == sp->ahead_pos + i &&
             (sp->ahead_src == SPEC_SRC_MTP ? sp->mtp_force : sp->force) != 'r') {
-            float *logit = falloc(V);
-            memcpy(logit, sp->ahead_logit + (int64_t)(i - 1) * V, (size_t)V * sizeof(float));
+            float *logit = NULL;
+            if (sp->greedy && !sp->ahead_logit) {
+                sp->next_tok = sp->ahead_tok[i];
+            } else {
+                logit = falloc(V);
+                memcpy(logit, sp->ahead_logit + (int64_t)(i - 1) * V, (size_t)V * sizeof(float));
+            }
             if (sp->ahead_src == SPEC_SRC_MTP) sp->mtp_accepted++; else sp->accepted++;
             if (++sp->ahead_i == sp->ahead_n) q36_spec_settle(m, sp, sp->ahead_n, 0);
             return logit;
@@ -10165,20 +10190,38 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
     if (!k) {
         sp->forwards++;
         double t0 = now_s();
+        if (sp->greedy) { m->greedy_out = &sp->next_tok; m->greedy_done = 0; }
         float *logit = step(m, &tok, 1, pos);
+        m->greedy_out = NULL;
         spec_gate_forward(&sp->gate, 1, now_s() - t0);
+        if (sp->greedy && logit && !m->greedy_done) {
+            sp->next_tok = argmax_first(logit, V);
+            free(logit); logit = NULL;
+        }
         return logit;
     }
-    int S = k + 1;
+    int S = k + 1, picks[Q36_SPEC_ROWS];
     sp->ids[0] = tok; memcpy(sp->ids + 1, d, (size_t)k * sizeof(int));
     m->snap_rows = k; g_q36_rowwise = 1;
     double t0 = t_verify ? t_verify : now_s();
+    if (sp->greedy) { m->greedy_out = picks; m->greedy_done = 0; }
     float *logit = step_ex(m, sp->ids, S, pos, S);
+    m->greedy_out = NULL;
     spec_gate_forward(&sp->gate, S, now_s() - t0);
     m->snap_rows = 0; g_q36_rowwise = 0;
     sp->forwards++; sp->verifies++;
     if (src == SPEC_SRC_MTP) sp->mtp_drafts += (uint64_t)k; else sp->drafts += (uint64_t)k;
     sp->ahead_n = S; sp->ahead_i = 1; sp->ahead_pos = pos; sp->ahead_src = src;
+    if (sp->greedy) {
+        if (logit && !m->greedy_done) {
+            for (int r = 0; r < S; r++) picks[r] = argmax_first(logit + (int64_t)r * V, V);
+            free(logit); logit = NULL;
+        }
+        sp->next_tok = picks[0];
+        for (int r = 1; r < S; r++) sp->ahead_tok[r] = picks[r];
+        sp->ahead_logit = NULL;
+        return NULL;
+    }
     sp->ahead_logit = falloc((int64_t)k * V);
     memcpy(sp->ahead_logit, logit + V, (size_t)k * V * sizeof(float));
     return logit;
@@ -10254,10 +10297,14 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     int len = np;
     Q36Spec *sp = &g_q36_run_spec;
     q36_spec_begin(m, sp, prompt, np);   /* COLI_LOOKUP=1: drafts, every token still the argmax below */
+    sp->greedy = !getenv("DUMP") && !getenv("COLI_LOGIT_DUMP");
     for (int s = 0; s < n_new; s++) {
-        dump_logits(logit, c->vocab);
-        int best = 0; float bv = logit[0];
-        for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        if (logit) dump_logits(logit, c->vocab);
+        int best;
+        if (logit) {
+            best = 0; float bv = logit[0];
+            for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        } else best = sp->next_tok;
         if (s == 0 && g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* record TTFT */
         if (g_stream) { stream_token(best); fflush(stdout); }
         if (s == n_new - 1) { free(logit); out[len++] = best; break; }
@@ -11113,9 +11160,10 @@ static void serve_one_turn(Model *m, ServeReq *q){
     double t0=clk.t0;
     unsigned char sbuf[16]; int sbn=0;
     Q36Spec spec; q36_spec_begin(m, &spec, ids, np);   /* COLI_LOOKUP=1: drafts, every token still sampled from the exact logits */
+    spec.greedy = q->temp <= 0.f && q->logprobs == 0 && !getenv("COLI_LOGIT_DUMP") && !getenv("DUMP");
     for(int s=0;s<q->max_tok;s++){
-        dump_logits(lo, m->c.vocab);
-        int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
+        if(lo) dump_logits(lo, m->c.vocab);
+        int tk = (!lo && spec.greedy) ? spec.next_tok : serve_sample(lo, m->c.vocab, q->temp, q->top_p);
         /* La coda si calcola PRIMA della free: dopo, lo non c'e piu. */
         char lptail[1024]; lptail[0]=0;
         if(q->logprobs>0) coli_logprob_tail(lptail,sizeof lptail,lo,m->c.vocab,tk,q->logprobs);

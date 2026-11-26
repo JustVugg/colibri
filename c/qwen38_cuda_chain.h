@@ -101,7 +101,11 @@ typedef struct {
     unsigned long long lane_chunks;
     CcBuf *qkv, *z, *ab, *cv, *dny, *lg, *gs, *us, *hs, *ds, *sgd;
     CcBuf *emb, *embd, *keys, *val, *gated, *normv;   /* emb: the PLE rows the host writes, embd: on the device */
-    CcBuf *mixd, *lgd, *kvd, *outd, *hypd, *find, *routed, *cs, *pcs;
+    CcBuf *mixd, *lgd, *kvd, *outd, *hypd, *find, *routed, *cs, *csd, *pcs, *pcsd;
+    CcBuf *step_up, *step_dev, *step_err;   /* Q38_CC_STEPGRAPH step record */
+    int sg_on, pcsd_nb;
+    unsigned long long sg_epoch, sg_tick, sg_launch, sg_capture, sg_eager;
+    struct Q38CcGraph *sgr;
     CcBuf *outdev, *gpick;   /* a greedy caller's logits on the card and their picks down (q38cc_greedy_ok) */
     unsigned long long greedy_rows;
     CcBuf *gseg, *nseg;               /* a deep verify's PLE rows past its first copy (q38cc_ple) */
@@ -272,6 +276,28 @@ static size_t q38cc_kv_stride(Q38CChain *ch, const Cfg *c) {   /* per attention 
 /* A weight's device copy: the tier's (w->gpu) or the chain's own (w->cc, made here from
  * the trunk's int8 rows, a GGUF's blocks, else the BF16/F32 rows as f32). NULL: nothing to
  * upload, or the device refused. */
+static int q38cc_mx4_moe_env(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("Q38_CC_MX4_MOE"); on = !(e && *e == '0'); }
+    return on;
+}
+static int q38cc_fuse_hcnorm(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("Q38_FUSE_HCNORM"); on = !(e && *e == '0'); }
+    return on && cc_gr_read_ready();
+}
+static int q38cc_fuse_combine(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("Q38_FUSE_COMBINE"); on = !(e && *e == '0'); }
+    return on && cc_combine_apply_ready();
+}
+static int q38cc_side_shared(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("Q38_CC_SIDE_SHARED"); on = !(e && *e == '0'); }
+    return on && cc_side_ready() && cc_side_switch_ready();
+}
+typedef struct Q38CcGraph { unsigned long long key, fp, tick; void *exec; } Q38CcGraph;
+#define Q38G_WAYS 4
 static ColiCudaTensor *q38cc_t(Q38CChain *ch, Q38Weight *w) {
     if (!w) return NULL;
     if (w->gpu) {
@@ -471,6 +497,12 @@ static void q38cc_free_own(Q38CChain *ch, Model *m) {
     }
     cc_free(ch->ple_ring); ch->ple_ring = NULL;
     cc_free(ch->prm); ch->prm = NULL;
+    if (ch->sgr) {
+        for (int k = 0; k < Q38G_WAYS; k++) { cc_graph_free(ch->sgr[k].exec); ch->sgr[k].exec = NULL; }
+        free(ch->sgr); ch->sgr = NULL;
+    }
+    cc_free(ch->csd); ch->csd = NULL; cc_free(ch->pcsd); ch->pcsd = NULL; ch->pcsd_nb = 0;
+    cc_free(ch->step_up); ch->step_up = NULL; cc_free(ch->step_dev); ch->step_dev = NULL; cc_free(ch->step_err); ch->step_err = NULL;
 }
 
 /* The parameters the kernels read (norm weights, the DeltaNet constants, the PLE's), in
@@ -643,6 +675,11 @@ static Q38CChain *q38cc_setup(Model *m, int mux_slots) {
     ch->dn_where = Q38CC_HOST;
     { const char *e = getenv("COLI_CUDA_CHAIN_FAULT"); ch->fault_at = e && *e ? strtoull(e, NULL, 10) : 0; }
     ch->ok = 1;
+    if (q38_env_bool("Q38_CC_STEPGRAPH", 1)) {
+        if (!cc_graph_ready() || !cc_step_ready() || !cc_dev_addr_ready() || !cc_graph_scratch_ready())
+            fprintf(stderr, "[chain] qwen38: Q38_CC_STEPGRAPH: backend lacks step-graph ops (an older DLL)\n");
+        else if ((ch->sgr = (Q38CcGraph *)calloc(Q38G_WAYS, sizeof *ch->sgr))) ch->sg_on = 1;
+    }
     ch->dm_on = q38cc_dm_able(ch, m);
     if (ch->dm_on) q38cc_head_card(ch, m);   /* the MTP head's experts in Q2_0 on the card */
     if (ch->dm_on) fprintf(stderr, "[chain] qwen38: a decode step's routed experts in the frame (the tier's residents by address, "
@@ -679,7 +716,12 @@ static int q38cc_bufs(Q38CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->outd, 2 * (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * H * F, CC_UP) &&
              cc_reserve(&ch->emb, r * Ep * F, CC_UP) && cc_reserve(&ch->embd, r * Ep * F, CC_DEV) &&
              cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
+             cc_reserve(&ch->csd, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_DEV) &&
              cc_reserve(&ch->pcs, (size_t)nbmax * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP);
+    if (ok && ch->sg_on)
+        ok = cc_reserve(&ch->step_up, (size_t)CC_STEP_INTS * 4, CC_UP) &&
+             cc_reserve(&ch->step_dev, (size_t)CC_STEP_INTS * 4, CC_DEV) &&
+             cc_reserve(&ch->step_err, 64, CC_DOWN);
     /* a verify's PLE segments (q38cc_ple) here, not in the frame: growing a buffer there waits
      * for the stream, which a hybrid layer before it holds until the host serves it */
     if (ok && c->ple_layer >= 0)
@@ -724,6 +766,25 @@ static int q38cc_mirror(Q38CChain *ch, Model *m) {
             if (!ch->kc[i] || !ch->vc[i] || !ch->ik[i] || !ch->pk[i]) { q38cc_mirror_free(ch, c); return 0; }
         }
         ch->cap = m->kv_cap;
+        ch->sg_epoch++;
+    }
+    if (ch->sg_on && c->rotary_dim > 0 && ch->pcsd_nb < nbmax) {
+        int half = c->rotary_dim / 2, R = c->idx_ratio > 0 ? c->idx_ratio : 1;
+        size_t nfloats = (size_t)nbmax * (size_t)c->rotary_dim;
+        if (cc_reserve(&ch->pcsd, nfloats * 4, CC_DEV)) {
+            float *pc = (float *)malloc(nfloats * sizeof(float));
+            if (pc) {
+                float den[256];
+                for (int j = 0; j < half && j < 256; j++) den[j] = powf(c->theta, (float)(2 * j) / c->rotary_dim);
+                for (int b = 0; b < nbmax; b++) for (int j = 0; j < half; j++) {
+                    float ang = (float)(b * R) / (j < 256 ? den[j] : powf(c->theta, (float)(2 * j) / c->rotary_dim));
+                    pc[((size_t)b * half + j) * 2] = cosf(ang); pc[((size_t)b * half + j) * 2 + 1] = sinf(ang);
+                }
+                int wok = cc_begin() && cc_write(ch->pcsd, 0, pc, nfloats * sizeof(float)) && cc_submit(1);
+                free(pc);
+                if (wok) { ch->pcsd_nb = nbmax; ch->sg_epoch++; }
+            }
+        }
     }
     return 1;
 }
@@ -898,12 +959,23 @@ static void q38cc_rollback(Model *m, int slot, int len) {
         if (ch->pk_valid[i] > len / R) ch->pk_valid[i] = len / R;
     }
     if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q38CC_DEV) { ch->snap_valid = 0; return; }
-    for (int i = 0; i < m->c.layers; i++) {
+    /* Q38_CC_STEPGRAPH: copy snapshot bits into live buffers so device addresses and ple_slot[0] stay fixed */
+    int copied = ch->sg_on && cc_begin();
+    size_t nr = (size_t)m->c.dn_vheads * m->c.dn_kdim * m->c.dn_vdim, nc = (size_t)m->c.dn_conv_dim * (m->c.dn_convk - 1);
+    for (int i = 0; i < m->c.layers && copied; i++)
+        if (!m->c.is_attn[i])
+            copied = cc_copy(ch->rec[i], 0, ch->rec_snap[slot][i], 0, nr) && cc_copy(ch->ring[i], 0, ch->ring_snap[slot][i], 0, nc);
+    if (copied && ch->ple_ring) {
+        size_t pc = q38cc_ple_cells(&m->c);
+        copied = cc_copy(ch->ple_ring, (size_t)ch->ple_slot[0] * pc, ch->ple_ring, (size_t)ch->ple_slot[1 + slot] * pc, pc);
+    }
+    if (copied) copied = cc_submit(0);
+    for (int i = 0; i < m->c.layers && !copied; i++) {
         if (m->c.is_attn[i]) continue;
         CcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
         t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
     }
-    if (ch->ple_ring) { int t = ch->ple_slot[0]; ch->ple_slot[0] = ch->ple_slot[1 + slot]; ch->ple_slot[1 + slot] = t; }
+    if (!copied && ch->ple_ring) { int t = ch->ple_slot[0]; ch->ple_slot[0] = ch->ple_slot[1 + slot]; ch->ple_slot[1 + slot] = t; }
     ch->snap_valid = 0;
 }
 static int q38cc_spec_slots(Q38CChain *ch, Model *m, int rows) {
@@ -971,6 +1043,12 @@ static CcBuf *q38cc_hb(const Q38CChain *ch) { return ch->hyp ? ch->hyp : ch->hyp
 static int q38cc_ho(const Q38CChain *ch, int W) { return ch->hyp ? ch->hoff * W : 0; }
 static int q38cc_gr_read(Q38CChain *ch, Model *m, GatedResidual *g, size_t norm_off, int n, CcBuf *inj) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, R = c->hc_rank;
+    if (n <= 8 && !ch->hyp && q38cc_fuse_hcnorm()) {
+        CcGrRead gp = {n, H, W, C, R, (int)norm_off, inj != NULL, 0, c->eps, (float)C, {0, 0, 0, 0}};
+        int r = cc_gr_read(q38cc_t(ch, &g->down), q38cc_t(ch, &g->up), inj ? q38cc_t(ch, &g->inject) : NULL,
+                           ch->hyper, ch->prm, ch->hn, ch->low, ch->mix, ch->mixed, inj, &gp);
+        if (r >= 0) return r;
+    }
     CcNorm np = {n * C, H, C, q38cc_ho(ch, W), W, H, 0, W, H, (int)norm_off, C, CC_NORM_ADD1, c->eps, 1.f};
     CcEw lo = {CC_EW_HC_LOW, n * R, R, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
     CcEw mx = {CC_EW_HC_MIX, n * H, H, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
@@ -1003,9 +1081,10 @@ static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int 
     CcNorm in = {n * IQ, ID, IQ, 0, ipw, ID, 0, ipw, ID, (int)ch->o_iqn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
     ok = ok && cc_norm(ch->k, ch->prm, ch->k, &kn) && cc_norm(ch->q, ch->prm, ch->q, &qn) && cc_norm(ch->ip, ch->prm, ch->ip, &in);
     if (ok && half) {
+        CcBuf *csb = ch->csd ? ch->csd : ch->cs;
         CcRope rk = {n * KVH, KVH, 0, kvo, D, half, 0, 2 * half}, rq = {n * QH, QH, 0, qo, 2 * D, half, 0, 2 * half};
         CcRope ri = {n * IQ, IQ, 0, ipw, ID, half, 0, 2 * half};
-        ok = cc_rope(ch->k, ch->cs, &rk) && cc_rope(ch->q, ch->cs, &rq) && cc_rope(ch->ip, ch->cs, &ri);
+        ok = cc_rope(ch->k, csb, &rk) && cc_rope(ch->q, csb, &rq) && cc_rope(ch->ip, csb, &ri);
     }
     if (ok && q38_kv16()) {   /* K and V as every backend keeps them (float16), before anything reads them */
         CcEw r = {CC_EW_F16, n * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
@@ -1022,15 +1101,15 @@ static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int 
         ri[s] = (CcRegion){(size_t)(pb + s) * ID, (size_t)s * ipw + (size_t)IQ * ID, (size_t)ID};
     }
     size_t ko = (size_t)ch->attn_ord[i] * q38cc_kv_stride(ch, c);
+    const int need_hbank = m->K[i] != NULL;
     ok = (ch->kvh ? cc_copy_regions_h(ch->kc[i], ch->k, rg, n * KVH) && cc_copy_regions_h(ch->vc[i], ch->v, rg, n * KVH)
                   : cc_copy_regions(ch->kc[i], ch->k, rg, n * KVH) && cc_copy_regions(ch->vc[i], ch->v, rg, n * KVH)) &&
-         cc_copy_regions(ch->ik[i], ch->ip, ri, n) &&
-         cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) &&
-         cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
-    if (ok) {   /* index keys back, compact: one copy over the rows (a copy a row filled the driver's queue while
-                 * a hybrid layer before held the stream, and the host waited on it before serving that layer) */
+         cc_copy_regions(ch->ik[i], ch->ip, ri, n);
+    if (ok && need_hbank) {
         for (int s = 0; s < n; s++) ri[s] = (CcRegion){ko + 2 * (size_t)ch->rows * kvo + (size_t)s * ID, (size_t)s * ipw + (size_t)IQ * ID, (size_t)ID};
-        ok = cc_copy_regions(ch->kvd, ch->ip, ri, n);
+        ok = cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) &&
+             cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo) &&
+             cc_copy_regions(ch->kvd, ch->ip, ri, n);
     }
     free(rg); free(ri);
     /* the pooled keys of the blocks this step completes (and any behind the watermark) */
@@ -1137,14 +1216,15 @@ static ColiCudaTensor *q38cc_tb(Q38CChain *ch, Q38Weight *w) {
     w->cc = t;
     return t;
 }
-static int q38cc_ple(Q38CChain *ch, Model *m, int n, int c0, int ns) {
+static int q38cc_ple_ex(Q38CChain *ch, Model *m, int n, int c0, int ns, int in_graph) {
     Cfg *c = &m->c; Layer *l = &m->L[c->ple_layer];
     int W = c->hc_width, H = c->hidden, E = c->ngram_heads * c->ngram_head_dim;
     size_t pc = q38cc_ple_cells(c);
     /* the rows to the device once: the projections read their input row again for every output
      * row, which from the host's memory was over the bus every time (a decode step's key and value
      * 424 and 408 us on an RTX PRO 4000, 124 and 32 GB/s) */
-    int ok = cc_write(ch->emb, 0, ch->host_emb, (size_t)n * E * 4) && cc_copy(ch->embd, 0, ch->emb, 0, (size_t)n * E) &&
+    int ok = (in_graph || cc_write(ch->emb, 0, ch->host_emb, (size_t)n * E * 4)) &&
+             cc_copy(ch->embd, 0, ch->emb, 0, (size_t)n * E) &&
              cc_matmul(q38cc_tb(ch, &l->ple_key), ch->embd, 0, ch->keys, 0, n) &&
              cc_matmul(q38cc_tb(ch, &l->ple_value), ch->embd, 0, ch->val, 0, n);
     CcPle g = {0, n, c->hc_count, H, c->ple_convk, c->ngram_size, 0, q38cc_ho(ch, W), 0, -1, 0, c->eps, (int)ch->o_ple, 0, 0};
@@ -1155,7 +1235,7 @@ static int q38cc_ple(Q38CChain *ch, Model *m, int n, int c0, int ns) {
                     (int)((size_t)snap * pc), c->eps, 0, (int)ch->o_pconv, (int)((size_t)ch->ple_slot[0] * pc)};
         return ok && cc_ple(NULL, q38cc_hb(ch), NULL, NULL, ch->gated, ch->normv, ch->prm, ch->ple_ring, &cv);
     }
-    ok = ok && cc_reserve(&ch->gseg, (size_t)n * W * 4, CC_DEV) && cc_reserve(&ch->nseg, (size_t)n * W * 4, CC_DEV);
+    if (!in_graph) ok = ok && cc_reserve(&ch->gseg, (size_t)n * W * 4, CC_DEV) && cc_reserve(&ch->nseg, (size_t)n * W * 4, CC_DEV);
     for (int r = 0; r < ns && ok; r++) {
         int len = r < ns - 1 ? 1 : n - r;
         CcBuf *gb = ch->gated, *nb = ch->normv;
@@ -1171,6 +1251,7 @@ static int q38cc_ple(Q38CChain *ch, Model *m, int n, int c0, int ns) {
     }
     return ok;
 }
+static int q38cc_ple(Q38CChain *ch, Model *m, int n, int c0, int ns) { return q38cc_ple_ex(ch, m, n, c0, ns, 0); }
 static int q38cc_shared(Q38CChain *ch, Model *m, Layer *l, int i, int n) {
     Cfg *c = &m->c; int SI = c->shared_inter;
     CcEw sw = {CC_EW_SWIGLU, n * SI, SI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
@@ -1183,6 +1264,11 @@ static int q38cc_shared(Q38CChain *ch, Model *m, Layer *l, int i, int n) {
 static int q38cc_moe_apply(Q38CChain *ch, Model *m, int n, CcBuf *routed) {
     Cfg *c = &m->c;
     CcEw cb = {CC_EW_COMBINE, n * c->hidden, c->hidden, 1, 1 | 2 | 4 | 8, 1, 0, 0, 0, 0, 0, 1.f};
+    if (q38cc_fuse_combine()) {
+        CcEw ap = {CC_EW_HC_APPLY, n * c->hc_width, c->hidden, c->hc_count, 0, 1, 0, 0, 0, 0, 0, 1.f};
+        int r = cc_combine_apply(ch->hyper, NULL, routed, ch->ds, ch->sgd, ch->inj_m, &cb, &ap);
+        if (r >= 0) return r;
+    }
     return cc_ew(ch->blk, NULL, routed, ch->ds, ch->sgd, &cb) && q38cc_gr_apply(ch, m, ch->inj_m, n);
 }
 /* Layer i's new K/V and index-key rows (an attention layer's) into the host's caches once
@@ -1855,11 +1941,13 @@ static int q38cc_dm_able(Q38CChain *ch, Model *m) {
     if (!q38cc_dm_wanted() || !cc_moe_ready() || E <= 0 || E > CC_ROUTE_EMAX || K < 1 || K > 32 || rt_fp ||
         g_q38_act || g_q38_dump || g_q38_cov || (g && g[0] == '0') || !qt_experts_on() || qt_chain_devices() != 1) return 0;
     if (c->hidden % 32 || c->inter % 32 || c->hidden > CC_MOE_DIM_MAX || c->inter > CC_MOE_DIM_MAX) return 0;
-    if (!qt_chain_format(&ch->dm_fmt, &ch->dm_gs) || (ch->dm_fmt == 4 && (ch->dm_gs < 16 || ch->dm_gs % 16))) return 0;
+    if (!qt_chain_format(&ch->dm_fmt, &ch->dm_gs)) return 0;
+    if (ch->dm_fmt == 7 && !(ch->dm_gs == 32 && q38cc_mx4_moe_env())) return 0;
+    if (ch->dm_fmt == 4 && (ch->dm_gs < 16 || ch->dm_gs % 16)) return 0;
     /* the host's share of a step takes its distinct experts in waves of the RAM cache's slots
      * (q38_moe_decode_grouped), so a cache of one slot or more serves it */
     for (int i = 0; i < L; i++) {
-        if (!(q38_layer_int4(m, i) || g_q38_gguf) || m->cache[i].cap < 1) return 0;
+        if (!(q38_layer_int4(m, i) || g_q38_gguf || ch->dm_fmt == 7) || m->cache[i].cap < 1) return 0;
         int fg, fd;
         if (ch->dm_fmt >= 100 && (!qt_chain_layer_format(i, &fg, &fd) || !cc_moe_block_type(fg - 100) || !cc_moe_block_type(fd - 100)))
             return 0;
@@ -2177,6 +2265,26 @@ static int q38cc_dm_sum(Q38CChain *ch, Model *m, int i, int n, unsigned v, CcBuf
 }
 static int q38cc_dm_layer_b(Q38CChain *ch, Model *m, int i, int n, unsigned v) { return q38cc_dm_sum(ch, m, i, n, v, ch->dm_hid, 0, 0); }
 static int q38cc_dm_layer(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
+    if (n <= Q38CC_DM_ROWS && q38cc_side_shared() && !q38cc_dm_hosted(ch, i, n)) {
+        CcBuf *tab = q38cc_dm_tab(ch, n);
+        int stg = tab == ch->dm_tabb && ch->dm_frn[i] > 0;
+        if (!stg) {
+            Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
+            CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
+            CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 3, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};
+            if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
+            *v = 0;
+            int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) &&
+                     cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
+                     cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) &&
+                     cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K) &&
+                     cc_side_begin() && q38cc_shared(ch, m, l, i, n) && cc_side_switch() &&
+                     cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp) &&
+                     cc_side_end();
+            ch->dm_steps++;
+            return ok;
+        }
+    }
     return q38cc_dm_layer_a(ch, m, l, i, n, v) && q38cc_dm_layer_b(ch, m, i, n, *v);
 }
 /* np pooled slots on the CPU, their rows where the pool holds them (g[p]: gate, up and down at
@@ -3566,6 +3674,259 @@ static void q38cc_pd_end(Q38CChain *ch, int S, int pd, double sec) {
  * read-out; logit: the last nlogits rows' logits (a greedy caller's picks instead, in
  * m->greedy_out, q38cc_greedy_ok). 0 = not taken (nothing changed, or the device was lost
  * and the state rebuilt: the CPU runs the step), 1 = done. */
+/* ---- Q38_CC_STEPGRAPH: whole-step CUDA graph for card-resident decode / verify steps ----- */
+static unsigned long long q38g_mix(unsigned long long h, const void *p) {
+    unsigned long long v = (unsigned long long)(uintptr_t)p;
+    h ^= v; h *= 0x100000001b3ULL; return h ^ (h >> 33);
+}
+static unsigned long long q38g_buf(unsigned long long h, const CcBuf *b) { return q38g_mix(h, b ? cc_dev_addr(b) : NULL); }
+static int q38cc_dm_layer_card(Q38CChain *ch, Model *m, Layer *l, int i, int n, CcBuf *tab) {
+    Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
+    CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
+    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 3, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};
+    if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
+    int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp);
+    if (!ok) return 0;
+    if (q38cc_side_shared()) {
+        return cc_side_begin() && q38cc_shared(ch, m, l, i, n) && cc_side_switch() &&
+               cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp) &&
+               cc_side_end();
+    }
+    return q38cc_shared(ch, m, l, i, n) && cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
+}
+static unsigned long long q38cc_step_fp(Q38CChain *ch, Model *m, CcBuf *tab, int ns) {
+    Cfg *c = &m->c; int L = c->layers;
+    CcBuf *all[] = {ch->prm, ch->hyper, ch->hn, ch->low, ch->mix, ch->mixed, ch->inj_a, ch->inj_m, ch->blk, ch->q, ch->k, ch->v,
+                    ch->ip, ch->ctx, ch->qkv, ch->z, ch->ab, ch->cv, ch->dny, ch->lg, ch->gs, ch->us, ch->hs, ch->ds, ch->sgd,
+                    ch->mixd, ch->lgd, ch->routed, ch->cs, ch->csd, ch->dm_ids, ch->dm_w, ch->dm_idsd, ch->dm_wd, ch->dm_hid,
+                    ch->dm_y, ch->dm_hy, tab, ch->hyper_up, ch->emb, ch->embd, ch->keys, ch->val, ch->gated, ch->normv,
+                    ch->ple_ring, ch->gseg, ch->nseg, ch->qsc, ch->sel, ch->kvd, ch->pcsd,
+                    ch->outd, ch->outdev, ch->gpick, ch->hypd, ch->step_up, ch->step_dev, ch->step_err};
+    unsigned long long h = q38g_mix(0xcbf29ce484222325ULL, (const void *)(uintptr_t)ch->rows);
+    for (size_t k = 0; k < sizeof all / sizeof *all; k++) h = q38g_buf(h, all[k]);
+    h = q38g_mix(h, (const void *)(uintptr_t)ch->sg_epoch);
+    h = q38g_mix(h, (const void *)(uintptr_t)ch->cap);
+    h = q38g_mix(h, (const void *)(uintptr_t)ch->ple_slot[0]);
+    h = q38g_mix(h, cc_graph_scratch());
+    for (int i = 0; i < L; i++) {
+        if (c->is_attn[i]) {
+            h = q38g_buf(q38g_buf(q38g_buf(q38g_buf(h, ch->kc[i]), ch->vc[i]), ch->ik[i]), ch->pk[i]);
+        } else {
+            h = q38g_buf(q38g_buf(h, ch->rec[i]), ch->ring[i]);
+            for (int sl = 0; sl < ns && sl < ch->snap_slots; sl++)
+                h = q38g_buf(q38g_buf(h, ch->rec_snap[sl] ? ch->rec_snap[sl][i] : NULL),
+                             ch->ring_snap[sl] ? ch->ring_snap[sl][i] : NULL);
+        }
+    }
+    return h;
+}
+static int q38cc_step_ops(Q38CChain *ch, Model *m, CcBuf *tab, int n, int ns, int nlogits, int want_streams, int greedy, int need_hbank) {
+    Cfg *c = &m->c;
+    int H = c->hidden, W = c->hc_width, L = c->layers, K = c->topk, V = c->vocab, half = c->rotary_dim / 2;
+    int QH = c->q_heads, KVH = c->kv_heads, D = c->head_dim, kvo = KVH * D, qo = QH * 2 * D;
+    int IQ = c->idx_qheads, ID = c->idx_dim, R = c->idx_ratio, ipw = (IQ + 1) * ID;
+    const int kv16 = q38_kv16();
+    const int pk_nb = (n + R - 1) / R + 2;
+    const int nbmax = (int)(cc_bytes(ch->qsc) / 4 / (2 * (size_t)ch->rows));
+    int ok = cc_step_load(ch->step_dev, 0, ch->step_up, 0, CC_STEP_INTS) &&
+             cc_copy(ch->hyper, 0, ch->hyper_up, 0, (size_t)n * W) &&
+             (!half || cc_copy(ch->csd, 0, ch->cs, 0, (size_t)n * 2 * half));
+    for (int i = 0; i < L && ok; i++) {
+        Layer *l = &m->L[i];
+        if (i > 0) ok = q38cc_moe_apply(ch, m, n, ch->dm_y);
+        if (ok && i == c->ple_layer) ok = q38cc_ple_ex(ch, m, n, 0, ns, 1);
+        ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
+        if (ok && c->is_attn[i]) {
+            ok = cc_matmul(q38cc_t(ch, &l->q), ch->mixed, 0, ch->q, 0, n) &&
+                 cc_matmul(q38cc_t(ch, &l->k), ch->mixed, 0, ch->k, 0, n) &&
+                 cc_matmul(q38cc_t(ch, &l->v), ch->mixed, 0, ch->v, 0, n) &&
+                 cc_matmul(q38cc_t(ch, &l->idx_qk), ch->mixed, 0, ch->ip, 0, n);
+            CcNorm kn = {n * KVH, D, KVH, 0, kvo, D, 0, kvo, D, (int)ch->o_kn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
+            CcNorm qn = {n * QH, D, QH, 0, qo, 2 * D, 0, qo, 2 * D, (int)ch->o_qn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
+            CcNorm in = {n * IQ, ID, IQ, 0, ipw, ID, 0, ipw, ID, (int)ch->o_iqn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
+            ok = ok && cc_norm(ch->k, ch->prm, ch->k, &kn) && cc_norm(ch->q, ch->prm, ch->q, &qn) && cc_norm(ch->ip, ch->prm, ch->ip, &in);
+            if (ok && half) {
+                CcBuf *csb = ch->csd ? ch->csd : ch->cs;
+                CcRope rk = {n * KVH, KVH, 0, kvo, D, half, 0, 2 * half}, rq = {n * QH, QH, 0, qo, 2 * D, half, 0, 2 * half};
+                CcRope ri = {n * IQ, IQ, 0, ipw, ID, half, 0, 2 * half};
+                ok = cc_rope(ch->k, csb, &rk) && cc_rope(ch->q, csb, &rq) && cc_rope(ch->ip, csb, &ri);
+            }
+            if (ok && (ch->kvh || kv16)) {
+                CcEw r = {CC_EW_F16, n * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
+                ok = cc_ew(ch->k, ch->k, NULL, NULL, NULL, &r) && cc_ew(ch->v, ch->v, NULL, NULL, NULL, &r);
+            }
+            CcKvAppend kpv = { .S = n, .heads = KVH, .len = D, .half = ch->kvh, .ring = 0, .cap = ch->cap,
+                               .dst_off = 0, .dst_head = ch->cap * D, .dst_pos = D,
+                               .src_off = 0, .src_row = kvo, .src_head = D, .step_off = 0 };
+            CcKvAppend kpi = { .S = n, .heads = 1, .len = ID, .half = 0, .ring = 0, .cap = ch->cap,
+                               .dst_off = 0, .dst_head = 0, .dst_pos = ID,
+                               .src_off = IQ * ID, .src_row = ipw, .src_head = 0, .step_off = 0 };
+            ok = ok && cc_kv_append_s(ch->kc[i], ch->k, ch->vc[i], ch->v, ch->step_dev, &kpv) &&
+                 cc_kv_append_s(ch->ik[i], ch->ip, NULL, NULL, ch->step_dev, &kpi);
+            if (ok && need_hbank) {
+                size_t ko = (size_t)ch->attn_ord[i] * q38cc_kv_stride(ch, c);
+                CcRegion ri[Q38CC_DM_ROWS];
+                for (int s = 0; s < n; s++)
+                    ri[s] = (CcRegion){ko + 2 * (size_t)ch->rows * kvo + (size_t)s * ID, (size_t)s * ipw + (size_t)IQ * ID, (size_t)ID};
+                ok = cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) &&
+                     cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo) &&
+                     cc_copy_regions(ch->kvd, ch->ip, ri, n);
+            }
+            CcQsa pp = {0, ID, R, 0, half, n, 0, 0, 0, 0, 0, 0, 0, c->eps, 0, (int)ch->o_ikn[i], 0, pk_nb};
+            CcQsa ps = {1, ID, R, 0, 0, n, 0, c->idx_budget, IQ, 0, ipw, nbmax, q38cc_selrow(c), c->eps, 0, 0, 0, 0};
+            CcAttn at = {n, QH, KVH, D, 0, ch->cap, 0, qo, 2 * D, D, qo, 2 * D, 1, 0, QH * D, 0, q38cc_selrow(c),
+                         1.f / sqrtf((float)D), 0, 0};
+            CcAttnS as = { .a = at, .half = ch->kvh, .nmax = q38cc_selrow(c) - 1, .step_off = 0 };
+            ok = ok && cc_qsa_s(ch->ik[i], ch->prm, ch->pk[i], half ? ch->pcsd : ch->pcs, NULL, NULL, ch->step_dev, &pp, 0) &&
+                 cc_qsa_s(ch->ip, NULL, ch->pk[i], NULL, ch->qsc, ch->sel, ch->step_dev, &ps, 0) &&
+                 cc_attn_s(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, ch->step_dev, &as) &&
+                 cc_matmul(q38cc_t(ch, &l->o), ch->ctx, 0, ch->blk, 0, n);
+        } else if (ok) {
+            ok = q38cc_deltanet(ch, m, l, i, n, 0, ns);
+        }
+        ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n) &&
+             q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m) &&
+             q38cc_dm_layer_card(ch, m, l, i, n, tab);
+    }
+    if (ok) {
+        CcRegion r_ids[128], r_w[128];
+        int nr = 0;
+        for (int i = 0; i < L && ok; i++) {
+            size_t io = (size_t)i * (size_t)ch->rows * (size_t)K;
+            r_ids[nr] = r_w[nr] = (CcRegion){io, io, (size_t)n * (size_t)K};
+            nr++;
+            if (nr == 128 || i + 1 == L) {
+                ok = cc_copy_regions(ch->dm_idsd, ch->dm_ids, r_ids, nr) &&
+                     cc_copy_regions(ch->dm_wd, ch->dm_w, r_w, nr);
+                nr = 0;
+            }
+        }
+    }
+    if (ok) ok = q38cc_moe_apply(ch, m, n, ch->dm_y);
+    if (ok && want_streams) ok = cc_copy(ch->hypd, 0, ch->hyper, 0, (size_t)n * W);
+    if (ok && nlogits > 0) {
+        int lo0 = n - nlogits;
+        ok = q38cc_gr_read(ch, m, &m->final_gr, ch->o_fn, n, NULL) &&
+             cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)lo0 * H, greedy ? ch->outdev : ch->outd, 0, nlogits) &&
+             (!greedy || cc_pick_rows(ch->outdev, 0, ch->gpick, V, nlogits));
+    }
+    if (ok) ok = cc_copy(ch->step_err, 0, ch->step_dev, CC_STEP_ERR, 1);
+    return ok;
+}
+static int q38cc_step_run(Q38CChain *ch, Model *m, int n, int pb, int ns, int nlogits, float *hyper_h,
+                          int want_streams, int greedy) {
+    Cfg *c = &m->c;
+    int W = c->hc_width, L = c->layers, QH = c->q_heads, KVH = c->kv_heads, D = c->head_dim, qo = QH * 2 * D;
+    int R = c->idx_ratio > 0 ? c->idx_ratio : 1, half = c->rotary_dim / 2;
+    CcBuf *tab = q38cc_dm_tab(ch, n);
+    if (!tab || tab == ch->dm_tabb || (half && !ch->pcsd)) return -1;
+    for (int i = 0; i < L; i++) if (q38cc_dm_hosted(ch, i, n)) return -1;
+    if (!cc_reserve(&ch->hyper_up, (size_t)Q38CC_DM_ROWS * W * 4, CC_UP)) return cc_lost() ? 0 : -1;
+    if (ns > 1 && c->ple_layer >= 0 && c->ple_layer < L &&
+        (!cc_reserve(&ch->gseg, (size_t)Q38CC_DM_ROWS * W * 4, CC_DEV) || !cc_reserve(&ch->nseg, (size_t)Q38CC_DM_ROWS * W * 4, CC_DEV)))
+        return cc_lost() ? 0 : -1;
+    for (int i = 0; i < L; i++) {
+        if (!c->is_attn[i]) continue;
+        CcAttn at = {n, QH, KVH, D, 0, ch->cap, 0, qo, 2 * D, D, qo, 2 * D, 1, 0, QH * D, 0, q38cc_selrow(c),
+                     1.f / sqrtf((float)D), 0, 0};
+        CcAttnS as = { .a = at, .half = ch->kvh, .nmax = q38cc_selrow(c) - 1, .step_off = 0 };
+        int r = cc_attn_s_reserve(&as);
+        if (r == 0) return cc_lost() ? 0 : -1;
+        if (r == 2) ch->sg_epoch++;
+    }
+    int need_push = ch->dn_where == Q38CC_HOST;
+    for (int i = 0; !need_push && i < L; i++) if (c->is_attn[i] && ch->kv_valid[i] < pb) need_push = 1;
+    if (need_push) {
+        if (!q38cc_frame_begin(ch) || !q38cc_push_state(ch, m, pb) || !cc_submit(0)) return 0;
+    }
+    int pk0 = -1, need_hbank = 0;
+    const int pk_nb = (n + R - 1) / R + 2;
+    for (int i = 0; i < L; i++) {
+        if (!c->is_attn[i]) continue;
+        if (m->K[i]) need_hbank = 1;
+        if (ch->pk_valid[i] > pb / R) ch->pk_valid[i] = pb / R;
+        if (pk0 < 0) pk0 = ch->pk_valid[i];
+        else if (ch->pk_valid[i] != pk0) return -1;
+    }
+    if (pk0 < 0) pk0 = 0;
+    if ((pb + n) / R - pk0 > pk_nb) return -1;
+    memcpy(cc_ptr(ch->hyper_up), hyper_h, (size_t)n * W * sizeof(float));
+    if (c->ple_layer >= 0 && c->ple_layer < L)
+        memcpy(cc_ptr(ch->emb), ch->host_emb, (size_t)n * (size_t)c->ngram_heads * (size_t)c->ngram_head_dim * sizeof(float));
+    int *stp = (int *)cc_ptr(ch->step_up);
+    if (!stp) return -1;
+    for (int k = 0; k < CC_STEP_INTS; k++) stp[k] = 0;
+    stp[CC_STEP_POS] = pb; stp[CC_STEP_ROWS] = n; stp[CC_STEP_PK0] = pk0;
+    unsigned long long key = 1ULL | ((unsigned long long)n << 1) | ((unsigned long long)ns << 8) |
+                             ((unsigned long long)nlogits << 16) | ((unsigned long long)want_streams << 24) |
+                             ((unsigned long long)greedy << 25) | ((unsigned long long)need_hbank << 26) |
+                             ((unsigned long long)q38cc_side_shared() << 27) | ((unsigned long long)q38cc_fuse_hcnorm() << 28) |
+                             ((unsigned long long)q38cc_fuse_combine() << 29);
+    unsigned long long fp = q38cc_step_fp(ch, m, tab, ns);
+    Q38CcGraph *e = NULL, *old = &ch->sgr[0];
+    for (int k = 0; k < Q38G_WAYS && !e; k++) {
+        if (ch->sgr[k].key == key && ch->sgr[k].fp == fp) e = &ch->sgr[k];
+        else if (ch->sgr[k].tick < old->tick) old = &ch->sgr[k];
+    }
+    ch->sg_tick++;
+    double t0 = now_s();
+    int ok = q38cc_frame_begin(ch);
+    if (ok && !e) {
+        cc_graph_free(old->exec);
+        *old = (Q38CcGraph){key, fp, ch->sg_tick, NULL};
+        ch->sg_eager++;
+        ok = q38cc_step_ops(ch, m, tab, n, ns, nlogits, want_streams, greedy, need_hbank);
+    } else if (ok && e->exec) {
+        e->tick = ch->sg_tick;
+        ch->sg_launch++;
+        ok = cc_graph_launch(e->exec);
+    } else if (ok) {
+        e->tick = ch->sg_tick;
+        void *x = NULL; int gok = 0, broke = 1;
+        if (cc_graph_begin()) {
+            gok = q38cc_step_ops(ch, m, tab, n, ns, nlogits, want_streams, greedy, need_hbank);
+            x = cc_graph_end(&broke);
+            if (x && gok) { e->exec = x; ch->sg_capture++; ok = cc_graph_launch(x); }
+            else {
+                cc_graph_free(x);
+                if (!x && !broke) ok = 0;
+                else {
+                    fprintf(stderr, "[chain] qwen38: Q38_CC_STEPGRAPH did not capture; falling back\n");
+                    ch->sg_on = 0;
+                    for (int k = 0; k < Q38G_WAYS; k++) { cc_graph_free(ch->sgr[k].exec); ch->sgr[k].exec = NULL; }
+                    ok = q38cc_step_ops(ch, m, tab, n, ns, nlogits, want_streams, greedy, need_hbank);
+                }
+            }
+        } else if (cc_lost()) ok = 0;
+        else {
+            ch->sg_on = 0;
+            ok = q38cc_step_ops(ch, m, tab, n, ns, nlogits, want_streams, greedy, need_hbank);
+        }
+    }
+    ok = ok && cc_submit(1);
+    double wt = now_s() - t0;
+    m->timers.seconds[Q38_TM_DENSE_MATMUL] += wt; ch->wait_ms += wt * 1e3;
+    if (!ok) return 0;
+    if (((const int *)cc_ptr(ch->step_err))[0] != 0) {
+        fprintf(stderr, "[chain] qwen38: step graph error bits 0x%x at pos %d\n",
+                ((const unsigned *)cc_ptr(ch->step_err))[0], pb);
+        return 0;
+    }
+    if (need_hbank)
+        for (int i = 0; i < L; i++) if (c->is_attn[i]) q38cc_kv_down(ch, m, i, n, pb);
+    if (want_streams) memcpy(hyper_h, cc_ptr(ch->hypd), (size_t)n * W * sizeof(float));
+    for (int i = 0; i < L; i++) ch->dm_ran[i] = 1;
+    ch->dm_steps += (unsigned long long)L;
+    q38cc_dm_books(ch, m, n, pb);
+    for (int i = 0; i < L; i++) {
+        if (!c->is_attn[i]) continue;
+        ch->kv_valid[i] = pb + n;
+        if ((pb + n) / R > ch->pk_valid[i]) ch->pk_valid[i] = (pb + n) / R;
+    }
+    ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
+    return 1;
+}
+
 static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlogits, float *hyper_h,
                          int want_streams, float *mixed_h, float *logit) {
     if (!g_cuda_chain || m->mux_rows) return 0;
@@ -3619,9 +3980,10 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         if (ns < 0) ns = 0;
         if (ns) snapped = c0 + ns;
         if (half) {
-            float *cs = (float *)cc_ptr(ch->cs);
+            float *cs = (float *)cc_ptr(ch->cs), den[256];
+            for (int j = 0; j < half && j < 256; j++) den[j] = powf(c->theta, (float)(2 * j) / c->rotary_dim);
             for (int s = 0; s < n; s++) for (int j = 0; j < half; j++) {
-                float ang = (float)(pb + s) / powf(c->theta, (float)(2 * j) / c->rotary_dim);
+                float ang = (float)(pb + s) / (j < 256 ? den[j] : powf(c->theta, (float)(2 * j) / c->rotary_dim));
                 cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
             }
         }
@@ -3637,6 +3999,13 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             q38cc_dm_caps_back(ch, m);
         }
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
+        /* Q38_CC_STEPGRAPH whole-step CUDA graph fast path for card-resident decode / verify steps */
+        if (dm && ch->sg_on && c0 == 0 && n == S && S <= Q38CC_DM_ROWS && !mixed_h && !q38cc_df(m) &&
+            ch->step_up && ch->step_dev && ch->step_err && ch->csd) {
+            int sr = q38cc_step_run(ch, m, n, pb, ns, nlogits, hyper_h, want_streams, greedy);
+            if (sr == 0) goto lost;
+            if (sr > 0) break;
+        }
         /* a short prompt's chunk with the pool's slots on the CPU: two lanes (q38cc_chunk_lanes) */
         int lanes = dm && q38cc_lanes_on() && n >= q38cc_lanes_min() && ns == 0 && q38cc_pc_step(ch, n) && q38cc_dm_tab(ch, n) == ch->dm_tabd;
         for (int i = 0; i < L && lanes; i++) lanes = !ch->dm_part[i];
@@ -3658,7 +4027,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
                            (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy));
         if (dm) cc_host_wait_arm(ch->dm_hfl);
         if (!q38cc_frame_begin(ch) || !q38cc_hyper_in(ch, hyper_h + (size_t)c0 * W, n, W) ||
-            !q38cc_push_state(ch, m, pb)) goto lost;
+            !q38cc_push_state(ch, m, pb) || (half && ch->csd && !cc_copy(ch->csd, 0, ch->cs, 0, (size_t)n * 2 * half))) goto lost;
         if (dm && q38cc_dm_tab(ch, n) == ch->dm_tabb && !q38cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
         int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
@@ -3914,6 +4283,9 @@ static void q38cc_report(Model *m) {
     if (ch->dm_skip)
         fprintf(stderr, "[chain] qwen38: %llu hybrid layer steps without a slot of the host's: the device went on without its word "
                         "(COLI_CUDA_CHAIN_HOST_SKIP=0: it waits)\n", ch->dm_skip);
+    if (ch->sg_launch || ch->sg_capture || ch->sg_eager)
+        fprintf(stderr, "[chain] qwen38: Q38_CC_STEPGRAPH: %llu step graphs replayed, %llu captured, %llu eager%s\n",
+                ch->sg_launch, ch->sg_capture, ch->sg_eager, ch->sg_on ? "" : " (switched off)");
     if (ch->pd_rounds)
         fprintf(stderr, "[chain] qwen38: a decode step's pooled experts %s, as %llu measures found (the last: %.2f ms a step with the CPU's, "
                         "%.2f over the bus; COLI_CUDA_CHAIN_POOL_READ=1 the bus, 0 the CPU)\n", ch->pd_bus ? "over the bus" : "on the CPU",

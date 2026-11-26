@@ -324,6 +324,24 @@ typedef struct { int R, V, K, x_off, x_row, o_off, o_row, splits; } CcDfTopk;
 /* a target layer's rows as the drafter's context: y[y_off + r y_row + c] = sum over b < C of x[x_off + r x_row + b D + c] */
 typedef struct { int n, D, C, x_off, x_row, y_off, y_row; } CcDfTap;
 
+/* ---- a decode step the device reads (Qwen3.8's Q38_CC_STEPGRAPH) ---------------------- */
+#define CC_STEP_POS   0
+#define CC_STEP_ROWS  1
+#define CC_STEP_PK0   2
+#define CC_STEP_SEQ   3
+#define CC_STEP_ERR   4
+#define CC_STEP_INTS  16
+#define CC_STEP_ERR_KV   1u
+#define CC_STEP_ERR_PK   2u
+#define CC_STEP_ERR_QSA  4u
+#define CC_STEP_ERR_ATTN 8u
+typedef struct { int v[CC_STEP_INTS]; } CcStep;
+typedef struct { int S, heads, len, half, ring, cap;
+                 int dst_off, dst_head, dst_pos, src_off, src_row, src_head; int step_off; int rsv[3]; } CcKvAppend;
+#define CC_ATTN_S_ROWS 8
+typedef struct { CcAttn a; int half, nmax, step_off; int rsv[3]; } CcAttnS;
+typedef struct { int n, H, W, C, R, norm_off, inject, flags; float eps, fc; int rsv[4]; } CcGrRead;
+
 typedef struct ColiCudaChainOps {
     size_t size;
     /* after coli_cuda_init, for a configured device; 1 = the chain is up on it. Each
@@ -546,6 +564,21 @@ typedef struct ColiCudaChainOps {
     int  (*relattn_pb)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
                        CcBuf *pb, CcBuf *part, int nc, const CcRelAttn *p);
     int  (*ink2_kv_put)(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb, int S, int KV, int hd, int cap, int vs_off);
+    /* Q38_CC_STEPGRAPH step ops, multi-block pick, fused HC read/combine, doorbell, side stream */
+    int  (*step_load)(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, int n);
+    int  (*kv_append_s)(CcBuf *dst, CcBuf *src, CcBuf *dst2, CcBuf *src2, CcBuf *step, const CcKvAppend *p);
+    int  (*qsa_s)(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, CcBuf *step, const CcQsa *p, int step_off);
+    int  (*attn_s)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, CcBuf *step, const CcAttnS *p);
+    int  (*attn_s_reserve)(const CcAttnS *p);
+    int  (*pick_rows_mb)(CcBuf *logits, size_t off, CcBuf *out, int n, int rows);
+    int  (*gr_read)(ColiCudaTensor *down, ColiCudaTensor *up, ColiCudaTensor *inject, CcBuf *hcs, CcBuf *prm, CcBuf *hn,
+                    CcBuf *low, CcBuf *mix, CcBuf *mixed, CcBuf *inj, const CcGrRead *p);
+    int  (*combine_apply)(CcBuf *hcs, CcBuf *blk, CcBuf *routed, CcBuf *ds, CcBuf *sgd, CcBuf *inj, const CcEw *cb, const CcEw *ap);
+    int  (*wait_ge)(CcBuf *flag, size_t word, CcBuf *step, size_t step_off, int sw, unsigned add);
+    int  (*flag_set)(CcBuf *flag, size_t word, CcBuf *step, size_t step_off, int sw, unsigned add);
+    int  (*side_begin)(void);
+    int  (*side_switch)(void);
+    int  (*side_end)(void);
 } ColiCudaChainOps;
 #define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
 #define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
@@ -932,6 +965,50 @@ static inline int cc_relattn_pb(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf 
 static inline int cc_ink2_kv_put(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb, int S, int KV, int hd, int cap, int vs_off) {
     return cc_ink2_pb_ready() ? cc_ops()->ink2_kv_put(kc, vc, kvs, pb, S, KV, hd, cap, vs_off) : 0;
 }
+#define CC_OPS_HAS(t, f) ((t) && (t)->size >= offsetof(ColiCudaChainOps, f) + sizeof (t)->f && (t)->f)
+static inline int cc_step_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return CC_OPS_HAS(t, step_load) && CC_OPS_HAS(t, kv_append_s) && CC_OPS_HAS(t, qsa_s) && CC_OPS_HAS(t, attn_s) &&
+           CC_OPS_HAS(t, attn_s_reserve);
+}
+static inline int cc_step_load(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, int n) {
+    return cc_step_ready() ? cc_ops()->step_load(dst, doff, src, soff, n) : 0;
+}
+static inline int cc_kv_append_s(CcBuf *dst, CcBuf *src, CcBuf *dst2, CcBuf *src2, CcBuf *step, const CcKvAppend *p) {
+    return cc_step_ready() ? cc_ops()->kv_append_s(dst, src, dst2, src2, step, p) : 0;
+}
+static inline int cc_qsa_s(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, CcBuf *step, const CcQsa *p, int step_off) {
+    return cc_step_ready() ? cc_ops()->qsa_s(src, w, pk, cs, sc, sel, step, p, step_off) : 0;
+}
+static inline int cc_attn_s(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, CcBuf *step, const CcAttnS *p) {
+    return cc_step_ready() ? cc_ops()->attn_s(q, kc, vc, o, gate, sel, step, p) : 0;
+}
+static inline int cc_attn_s_reserve(const CcAttnS *p) { return cc_step_ready() ? cc_ops()->attn_s_reserve(p) : 0; }
+static inline int cc_pick_rows_mb_ready(void) { const ColiCudaChainOps *t = cc_ops(); return CC_OPS_HAS(t, pick_rows_mb); }
+static inline int cc_pick_rows_mb(CcBuf *logits, size_t off, CcBuf *out, int n, int rows) {
+    return cc_pick_rows_mb_ready() ? cc_ops()->pick_rows_mb(logits, off, out, n, rows) : 0;
+}
+static inline int cc_gr_read_ready(void) { const ColiCudaChainOps *t = cc_ops(); return CC_OPS_HAS(t, gr_read); }
+static inline int cc_gr_read(ColiCudaTensor *down, ColiCudaTensor *up, ColiCudaTensor *inject, CcBuf *hcs, CcBuf *prm, CcBuf *hn,
+                             CcBuf *low, CcBuf *mix, CcBuf *mixed, CcBuf *inj, const CcGrRead *p) {
+    return cc_gr_read_ready() ? cc_ops()->gr_read(down, up, inject, hcs, prm, hn, low, mix, mixed, inj, p) : -1;
+}
+static inline int cc_combine_apply_ready(void) { const ColiCudaChainOps *t = cc_ops(); return CC_OPS_HAS(t, combine_apply); }
+static inline int cc_combine_apply(CcBuf *hcs, CcBuf *blk, CcBuf *routed, CcBuf *ds, CcBuf *sgd, CcBuf *inj, const CcEw *cb, const CcEw *ap) {
+    return cc_combine_apply_ready() ? cc_ops()->combine_apply(hcs, blk, routed, ds, sgd, inj, cb, ap) : -1;
+}
+static inline int cc_doorbell_ready(void) { const ColiCudaChainOps *t = cc_ops(); return CC_OPS_HAS(t, wait_ge) && CC_OPS_HAS(t, flag_set); }
+static inline int cc_wait_ge(CcBuf *flag, size_t word, CcBuf *step, size_t step_off, int sw, unsigned add) {
+    return cc_doorbell_ready() ? cc_ops()->wait_ge(flag, word, step, step_off, sw, add) : 0;
+}
+static inline int cc_flag_set(CcBuf *flag, size_t word, CcBuf *step, size_t step_off, int sw, unsigned add) {
+    return cc_doorbell_ready() ? cc_ops()->flag_set(flag, word, step, step_off, sw, add) : 0;
+}
+static inline int cc_side_ready(void) { const ColiCudaChainOps *t = cc_ops(); return CC_OPS_HAS(t, side_begin) && CC_OPS_HAS(t, side_end); }
+static inline int cc_side_begin(void) { return cc_side_ready() ? cc_ops()->side_begin() : 0; }
+static inline int cc_side_switch_ready(void) { const ColiCudaChainOps *t = cc_ops(); return cc_side_ready() && CC_OPS_HAS(t, side_switch); }
+static inline int cc_side_switch(void) { return cc_side_switch_ready() ? cc_ops()->side_switch() : 0; }
+static inline int cc_side_end(void) { return cc_side_ready() ? cc_ops()->side_end() : 0; }
 #endif
 
 #ifdef __cplusplus

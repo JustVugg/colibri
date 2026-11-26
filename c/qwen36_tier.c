@@ -1986,8 +1986,8 @@ void qt_chain_own(void){
 }
 int qt_chain_format(int *fmt,int *gs){
     if(!G.on) return 0;
-    if(fmt) *fmt=G.wfmt==QT_GGUF?QT_GGUF:G.wfmt==8?8:G.wfmt==1?1:G.egs?4:2;
-    if(gs) *gs=G.egs;
+    if(fmt) *fmt=G.wfmt==QT_GGUF?QT_GGUF:G.wfmt==8?8:G.wfmt==7?7:G.wfmt==1?1:G.egs?4:2;
+    if(gs) *gs=G.wfmt==7?32:G.egs;
     return 1;
 }
 int qt_chain_layer_format(int layer,int *fmt,int *fmt_d){
