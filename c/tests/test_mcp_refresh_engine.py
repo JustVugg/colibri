@@ -78,9 +78,10 @@ class EngineRefreshTest(unittest.TestCase):
                         mock.patch.object(setup_flow, 'serve_pidfile', return_value=str(pidfile)), \
                         mock.patch.object(setup_flow, 'spawn_detached', side_effect=tracked_spawn):
                     server.handle({'jsonrpc': '2.0', 'id': 1,
-                                   'method': 'tools/call', 'params': {'name': 'start'}})
+                                   'method': 'tools/call',
+                                   'params': {'name': 'start', 'arguments': {'wait_seconds': 40}}})
                     for worker in server.threads:
-                        worker.join(timeout=12)
+                        worker.join(timeout=60)
                         self.assertFalse(worker.is_alive())
                 replies = [json.loads(line) for line in server.out.getvalue().splitlines()]
                 self.assertEqual(len(processes), 1, 'unexpected launcher count')

@@ -18,8 +18,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 folder = pathlib.Path(os.environ['TEST_DIR'])
 with open(folder / 'launches', 'a') as handle:
     handle.write(str(os.getpid()) + '\\n')
-# Model startup is not instantaneous: the PID/health endpoint arrives later.
-time.sleep(1)
+# Model startup is not instantaneous: the PID/health endpoint arrives later,
+# here after start_server's five-second wait, as on a slow machine.
+time.sleep(6)
 class Handler(BaseHTTPRequestHandler):
     server_version = 'colibri'
     sys_version = ''
@@ -67,9 +68,10 @@ class StartAdmissionTest(unittest.TestCase):
                         mock.patch.object(setup_flow, 'spawn_detached', side_effect=tracked_spawn):
                     for number in (1, 2):
                         server.handle({'jsonrpc': '2.0', 'id': number,
-                                       'method': 'tools/call', 'params': {'name': 'start'}})
+                                       'method': 'tools/call',
+                                       'params': {'name': 'start', 'arguments': {'wait_seconds': 40}}})
                     for worker in server.threads:
-                        worker.join(timeout=12)
+                        worker.join(timeout=60)
                         self.assertFalse(worker.is_alive())
                 replies = [json.loads(line) for line in server.out.getvalue().splitlines()]
                 self.assertEqual(len(processes), 1, 'overlapping starts spawned duplicate servers')
