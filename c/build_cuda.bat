@@ -92,7 +92,7 @@ rem -Xcompiler=-W3 sets the MSVC host-compiler warning level.
 "%NVCC%" -O3 -std=c++17 -arch=%CUDA_ARCH% -Xcompiler=-W3 -shared ^
     %CCBIN_FLAG% %UNSUPPORTED_FLAG% ^
     -DCOLI_CUDA_BUILDING_DLL %CUDA_LIB% -lcudart ^
-    backend_cuda.cu -o coli_cuda.dll
+    backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu -o coli_cuda.dll
 set "RC=%ERRORLEVEL%"
 
 popd

@@ -312,6 +312,11 @@ typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
 typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps, scale; } CcInk2Mix;
 typedef struct { int nseg, n, per_row, x_off, x_row, has_w, w_off; float thr; } CcInk2Clip;
 typedef struct { int S, C, K, hd, x_off, x_row, d_off, d_row, st_off, ring_off; float fc; } CcInk2Dconv;
+/* Per-slot Q8 KV descriptor for Inkling-2 multi-slot batched CUDA chain (cuda_inkc.cuh):
+ * k_q/v_q hold int8_t[KV][cap][hd], k_sc/v_sc hold float[KV][cap] per-head-row scales. */
+typedef struct { void *k_q; float *k_sc; void *v_q; float *v_sc; int cap; int pos; } CcInk2KvRow;
+/* One sequence segment inside a packed multi-prompt prefill batch (cuda_inkc.cuh). */
+typedef struct { int start, len, ring_base, pos_base; } CcInk2Seg;
 typedef struct { int n, g_off, u_off, y_off; float b1, b2; } CcSitu;
 /* DFlash2's two-tap dynamic depthwise convolution (cuda_dflash.cuh): y[r][c] = k0 x[r][c] + k1 x[r-1][c] over
  * blocks of B rows (x[r-1] 0 at a block's first row), k_t = prm[b_off + t C + c] plus (flags 2: times 1 plus)
@@ -546,6 +551,19 @@ typedef struct ColiCudaChainOps {
     int  (*relattn_pb)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
                        CcBuf *pb, CcBuf *part, int nc, const CcRelAttn *p);
     int  (*ink2_kv_put)(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb, int S, int KV, int hd, int cap, int vs_off);
+    /* Inkling-2 multi-slot (KV_SLOTS > 1) batched mux convs, per-slot Q8 KV attention/scatter, GPU logit softcap */
+    int  (*sconv_mux)(CcBuf *x, CcBuf *w, CcBuf *ring, CcBuf *ring_bases, const CcSconv *p);
+    int  (*ink2_dconv_mux)(CcBuf *x, CcBuf *dyn, CcBuf *prm, CcBuf *ring, CcBuf *ring_bases, const CcInk2Dconv *p);
+    int  (*relattn_q8)(CcBuf *q, CcBuf *kv_tab, size_t tab_off, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
+                       CcBuf *part, int nc, const CcRelAttn *p, int mux);
+    int  (*ink2_kv_put_q8)(CcBuf *kv_tab, size_t tab_off, CcBuf *kvs, int S, int KV, int hd, int vs_off, int mux);
+    int  (*ink2_softcap)(CcBuf *x, int n, float cap);
+    /* Packed multi-prompt prefill (many prompts in one GPU frame at peak Tensor-Core utilization) */
+    int  (*sconv_packed)(CcBuf *x, CcBuf *w, CcBuf *ring, CcBuf *segs, int nseg, const CcSconv *p);
+    int  (*ink2_dconv_packed)(CcBuf *x, CcBuf *dyn, CcBuf *prm, CcBuf *ring, CcBuf *segs, int nseg, const CcInk2Dconv *p);
+    int  (*relattn_q8_packed)(CcBuf *q, CcBuf *kv_tab, size_t tab_off, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
+                              CcBuf *segs, CcBuf *tile_map, int ntiles, const CcRelAttn *p);
+    int  (*ink2_kv_put_q8_packed)(CcBuf *kv_tab, size_t tab_off, CcBuf *kvs, CcBuf *segs, CcBuf *row_seg, int N, int KV, int hd, int vs_off);
 } ColiCudaChainOps;
 #define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
 #define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
@@ -931,6 +949,45 @@ static inline int cc_relattn_pb(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf 
 }
 static inline int cc_ink2_kv_put(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb, int S, int KV, int hd, int cap, int vs_off) {
     return cc_ink2_pb_ready() ? cc_ops()->ink2_kv_put(kc, vc, kvs, pb, S, KV, hd, cap, vs_off) : 0;
+}
+static inline int cc_ink2_mux_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ink2_softcap) + sizeof t->ink2_softcap &&
+           t->sconv_mux && t->ink2_dconv_mux && t->relattn_q8 && t->ink2_kv_put_q8 && t->ink2_softcap;
+}
+static inline int cc_sconv_mux(CcBuf *x, CcBuf *w, CcBuf *ring, CcBuf *ring_bases, const CcSconv *p) {
+    return cc_ink2_mux_ready() ? cc_ops()->sconv_mux(x, w, ring, ring_bases, p) : 0;
+}
+static inline int cc_ink2_dconv_mux(CcBuf *x, CcBuf *dyn, CcBuf *prm, CcBuf *ring, CcBuf *ring_bases, const CcInk2Dconv *p) {
+    return cc_ink2_mux_ready() ? cc_ops()->ink2_dconv_mux(x, dyn, prm, ring, ring_bases, p) : 0;
+}
+static inline int cc_relattn_q8(CcBuf *q, CcBuf *kv_tab, size_t tab_off, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
+                                CcBuf *part, int nc, const CcRelAttn *p, int mux) {
+    return cc_ink2_mux_ready() ? cc_ops()->relattn_q8(q, kv_tab, tab_off, o, kvs, r, relp, tau, part, nc, p, mux) : 0;
+}
+static inline int cc_ink2_kv_put_q8(CcBuf *kv_tab, size_t tab_off, CcBuf *kvs, int S, int KV, int hd, int vs_off, int mux) {
+    return cc_ink2_mux_ready() ? cc_ops()->ink2_kv_put_q8(kv_tab, tab_off, kvs, S, KV, hd, vs_off, mux) : 0;
+}
+static inline int cc_ink2_softcap(CcBuf *x, int n, float cap) {
+    return cc_ink2_mux_ready() ? cc_ops()->ink2_softcap(x, n, cap) : 0;
+}
+static inline int cc_ink2_pack_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ink2_kv_put_q8_packed) + sizeof t->ink2_kv_put_q8_packed &&
+           t->sconv_packed && t->ink2_dconv_packed && t->relattn_q8_packed && t->ink2_kv_put_q8_packed;
+}
+static inline int cc_sconv_packed(CcBuf *x, CcBuf *w, CcBuf *ring, CcBuf *segs, int nseg, const CcSconv *p) {
+    return cc_ink2_pack_ready() ? cc_ops()->sconv_packed(x, w, ring, segs, nseg, p) : 0;
+}
+static inline int cc_ink2_dconv_packed(CcBuf *x, CcBuf *dyn, CcBuf *prm, CcBuf *ring, CcBuf *segs, int nseg, const CcInk2Dconv *p) {
+    return cc_ink2_pack_ready() ? cc_ops()->ink2_dconv_packed(x, dyn, prm, ring, segs, nseg, p) : 0;
+}
+static inline int cc_relattn_q8_packed(CcBuf *q, CcBuf *kv_tab, size_t tab_off, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
+                                       CcBuf *segs, CcBuf *tile_map, int ntiles, const CcRelAttn *p) {
+    return cc_ink2_pack_ready() ? cc_ops()->relattn_q8_packed(q, kv_tab, tab_off, o, kvs, r, relp, tau, segs, tile_map, ntiles, p) : 0;
+}
+static inline int cc_ink2_kv_put_q8_packed(CcBuf *kv_tab, size_t tab_off, CcBuf *kvs, CcBuf *segs, CcBuf *row_seg, int N, int KV, int hd, int vs_off) {
+    return cc_ink2_pack_ready() ? cc_ops()->ink2_kv_put_q8_packed(kv_tab, tab_off, kvs, segs, row_seg, N, KV, hd, vs_off) : 0;
 }
 #endif
 
