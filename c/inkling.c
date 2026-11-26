@@ -232,9 +232,11 @@ typedef struct {
  * stands and the record of the tokens it holds. The Model holds the conversation a
  * prefill runs on (ink_seq_swap trades it for a parked one); a multiplexed decode
  * step parks them all and reads each row's from its InkRow. */
-typedef struct { float **K, **V; float **cs[4]; int kv_len; kv_prefix kvp; } InkSeq;
+typedef struct { float **K, **V; float **cs[4]; int kv_len, max_t; kv_prefix kvp; } InkSeq;
 typedef struct { InkSeq *seq; int pos; } InkRow;
 static int g_ink_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
+static InkSeq *g_ink_mux_seq;     /* [slots]: the conversations the Model does not hold */
+static int g_ink_mux_cur;         /* the slot the Model holds, -1 when every one is parked */
 
 typedef struct {
     Cfg c;
@@ -2844,6 +2846,9 @@ static int  ink_vk_load_batch(void *ctx, int layer, const int *e, int n, VktExpe
  * rows), which the tier's host pool must leave in RAM. */
 static int ink_ctx_max(void);
 static size_t ink_kv_later(const Model *m) {
+#ifdef COLI_CUDA
+    if (g_ink2cc_want && g_ink_mux_slots > 1) return 0;   /* device-canonical Q8 KV in CUDA mux chain */
+#endif
     const Cfg *c = &m->c;
     int t = ink_ctx_max();
     if (t > 65536) t = 65536;
@@ -2864,7 +2869,20 @@ static void ink_tier_warm(Model *m, const char *engine) {
     int n = pl && pe && !(warm && *warm == '0') ? XT(plan)(pl, pe, all) : 0;
     if (n > 0) {
         double t0 = now_s();
-        #pragma omp parallel for schedule(dynamic, 4)
+        /* Cap concurrent warm-start disk reads (default 4, override via COLI_VK_TIER_WARM_THREADS)
+         * so loading gigabytes of experts off a chipset-attached NVMe does not saturate shared
+         * PCIe lanes and starve NIC/audio DMA on the same chipset bridge. */
+        int wth = 4;
+        const char *wte = getenv("COLI_VK_TIER_WARM_THREADS");
+        if (wte && *wte) {
+            int v = atoi(wte);
+            if (v > 0) wth = v;
+        }
+#ifdef _OPENMP
+        int max_th = omp_get_max_threads();
+        if (max_th > 0 && wth > max_th) wth = max_th;
+#endif
+        #pragma omp parallel for schedule(dynamic, 4) num_threads(wth)
         for (int i = 0; i < n; i++) {
             Slot tmp;
             if (ink_vk_tmp_slot(m, &tmp, pe[i])) {
@@ -3053,7 +3071,7 @@ static void ink_cu_tier_start(Model *m) {
      * whose experts it runs in the frame, and off for the others: there it measured no faster than the
      * matrices a call at a time) planned here, before the tier sizes itself: the tier leaves its
      * buffers and K/V mirrors */
-    g_ink2cc_want = c->v2 && g_cuda && !XT(ready)() && g_ink_mux_slots <= 1 && ink2cc_wanted(c);
+    g_ink2cc_want = c->v2 && g_cuda && !XT(ready)() && ink2cc_wanted(c);
     if (!c->v2 || !g_cuda || XT(ready)() || !cut_wanted()) return;   /* cut_wanted: COLI_VK_TIER=0 keeps it off */
     int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
     if (!coli_cuda_init(&dev, 1)) { fprintf(stderr, "[CUDA] tier inkling: device %d unavailable; the experts stay on the CPU\n", dev); return; }
@@ -3966,20 +3984,21 @@ static int step_greedy(Model *m, int tok, int pos0, int *tok_out) {
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
 static void ink_seq_swap(Model *m, InkSeq *q) {
 #ifdef COLI_CUDA
-    ink2cc_sync_cs(m);
+    if (g_ink_mux_slots <= 1) ink2cc_sync_cs(m);
 #endif
-    float **K = m->K, **V = m->V; int len = m->kv_len; kv_prefix p = m->kvp;
-    m->K = q->K; m->V = q->V; m->kv_len = q->kv_len; m->kvp = q->kvp;
-    q->K = K; q->V = V; q->kv_len = len; q->kvp = p;
+    float **K = m->K, **V = m->V; int len = m->kv_len, mt = m->max_t; kv_prefix p = m->kvp;
+    m->K = q->K; m->V = q->V; m->kv_len = q->kv_len; m->max_t = q->max_t; m->kvp = q->kvp;
+    q->K = K; q->V = V; q->kv_len = len; q->max_t = mt; q->kvp = p;
     for (int j = 0; j < 4; j++) { float **cs = m->cs[j]; m->cs[j] = q->cs[j]; q->cs[j] = cs; }
 #ifdef COLI_CUDA
-    ink2cc_host_wrote(m, 0);
+    if (g_ink_mux_slots <= 1) ink2cc_host_wrote(m, 0);
 #endif
 }
 /* A conversation's state of its own, the shape the Model's has at its max_t. */
 static void ink_seq_alloc(Model *m, InkSeq *q) {
     Cfg *c = &m->c;
     memset(q, 0, sizeof *q);
+    q->max_t = m->max_t;
     q->K = calloc(c->n_state, sizeof(float*)); q->V = calloc(c->n_state, sizeof(float*));
     for (int j = 0; j < 4; j++) q->cs[j] = calloc(c->n_state, sizeof(float*));
     for (int i = 0; i < c->n_state; i++) {
@@ -4044,6 +4063,18 @@ static void state_reset(Model *m) {
 
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
+#ifdef COLI_CUDA
+    if (g_cu_chain && g_ink_mux_slots > 1) {
+        /* Multi-slot CUDA chain stores canonical packed Q8 KV directly in VRAM (saving ~29 GiB host RAM
+         * at 64 slots). Keep m->max_t and m->kvp live for prefix reuse; ink2cc_ensure_slot grows VRAM lazily. */
+        if (max_t <= m->max_t) return;
+        int keep = (m->kv_len > 0 && m->kv_len <= max_t) ? m->kv_len : 0;
+        m->max_t = max_t;
+        if (kv_prefix_grow(&m->kvp, max_t, keep)) m->kv_len = keep;
+        else                                      m->kv_len = 0;
+        return;
+    }
+#endif
     if (m->K && max_t <= m->max_t) return;   /* reuse across prompts when big enough */
 
     /* GROW, DO NOT RESTART.
@@ -4281,7 +4312,7 @@ static int pi_desc(const void *a, const void *b) {
     float d = ((const PI*)b)->p - ((const PI*)a)->p;
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
-static int sample_logits(const float *logit, int n, float temp, float top_p) {
+static int sample_logits_u(const float *logit, int n, float temp, float top_p, double u_rng) {
     coli_logit_dump(logit, n);
     int best = 0;
     float max_l = logit[0];
@@ -4309,7 +4340,7 @@ static int sample_logits(const float *logit, int n, float temp, float top_p) {
     }
     if (m <= 0) { if (c != stack_c) free(c); return best; }
     if (top_p <= 0.f || top_p >= 1.f) {
-        double r = rng_next() * sum, run = 0.0;
+        double r = u_rng * sum, run = 0.0;
         int pick = c[0].i;
         for (int i = 0; i < m; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
         if (c != stack_c) free(c);
@@ -4319,11 +4350,14 @@ static int sample_logits(const float *logit, int n, float temp, float top_p) {
     double cut = top_p * sum;
     double acc = 0.0; int k = 0;
     while (k < m && acc < cut) acc += c[k++].p;
-    double r = rng_next() * acc, run = 0.0;
+    double r = u_rng * acc, run = 0.0;
     int pick = c[0].i;
     for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
     if (c != stack_c) free(c);
     return pick;
+}
+static int sample_logits(const float *logit, int n, float temp, float top_p) {
+    return sample_logits_u(logit, n, temp, top_p, temp > 0.f ? rng_next() : 0.0);
 }
 
 /* REP_PEN, or the engine's default: 1.1 for Inkling, off for Inkling-2. Its tool calls repeat the
@@ -5100,14 +5134,15 @@ static void serve_tiers_emap(Model *m) {
  * each (ink_step_rows): the matrices and the experts are read once for all of them.
  * A request's frames are a lone request's; they interleave by id. As alone, CANCEL
  * ends a request with DONE and STOP is not read. */
-static InkSeq *g_ink_mux_seq;   /* [slots]: the conversations the Model does not hold */
-static int g_ink_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
+/* (g_ink_mux_seq / g_ink_mux_cur forward-declared near InkSeq) */
 
 typedef struct {
     SReq q;
     int active, cancel, limited, forwards;
     int *ids, np, gen;
-    float *lo;                  /* the logits the next pick reads */
+    float *lo;                  /* the logits the next pick reads (NULL when next_tk is pre-sampled) */
+    int has_tk, next_tk;        /* pre-sampled next token (skips per-step falloc+memcpy in serve_mux) */
+    char lptail[1024];          /* pre-computed logprob tail when q.logprobs > 0 and has_tk */
     int hist[128], nhist;       /* the repetition penalty's history, as serve_one keeps it */
     InkReqClock clk;
 } InkMuxReq;
@@ -5121,7 +5156,7 @@ static void ink_mux_bind(Model *m, int slot) {
 
 /* A request's end, as serve_one ends one. */
 static void ink_mux_finish(Model *m, InkMuxReq *r) {
-    free(r->lo); r->lo = NULL; free(r->ids); r->ids = NULL; r->active = 0;
+    free(r->lo); r->lo = NULL; free(r->ids); r->ids = NULL; r->active = 0; r->has_tk = 0;
     if (r->cancel) r->limited = 0;
     double dt = now_s() - r->clk.t0;
     double tot = (double)(m->hits - r->clk.h0 + m->miss - r->clk.m0);
@@ -5142,11 +5177,17 @@ static void ink_mux_finish(Model *m, InkMuxReq *r) {
 static int ink_mux_pick(Model *m, Tok *T, InkMuxReq *r, float rep, int *tk_out) {
     Cfg *c = &m->c;
     if (r->cancel || r->gen >= r->q.max_tok) { ink_mux_finish(m, r); return 0; }
-    apply_rep_penalty(r->lo, c->unpad_vocab, r->hist, r->nhist, rep);
-    int tk = sample_logits(r->lo, c->unpad_vocab, r->q.temp, r->q.top_p);
+    int tk;
     char lptail[1024]; lptail[0] = 0;
-    if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, c->unpad_vocab, tk, r->q.logprobs);
-    free(r->lo); r->lo = NULL;
+    if (r->has_tk) {
+        tk = r->next_tk; r->has_tk = 0;
+        if (r->q.logprobs > 0) snprintf(lptail, sizeof lptail, "%s", r->lptail);
+    } else {
+        apply_rep_penalty(r->lo, c->unpad_vocab, r->hist, r->nhist, rep);
+        tk = sample_logits(r->lo, c->unpad_vocab, r->q.temp, r->q.top_p);
+        if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, c->unpad_vocab, tk, r->q.logprobs);
+        free(r->lo); r->lo = NULL;
+    }
     if (tk == c->eos) { r->limited = 0; ink_mux_finish(m, r); return 0; }
     if (r->nhist < 128) r->hist[r->nhist++] = tk;
     else { memmove(r->hist, r->hist + 1, 127*sizeof(int)); r->hist[127] = tk; }
@@ -5159,58 +5200,67 @@ static int ink_mux_pick(Model *m, Tok *T, InkMuxReq *r, float rep, int *tk_out) 
     *tk_out = tk; return 1;
 }
 
+/* Drain ready SUBMIT / CANCEL / IMAGE commands from stdin (blocking only when block!=0). */
+static void ink_mux_drain_cmds(Model *m, Tok *T, InkMuxReq *rq, int n, int *input_eof, int block) {
+    while (!*input_eof && (block || coli_stdin_readable())) {
+        block = 0;
+        ColiServeCommand command;
+        ColiServeReadResult result = coli_serve_read_command(stdin, &inkling_wire, &command);
+        if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) { *input_eof = 1; break; }
+        if (result == COLI_SERVE_READ_NOMEM) { coli_serve_write_error(stdout, command.id, "out of memory"); *input_eof = 1; break; }
+        if (result == COLI_SERVE_READ_BAD_REQUEST) {
+            if (command.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, command.id, "bad submit header");
+            coli_serve_command_dispose(&command);
+            continue;
+        }
+        if (result == COLI_SERVE_READ_OK) {
+            if (command.kind == COLI_SERVE_COMMAND_CANCEL) {
+                for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, command.id)) rq[i].cancel = 1;
+            } else if (command.kind == COLI_SERVE_COMMAND_IMAGE) {
+                ink_image_hold(&command);
+            } else if (command.kind == COLI_SERVE_COMMAND_SUBMIT) {
+                if (command.slot < 0 || command.slot >= n) coli_serve_write_error(stdout, command.id, "invalid cache slot");
+                else if (rq[command.slot].active) coli_serve_write_error(stdout, command.slot >= 0 ? command.id : "", "SLOT_BUSY");
+                else {
+                    InkMuxReq *t = &rq[command.slot];
+                    memset(t, 0, sizeof *t);
+                    snprintf(t->q.id, sizeof(t->q.id), "%s", command.id);
+                    t->q.max_tok = command.max_tokens; t->q.temp = command.temperature;
+                    t->q.logprobs = command.logprobs; t->q.pin = command.pin;
+                    t->q.top_p = command.top_p; t->q.plen = (int)command.payload_bytes;
+                    t->q.alen = (int)command.extension_bytes;
+                    t->q.audio = coli_serve_command_extension(&command);
+                    t->q.payload = (char *)coli_serve_command_take_payload(&command);
+                    ink_image_attach(&t->q);
+                    ink_mux_bind(m, command.slot);
+                    int ok = ink_serve_start(m, T, &t->q, &t->ids, &t->np, &t->lo, &t->clk, 0);
+                    free(t->q.payload); t->q.payload = NULL; t->q.audio = NULL;
+                    free(t->q.img); t->q.img = NULL;
+                    if (ok) {
+                        t->active = 1; t->limited = 1; t->forwards = 1;
+                        for (int i = (t->np > 128 ? t->np - 128 : 0); i < t->np; i++) t->hist[t->nhist++] = t->ids[i];
+                    }
+                }
+            }
+            coli_serve_command_dispose(&command);
+        }
+    }
+}
+
 static void serve_mux(Model *m, Tok *T) {
-    int n = g_ink_mux_slots, V = m->c.unpad_vocab, input_eof = 0;
+    int n = g_ink_mux_slots, V = m->c.unpad_vocab, D = m->c.hidden, input_eof = 0;
     InkMuxReq *rq = calloc((size_t)n, sizeof *rq);
     InkRow *rows = malloc((size_t)n * sizeof *rows);
     int *tok = malloc((size_t)n * sizeof(int)), *who = malloc((size_t)n * sizeof(int));
-    if (!rq || !rows || !tok || !who) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
+    float *x_buf = falloc((int64_t)n * D);
+    if (!rq || !rows || !tok || !who || !x_buf) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
     float rep = ink_rep_pen(m);
     unsigned long long steps = 0, nrows = 0;
     fprintf(stderr, "[inkling] serving %d conversations at once (KV_SLOTS)\n", n);
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
-        /* idle: wait for a command; decoding: take one only when one is there */
-        if (!input_eof && (!active || coli_stdin_readable())) {
-            ColiServeCommand command;
-            ColiServeReadResult result = coli_serve_read_command(stdin, &inkling_wire, &command);
-            if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) input_eof = 1;
-            else if (result == COLI_SERVE_READ_NOMEM) { coli_serve_write_error(stdout, command.id, "out of memory"); input_eof = 1; }
-            else if (result == COLI_SERVE_READ_BAD_REQUEST) {
-                if (command.kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(stdout, command.id, "bad submit header");
-                coli_serve_command_dispose(&command);
-            } else if (result == COLI_SERVE_READ_OK) {
-                if (command.kind == COLI_SERVE_COMMAND_CANCEL) {
-                    for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, command.id)) rq[i].cancel = 1;
-                } else if (command.kind == COLI_SERVE_COMMAND_IMAGE) {
-                    ink_image_hold(&command);
-                } else if (command.kind == COLI_SERVE_COMMAND_SUBMIT) {
-                    if (command.slot < 0 || command.slot >= n) coli_serve_write_error(stdout, command.id, "invalid cache slot");
-                    else if (rq[command.slot].active) coli_serve_write_error(stdout, command.id, "SLOT_BUSY");
-                    else {
-                        InkMuxReq *t = &rq[command.slot];
-                        memset(t, 0, sizeof *t);
-                        snprintf(t->q.id, sizeof(t->q.id), "%s", command.id);
-                        t->q.max_tok = command.max_tokens; t->q.temp = command.temperature;
-                        t->q.logprobs = command.logprobs; t->q.pin = command.pin;
-                        t->q.top_p = command.top_p; t->q.plen = (int)command.payload_bytes;
-                        t->q.alen = (int)command.extension_bytes;
-                        t->q.audio = coli_serve_command_extension(&command);
-                        t->q.payload = (char *)coli_serve_command_take_payload(&command);
-                        ink_image_attach(&t->q);
-                        ink_mux_bind(m, command.slot);
-                        int ok = ink_serve_start(m, T, &t->q, &t->ids, &t->np, &t->lo, &t->clk, 0);
-                        free(t->q.payload); t->q.payload = NULL; t->q.audio = NULL;
-                        free(t->q.img); t->q.img = NULL;
-                        if (ok) {
-                            t->active = 1; t->limited = 1; t->forwards = 1;
-                            for (int i = (t->np > 128 ? t->np - 128 : 0); i < t->np; i++) t->hist[t->nhist++] = t->ids[i];
-                        }
-                    }
-                }
-                coli_serve_command_dispose(&command);
-            }
-        }
+        /* Drain all ready SUBMIT/CANCEL/IMAGE commands before stepping so bursts batch into one forward */
+        ink_mux_drain_cmds(m, T, rq, n, &input_eof, !active);
         active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
         if (!active) { if (input_eof) break; continue; }
         int S = 0, ended = 0;
@@ -5221,26 +5271,83 @@ static void serve_mux(Model *m, Tok *T) {
         }
         if (S) {
             ink_mux_bind(m, -1);   /* every conversation parked: the rows read theirs */
-            float *lo = ink_step_rows(m, rows, tok, S);
-            steps++; nrows += (unsigned long long)S;
-            for (int s = 0; s < S; s++) {
-                InkMuxReq *t = &rq[who[s]];
-                t->lo = falloc(V); memcpy(t->lo, lo + (int64_t)s * V, (size_t)V * sizeof(float));
-                t->forwards++;
+            int handled = 0;
+#ifdef COLI_CUDA
+            if (g_cu_chain && m->c.v2) {
+                for (int s = 0; s < S; s++) {
+                    wt_row_f32(m->embed, (int64_t)tok[s] * D, x_buf + (int64_t)s * D, D);
+                    if (m->embed_norm) rmsnorm_row(x_buf + (int64_t)s * D, x_buf + (int64_t)s * D, m->embed_norm, D, m->c.eps);
+                }
+                int all_greedy = (rep <= 1.f);
+                for (int s = 0; s < S && all_greedy; s++) {
+                    const InkMuxReq *t = &rq[who[s]];
+                    if (t->q.temp > 0.f || t->q.logprobs > 0) all_greedy = 0;
+                }
+                m->mux_rows = rows;
+                int picked[64];
+                const float *lo_ro = NULL;
+                if (all_greedy && ink2cc_forward_mux(m, x_buf, S, picked, NULL)) {
+                    for (int s = 0; s < S; s++) {
+                        rows[s].seq->kv_len = rows[s].pos + 1;
+                        kv_prefix_record(&rows[s].seq->kvp, tok + s, rows[s].pos, 1);
+                        InkMuxReq *t = &rq[who[s]];
+                        t->next_tk = picked[s]; t->has_tk = 1; t->forwards++;
+                    }
+                    handled = 1;
+                } else if (ink2cc_forward_mux(m, x_buf, S, NULL, &lo_ro)) {
+                    double u_rng[64];
+                    for (int s = 0; s < S; s++) {
+                        rows[s].seq->kv_len = rows[s].pos + 1;
+                        kv_prefix_record(&rows[s].seq->kvp, tok + s, rows[s].pos, 1);
+                        u_rng[s] = rq[who[s]].q.temp > 0.f ? rng_next() : 0.0;
+                    }
+                    #pragma omp parallel for schedule(static) if(S >= 4)
+                    for (int s = 0; s < S; s++) {
+                        InkMuxReq *t = &rq[who[s]];
+                        float *lr = (float *)(lo_ro + (size_t)s * V);
+                        if (rep > 1.f) apply_rep_penalty(lr, V, t->hist, t->nhist, rep);
+                        int tk = sample_logits_u(lr, V, t->q.temp, t->q.top_p, u_rng[s]);
+                        t->lptail[0] = 0;
+                        if (t->q.logprobs > 0) coli_logprob_tail(t->lptail, sizeof t->lptail, lr, V, tk, t->q.logprobs);
+                        t->next_tk = tk; t->has_tk = 1; t->forwards++;
+                    }
+                    handled = 1;
+                }
+                m->mux_rows = NULL;
             }
-            free(lo);
+#endif
+            if (!handled) {
+                float *lo = ink_step_rows(m, rows, tok, S);
+                double *us = alloca((size_t)S * sizeof(double));
+                for (int s = 0; s < S; s++) us[s] = rq[who[s]].q.temp > 0.f ? rng_next() : 0.0;
+                #pragma omp parallel for schedule(static) if(S >= 4)
+                for (int s = 0; s < S; s++) {
+                    InkMuxReq *t = &rq[who[s]];
+                    float *row_lo = lo + (int64_t)s * V;
+                    if (rep > 1.f) apply_rep_penalty(row_lo, V, t->hist, t->nhist, rep);
+                    int tk = sample_logits_u(row_lo, V, t->q.temp, t->q.top_p, us[s]);
+                    t->lptail[0] = 0;
+                    if (t->q.logprobs > 0) coli_logprob_tail(t->lptail, sizeof t->lptail, row_lo, V, tk, t->q.logprobs);
+                    t->next_tk = tk; t->has_tk = 1;
+                    t->forwards++;
+                }
+                free(lo);
+            }
+            steps++; nrows += (unsigned long long)S;
         }
         if (ended) {
 #ifdef COLI_VULKAN
             ink_vk_report(); ink_vk_tier_report(m, "turn");
-#elif defined(COLI_CUDA)
-            ink_vk_tier_report(m, "turn");
+#endif
+#ifdef COLI_CUDA
+            ink_vk_tier_report(m, "turn"); ink2cc_report(m);
 #endif
             serve_tiers_emap(m);
         }
     }
     fprintf(stderr, "[inkling] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n, steps, nrows,
             steps ? (double)nrows / (double)steps : 0.0);
+    free(x_buf);
     ink_mux_bind(m, 0);
     free(rq); free(rows); free(tok); free(who);
 }

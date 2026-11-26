@@ -6314,6 +6314,43 @@ __device__ __forceinline__ void hcm_i4_bk64_body(const HcmI4Args &A) {
     if (nk64 > 1) HCM64_FETCH(qw_nxt, sc_nxt, 1);
 
     const int ar = lane & 15, ac = lane >> 4, bn = (lane & 7) + ((lane >> 4) << 3), bc = (lane >> 3) & 1;
+    if constexpr (BM == 64) {
+        if (M <= 16) {
+            /* Fast path for sparse multi-slot decode (e.g. 64 agents -> avg ~4 rows/expert):
+             * skip i=1,2,3 (75% empty M-tiles) while keeping full weight prefetch & dequant overlap. */
+            for (int ks = 0; ks < nk32; ks++) {
+                asm volatile("cp.async.wait_group %0;\n" :: "n"(XS - 2));
+                __syncthreads();
+                {
+                    int nx = ks + XS - 1;
+                    if (nx < nk32) HCM32_LDX(nx % XS, nx);
+                    asm volatile("cp.async.commit_group;\n");
+                }
+                const unsigned xb = xs0 + (ks % XS) * XB, wb = ws0 + (ks & 1) * WB;
+                bd_u32 a0[4], a1[4], b0[NJ / 2][4], b1[NJ / 2][4];
+                #pragma unroll
+                for (int jp = 0; jp < NJ / 2; jp++) hcm_ldm4(b0[jp], wb + hcm_swz(wc * WN + jp * 16 + bn, bc));
+                hcm_ldm4(a0, xb + hcm_swz(ar, ac));
+                #pragma unroll
+                for (int jp = 0; jp < NJ / 2; jp++) hcm_ldm4(b1[jp], wb + hcm_swz(wc * WN + jp * 16 + bn, 2 + bc));
+                hcm_ldm4(a1, xb + hcm_swz(ar, 2 + ac));
+                #pragma unroll
+                for (int j = 0; j < NJ; j++) hcm_mma(acc[0][j], a0, b0[j >> 1][2 * (j & 1)], b0[j >> 1][2 * (j & 1) + 1]);
+                if ((ks & 1) == 0) {
+                    HCM32_STW(1, w1a, w1b, sc_cur);
+                } else if (ks + 1 < nk32) {
+                    HCM64_SPLIT(qw_nxt, w0a, w0b, w1a, w1b);
+                    sc_cur = sc_nxt;
+                    HCM32_STW(0, w0a, w0b, sc_cur);
+                    const int nkb = (ks >> 1) + 2;
+                    if (nkb < nk64) HCM64_FETCH(qw_nxt, sc_nxt, nkb);
+                }
+                #pragma unroll
+                for (int j = 0; j < NJ; j++) hcm_mma(acc[0][j], a1, b1[j >> 1][2 * (j & 1)], b1[j >> 1][2 * (j & 1) + 1]);
+            }
+            goto hcm_bk64_epilogue;
+        }
+    }
     for (int ks = 0; ks < nk32; ks++) {
         asm volatile("cp.async.wait_group %0;\n" :: "n"(XS - 2));
         __syncthreads();
@@ -6350,6 +6387,7 @@ __device__ __forceinline__ void hcm_i4_bk64_body(const HcmI4Args &A) {
             }
         }
     }
+hcm_bk64_epilogue:
     #undef HCM32_LDX
     #undef HCM64_FETCH
     #undef HCM64_SPLIT

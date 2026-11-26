@@ -8486,6 +8486,10 @@ class APIServer(ThreadingHTTPServer):
         self.max_tokens = max_tokens
         self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
         self.kv_slots = kv_slots
+        # Scale connection caps with kv_slots so multi-slot bursts from loopback (e.g. 64 concurrent
+        # subagents from 127.0.0.1) are never dropped by the single-slot per-IP cap of 8.
+        self.max_connections = max(self.MAX_CONNECTIONS, kv_slots * 2 + 16) if kv_slots > 1 else self.MAX_CONNECTIONS
+        self.max_connections_per_ip = max(self.MAX_CONNECTIONS_PER_IP, kv_slots + 16) if kv_slots > 1 else self.MAX_CONNECTIONS_PER_IP
         self.cors_origins = tuple(cors_origins)
         # Extra Host header values trusted past the DNS-rebinding guard, for a
         # reverse proxy / MagicDNS in front of the loopback bind (#597). Explicit
@@ -8629,10 +8633,10 @@ class APIServer(ThreadingHTTPServer):
         peer = client_address[0] if client_address else "?"
         with self._conn_lock:
             mine = self._conn_by_ip.get(peer, 0)
-            if self._conn_live >= self.MAX_CONNECTIONS:
-                reason = "server cap %d" % self.MAX_CONNECTIONS
-            elif mine >= self.MAX_CONNECTIONS_PER_IP:
-                reason = "per-address cap %d" % self.MAX_CONNECTIONS_PER_IP
+            if self._conn_live >= self.max_connections:
+                reason = "server cap %d" % self.max_connections
+            elif mine >= self.max_connections_per_ip:
+                reason = "per-address cap %d" % self.max_connections_per_ip
             else:
                 reason = None
                 self._conn_live += 1

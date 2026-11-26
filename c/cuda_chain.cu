@@ -5451,5 +5451,7 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_probe_qwen36_profile_,
     CC_GRAPH_OPS,
     cc_relattn_pb, cc_ink2_kv_put,
+    cc_sconv_mux, cc_ink2_dconv_mux, cc_relattn_q8, cc_ink2_kv_put_q8, cc_ink2_softcap,
+    cc_sconv_packed, cc_ink2_dconv_packed, cc_relattn_q8_packed, cc_ink2_kv_put_q8_packed,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
