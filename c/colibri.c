@@ -2691,7 +2691,7 @@ static QT qt_kvb_gguf(Model *m, const char *prefix, int H, int nope, int V, int 
  * against (a tensor whose use is not pinned to a config dim here). */
 static float *ld(Model *m, const char *name, int64_t want){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0) st_die_missing(&m->S,name);
-    if(want>=0 && n!=want){ fprintf(stderr,"%s: %lld elements, config implies %lld -- refusing\n",
+    if(want>=0 && n<want){ /* fewer than the forward pass reads: past the end; more were read as their prefix before */ fprintf(stderr,"%s: %lld elements, config implies %lld -- refusing\n",
                                     name,(long long)n,(long long)want); exit(1); }
     float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
     st_read_f32(&m->S,name,p,0); return p;

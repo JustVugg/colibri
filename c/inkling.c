@@ -1132,7 +1132,7 @@ static const char *embed_norm_name(shards *S) {
 static float *load_tn(Model *m, const char *name, int64_t want) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
-    if (want >= 0 && n != want) {
+    if (want >= 0 && n < want) {   /* fewer than the forward pass reads: past the end; more were read as their prefix before */
         fprintf(stderr, "%s: %lld elements, config implies %lld -- refusing\n", name, (long long)n, (long long)want);
         exit(1);
     }
