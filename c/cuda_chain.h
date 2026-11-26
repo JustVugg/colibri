@@ -144,10 +144,14 @@ typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; int planar, h
  * floats) routed to ids and w as cc_route writes them (i_off + s*i_row, w_off + s*w_row,
  * K each); expert e is entry t_off + e of the table (E of them), its matrices of format fmt (1 int8
  * rows, 2 int4 rows, 4 int4 with a scale per gs inputs, 8 fp8-e4m3 with a scale per
- * 128 x 128 block: the tier's formats; 100 + t a GGUF's ggml type t, fmt_d down's, the types
- * with cuda_bd.cuh's integer step), D and I multiples of 32 up to CC_MOE_DIM_MAX. hid holds S*K rows of
- * I floats (silu(gate) * up, act 0, the only one) and then S*K rows of D (down's
- * output). parts 1: the experts the table holds; parts 2: y (y_off + s*y_row) = the
+ * 128 x 128 block: the tier's formats; 7 MXFP4 (compressed-tensors: [O][I/2] e2m1 nibbles, low
+ * nibble the even column, and one ue8m0 exponent BYTE a 32 inputs, [O][I/32], in CcExpert's
+ * gs/us/ds cast to float pointers; gs unused; the SYCL backend only); 100 + t a GGUF's ggml type
+ * t, fmt_d down's, the types with cuda_bd.cuh's integer step), D and I multiples of 32 up to
+ * CC_MOE_DIM_MAX. hid holds S*K rows of I floats (act 0: silu(gate) * up; act 1, the SYCL
+ * backend only: the clamped SwiGLU of deepseek_v41.c's swiglu_into, up clamped to
+ * [-act_lim, act_lim] and gate to at most act_lim before silu(gate) * up, act_lim > 0) and
+ * then S*K rows of D (down's output). parts 1: the experts the table holds; parts 2: y (y_off + s*y_row) = the
  * host's row (hy at h_off + s*D, h_off >= 0; else 0) plus each slot the table holds,
  * w * down's output, in rank order (the CPU tier's order: its misses, then the device's
  * results); 3 both. A slot whose id is -1 or whose entry is not on the device adds
@@ -162,6 +166,7 @@ typedef struct {
                      0 = fmt's; a matrix's rows as the file has them, padded to words */
     int lay_S, lay_s0;   /* parts 2 only: hid as a parts 1 of lay_S rows left it (0: S), this call's
                             S rows its rows lay_s0.. (a prompt chunk's lanes sum their own rows) */
+    float act_lim;   /* act 1's limit (> 0; refused otherwise); unread for act 0, so a zeroed field keeps act 0 */
 } CcMoe;
 /* the ggml types cc_moe takes for a GGUF's experts (CcMoe.fmt >= 100: cuda_bd.cuh's integer step) */
 static inline int cc_moe_block_type(int t) {
@@ -500,6 +505,25 @@ typedef struct ColiCudaChainOps {
      * caller's n calls), 0 a failure */
     int  (*attn_h_mx)(CcBuf *q, CcBuf *const *kc, CcBuf *const *vc, const int *pos, const int *cap, int n, CcBuf *o, CcBuf *gate, const CcAttn *p);
     int  (*copy_regions_h_mx)(CcBuf *const *dst, int n, CcBuf *src, const CcRegion *r, int per);
+    /* matmul_grp: n matrices of one shape (O x I each) in one launch, matrix k's input row r at x + xo + r x_row +
+     * k x_grp, its output row r at y + yo + r y_row + k O (DeepSeek V4.1's wo_a groups). 1 done, -1 not taken (the
+     * caller's matmul a matrix), 0 a failure */
+    int  (*matmul_grp)(ColiCudaTensor *const *t, int n, CcBuf *x, size_t xo, int x_row, int x_grp, CcBuf *y, size_t yo, int y_row, int S);
+    /* ds_attn_rows: ds_attn's decode row (S 1, flags 0) for n rows of different conversations (n <= 8) in one call: p
+     * is row 0's, row r's query, list and output rows r q_row / l_row / o_row on, its window and compressed rows at
+     * wo[r] / co[r] (in place of w_off / c_off). 1 done, -1 not taken (n separate ds_attn calls), 0 a failure */
+    int  (*ds_attn_rows)(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p, const int *wo, const int *co, int n);
+    /* moe_tail: a chain-MoE layer's last frame in one launch (DeepSeek V4.1's decode rows): moe parts 2 with p (y = hy +
+     * each held slot's w * down, in rank order), ew ADD (br = y + ds, S * D floats from offset 0) and mhc POST with po
+     * (xn = comb(xs) + post * br), the three kernels' statements in their order, so y, br and xn have their bits.
+     * 1 done, -1 not taken (the caller's three ops), 0 a failure */
+    int  (*moe_tail)(CcBuf *tab, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *hy, CcBuf *y, CcBuf *ds, CcBuf *br, CcBuf *xs,
+                     CcBuf *hp, CcBuf *xn, const CcMoe *p, const CcMhc *po);
+    /* mark: a point of the open frame, complete once every op before it is (what signal's host task waited for), that
+     * holds no later op back; reached: 1 the last mark is complete (the rows the ops before it wrote to DOWN memory
+     * are there), 0 not yet, -1 no mark or a lost device. The host polls reached where it polled signal's word. */
+    int  (*mark)(void);
+    int  (*reached)(void);
 } ColiCudaChainOps;
 #define CC_MX_N 16   /* conversations a dnconv_mx / dnrec_mx launch takes (KV_SLOTS' limit) */
 #define CC_MX_ATTN_N 8   /* conversations an attn_h_mx call takes: a decode step's rows in the backend's attention */
@@ -615,6 +639,18 @@ static inline int cc_dsv4_ready(void) {
 static inline int cc_mhc(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y, const CcMhc *p) {
     return cc_dsv4_ready() ? cc_ops()->mhc(mode, x, m, hp, prm, y, p) : 0;
 }
+static inline int cc_moe_tail(CcBuf *tab, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *hy, CcBuf *y, CcBuf *ds, CcBuf *br, CcBuf *xs,
+                              CcBuf *hp, CcBuf *xn, const CcMoe *p, const CcMhc *po) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, moe_tail) + sizeof t->moe_tail && t->moe_tail
+           ? t->moe_tail(tab, ids, w, hid, hy, y, ds, br, xs, hp, xn, p, po) : -1;
+}
+static inline int cc_mark_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, reached) + sizeof t->reached && t->mark && t->reached;
+}
+static inline int cc_mark(void) { return cc_mark_ready() ? cc_ops()->mark() : 0; }
+static inline int cc_reached(void) { return cc_mark_ready() ? cc_ops()->reached() : -1; }
 static inline int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p) {
     return cc_dsv4_ready() ? cc_ops()->ds_attn(q, win, cmp, list, prm, out, p) : 0;
 }
@@ -717,6 +753,16 @@ static inline int cc_attn_h_mx(CcBuf *q, CcBuf *const *kc, CcBuf *const *vc, con
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, attn_h_mx) + sizeof t->attn_h_mx && t->attn_h_mx
            ? t->attn_h_mx(q, kc, vc, pos, cap, n, o, gate, p) : -1;
+}
+static inline int cc_matmul_grp(ColiCudaTensor *const *tt, int n, CcBuf *x, size_t xo, int x_row, int x_grp, CcBuf *y, size_t yo, int y_row, int S) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, matmul_grp) + sizeof t->matmul_grp && t->matmul_grp
+           ? t->matmul_grp(tt, n, x, xo, x_row, x_grp, y, yo, y_row, S) : -1;
+}
+static inline int cc_ds_attn_rows(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p, const int *wo, const int *co, int n) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ds_attn_rows) + sizeof t->ds_attn_rows && t->ds_attn_rows
+           ? t->ds_attn_rows(q, win, cmp, list, prm, out, p, wo, co, n) : -1;
 }
 static inline int cc_copy_regions_h_mx(CcBuf *const *dst, int n, CcBuf *src, const CcRegion *r, int per) {
     const ColiCudaChainOps *t = cc_ops();

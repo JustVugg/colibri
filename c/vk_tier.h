@@ -201,6 +201,13 @@ typedef struct {
     size_t dense_bytes;            /* dense weights the engine puts on the device after vkt_init */
     size_t chain_bytes;            /* what the dense chain allocates at its first forward, after the
                                       tier has filled the device (its KV mirror, a prompt chunk): left free */
+    /* Optional, with a second device (COLI_VK_DEV2): a home by layer. The main layers from home_split on have
+     * their experts on the second device only, the ones before on the primary only, for an engine whose dense
+     * chain runs those layers there (vkt_home says whether it is in force; 0: experts go where there is room).
+     * dense_bytes2: the dense weights the engine puts on the second device after vkt_init (dense_bytes is then
+     * the primary's part); chain_bytes is left free on both. */
+    int home_split;
+    size_t dense_bytes2;
     /* Optional: is this expert in the engine's RAM cache right now? With it the tier
      * balances a step: when the device keeps the CPU waiting, resident experts the
      * CPU also holds in RAM go back to the CPU (never ones it would read from disk),
@@ -300,6 +307,7 @@ int  vkt_step_rows(int S, int block);
 int  vkt_stream_prefetch(int layer, int S);
 /* How many devices hold experts: 0 (the tier is off), 1, or 2 (COLI_VK_DEV2's too). */
 int  vkt_devices(void);
+int  vkt_home(void);
 /* The layers the tier serves: VktConfig.layers plus the extra layers it took (an MTP
  * head's, when their form has a device form); 0 when it is off. */
 int  vkt_layers(void);
@@ -419,6 +427,7 @@ static inline size_t vkt_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(vo
 static inline int  vkt_step_rows(int S,int b){return S<b?S:b;}
 static inline int  vkt_stream_prefetch(int l,int S){(void)l;(void)S;return 0;}
 static inline int  vkt_devices(void){return 0;}
+static inline int  vkt_home(void){return 0;}
 static inline int  vkt_layers(void){return 0;}
 static inline int  vkt_ram_first(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_ram_gave(void){}

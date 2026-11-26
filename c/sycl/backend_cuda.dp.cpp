@@ -89,6 +89,7 @@ struct ColiCudaTensor {
 
 static size_t tensor_scale_bytes(const ColiCudaTensor *t) {
     if (!t->fmt || t->fmt == 6) return 0;
+    if (t->fmt == 9) return 256 * sizeof(float) + t->scale_count;   /* the e4m3 table, then the ue8m0 tile bytes */
     return t->scale_count * (t->fmt == 7 ? sizeof(uint8_t) : sizeof(float));
 }
 
@@ -293,6 +294,7 @@ static size_t row_bytes(int fmt, int I) {
     if (fmt == 7) return (size_t)(I + 1) / 2;   /* MXFP4: e2m1 nibbles, 2 per byte */
     if (fmt == 6) return (size_t)(((int64_t)I + COLI_E8_QK - 1) / COLI_E8_QK) * COLI_E8_BBYTES;
     if (fmt == 8) return (size_t)I;             /* fp8-e4m3: raw bytes, layout of fmt=1 */
+    if (fmt == 9) return (size_t)I;             /* fp8-e4m3 with one ue8m0 a 32x32 tile (deepseek_v41's W8) */
     return 0;
 }
 
@@ -2654,6 +2656,753 @@ catch (sycl::exception const &exc) {
     try { dq().wait(); } catch (...) {}   /* the caller frees xq and sx when this returns: no copy of them in flight */
     return sycl_caught(exc, "coli_cuda_matmul_i8act");
 }
+
+/* coli_cuda_e4m3t_* (deepseek_v41's V41_TRUNK_GPU): an FP8 matrix as deepseek_v41's W8 holds it -- e4m3 bytes,
+ * O rows of I, and one ue8m0 scale a 32x32 tile ((O/32) x (I/32) bytes) -- times float activations, with the bits
+ * of deepseek_v41.c's mv8_rows on an AVX2 x86-64-v4 build. That loop, per output o and row r, per tile of 32
+ * columns: four 8-wide decodes w0..w3 (the e4m3 byte as a float, NaN for 0x7F/0xFF); acc = w0*x0 (a multiply),
+ * then acc = fma(w1,x1,acc), fma(w2,x2,acc), fma(w3,x3,acc) lane by lane; h = hsum256(acc), i.e.
+ * ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)); then sum = fma(h, tile, sum) (gcc fuses `sum += h * tile`: vfmadd213ss,
+ * checked in the built binary). Here 8 lanes of a sub-group are the 8 accumulator lanes of one output: lane j
+ * takes columns j, j+8, j+16, j+24 of each tile, the same multiply and fmas, the same pairwise additions through
+ * sub-group shifts (4, 2, 1), and the group's first lane folds the tiles in order. Nothing is reassociated
+ * (-fp-model=precise), the decode is the CPU's table, so the outputs are the CPU's to the bit; the engine's
+ * V41_E4_CHECK compares them. I a multiple of 32 (checked), O any; up to E4T_ROWS rows a pass reuse each weight. */
+#define E4T_ROWS 8
+struct ColiE4m3t { int device, O, I; uint8_t *q, *s; float *lut; };
+template <int SG>
+static void e4m3t_kernel(float *y, int ystride, const float *x, int xstride, const uint8_t *q, const uint8_t *sc,
+                         const float *lut, int S, int I, int O) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lid = item.get_local_id(2), j = lid & 7;
+    const int o = (item.get_group(2) * item.get_local_range(2) + lid) >> 3;
+    const int r0 = item.get_group(1) * E4T_ROWS;
+    const int nr = S - r0 < E4T_ROWS ? S - r0 : E4T_ROWS;
+    const bool live = o < O;   /* lanes past the end still shuffle (the whole sub-group), they write nothing */
+    const int oo = live ? o : O - 1, tiles = I >> 5;
+    const uint8_t *row = q + (size_t)oo * I;
+    const uint8_t *srow = sc + (size_t)(oo >> 5) * tiles;
+    float sum[E4T_ROWS];
+#pragma unroll
+    for (int r = 0; r < E4T_ROWS; r++) sum[r] = 0.0f;
+    for (int t = 0; t < tiles; t++) {
+        const int base = t << 5;
+        const float w0 = lut[row[base + j]], w1 = lut[row[base + 8 + j]], w2 = lut[row[base + 16 + j]], w3 = lut[row[base + 24 + j]];
+        const float tile = sycl::bit_cast<float>((uint32_t)srow[t] << 23);
+#pragma unroll
+        for (int r = 0; r < E4T_ROWS; r++) {
+            if (r < nr) {
+                const float *xr = x + (size_t)(r0 + r) * xstride + base;
+                float acc = w0 * xr[j];
+                acc = sycl::fma(w1, xr[8 + j], acc);
+                acc = sycl::fma(w2, xr[16 + j], acc);
+                acc = sycl::fma(w3, xr[24 + j], acc);
+                float a = acc + sycl::shift_group_left(sg, acc, 4);   /* lane j<4: v_j + v_{j+4} */
+                float b = a + sycl::shift_group_left(sg, a, 2);       /* lane 0: a0+a2, lane 1: a1+a3 */
+                float h = b + sycl::shift_group_left(sg, b, 1);       /* lane 0: (a0+a2)+(a1+a3) */
+                if (j == 0) sum[r] = sycl::fma(h, tile, sum[r]);
+            }
+        }
+    }
+    if (live && j == 0)
+        for (int r = 0; r < nr; r++) y[(size_t)(r0 + r) * ystride + o] = sum[r];
+}
+/* e4m3t3_kernel: the same bits, a tile a work-item. The AVX2 loop's 8 lanes are an order, not a layout: accumulator j
+ * takes columns j, j+8, j+16, j+24 of the tile. One work-item does all eight in registers -- a tile's 32 bytes in two
+ * 16-byte loads, acc_j = w_j*x_j then three fmas each, h = ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)) -- so no byte loads and
+ * no shuffles. A work-group of 256 takes E4T3_OUTS outputs, 256/E4T3_OUTS work-items an output over its tiles
+ * (t = k, k + that, ...); each h of each row goes to local memory; after a barrier one work-item an (output, row) folds
+ * sum = fma(h, tile, sum) in tile order. Every value goes through mv8_rows_cpu's operations in their order. Rows:
+ * E4T3_ROWS a work-group (grid y); local memory E4T3_ROWS x E4T3_OUTS x (I/32) floats. */
+#define E4T3_ROWS 4
+#define E4T3_OUTS 8
+/* quant.h's e4m3_decode8 for one byte, computed (the table e4m3t_kernel reads is built from the same formula) */
+static inline float e4t_dec(uint32_t b) {
+    const uint32_t low = b & 0x7fu;
+    const float v = sycl::bit_cast<float>(((b & 0x80u) << 24) | (low << 20)) * 0x1p120f;
+    return low == 0x7fu ? sycl::bit_cast<float>(0x7fc00000u) : v;
+}
+template <int SG>
+static void e4m3t3_kernel(float *y, int ystride, const float *x, int xstride, const uint8_t *q, const uint8_t *sc,
+                          const float *lut, int S, int I, int O, int outs, uint8_t *slm) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    (void)lut;
+    const int lid = item.get_local_id(2), per = item.get_local_range(2) / outs;
+    const int ol = lid / per, k = lid % per;
+    const int o0 = item.get_group(2) * outs, o = o0 + ol;
+    const int r0 = item.get_group(1) * E4T3_ROWS;
+    const int nr = S - r0 < E4T3_ROWS ? S - r0 : E4T3_ROWS;
+    const int tiles = I >> 5;
+    float *hs = (float *)slm;   /* [row][output][tile] */
+    if (o < O) {
+        const uint8_t *row = q + (size_t)o * I;
+        for (int t = k; t < tiles; t += per) {
+            const int base = t << 5;
+            const sycl::uint4 b0 = *(const sycl::uint4 *)(row + base), b1 = *(const sycl::uint4 *)(row + base + 16);
+            const uint32_t wd[8] = { b0.x(), b0.y(), b0.z(), b0.w(), b1.x(), b1.y(), b1.z(), b1.w() };
+            for (int r = 0; r < nr; r++) {
+                /* columns in order, 4 at a time as they load: column c feeds accumulator c & 7 -- a multiply for the
+                 * first 8, then an fma -- so each accumulator sees j, j+8, j+16, j+24 in that order, as on the CPU */
+                const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)(r0 + r) * xstride + base);
+                float a[8];
+#pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const sycl::float4 f = x4[v];
+                    const float xv[4] = { f.x(), f.y(), f.z(), f.w() };
+                    const uint32_t word = wd[v];
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        const int c = 4 * v + e;
+                        const float wv = e4t_dec((word >> (e * 8)) & 0xffu);
+                        if (c < 8) a[c & 7] = wv * xv[e];
+                        else a[c & 7] = sycl::fma(wv, xv[e], a[c & 7]);
+                    }
+                }
+                const float p0 = a[0] + a[4], p1 = a[1] + a[5], p2 = a[2] + a[6], p3 = a[3] + a[7];
+                const float q0 = p0 + p2, q1 = p1 + p3;
+                hs[((size_t)r * outs + ol) * tiles + t] = q0 + q1;
+            }
+        }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (lid < outs * nr) {
+        const int fo = lid % outs, fr = lid / outs, oo = o0 + fo;
+        if (oo < O) {
+            const uint8_t *srow = sc + (size_t)(oo >> 5) * tiles;
+            const float *hr = hs + ((size_t)fr * outs + fo) * tiles;
+            float sum = 0.0f;
+            int t = 0;
+            for (; t + 4 <= tiles; t += 4) {   /* the loads ahead of the chain; the fmas still one after another */
+                const float h0 = hr[t], h1 = hr[t + 1], h2 = hr[t + 2], h3 = hr[t + 3];
+                sum = sycl::fma(h0, sycl::bit_cast<float>((uint32_t)srow[t] << 23), sum);
+                sum = sycl::fma(h1, sycl::bit_cast<float>((uint32_t)srow[t + 1] << 23), sum);
+                sum = sycl::fma(h2, sycl::bit_cast<float>((uint32_t)srow[t + 2] << 23), sum);
+                sum = sycl::fma(h3, sycl::bit_cast<float>((uint32_t)srow[t + 3] << 23), sum);
+            }
+            for (; t < tiles; t++) sum = sycl::fma(hr[t], sycl::bit_cast<float>((uint32_t)srow[t] << 23), sum);
+            y[(size_t)(r0 + fr) * ystride + oo] = sum;
+        }
+    }
+}
+/* e4t_fast_k: fmt 9 for a decode's few rows (S <= E4T_FAST_ROWS), not mv8_rows_cpu's bits (quality-gated: the dense
+ * chain's GPU path): a sub-group an output row; each lane takes 16-byte chunks of the row (16 columns of one 32x32 tile),
+ * decodes them (e4t_dec), dots them with the rows' activations, scales the chunk by its tile, and the sub-group sums
+ * its lanes. The int8 gemv's shape, at fmt 9's one byte a weight. */
+#define E4T_FAST_ROWS 4
+template <int SG>
+static void e4t_fast_k(float *y, int ystride, const float *x, int xstride, const uint8_t *q, const uint8_t *sc, int S,
+                       int I, int O) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = sg.get_local_linear_id();
+    const int o = item.get_group(2) * (item.get_local_range(2) / SG) + (int)sg.get_group_linear_id();
+    if (o >= O) return;   /* the whole sub-group: one row */
+    const int tiles = I >> 5, nr = S < E4T_FAST_ROWS ? S : E4T_FAST_ROWS;
+    const uint8_t *row = q + (size_t)o * I, *srow = sc + (size_t)(o >> 5) * tiles;
+    float acc[E4T_FAST_ROWS] = {0.f, 0.f, 0.f, 0.f};
+    for (int c0 = lane * 16; c0 < I; c0 += SG * 16) {
+        const sycl::uint4 b = *(const sycl::uint4 *)(row + c0);
+        const uint32_t wd[4] = { b.x(), b.y(), b.z(), b.w() };
+        float w[16];
+#pragma unroll
+        for (int c = 0; c < 16; c++) w[c] = e4t_dec((wd[c >> 2] >> ((c & 3) * 8)) & 0xffu);
+        const float tl = sycl::bit_cast<float>((uint32_t)srow[c0 >> 5] << 23);
+#pragma unroll
+        for (int r = 0; r < E4T_FAST_ROWS; r++) {
+            if (r >= nr) break;
+            const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)r * xstride + c0);
+            float part = 0.f;
+#pragma unroll
+            for (int v = 0; v < 4; v++) {
+                const sycl::float4 f = x4[v];
+                part += w[4 * v] * f.x() + w[4 * v + 1] * f.y() + w[4 * v + 2] * f.z() + w[4 * v + 3] * f.w();
+            }
+            acc[r] += part * tl;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < E4T_FAST_ROWS; r++) {
+        if (r >= nr) break;
+        const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+        if (lane == 0) y[(size_t)r * ystride + o] = v;
+    }
+}
+/* e4t_fastk_k: e4t_fast_k with a row split over KS sub-groups (measured: the decode's small matrices -- 1024 x 4096, 512 and
+ * 1280 x 5120 -- ran at 150-240 GB/s: a sub-group a row filled about a quarter of the card's threads, each lane a few
+ * loads). Sub-group g of a row takes the row's 16-column chunks g*SG + lane, stepping KS*SG; each reduces over its lanes
+ * as e4t_fast_k does, and the row's KS partials are added in g order from local memory (a fixed order: the same bits on
+ * every run, not e4t_fast_k's bits -- held to the same tolerance against the exact kernel). COLI_SYCL_E4T_KS: 1 =
+ * e4t_fast_k, 2/4/8 forces KS; unset picks KS so the launch has >= 4096 sub-groups, every sub-group a chunk at least. */
+template <int SG, int KS>
+static void e4t_fastk_k(float *y, int ystride, const float *x, int xstride, const uint8_t *q, const uint8_t *sc, int S,
+                        int I, int O, uint8_t *slm) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = sg.get_local_linear_id(), sgi = (int)sg.get_group_linear_id();
+    const int rows_wg = (int)(item.get_local_range(2) / SG) / KS, slot = sgi / KS, g = sgi % KS;
+    const int o = item.get_group(2) * rows_wg + slot;
+    const int tiles = I >> 5, nr = S < E4T_FAST_ROWS ? S : E4T_FAST_ROWS;
+    float acc[E4T_FAST_ROWS] = {0.f, 0.f, 0.f, 0.f};
+    if (o < O) {
+        const uint8_t *row = q + (size_t)o * I, *srow = sc + (size_t)(o >> 5) * tiles;
+        for (int c0 = (g * SG + lane) * 16; c0 < I; c0 += KS * SG * 16) {
+            const sycl::uint4 b = *(const sycl::uint4 *)(row + c0);
+            const uint32_t wd[4] = { b.x(), b.y(), b.z(), b.w() };
+            float w[16];
+#pragma unroll
+            for (int c = 0; c < 16; c++) w[c] = e4t_dec((wd[c >> 2] >> ((c & 3) * 8)) & 0xffu);
+            const float tl = sycl::bit_cast<float>((uint32_t)srow[c0 >> 5] << 23);
+#pragma unroll
+            for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                if (r >= nr) break;
+                const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)r * xstride + c0);
+                float part = 0.f;
+#pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const sycl::float4 f = x4[v];
+                    part += w[4 * v] * f.x() + w[4 * v + 1] * f.y() + w[4 * v + 2] * f.z() + w[4 * v + 3] * f.w();
+                }
+                acc[r] += part * tl;
+            }
+        }
+    }
+    float *pt = (float *)slm;   /* [rows_wg][KS][E4T_FAST_ROWS] */
+#pragma unroll
+    for (int r = 0; r < E4T_FAST_ROWS; r++) {
+        const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+        if (lane == 0) pt[(slot * KS + g) * E4T_FAST_ROWS + r] = v;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (g == 0 && lane < nr && o < O) {
+        float v = 0.f;
+#pragma unroll
+        for (int k = 0; k < KS; k++) v += pt[(slot * KS + k) * E4T_FAST_ROWS + lane];
+        y[(size_t)lane * ystride + o] = v;
+    }
+}
+/* e4t_fastg_k: one launch for NG fmt9 matrices of the same shape (ol x I) whose inputs are NG slices of each row --
+ * DeepSeek V4.1's wo_a output groups (8 of 1024 x 4096: 8 launches at the ~10-12 us floor). Output o of
+ * [0, NG*ol) is group k = o / ol's row o % ol; its input is row r's slice x + r*x_row + k*x_grp; y[r*y_row + o]. A
+ * group's row is e4t_fastk_k's arithmetic (KS sub-groups a row, their partials added in g order), so the result is
+ * the per-group launches' with the same KS. */
+#define E4TG_MAX 16
+struct E4tGrp { const uint8_t *q[E4TG_MAX]; const uint8_t *sc[E4TG_MAX]; };
+template <int SG, int KS>
+static void e4t_fastg_k(float *y, int y_row, const float *x, int x_row, int x_grp, E4tGrp gp, int S, int I, int ol,
+                        int NG, uint8_t *slm) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = sg.get_local_linear_id(), sgi = (int)sg.get_group_linear_id();
+    const int rows_wg = (int)(item.get_local_range(2) / SG) / KS, slot = sgi / KS, g = sgi % KS;
+    const int o = item.get_group(2) * rows_wg + slot, O = NG * ol;
+    const int tiles = I >> 5, nr = S < E4T_FAST_ROWS ? S : E4T_FAST_ROWS;
+    float acc[E4T_FAST_ROWS] = {0.f, 0.f, 0.f, 0.f};
+    if (o < O) {
+        const int k = o / ol, oo = o - k * ol;
+        const uint8_t *row = gp.q[k] + (size_t)oo * I, *srow = gp.sc[k] + (size_t)(oo >> 5) * tiles;
+        const float *xk = x + (size_t)k * x_grp;
+        for (int c0 = (g * SG + lane) * 16; c0 < I; c0 += KS * SG * 16) {
+            const sycl::uint4 b = *(const sycl::uint4 *)(row + c0);
+            const uint32_t wd[4] = { b.x(), b.y(), b.z(), b.w() };
+            float w[16];
+#pragma unroll
+            for (int c = 0; c < 16; c++) w[c] = e4t_dec((wd[c >> 2] >> ((c & 3) * 8)) & 0xffu);
+            const float tl = sycl::bit_cast<float>((uint32_t)srow[c0 >> 5] << 23);
+#pragma unroll
+            for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                if (r >= nr) break;
+                const sycl::float4 *x4 = (const sycl::float4 *)(xk + (size_t)r * x_row + c0);
+                float part = 0.f;
+#pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const sycl::float4 f = x4[v];
+                    part += w[4 * v] * f.x() + w[4 * v + 1] * f.y() + w[4 * v + 2] * f.z() + w[4 * v + 3] * f.w();
+                }
+                acc[r] += part * tl;
+            }
+        }
+    }
+    float *pt = (float *)slm;
+#pragma unroll
+    for (int r = 0; r < E4T_FAST_ROWS; r++) {
+        const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+        if (lane == 0) pt[(slot * KS + g) * E4T_FAST_ROWS + r] = v;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (g == 0 && lane < nr && o < O) {
+        float v = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < KS; kk++) v += pt[(slot * KS + kk) * E4T_FAST_ROWS + lane];
+        y[(size_t)lane * y_row + o] = v;
+    }
+}
+/* e4t_fastob_k: fmt9 for 2..E4T_FAST_ROWS rows, OB outputs a sub-group: a lane loads its 16-column chunk of the rows'
+ * activations once into registers and uses it for OB output rows (e4t_fastk_k reloaded it for every output:
+ * ~150 GB/s at 4 rows, L1-bound). KS sub-groups split a row as in e4t_fastk_k; each (output, row)'s partials are added in
+ * g order from local memory: a fixed order, not e4t_fastk_k's bits (another lane-to-chunk map at sub-group 16), held to the
+ * same tolerance. KS is chosen from I alone (>= 2 chunks a lane), so a grouped launch (NG matrices of ol rows, inputs as
+ * slices: e4t_fastg_k's contract) and a launch a matrix give the same bits. COLI_SYCL_E4T_OB=0: e4t_fastk_k / fastg_k. */
+#define E4TOB 4
+template <int SG, int KS>
+static void e4t_fastob_k(float *y, int y_row, const float *x, int x_row, int x_grp, E4tGrp gp, int S, int I, int ol,
+                         int NG, uint8_t *slm) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = sg.get_local_linear_id(), sgi = (int)sg.get_group_linear_id();
+    const int slots = (int)(item.get_local_range(2) / SG) / KS, slot = sgi / KS, g = sgi % KS;
+    const int O = NG * ol, o0 = (item.get_group(2) * slots + slot) * E4TOB;
+    const int tiles = I >> 5, nr = S < E4T_FAST_ROWS ? S : E4T_FAST_ROWS;
+    float acc[E4TOB][E4T_FAST_ROWS];
+#pragma unroll
+    for (int j = 0; j < E4TOB; j++)
+#pragma unroll
+        for (int r = 0; r < E4T_FAST_ROWS; r++) acc[j][r] = 0.f;
+    const uint8_t *row[E4TOB], *srow[E4TOB];
+    int xo[E4TOB];
+#pragma unroll
+    for (int j = 0; j < E4TOB; j++) {
+        const int o = o0 + j < O ? o0 + j : O - 1, k = o / ol, oo = o - k * ol;
+        row[j] = gp.q[k] + (size_t)oo * I; srow[j] = gp.sc[k] + (size_t)(oo >> 5) * tiles; xo[j] = k * x_grp;
+    }
+    const bool same = xo[0] == xo[E4TOB - 1];   /* the OB rows in one group: one activation chunk serves them all */
+    for (int c0 = (g * SG + lane) * 16; c0 < I; c0 += KS * SG * 16) {
+        float xv[E4T_FAST_ROWS][16];
+        if (same) {
+#pragma unroll
+            for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                if (r >= nr) break;
+                const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)r * x_row + xo[0] + c0);
+#pragma unroll
+                for (int v = 0; v < 4; v++) { const sycl::float4 f = x4[v]; xv[r][4 * v] = f.x(); xv[r][4 * v + 1] = f.y(); xv[r][4 * v + 2] = f.z(); xv[r][4 * v + 3] = f.w(); }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < E4TOB; j++) {
+            if (!same) {
+#pragma unroll
+                for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                    if (r >= nr) break;
+                    const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)r * x_row + xo[j] + c0);
+#pragma unroll
+                    for (int v = 0; v < 4; v++) { const sycl::float4 f = x4[v]; xv[r][4 * v] = f.x(); xv[r][4 * v + 1] = f.y(); xv[r][4 * v + 2] = f.z(); xv[r][4 * v + 3] = f.w(); }
+                }
+            }
+            const sycl::uint4 b = *(const sycl::uint4 *)(row[j] + c0);
+            const uint32_t wd[4] = { b.x(), b.y(), b.z(), b.w() };
+            float w[16];
+#pragma unroll
+            for (int c = 0; c < 16; c++) w[c] = e4t_dec((wd[c >> 2] >> ((c & 3) * 8)) & 0xffu);
+            const float tl = sycl::bit_cast<float>((uint32_t)srow[j][c0 >> 5] << 23);
+#pragma unroll
+            for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                if (r >= nr) break;
+                float part = 0.f;
+#pragma unroll
+                for (int v = 0; v < 4; v++)
+                    part += w[4 * v] * xv[r][4 * v] + w[4 * v + 1] * xv[r][4 * v + 1] + w[4 * v + 2] * xv[r][4 * v + 2] + w[4 * v + 3] * xv[r][4 * v + 3];
+                acc[j][r] += part * tl;
+            }
+        }
+    }
+    float *pt = (float *)slm;   /* [slots][KS][OB][rows] */
+#pragma unroll
+    for (int j = 0; j < E4TOB; j++)
+#pragma unroll
+        for (int r = 0; r < E4T_FAST_ROWS; r++) {
+            const float v = sycl::reduce_over_group(sg, acc[j][r], sycl::plus<float>());
+            if (lane == 0) pt[((slot * KS + g) * E4TOB + j) * E4T_FAST_ROWS + r] = v;
+        }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (g == 0 && lane < E4TOB * nr) {
+        const int j = lane / nr, r = lane - j * nr, o = o0 + j;
+        if (o < O) {
+            float v = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < KS; kk++) v += pt[((slot * KS + kk) * E4TOB + j) * E4T_FAST_ROWS + r];
+            y[(size_t)r * y_row + o] = v;
+        }
+    }
+}
+static int e4t_ob_on(void) { const char *e = std::getenv("COLI_SYCL_E4T_OB"); return !(e && *e == '0'); }
+/* the fewest rows an ungrouped product takes e4t_fastob_k (COLI_SYCL_E4T_OB_MIN, default 3): at 2 rows the KS-split rows
+ * kernel is 4-25 % faster on every trunk shape (test_sycl_e4t_chain), at 3-4 the 4-output one on most; the grouped launch keeps 2 */
+static int e4t_ob_min(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = std::getenv("COLI_SYCL_E4T_OB_MIN"); m = e && *e ? std::atoi(e) : 3; if (m < 2) m = 2; }
+    return m;
+}
+static int e4t_ob_ks(int I) { int ks = 8; while (ks > 1 && I / (16 * 16 * ks) < 2) ks >>= 1; return ks; }
+/* the launch: NG matrices (1: an ungrouped one), outputs O = NG * ol, at sub-group 16 */
+static void e4t_ob_launch(sycl::queue &q, float *y, int y_row, const float *x, int x_row, int x_grp, const E4tGrp &gp, int S,
+                          int I, int ol, int NG) {
+    const int ks = e4t_ob_ks(I), slots = (256 / 16) / ks, O = NG * ol, blocks = (O + E4TOB - 1) / E4TOB;
+    dpct::dim3 grid((unsigned)((blocks + slots - 1) / slots), 1u);
+    const size_t slm = (size_t)(256 / 16) * E4TOB * E4T_FAST_ROWS * sizeof(float);
+    #define E4OB_L(K_) COLI_SG_LAUNCH(q, 16, grid, 256, slm, e4t_fastob_k<SG, K_>(y, y_row, x, x_row, x_grp, gp, S, I, ol, NG, dpct_local))
+    if (ks == 8) E4OB_L(8); else if (ks == 4) E4OB_L(4); else if (ks == 2) E4OB_L(2); else E4OB_L(1);
+    #undef E4OB_L
+}
+extern "C" void *coli_cuda_e4m3t_upload(int device, const unsigned char *q, const unsigned char *s, int O, int I) try {
+    if (fault_injected() || !q || !s || O < 1 || I < 32 || (I & 31)) return NULL;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return NULL;
+    const size_t qb = (size_t)O * I, sb = (size_t)((O + 31) / 32) * (I / 32);
+    ColiE4m3t *t = (ColiE4m3t *)std::calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->device = device; t->O = O; t->I = I;
+    float lut[256];
+    for (int b = 0; b < 256; b++) {   /* quant.h's e4m3_decode8: bits placed, times 2^120 (exact); 0x7F/0xFF NaN */
+        const uint32_t bits = ((uint32_t)(b & 0x80) << 24) | ((uint32_t)(b & 0x7f) << 20);
+        float v; std::memcpy(&v, &bits, 4); v *= 0x1p120f;
+        lut[b] = (b & 0x7f) == 0x7f ? NAN : v;
+    }
+    if (COLI_SYCL_ALLOC(t->q, (uint8_t *)sycl::malloc_device(qb, dq()), qb) != 0 ||
+        COLI_SYCL_ALLOC(t->s, (uint8_t *)sycl::malloc_device(sb, dq()), sb) != 0 ||
+        COLI_SYCL_ALLOC(t->lut, sycl::malloc_device<float>(256, dq()), 256 * sizeof(float)) != 0 ||
+        COLI_SYCL_TRY(dq().memcpy(t->q, q, qb)) != 0 || COLI_SYCL_TRY(dq().memcpy(t->s, s, sb)) != 0 ||
+        COLI_SYCL_TRY(dq().memcpy(t->lut, lut, sizeof lut).wait()) != 0) {
+        try { dq().wait(); } catch (...) {}
+        if (t->q) sycl::free(t->q, dq()); if (t->s) sycl::free(t->s, dq()); if (t->lut) sycl::free(t->lut, dq());
+        std::free(t); return NULL;
+    }
+    return t;
+}
+catch (sycl::exception const &exc) { sycl_caught(exc, "coli_cuda_e4m3t_upload"); return NULL; }
+extern "C" void coli_cuda_e4m3t_free(void *h) {
+    ColiE4m3t *t = (ColiE4m3t *)h;
+    if (!t) return;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (ctx && select_ctx(ctx)) { try { dq().wait(); sycl::free(t->q, dq()); sycl::free(t->s, dq()); sycl::free(t->lut, dq()); } catch (...) {} }
+    std::free(t);
+}
+extern "C" int coli_cuda_e4m3t_mv(void *h, float *y, int ystride, const float *x, int xstride, int S) try {
+    ColiE4m3t *t = (ColiE4m3t *)h;
+    if (fault_injected() || !t || !y || !x || S < 1 || xstride < t->I || ystride < t->O) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    const int I = t->I, O = t->O;
+    const size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
+    if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+    /* packed on the device (rows I and O apart); the host's strides only in the copies */
+    if (xstride == I) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx, x, xb)), "e4m3t input upload")) return 0; }
+    else for (int r = 0; r < S; r++)
+        if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * 4)), "e4m3t input upload")) return 0;
+    const int outs_per_wg = 256 / 8;
+    dpct::dim3 grid((unsigned)((O + outs_per_wg - 1) / outs_per_wg), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
+    float *dy = ctx->dy; const float *dx = ctx->dx;
+    const uint8_t *dq8 = t->q, *ds = t->s; const float *dl = t->lut;
+    COLI_SG_LAUNCH(dq(), ctx->sg, grid, 256, 0, e4m3t_kernel<SG>(dy, O, dx, I, dq8, ds, dl, S, I, O));
+    if (!cuda_ok(0, "e4m3t launch")) return 0;
+    if (ystride == O) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(y, dy, yb).wait()), "e4m3t output download")) return 0; }
+    else {
+        for (int r = 0; r < S; r++)
+            if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(y + (size_t)r * ystride, dy + (size_t)r * O, (size_t)O * 4)), "e4m3t output download")) return 0;
+        if (!cuda_ok(COLI_SYCL_TRY(dq().wait()), "e4m3t output download")) return 0;
+    }
+    return 1;
+}
+catch (sycl::exception const &exc) {
+    try { dq().wait(); } catch (...) {}
+    return sycl_caught(exc, "coli_cuda_e4m3t_mv");
+}
+
+/* coli_cuda_bf16t_* (deepseek_v41's V41_TRUNK_GPU, the BF16 matrices: the head, the router, the compressor and the
+ * indexer's projections): the bits of deepseek_v41.c's mvb_cpu on an AVX2 build. That loop, per output o: acc = 0;
+ * for i in steps of 8, acc = fma(bf16(w[i..i+7]), x[i..i+7], acc) lane by lane; y = hsum256(acc), i.e.
+ * ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)). Here lane j of 8 is accumulator lane j: columns j, j+8, ... in order,
+ * the same fmas from +0, the same sub-group shifts (4, 2, 1) as e4m3t. bf16 -> float is a shift (exact, NaNs
+ * kept). I a multiple of 8 (the CPU's tail loop never runs). */
+struct ColiBf16t { int device, O, I; uint16_t *w; int lb; };   /* lb: 0 the rows as they are, else blocks of lb outputs (bf16t3_kernel) */
+template <int SG>
+static void bf16t_kernel(float *y, int ystride, const float *x, int xstride, const uint16_t *w, int S, int I, int O) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lid = item.get_local_id(2), j = lid & 7;
+    const int o = (item.get_group(2) * item.get_local_range(2) + lid) >> 3;
+    const int r0 = item.get_group(1) * E4T_ROWS;
+    const int nr = S - r0 < E4T_ROWS ? S - r0 : E4T_ROWS;
+    const bool live = o < O;
+    const int oo = live ? o : O - 1;
+    const uint16_t *row = w + (size_t)oo * I;
+    float acc[E4T_ROWS];
+#pragma unroll
+    for (int r = 0; r < E4T_ROWS; r++) acc[r] = 0.0f;
+    for (int i = j; i < I; i += 8) {
+        const float wv = sycl::bit_cast<float>((uint32_t)row[i] << 16);
+#pragma unroll
+        for (int r = 0; r < E4T_ROWS; r++)
+            if (r < nr) acc[r] = sycl::fma(wv, x[(size_t)(r0 + r) * xstride + i], acc[r]);
+    }
+#pragma unroll
+    for (int r = 0; r < E4T_ROWS; r++) {
+        if (r < nr) {   /* nr is the same for the whole sub-group: every lane shuffles */
+            const float v = acc[r];
+            float a = v + sycl::shift_group_left(sg, v, 4);
+            float b = a + sycl::shift_group_left(sg, a, 2);
+            float h = b + sycl::shift_group_left(sg, b, 1);
+            if (live && j == 0) y[(size_t)(r0 + r) * ystride + o] = h;
+        }
+    }
+}
+/* bf16t2_kernel: the same bits as bf16t_kernel with one work-item an output: its eight accumulators (lane j of 8 there:
+ * columns j, j+8, ... in order, fma from +0) live in that work-item, which reads its row 16 bytes at a time (8 columns:
+ * one step of each accumulator) instead of 2 bytes a lane; then the same tree, ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)).
+ * Measured: bf16t_kernel ran the lm head (129280 x 5120) at ~150 GB/s, 8 ms of a 4-row decode step. Rows BF2_ROWS a pass
+ * (32 accumulators a work-item at 4), sub-group 16 for the registers. COLI_SYCL_BF16T_V1=1: bf16t_kernel. */
+#define BF2_ROWS 4
+template <int SG>
+static void bf16t2_kernel(float *y, int ystride, const float *x, int xstride, const uint16_t *w, int S, int I, int O) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int o = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    const int r0 = item.get_group(1) * BF2_ROWS;
+    const int nr = S - r0 < BF2_ROWS ? S - r0 : BF2_ROWS;
+    if (o >= O) return;   /* no sub-group operation below */
+    const uint32_t *row = (const uint32_t *)(w + (size_t)o * I);
+    float acc[BF2_ROWS][8];
+#pragma unroll
+    for (int r = 0; r < BF2_ROWS; r++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc[r][j] = 0.0f;
+#pragma unroll 4
+    for (int i = 0; i < I; i += 8) {
+        const sycl::uint4 q = *(const sycl::uint4 *)(row + (i >> 1));
+        const uint32_t wd[4] = { q.x(), q.y(), q.z(), q.w() };
+        float wv[8];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            wv[2 * k] = sycl::bit_cast<float>(wd[k] << 16);
+            wv[2 * k + 1] = sycl::bit_cast<float>(wd[k] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int r = 0; r < BF2_ROWS; r++) {
+            if (r < nr) {
+                const float *xr = x + (size_t)(r0 + r) * xstride + i;
+#pragma unroll
+                for (int j = 0; j < 8; j++) acc[r][j] = sycl::fma(wv[j], xr[j], acc[r][j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < BF2_ROWS; r++) {
+        if (r < nr) {
+            const float a0 = acc[r][0] + acc[r][4], a1 = acc[r][1] + acc[r][5], a2 = acc[r][2] + acc[r][6], a3 = acc[r][3] + acc[r][7];
+            const float b0 = a0 + a2, b1 = a1 + a3;
+            y[(size_t)(r0 + r) * ystride + o] = b0 + b1;
+        }
+    }
+}
+static int bf16t_v1(void) { const char *e = getenv("COLI_SYCL_BF16T_V1"); return e && atoi(e) > 0; }
+/* bf16t3_kernel: bf16t2_kernel's arithmetic, so mvb_cpu's bits, at what the card streams. Two changes, neither
+ * one of an operation:
+ *  - the bytes: bf16t2's work-item walks its own 10 KB row, so the 16 lanes of a sub-group ask for 16 different cache
+ *    lines a step, and the lm head (129280 x 5120, 1.32 GB, past every cache) came at ~550 GB/s where a read-only
+ *    kernel over one contiguous run a sub-group gets ~650. Here the matrix is stored in blocks of LB outputs, a block's
+ *    step t (8 columns, 16 bytes an output) as [lane][4 dwords]: a sub-group's step is one run of SG * 16 bytes
+ *    (LB = SG) or every other run (LB = 2 * SG: two sub-groups a block). The last block is padded with zero rows.
+ *  - the rows: NR is a template argument (bf16t2 tests r < nr four times a step), 1..4; coli_cuda_bf16t_mv launches a
+ *    pass per four rows. With both, 1 to 4 rows cost the same 2.0-2.1 ms on a Max 1100 (bf16t2: 2.4 / 2.6 / 3.0 / 3.5).
+ * Each output still has its eight accumulators in one work-item: columns j, j+8, ... in order, fma from +0, then
+ * ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)). test_sycl_bf16t holds it to the reference and to bf16t2_kernel byte for byte.
+ * A matrix gets the layout at upload: COLI_SYCL_BF16T_LB=32 any matrix, =0 none (bf16t2_kernel, the rows as they are);
+ * unset (BF16T_ILV_DEFAULT 1), the ones of BF16T_ILV_MIN bytes and more: the head; the small ones are cache-resident
+ * and stay as they were. COLI_SYCL_BF16T_V1=1 at upload keeps the rows too. On the card (test_sycl_bf16t,
+ * a call = input upload, kernel, logits download, median of 40): the head at 1 / 2 / 3 / 4 rows 2.07 / 2.10 / 2.21 /
+ * 2.27 ms against bf16t2_kernel's 2.48 / 2.71 / 3.05 / 3.32, both the reference's bytes at 1..5 rows. */
+#define BF16T_LB 32
+#define BF16T_ILV_MIN ((size_t)64 << 20)
+#define BF16T_ILV_DEFAULT 1
+template <int SG, int LB, int NR>
+static void bf16t3_kernel(float *y, int ystride, const float *x, int xstride, const uint32_t *w, int I, int O) {
+    static_assert(LB == SG || LB == 2 * SG, "a block is one sub-group or two");
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const size_t sgi = item.get_group(2) * (item.get_local_range(2) / SG) + sg.get_group_id()[0];
+    const int lane = (int)sg.get_local_id()[0];
+    const size_t o = sgi * SG + lane;
+    if (sgi * SG >= (size_t)O) return;   /* past the last block: the whole sub-group (no sub-group operation below) */
+    const size_t blk = LB == SG ? sgi : sgi >> 1;
+    const int bl = LB == SG ? lane : (int)(sgi & 1) * SG + lane;
+    const int nit = I / 8;
+    const uint32_t *base = w + blk * (size_t)nit * (LB * 4) + (size_t)bl * 4;
+    float acc[NR][8];
+#pragma unroll
+    for (int r = 0; r < NR; r++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc[r][j] = 0.0f;
+#pragma unroll 4
+    for (int t = 0; t < nit; t++) {
+        const sycl::uint4 q = *(const sycl::uint4 *)(base + (size_t)t * (LB * 4));
+        const uint32_t wd[4] = { q.x(), q.y(), q.z(), q.w() };
+        float wv[8];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            wv[2 * k] = sycl::bit_cast<float>(wd[k] << 16);
+            wv[2 * k + 1] = sycl::bit_cast<float>(wd[k] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int r = 0; r < NR; r++) {
+            const float *xr = x + (size_t)r * xstride + (size_t)t * 8;
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc[r][j] = sycl::fma(wv[j], xr[j], acc[r][j]);
+        }
+    }
+    if (o < (size_t)O) {
+#pragma unroll
+        for (int r = 0; r < NR; r++) {
+            const float a0 = acc[r][0] + acc[r][4], a1 = acc[r][1] + acc[r][5], a2 = acc[r][2] + acc[r][6], a3 = acc[r][3] + acc[r][7];
+            const float b0 = a0 + a2, b1 = a1 + a3;
+            y[(size_t)r * ystride + o] = b0 + b1;
+        }
+    }
+}
+/* the layout a matrix of `bytes` gets at upload */
+static int bf16t_lb(size_t bytes) {
+    if (bf16t_v1()) return 0;
+    const char *e = getenv("COLI_SYCL_BF16T_LB");
+    if (e && *e) return atoi(e) == BF16T_LB ? BF16T_LB : 0;
+    return BF16T_ILV_DEFAULT && bytes >= BF16T_ILV_MIN ? BF16T_LB : 0;
+}
+/* rows [o0, o0 + n * lb) of w into n blocks at dst: a block's step t as [lane][16 bytes]; rows past O are zeros */
+static void bf16t_blocks(uint8_t *dst, const unsigned short *w, size_t o0, size_t n, int lb, int O, int I) {
+    const int nit = I / 8;
+    const size_t blk_bytes = (size_t)lb * I * 2;
+    for (size_t b = 0; b < n; b++)
+        for (int lane = 0; lane < lb; lane++) {
+            const size_t o = o0 + b * lb + lane;
+            uint8_t *d = dst + b * blk_bytes + (size_t)lane * 16;
+            if (o < (size_t)O) {
+                const uint8_t *src = (const uint8_t *)(w + o * (size_t)I);
+                for (int t = 0; t < nit; t++) std::memcpy(d + (size_t)t * lb * 16, src + (size_t)t * 16, 16);
+            } else {
+                for (int t = 0; t < nit; t++) std::memset(d + (size_t)t * lb * 16, 0, 16);
+            }
+        }
+}
+extern "C" void *coli_cuda_bf16t_upload(int device, const unsigned short *w, int O, int I) try {
+    if (fault_injected() || !w || O < 1 || I < 8 || (I & 7)) return NULL;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return NULL;
+    const int lb = bf16t_lb((size_t)O * I * sizeof(uint16_t));
+    const size_t blk_bytes = (size_t)(lb ? lb : 1) * I * sizeof(uint16_t), nb = lb ? ((size_t)O + lb - 1) / lb : (size_t)O;
+    const size_t wb = nb * blk_bytes;   /* lb: the last block padded to lb rows */
+    ColiBf16t *t = (ColiBf16t *)std::calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->device = device; t->O = O; t->I = I; t->lb = lb;
+    int bad = COLI_SYCL_ALLOC(t->w, (uint16_t *)sycl::malloc_device(wb, dq()), wb) != 0;
+    if (!bad && !lb) bad = COLI_SYCL_TRY(dq().memcpy(t->w, w, wb).wait()) != 0;
+    if (!bad && lb) {   /* through a host buffer of ~32 MB of blocks */
+        size_t per = ((size_t)32 << 20) / blk_bytes;
+        if (per < 1) per = 1;
+        if (per > nb) per = nb;
+        uint8_t *stage = (uint8_t *)std::malloc(per * blk_bytes);
+        bad = !stage;
+        for (size_t b0 = 0; !bad && b0 < nb; b0 += per) {
+            const size_t n = nb - b0 < per ? nb - b0 : per;
+            bf16t_blocks(stage, w, b0 * lb, n, lb, O, I);
+            bad = COLI_SYCL_TRY(dq().memcpy((uint8_t *)t->w + b0 * blk_bytes, stage, n * blk_bytes).wait()) != 0;
+        }
+        std::free(stage);
+    }
+    if (bad) {
+        try { dq().wait(); } catch (...) {}
+        if (t->w) sycl::free(t->w, dq());
+        std::free(t); return NULL;
+    }
+    if (lb) std::fprintf(stderr, "[SYCL] BF16 matrix %d x %d (%.2f GiB) in blocks of %d outputs: bf16t3_kernel, the same bits (COLI_SYCL_BF16T_LB=0: the rows as they are, bf16t2_kernel)\n",
+                         O, I, (double)wb / (double)((size_t)1 << 30), lb);
+    return t;
+}
+catch (sycl::exception const &exc) { sycl_caught(exc, "coli_cuda_bf16t_upload"); return NULL; }
+extern "C" void coli_cuda_bf16t_free(void *h) {
+    ColiBf16t *t = (ColiBf16t *)h;
+    if (!t) return;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (ctx && select_ctx(ctx)) { try { dq().wait(); sycl::free(t->w, dq()); } catch (...) {} }
+    std::free(t);
+}
+extern "C" int coli_cuda_bf16t_mv(void *h, float *y, int ystride, const float *x, int xstride, int S) try {
+    ColiBf16t *t = (ColiBf16t *)h;
+    if (fault_injected() || !t || !y || !x || S < 1 || xstride < t->I || ystride < t->O) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    const int I = t->I, O = t->O;
+    const size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
+    if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+    if (xstride == I) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx, x, xb)), "bf16t input upload")) return 0; }
+    else for (int r = 0; r < S; r++)
+        if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * 4)), "bf16t input upload")) return 0;
+    float *dy = ctx->dy; const float *dx = ctx->dx; const uint16_t *dw = t->w;
+    if (t->lb) {   /* the blocks: a pass per four rows, the row count the kernel's */
+        const uint32_t *dw32 = (const uint32_t *)t->w;
+        dpct::dim3 grid((unsigned)((O + 255) / 256), 1u);
+        for (int r0 = 0; r0 < S; r0 += BF2_ROWS) {
+            const int nr = S - r0 < BF2_ROWS ? S - r0 : BF2_ROWS;
+            float *yy = dy + (size_t)r0 * O; const float *xx = dx + (size_t)r0 * I;
+            switch (nr) {
+            case 1: COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t3_kernel<SG, BF16T_LB, 1>(yy, O, xx, I, dw32, I, O)); break;
+            case 2: COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t3_kernel<SG, BF16T_LB, 2>(yy, O, xx, I, dw32, I, O)); break;
+            case 3: COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t3_kernel<SG, BF16T_LB, 3>(yy, O, xx, I, dw32, I, O)); break;
+            default: COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t3_kernel<SG, BF16T_LB, 4>(yy, O, xx, I, dw32, I, O)); break;
+            }
+        }
+    } else if (bf16t_v1()) {
+        const int outs_per_wg = 256 / 8;
+        dpct::dim3 grid((unsigned)((O + outs_per_wg - 1) / outs_per_wg), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
+        COLI_SG_LAUNCH(dq(), ctx->sg, grid, 256, 0, bf16t_kernel<SG>(dy, O, dx, I, dw, S, I, O));
+    } else {
+        dpct::dim3 grid((unsigned)((O + 255) / 256), (unsigned)((S + BF2_ROWS - 1) / BF2_ROWS));
+        COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t2_kernel<SG>(dy, O, dx, I, dw, S, I, O));
+    }
+    if (!cuda_ok(0, "bf16t launch")) return 0;
+    if (ystride == O) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(y, dy, yb).wait()), "bf16t output download")) return 0; }
+    else {
+        for (int r = 0; r < S; r++)
+            if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(y + (size_t)r * ystride, dy + (size_t)r * O, (size_t)O * 4)), "bf16t output download")) return 0;
+        if (!cuda_ok(COLI_SYCL_TRY(dq().wait()), "bf16t output download")) return 0;
+    }
+    return 1;
+}
+catch (sycl::exception const &exc) {
+    try { dq().wait(); } catch (...) {}
+    return sycl_caught(exc, "coli_cuda_bf16t_mv");
+}
+
+/* The FP8 matrix as a resident ColiCudaTensor, for the dense chain (cc_matmul -> coli_cuda_tensor_gemm_async):
+ * fmt 9 = e4m3 bytes [O][I] with one ue8m0 byte a 32x32 tile, the decode table and the tile bytes in `scales`
+ * (256 floats, then ((O+31)/32) x (I/32) bytes); the product is e4m3t_kernel: mv8_rows_cpu's bits. (A BF16 matrix
+ * needs no format of its own: plain bf16 rows are the GGUF type BF16, fmt 130 through coli_cuda_tensor_upload, the
+ * block decoder's float GEMV -- shared by every engine.) */
+extern "C" int coli_cuda_tensor_upload_e4t(ColiCudaTensor **tensor, const unsigned char *q, const unsigned char *s,
+                                           int O, int I, int device) try {
+    if (!tensor || fault_injected() || !q || !s || O < 1 || I < 32 || (I & 31)) return 0;
+    if (*tensor) return 1;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    const size_t qb = (size_t)O * I, sb = (size_t)((O + 31) / 32) * (I / 32), tb = 256 * sizeof(float) + sb;
+    ColiCudaTensor *t = (ColiCudaTensor *)std::calloc(1, sizeof *t);
+    if (!t) return 0;
+    t->fmt = 9; t->I = I; t->O = O; t->device = device; t->weights_owned = 1; t->weight_bytes = qb; t->scale_count = sb;
+    float lut[256];
+    for (int b = 0; b < 256; b++) {   /* quant.h's e4m3_decode8: bits placed, times 2^120 (exact); 0x7F/0xFF NaN */
+        const uint32_t bits = ((uint32_t)(b & 0x80) << 24) | ((uint32_t)(b & 0x7f) << 20);
+        float v; std::memcpy(&v, &bits, 4); v *= 0x1p120f;
+        lut[b] = (b & 0x7f) == 0x7f ? NAN : v;
+    }
+    uint8_t *w = nullptr, *sc = nullptr;
+    if (COLI_SYCL_ALLOC(w, (uint8_t *)sycl::malloc_device(qb, dq()), qb) != 0 ||
+        COLI_SYCL_ALLOC(sc, (uint8_t *)sycl::malloc_device(tb, dq()), tb) != 0 ||
+        COLI_SYCL_TRY(dq().memcpy(w, q, qb)) != 0 || COLI_SYCL_TRY(dq().memcpy(sc, lut, sizeof lut)) != 0 ||
+        COLI_SYCL_TRY(dq().memcpy(sc + sizeof lut, s, sb).wait()) != 0) {
+        try { dq().wait(); } catch (...) {}
+        if (w) sycl::free(w, dq()); if (sc) sycl::free(sc, dq());
+        std::free(t); return 0;
+    }
+    t->weights = w; t->scales = (float *)sc;
+    *tensor = t;
+    return 1;
+}
+catch (sycl::exception const &exc) { return sycl_caught(exc, "coli_cuda_tensor_upload_e4t"); }
 
 /* coli_cuda_tuned_default (backend_cuda.h): a switch's measured default from the devices' profiles
  * (coli_sycl_tuned_default), only where every device gives the same value; the first use of each switch that
@@ -5638,6 +6387,63 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     sycl::queue * st = (sycl::queue *)stream;
+    if (t->fmt == 9) {   /* FP8 with 32x32 ue8m0 tiles (coli_cuda_tensor_upload_e4t): no host wait */
+        const int I = t->I, O = t->O;
+        const uint8_t *dq8 = (const uint8_t *)t->weights;
+        const float *dl = t->scales;
+        const uint8_t *ds = (const uint8_t *)(t->scales + 256);
+        static int fast_env = -1;   /* COLI_SYCL_E4T_FAST: 1 (default) the decode rows' fast product (not the CPU's bits), 0 exact */
+        if (fast_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_FAST"); fast_env = !(e && *e == '0'); }
+        if (fast_env && S <= E4T_FAST_ROWS && ((uintptr_t)dq8 & 15) == 0 && ((uintptr_t)x_dev & 15) == 0) {
+            if (S >= e4t_ob_min() && e4t_ob_on()) {
+                E4tGrp gp1;
+                for (int k = 0; k < E4TG_MAX; k++) { gp1.q[k] = dq8; gp1.sc[k] = ds; }
+                e4t_ob_launch(*st, y_dev, O, x_dev, I, 0, gp1, S, I, O, 1);
+                return cuda_ok(0, "chain e4t ob launch");
+            }
+            const int sgw = ctx->sg, nsg = 256 / sgw;
+            static int ks_env = -1;
+            if (ks_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_KS"); ks_env = e ? std::atoi(e) : 0; }
+            int ks = 1;
+            if (ks_env == 1 || ks_env == 2 || ks_env == 4 || ks_env == 8) ks = ks_env;
+            else if (I / (16 * sgw) >= 8) ks = 2;   /* measured: KS 2 best wherever a row has >= 8 chunks a lane; shorter rows KS 1 */
+            if (ks > nsg || I / (16 * sgw) < ks) ks = 1;
+            if (ks == 1) {
+                dpct::dim3 grid((unsigned)((O + nsg - 1) / nsg), 1u);
+                COLI_SG_LAUNCH((*st), sgw, grid, 256, 0, e4t_fast_k<SG>(y_dev, O, x_dev, I, dq8, ds, S, I, O));
+            } else {
+                const int rows_wg = nsg / ks;
+                dpct::dim3 grid((unsigned)((O + rows_wg - 1) / rows_wg), 1u);
+                const size_t slm = (size_t)nsg * E4T_FAST_ROWS * sizeof(float);
+                if (ks == 2) COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastk_k<SG, 2>(y_dev, O, x_dev, I, dq8, ds, S, I, O, dpct_local));
+                else if (ks == 4) COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastk_k<SG, 4>(y_dev, O, x_dev, I, dq8, ds, S, I, O, dpct_local));
+                else COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastk_k<SG, 8>(y_dev, O, x_dev, I, dq8, ds, S, I, O, dpct_local));
+            }
+            return cuda_ok(0, "chain e4t fast launch");
+        }
+        /* outputs a work-group: their tile chains run side by side (the fold is the kernel's serial part); COLI_SYCL_E4T_OUTS
+         * overrides (1, 2, 4, 8, 16, 32, 64) */
+        static int outs_env = -1;
+        if (outs_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_OUTS"); outs_env = e ? std::atoi(e) : 0; }
+        const int rows_wg = S < E4T3_ROWS ? S : E4T3_ROWS;   /* local memory for the rows a work-group has */
+        int outs = 0;
+        if (outs_env == 1 || outs_env == 2 || outs_env == 4 || outs_env == 8 || outs_env == 16 || outs_env == 32 || outs_env == 64) outs = outs_env;
+        else {   /* 8 (measured best over 1..64 on the trunk's shapes, s1-e4t6), fewer where 48 KiB would not hold them */
+            outs = 8;
+            while (outs > 1 && (size_t)rows_wg * outs * (I / 32) * sizeof(float) > 48 * 1024) outs /= 2;
+        }
+        const size_t slm = (size_t)rows_wg * outs * (I / 32) * sizeof(float);
+        if (slm <= 48 * 1024 && ((uintptr_t)dq8 & 15) == 0 && ((uintptr_t)x_dev & 15) == 0) {   /* e4m3t3_kernel: a tile a work-item */
+            dpct::dim3 grid((unsigned)((O + outs - 1) / outs), (unsigned)((S + E4T3_ROWS - 1) / E4T3_ROWS));
+            static int sg_env = -1;   /* COLI_SYCL_E4T_SG: 32 (default, measured faster) or 16 */
+            if (sg_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_SG"); sg_env = e && std::atoi(e) == 16 ? 16 : 32; }
+            COLI_SG_LAUNCH((*st), sg_env, grid, 256, slm, e4m3t3_kernel<SG>(y_dev, O, x_dev, I, dq8, ds, dl, S, I, O, outs, dpct_local));
+        } else {
+            dpct::dim3 grid((unsigned)((O + 31) / 32), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
+            COLI_SG_LAUNCH((*st), ctx->sg, grid, 256, 0, e4m3t_kernel<SG>(y_dev, O, x_dev, I, dq8, ds, dl, S, I, O));
+        }
+        return cuda_ok(0, "chain e4t launch");
+    }
     if (t->fmt >= 100) return bd_tensor_gemv(ctx, t, y_dev, x_dev, S, st);   /* a GGUF's blocks: cuda_bd.cuh */
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288 && ((uintptr_t)x_dev & 15) == 0) {   /* x in float4 loads */
         const int sg = gemv_i8_sg(ctx, t->O, t->I), wpb = 256 / sg;
@@ -5775,6 +6581,38 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
     return cuda_ok(0, "chain gemm launch");
 }
 catch (sycl::exception const &exc) { return sycl_caught(exc, "coli_cuda_tensor_gemm_async"); }
+/* NG fmt9 matrices of one shape, inputs as slices of each row (e4t_fastg_k): 1 launched, -1 not taken (another format or
+ * shape, more than E4T_FAST_ROWS rows, the fast product off, misaligned: the caller's launch a matrix), 0 a failure */
+extern "C" int coli_cuda_tensor_gemm_grp_async(ColiCudaTensor *const *t, int ng, float *y_dev, int y_row, const float *x_dev,
+                                               int x_row, int x_grp, int S, void *stream) try {
+    if (fault_injected()) return 0;
+    if (!t || ng < 1 || ng > E4TG_MAX || !y_dev || !x_dev || S < 1) return 0;
+    const char *fe = std::getenv("COLI_SYCL_E4T_FAST"), *ge = std::getenv("COLI_SYCL_E4T_GRP");
+    if ((fe && *fe == '0') || (ge && *ge == '0') || S > E4T_FAST_ROWS) return -1;
+    E4tGrp gp;
+    const int I = t[0] ? t[0]->I : 0, ol = t[0] ? t[0]->O : 0, dev = t[0] ? t[0]->device : -1;
+    for (int k = 0; k < ng; k++) {
+        if (!t[k] || t[k]->fmt != 9 || t[k]->I != I || t[k]->O != ol || t[k]->device != dev) return -1;
+        gp.q[k] = (const uint8_t *)t[k]->weights; gp.sc[k] = (const uint8_t *)(t[k]->scales + 256);
+        if (((uintptr_t)gp.q[k] & 15) != 0) return -1;
+    }
+    for (int k = ng; k < E4TG_MAX; k++) { gp.q[k] = gp.q[0]; gp.sc[k] = gp.sc[0]; }
+    if (((uintptr_t)x_dev & 15) || (x_row & 3) || (x_grp & 3) || (I & 31) || I < 32) return -1;
+    DeviceContext *ctx = find_ctx(dev);
+    if (!select_ctx(ctx)) return 0;
+    sycl::queue *st = (sycl::queue *)stream;
+    if (S >= 2 && e4t_ob_on()) {
+        e4t_ob_launch(*st, y_dev, y_row, x_dev, x_row, x_grp, gp, S, I, ol, ng);
+        return cuda_ok(0, "chain e4t grouped ob launch") ? 1 : 0;
+    }
+    const int sgw = ctx->sg, nsg = 256 / sgw, ks = I / (16 * sgw) >= 8 ? 2 : 1, rows_wg = nsg / ks, O = ng * ol;
+    dpct::dim3 grid((unsigned)((O + rows_wg - 1) / rows_wg), 1u);
+    const size_t slm = (size_t)nsg * E4T_FAST_ROWS * sizeof(float);
+    if (ks == 2) COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastg_k<SG, 2>(y_dev, y_row, x_dev, x_row, x_grp, gp, S, I, ol, ng, dpct_local));
+    else COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastg_k<SG, 1>(y_dev, y_row, x_dev, x_row, x_grp, gp, S, I, ol, ng, dpct_local));
+    return cuda_ok(0, "chain e4t grouped launch") ? 1 : 0;
+}
+catch (sycl::exception const &exc) { return sycl_caught(exc, "coli_cuda_tensor_gemm_grp_async"); }
 
 /* A resident tensor's device copy for the dense chain's routed experts (cuda_chain.cu's
  * table of CcExpert): its weights, its scales and the scales' group size (fmt 4). */
@@ -5801,11 +6639,30 @@ extern "C" int coli_cuda_load_module(void) {
  * formats are the CUDA tier's: 1 int8 rows and 2 int4 rows (a scale per row), 4 int4
  * with a scale per gs inputs (gs a multiple of 16: a lane's 16 weights sit in one
  * group), 8 fp8-e4m3 with a scale per 128 x 128 block (a warp's 128 weights a step sit
- * in one), its values from a shared copy of c_e4m3. The sums are the CPU's up to the
- * order of the float additions. */
+ * in one), its values from a shared copy of c_e4m3; 7 MXFP4 (quant.h's matmul_mxfp4: e2m1
+ * nibbles as doubled exact integers, a 16-column chunk inside one 32-column group, its sum
+ * times the group's ue8m0 scale halved -- the scales are BYTES behind CcExpert's float
+ * pointers). The sums are the CPU's up to the order of the float additions. */
 #define MOE_RPW 2
 #define MOE_ROWS(wpb) ((wpb) * MOE_RPW)   /* output rows a block: a sub-group ("warp") MOE_RPW of them */
 #define MOE_DIM_MAX CC_MOE_DIM_MAX
+/* fmt 7: an e2m1 nibble (the low 4 bits of n; bit 3 the sign, bits 0..2 index
+ * {0,.5,1,1.5,2,3,4,6}) as TWICE its value, an exact small integer from the packed
+ * nibbles of 0xC8643210 (0,1,2,3,4,6,8,12); the 0.5 rides the group's scale (mx4_moe_scale) */
+__dpct_inline__ float mx4_d2(unsigned n) {
+    int v = (int)((0xC8643210u >> (4u * (n & 7u))) & 15u);
+    return (float)((n & 8u) ? -v : v);
+}
+/* fmt 7: a ue8m0 byte's 2^(s-127) (mx4_scale_dev's bits) halved, undoing mx4_d2's doubling */
+__dpct_inline__ float mx4_moe_scale(uint8_t s);
+/* fmt 7's scale i of a matrix: CcMoe.gs 32 = the tier's form (vk_tier.c turns each ue8m0 into the float 2^(s-127),
+ * one a 32 inputs: halved here like the byte), else the backend's (ue8m0 bytes, coli_cuda_tensor_upload) */
+__dpct_inline__ float mx4_sc(const float *sc, size_t i, int gs) {
+    return gs == 32 ? sc[i] * 0.5f : mx4_moe_scale(reinterpret_cast<const uint8_t *>(sc)[i]);
+}
+__dpct_inline__ float mx4_moe_scale(uint8_t s) {
+    return sycl::bit_cast<float>((uint32_t)s << 23) * 0.5f;
+}
 /* row o's dot with xs (n inputs), this lane's share; FMT 2/4 scaled by group here, 1/2/8
  * by row or block where noted */
 template <int FMT, int SG>
@@ -5849,6 +6706,18 @@ moe_lane_dot(const uint8_t *__restrict__ row, const float *__restrict__ sc,
             }
             acc += part * sc[(size_t)(o >> 7) * nb + (b0 >> 7)];
         }
+    } else if (FMT == 7) {   /* ng = n / 32 scales a row (mx4_sc: bytes or the tier's floats); a lane's 16 columns sit in group i0 / 32 */
+        for (int i0 = lane * 16; i0 < n; i0 += SG * 16) {
+            sycl::uint2 v =
+                *reinterpret_cast<const sycl::uint2 *>(row + i0 / 2);
+            float part = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned bb = ((k < 4 ? v.x() : v.y()) >> (8 * (k & 3))) & 255u;
+                part += xs[i0 + 2 * k] * mx4_d2(bb) + xs[i0 + 2 * k + 1] * mx4_d2(bb >> 4);
+            }
+            acc += part * mx4_sc(sc, (size_t)o * ng + (i0 >> 5), gs);
+        }
     }
     return acc;
 }
@@ -5859,7 +6728,19 @@ __dpct_inline__ float moe_warp_sum(float v) {
 }
 template <int FMT>
 __dpct_inline__ size_t moe_row_bytes(int n) {
-    return FMT == 2 || FMT == 4 ? (size_t)n / 2 : (size_t)n;
+    return FMT == 2 || FMT == 4 || FMT == 7 ? (size_t)n / 2 : (size_t)n;
+}
+/* the experts' activation of gate g and up u (CcMoe.act): 0 silu(g) * u; 1 the clamped SwiGLU
+ * of deepseek_v41.c's swiglu_into, the same comparisons in the same order: u to [-lim, lim],
+ * g to at most lim (no lower bound), then silu(g) * u */
+__dpct_inline__ float moe_act(float g, float u, const CcMoe &p) {
+    if (p.act == 1) {
+        const float lim = p.act_lim;
+        if (u > lim) u = lim;
+        if (u < -lim) u = -lim;
+        if (g > lim) g = lim;
+    }
+    return (g / (1.f + sycl::native::exp(-g))) * u;
 }
 
 /* gate and up for pair a = blockIdx.y (row a / K, slot a % K): hid[a][o] = silu(g) * u */
@@ -5882,7 +6763,7 @@ static void moe_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__
     item_ct1.barrier();
     int lane = item_ct1.get_local_id(2) & (SG - 1),
         warp = item_ct1.get_local_id(2) / SG,
-        ng = FMT == 4 ? (p.D + p.gs - 1) / p.gs : 1;
+        ng = FMT == 4 ? (p.D + p.gs - 1) / p.gs : FMT == 7 ? p.D / 32 : 1;
     size_t rb = moe_row_bytes<FMT>(p.D);
     for (int r = 0; r < MOE_RPW; r++) {
         int o = item_ct1.get_group(2) * MOE_ROWS(256 / SG) + r * (256 / SG) + warp;
@@ -5891,7 +6772,7 @@ static void moe_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__
         float u = moe_warp_sum<SG>(moe_lane_dot<FMT, SG>((const uint8_t *)ex.u + o * rb, ex.us, p.gs, ng, o, p.D, xs, slut));
         if (lane == 0) {
             if (FMT == 1 || FMT == 2) { g *= ex.gs[o]; u *= ex.us[o]; }
-            hid[(size_t)a * p.I + o] = (g / (1.f + sycl::native::exp(-g))) * u;
+            hid[(size_t)a * p.I + o] = moe_act(g, u, p);
         }
     }
 }
@@ -5915,7 +6796,7 @@ static void moe_dn_k(const CcExpert *__restrict__ tab,
     item_ct1.barrier();
     int lane = item_ct1.get_local_id(2) & (SG - 1),
         warp = item_ct1.get_local_id(2) / SG,
-        ng = FMT == 4 ? (p.I + p.gs - 1) / p.gs : 1;
+        ng = FMT == 4 ? (p.I + p.gs - 1) / p.gs : FMT == 7 ? p.I / 32 : 1;
     size_t rb = moe_row_bytes<FMT>(p.I), dn = (size_t)p.S * p.K * p.I;
     for (int r = 0; r < MOE_RPW; r++) {
         int o = item_ct1.get_group(2) * MOE_ROWS(256 / SG) + r * (256 / SG) + warp;
@@ -6032,7 +6913,8 @@ static void moe_rows_sum_k(const float *__restrict__ w, const float *__restrict_
  * conflict), each output row lpr lanes of 16-byte weight steps, gate and up in the same loop,
  * the lanes joined by shuffles. moe_gu_k and moe_dn_k took a warp a row with 8-byte steps
  * and lanes 16 floats apart: GLM-5.2's eight int4-g64 experts (6144 x 2048) 537 us a step on
- * an RTX PRO 4000. Formats 1, 2 and 4 (the CUDA tier's signed nibbles, weight 2j low), rows
+ * an RTX PRO 4000. Formats 1, 2 and 4 (the CUDA tier's signed nibbles, weight 2j low) and 7
+ * (MXFP4: a 16-byte step is one 32-column group, its sum times the group's halved ue8m0 scale), rows
  * 16-byte aligned (cudaMalloc'd tensors), the staged row within 48 KiB; else moe_launch. */
 #define MOE_GV_SMEM (49152 - 4096)   /* the staged row's dynamic shared memory: the slots' table beside it */
 static inline int moe_gv_lanes(int fmt, int n, int sg) {   /* about eight 16-byte steps a lane, 1 to the sub-group */
@@ -6060,7 +6942,31 @@ __dpct_inline__ float mg_dot8w(unsigned w, const sycl::float4 a) {
     return a.x() * mg_s8(w, 0) + a.y() * mg_s8(w, 1) + a.z() * mg_s8(w, 2) +
            a.w() * mg_s8(w, 3);
 }
-/* one 16-byte step q of a row against the staged row: 16 int8 or 32 int4 weights */
+/* fmt 7: a word's eight e2m1 nibbles (column order, low first) as doubled values, against 8 inputs */
+__dpct_inline__ float mg_dot4m(unsigned w, const sycl::float4 a,
+                               const sycl::float4 b) {
+    return a.x() * mx4_d2(w) + a.y() * mx4_d2(w >> 4) + a.z() * mx4_d2(w >> 8) +
+           a.w() * mx4_d2(w >> 12) + b.x() * mx4_d2(w >> 16) + b.y() * mx4_d2(w >> 20) +
+           b.z() * mx4_d2(w >> 24) + b.w() * mx4_d2(w >> 28);
+}
+/* fmt 7 the cheap way (FMT 77 in the moe_gv kernels): an e2m1 nibble's bits placed into a half -- magnitude bits
+ * (e1 e0 m) at the half's bits 11..9, the sign at bit 15 -- is the nibble's value times 2^-14 for all 16 codes (e > 0:
+ * (1 + m/2) 2^(e-15) vs (1 + m/2) 2^(e-1); e = 0: m 2^-15 vs m 2^-1), so twice that times 2^-15: mx4_d2's value times
+ * 2^-15 exactly. Two nibbles (i, i+4) of a word a mask, a shift and an or, then the hardware's half2 -> float2. The
+ * kernels multiply the group's scale by 2^15 (exact), so every product and sum is mx4_d2's times a power of two: the
+ * same bits. ~4 operations a weight instead of ~7 (measured: the experts' kernels were bound by the decode). */
+__dpct_inline__ sycl::float2 mg_h2(unsigned w) {
+    const unsigned u = ((w & 0x00070007u) << 9) | ((w & 0x00080008u) << 12);
+    return sycl::bit_cast<sycl::half2>(u).convert<float, sycl::rounding_mode::automatic>();
+}
+__dpct_inline__ float mg_dot4h(unsigned w, const sycl::float4 a, const sycl::float4 b) {
+    const sycl::float2 p0 = mg_h2(w), p1 = mg_h2(w >> 4), p2 = mg_h2(w >> 8), p3 = mg_h2(w >> 12);
+    return a.x() * p0.x() + a.y() * p1.x() + a.z() * p2.x() + a.w() * p3.x() + b.x() * p0.y() + b.y() * p1.y() +
+           b.z() * p2.y() + b.w() * p3.y();
+}
+static int mx4_half_on(void) { const char *e = std::getenv("COLI_SYCL_MX4_HALF"); return !(e && *e == '0'); }   /* read a launch: the test runs both */
+/* one 16-byte step q of a row against the staged row: 16 int8 or 32 int4 weights, or 32 e2m1
+ * ones (fmt 7: doubled, unscaled; the caller multiplies by the group's mx4_moe_scale) */
 template <int FMT>
 __dpct_inline__ float mg_step(sycl::uint4 v, int q, const sycl::float4 *xs) {
     if (FMT == 1) {
@@ -6070,6 +6976,16 @@ __dpct_inline__ float mg_step(sycl::uint4 v, int q, const sycl::float4 *xs) {
                mg_dot8w(v.w(), xs[mgx(b + 3)]);
     }
     int b = q * 8;
+    if (FMT == 77)
+        return mg_dot4h(v.x(), xs[mgx(b)], xs[mgx(b + 1)]) +
+               mg_dot4h(v.y(), xs[mgx(b + 2)], xs[mgx(b + 3)]) +
+               mg_dot4h(v.z(), xs[mgx(b + 4)], xs[mgx(b + 5)]) +
+               mg_dot4h(v.w(), xs[mgx(b + 6)], xs[mgx(b + 7)]);
+    if (FMT == 7)
+        return mg_dot4m(v.x(), xs[mgx(b)], xs[mgx(b + 1)]) +
+               mg_dot4m(v.y(), xs[mgx(b + 2)], xs[mgx(b + 3)]) +
+               mg_dot4m(v.z(), xs[mgx(b + 4)], xs[mgx(b + 5)]) +
+               mg_dot4m(v.w(), xs[mgx(b + 6)], xs[mgx(b + 7)]);
     return mg_dot4w(v.x(), xs[mgx(b)], xs[mgx(b + 1)]) +
            mg_dot4w(v.y(), xs[mgx(b + 2)], xs[mgx(b + 3)]) +
            mg_dot4w(v.z(), xs[mgx(b + 4)], xs[mgx(b + 5)]) +
@@ -6124,14 +7040,18 @@ static void moe_gv_gu_k(const CcExpert *__restrict__ tab,
                 if (FMT == 4) {
                     int gi = o * ng + (q * 32) / p.gs;
                     g += mg_step<FMT>(vg, q, xs) * ke[k].gs[gi]; uu += mg_step<FMT>(vu, q, xs) * ke[k].us[gi];
+                } else if (FMT == 7 || FMT == 77) {   /* step q is group q: nq ue8m0 bytes a row; 77: the scale times 2^15 */
+                    size_t gi = (size_t)o * nq + q;
+                    const float f = FMT == 77 ? 32768.f : 1.f;
+                    g += mg_step<FMT>(vg, q, xs) * (mx4_sc(ke[k].gs, gi, p.gs) * f);
+                    uu += mg_step<FMT>(vu, q, xs) * (mx4_sc(ke[k].us, gi, p.gs) * f);
                 } else { g += mg_step<FMT>(vg, q, xs); uu += mg_step<FMT>(vu, q, xs); }
             }
         }
         g = mg_lanes_sum(g, lpr); uu = mg_lanes_sum(uu, lpr);
         if (ql == 0 && live) {
-            if (FMT != 4) { g *= ke[k].gs[o]; uu *= ke[k].us[o]; }
-            hid[((size_t)s * p.K + k) * p.I + o] =
-                (g / (1.f + sycl::native::exp(-g))) * uu;
+            if (FMT != 4 && FMT != 7 && FMT != 77) { g *= ke[k].gs[o]; uu *= ke[k].us[o]; }
+            hid[((size_t)s * p.K + k) * p.I + o] = moe_act(g, uu, p);
         }
     }
 }
@@ -6171,11 +7091,14 @@ static void moe_gv_dn_k(const CcExpert *__restrict__ tab,
             const sycl::uint4 *wd = (const sycl::uint4 *)ex.d + (size_t)oc * nq;
             for (int q = ql; q < nq; q += lpr) {
                 float d = mg_step<FMT>(wd[q], q, xs);
-                v += FMT == 4 ? d * ex.ds[oc * ng + (q * 32) / p.gs] : d;
+                v += FMT == 4 ? d * ex.ds[oc * ng + (q * 32) / p.gs]
+                   : FMT == 7 ? d * mx4_sc(ex.ds, (size_t)oc * nq + q, p.gs)
+                   : FMT == 77 ? d * (mx4_sc(ex.ds, (size_t)oc * nq + q, p.gs) * 32768.f)
+                   : d;
             }
         }
         v = mg_lanes_sum(v, lpr);
-        if (ql == 0 && live) hid[dn + (size_t)j * p.D + o] = FMT != 4 ? v * ex.ds[oc] : v;
+        if (ql == 0 && live) hid[dn + (size_t)j * p.D + o] = FMT != 4 && FMT != 7 && FMT != 77 ? v * ex.ds[oc] : v;
     }
 }
 static int moe_gv_sg(const DeviceContext *ctx) {
@@ -6354,8 +7277,7 @@ moe_bd_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__ x,
             for (int q = ql; q < nq; q += lpr) { bdi_step<TG, 1>(wg, (bd_u32)q, X, 1, tb, &g); bdi_step<TG, 1>(wu, (bd_u32)q, X, 1, tb, &uu); }
         }
         g = mg_lanes_sum(g, lpr); uu = mg_lanes_sum(uu, lpr);
-        if (ql == 0 && live) hid[((size_t)s * p.K + k) * p.I + o] =
-            (g / (1.f + sycl::native::exp(-g))) * uu;
+        if (ql == 0 && live) hid[((size_t)s * p.K + k) * p.I + o] = moe_act(g, uu, p);
     }
 }
 
@@ -6488,7 +7410,7 @@ static int moe_bd_launch(DeviceContext *ctx, const CcExpert *tab,
 static int moe_gv_ok(const CcMoe *p) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_MOE_GV"); on = !(e && *e == '0'); }
-    return on && (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs % 32 == 0)) && p->K <= CC_ROUTE_KMAX &&
+    return on && (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs % 32 == 0) || p->fmt == 7) && p->K <= CC_ROUTE_KMAX &&
            moe_gv_smem(p->D) <= MOE_GV_SMEM && moe_gv_smem(p->I) <= MOE_GV_SMEM;
 }
 
@@ -6547,7 +7469,9 @@ extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, i
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream) {
     if (fault_injected()) return 0;
-    if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32 || p->act) return 0;
+    if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32) return 0;
+    /* act 0 silu(gate) * up; act 1 the clamped SwiGLU (moe_act), its limit act_lim > 0 (NaN refused) */
+    if (p->act != 0 && !(p->act == 1 && p->act_lim > 0.f)) return 0;
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;   /* the rows hid's layout is for: a part 1's, its rows' sums' (CcMoe.lay_S) */
     if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
     if (p->fmt >= 100) {   /* a GGUF's experts: every row on the GEMV kernels (a prompt chunk's went through the
@@ -6575,7 +7499,8 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         return 1;
     }
     if (p->fmt == 4 && (p->gs < 16 || p->gs % 16)) return 0;
-    if (p->fmt != 1 && p->fmt != 2 && p->fmt != 4 && p->fmt != 8) return 0;
+    /* fmt 7 (MXFP4, the scales ue8m0 bytes behind CcExpert's float pointers): the GEMV kernels alone */
+    if (p->fmt != 1 && p->fmt != 2 && p->fmt != 4 && p->fmt != 7 && p->fmt != 8) return 0;
     if (p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;   /* an input row in 48 KiB of shared memory, the fp8 table beside it */
     DeviceContext *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
@@ -6583,9 +7508,11 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
     /* a prompt chunk's rows through the matrix engines (sorted by expert: coli_sycl_xmx_moe, the f16
      * joint_matrix tiles where hcg's and tcg's tensor-core tiles were), where the profile has the
      * shape and the family takes the format and the widths (whole steps of 64); else, and for a
-     * decode step, the warp kernels per (row, slot) */
+     * decode step, the warp kernels per (row, slot). The engines' epilogue is act 0's alone: an act 1
+     * call's rows take the warp kernels (a parts 2 call must pass the act its parts 1 had, as every
+     * other field, for the layout to agree) */
     const coli_sycl_profile &prof = coli_sycl_profile_for(device);
-    int rows = LS > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && p->D % XMX_BK == 0 && p->I % XMX_BK == 0 &&
+    int rows = LS > CC_MOE_FRAME_ROWS && p->act == 0 && p->E > 0 && p->E <= 4096 && p->D % XMX_BK == 0 && p->I % XMX_BK == 0 &&
                (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs >= 16 && p->gs % 16 == 0)) &&
                (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0 && xmx_engines(prof) && coli_sycl_xmx_moe_ok(prof, *p);
     if (LS > CC_MOE_FRAME_ROWS && (p->parts & 1)) xmx_note("routed experts (prompt rows)", rows);
@@ -6595,9 +7522,11 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         if (!x) return 0;
         int ok = rows ? moe_xmx_launch(prof, tab, x, ids, hid, m, p, st)
                : moe_gv_ok(p) ? (p->fmt == 1 ? moe_gv_launch<1>(tab, x, ids, hid, p, st) : p->fmt == 2 ? moe_gv_launch<2>(tab, x, ids, hid, p, st)
-                                                : moe_gv_launch<4>(tab, x, ids, hid, p, st))
+                                : p->fmt == 7 ? (mx4_half_on() ? moe_gv_launch<77>(tab, x, ids, hid, p, st) : moe_gv_launch<7>(tab, x, ids, hid, p, st))
+                                : moe_gv_launch<4>(tab, x, ids, hid, p, st))
                : p->fmt == 1 ? moe_launch<1>(tab, x, ids, hid, p, st) : p->fmt == 2 ? moe_launch<2>(tab, x, ids, hid, p, st)
-               : p->fmt == 4 ? moe_launch<4>(tab, x, ids, hid, p, st) : moe_launch<8>(tab, x, ids, hid, p, st);
+               : p->fmt == 4 ? moe_launch<4>(tab, x, ids, hid, p, st) : p->fmt == 7 ? moe_launch<7>(tab, x, ids, hid, p, st)
+               : moe_launch<8>(tab, x, ids, hid, p, st);
         if (!ok) return 0;
     }
     if (p->parts & 2) {

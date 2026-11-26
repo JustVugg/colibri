@@ -18,7 +18,15 @@
  * the coldest resident's place on either device, and a step sends each device its
  * own batch, both in flight at once. Streaming (big prefill steps' cold experts)
  * stays on the primary device. A second device that fails gives its experts back
- * to the CPU and the tier goes on with the primary one. */
+ * to the CPU and the tier goes on with the primary one.
+ *
+ * A home by layer (VktConfig.home_split = n > 0, with the second device): an engine whose dense
+ * chain runs the main layers from n on on the second device and the ones before on the primary
+ * (deepseek_v41_cuchain.h, V41_CHAIN_SPLIT) reads a layer's experts where that layer's frames
+ * run, so an expert has one fixed place: its layer's device. The warm start fills each device
+ * with its own layers' experts, a newcomer goes to its layer's device or takes the coldest
+ * resident's place there (the candidates are kept a device), and the tables an engine reads
+ * (vkt_dev_table, vkt_dev_count) are that device's. */
 #ifdef COLI_VULKAN
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,6 +128,8 @@ static struct {
     size_t stage_room;                 /* left out of the budget for a prompt chunk's staging (VktConfig.stage) */
     /* the second device (COLI_VK_DEV2) */
     int d2;                            /* the tier holds experts there */
+    int home;                          /* VktConfig.home_split with a second device: the main layers from it on live
+                                        * there, the ones before on the primary (0: any place, the rule above) */
     char d2_name[64];
     size_t d2_budget, d2_exp_bytes;
     int d2_rows;                       /* the most rows of a big step its one batch takes */
@@ -127,6 +137,7 @@ static struct {
     int nd2; int *d2_idx; int cd2;     /* a big step's rows on it: their assignments */
     const float **d2_y; ColiVkExpert **d2_bex; int *d2_brows; const float **d2_bx; float *d2_bw; int d2_cap, d2_cexp;
     unsigned long long d2_served, d2_steps, d2_big, d2_uploads, d2_lost;
+    unsigned long long d2_chain;       /* a home by layer: routed pairs the dense chain found on it (vkt_dev_count) */
     /* exclusive RAM/VRAM (vkt_ram_first): on, and the RAM slots given up for it. routed[l*E+e]
      * is the issue (seq) that last routed the expert, layer_seq[l] the layer's last issue: an
      * expert routed in its layer's current step may be one the CPU is computing from its RAM
@@ -233,11 +244,16 @@ static int kind_of(int layer) { return layer >= T.main_layers; }   /* main (0) o
 /* where a slot's tensors are or go: its device, or 2 for the primary device's host pool */
 static int place_of(const VSlot *v) { return v->host ? 2 : v->dev; }
 static void set_place(VSlot *v, int pl) { v->dev = (uint8_t)(pl == 2 ? 0 : pl); v->host = (uint8_t)(pl == 2); }
+/* the device a layer's experts live on (and the chain reads them on): 1 for a main layer from T.home on, else 0 */
+static int home_dev(int layer) { return T.home > 0 && !kind_of(layer) && layer >= T.home; }
 static int form_of(int layer) { return T.per_layer && layer < T.main_layers ? T.lform[layer] : kind_of(layer); }
 /* the class of the residents a newcomer of `layer` displaces: 0 the main layers of the most
  * common form, 1 the extra layers, 2 on those of the main layers' other rooms, room class
  * c at c + 1 (each class's rooms alike) */
-static int vcls_of(int layer) { return kind_of(layer) ? 1 : T.per_layer && T.lcls[layer] ? T.lcls[layer] + 1 : 0; }
+static int vcls_of(int layer) {
+    if (T.home > 0) return kind_of(layer) ? 1 : home_dev(layer) ? 2 : 0;   /* a home by layer: the victims a device (no forms by layer with it) */
+    return kind_of(layer) ? 1 : T.per_layer && T.lcls[layer] ? T.lcls[layer] + 1 : 0;
+}
 /* a main tensor's room (forms_per_layer): its class's, 0 with one form (its own size) */
 static size_t pad_w_of(int layer, int down) { return T.per_layer && !kind_of(layer) ? T.pad_w[T.lcls[layer]][down] : 0; }
 static size_t pad_s_of(int layer, int down) { return T.per_layer && !kind_of(layer) ? T.pad_s[T.lcls[layer]][down] : 0; }
@@ -710,6 +726,10 @@ static void d2_stop(const char *why) {
  * layer's to its pool on the primary device; -1 when they are full. */
 static int room_dev(int layer) {
     if (kind_of(layer)) return T.xres + T.xque < T.xmax ? 0 : -1;
+    if (T.home > 0) {   /* its layer's device, or nowhere */
+        const int d = home_dev(layer);
+        return (d == 0 || T.d2) && T.dres[d] + T.dque[d] < T.dmax[d] ? d : -1;
+    }
     if (T.dres[0] + T.dque[0] < T.dmax[0]) return 0;
     if (T.d2 && T.dres[1] + T.dque[1] < T.dmax[1]) return 1;
     if (T.dres[2] + T.dque[2] < T.dmax[2]) return 2;
@@ -900,6 +920,13 @@ static int plan_cmp(const void *a, const void *b) {
     return hx < hy ? 1 : hx > hy ? -1 : (x > y) - (x < y);
 }
 static uint32_t *const *g_heat_hist;
+/* the warm start's place for a main layer's expert (layer -1: is there any place left at all?) */
+static int plan_room(int layer) {
+    if (T.home <= 0) return room_dev(0);
+    if (layer >= 0) return room_dev(layer);
+    const int a = room_dev(0), b = room_dev(T.home);
+    return a >= 0 ? a : b;
+}
 /* The experts the warm start puts on the device: the history's, hottest first, then
  * (COLI_VK_TIER_FILL, on by default) whatever room is left with the experts no history
  * named, one of each layer in turn. A first run with no history used to start with an
@@ -930,10 +957,11 @@ int vkt_plan(int *layers, int *eids, int max) {
             if (g_heat_hist[l]) for (int e = 0; e < E; e++) if (g_heat_hist[l][e]) order[n++] = l * E + e;
         g_plan_heat = (const uint32_t *const *)g_heat_hist; g_plan_E = E;
         qsort(order, (size_t)n, sizeof(int), plan_cmp);
-        for (int i = 0; i < n && k < max && room_dev(0) >= 0; i++) {
+        for (int i = 0; i < n && k < max && plan_room(-1) >= 0; i++) {
             VSlot *v = &T.s[order[i]];
             if (v->state != VS_NONE) continue;
-            int dev = room_dev(0);   /* the hottest fill the primary device, the next ones the second, then the host pool */
+            int dev = plan_room(order[i] / E);   /* the hottest fill the primary device, the next ones the second, then the host pool; a home by layer: its layer's device */
+            if (dev < 0) continue;
             v->state = VS_QUEUED; set_place(v, dev); T.queued++; T.dque[dev]++;
             layers[k] = order[i] / E; eids[k] = order[i] % E; k++;
         }
@@ -944,12 +972,13 @@ int vkt_plan(int *layers, int *eids, int max) {
      * experts (route_trace.h's rt_drop_row), and with no table at all nothing is known */
     const char *fill = getenv("COLI_VK_TIER_FILL");
     if ((fill && *fill == '0') || !g_heat_hist) return k;
-    for (int e = 0; e < E && k < max && room_dev(0) >= 0; e++)
-        for (int l = 0; l < L && k < max && room_dev(0) >= 0; l++) {
+    for (int e = 0; e < E && k < max && plan_room(-1) >= 0; e++)
+        for (int l = 0; l < L && k < max && plan_room(-1) >= 0; l++) {
             if (!g_heat_hist[l]) continue;
             VSlot *v = &T.s[(size_t)l * E + e];
             if (v->state != VS_NONE) continue;
-            int dev = room_dev(0);
+            int dev = plan_room(l);
+            if (dev < 0) continue;
             v->state = VS_QUEUED; set_place(v, dev); T.queued++; T.dque[dev]++;
             layers[k] = l; eids[k] = e; k++;
         }
@@ -2929,6 +2958,8 @@ static void d2_init(long long fit0, long long all, int act) {
     T.d2_exp_bytes = tier_expert_bytes_at(di.buf_align ? di.buf_align : 256);
     double heap_free = di.has_budget ? (double)di.free_bytes : (double)di.local_bytes * 0.8;
     double room = heap_free - env_gb("COLI_VK_RESERVE2_GB", 0.5) * GiB, want = room;
+    /* a home by layer: the engine's dense chain puts its layers' matrices and its own buffers there too */
+    if (T.home > 0) { room -= (double)T.c.dense_bytes2 + (double)T.c.chain_bytes; want = room; }
     if (di.shares_ram) {
         double avail = (double)mem_available();
         double ram_room = avail > 0 ? avail - (double)T.c.ram_reserve - (double)T.c.dense_bytes - (double)T.c.ram_later - 2.0 * GiB : room;
@@ -2943,6 +2974,7 @@ static void d2_init(long long fit0, long long all, int act) {
         fit = (long long)full * (long long)(blk / T.d2_exp_bytes) + (long long)(rest / T.d2_exp_bytes);
     }
     long long fit_raw = fit, left = all - fit0;
+    if (T.home > 0) left = (long long)(T.main_layers - T.home) * T.c.experts;   /* its own layers' experts, no others */
     const char *cap = getenv("COLI_VK_EXPERTS2");
     if (cap && *cap && atoll(cap) >= 0 && fit > atoll(cap)) fit = atoll(cap);
     if (fit > left) fit = left;
@@ -2961,6 +2993,15 @@ static void d2_init(long long fit0, long long all, int act) {
     /* a big step's rows on it: their x rows within 128 MiB */
     long hr = (128L << 20) / ((long)T.c.hidden * 4);
     T.d2_rows = hr < 64 ? 64 : hr > 65535 ? 65535 : (int)hr;
+    if (T.home > 0) {   /* the primary holds its own layers' experts only */
+        const long long own = (long long)T.home * T.c.experts;
+        if (T.dmax[0] > own) { T.max_resident -= T.dmax[0] - (int)own; T.dmax[0] = (int)own; }
+        fprintf(stderr, VKT_TAG " tier %s: second device %s, budget %s = %d experts of %s (%s): the experts of layers %d.. live there, "
+                        "those of layers 0..%d on the primary device (%d), an expert on its layer's device only\n",
+                eng, T.d2_name, human((double)T.d2_budget, hb, sizeof hb), T.dmax[1], human((double)T.d2_exp_bytes, he, sizeof he),
+                di.shares_ram ? "shared RAM" : "device memory", T.home, T.home - 1, T.dmax[0]);
+        return;
+    }
     fprintf(stderr, VKT_TAG " tier %s: second device %s, budget %s = %d experts of %s (%s), the experts after the primary device's\n",
             eng, T.d2_name, human((double)T.d2_budget, hb, sizeof hb), T.dmax[1], human((double)T.d2_exp_bytes, he, sizeof he),
             di.shares_ram ? "shared RAM" : "device memory");
@@ -3476,7 +3517,10 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                 T.form[1].gu_fmt, T.xmax, human((double)T.x_bytes, hx, sizeof hx), human((double)T.x_budget, hp, sizeof hp));
     }
     fprintf(stderr, "\n");
+    /* VktConfig.home_split: a home by layer, with a second device and one form of experts only */
+    T.home = T.c.home_split > 0 && T.c.home_split < T.main_layers && !T.per_layer ? T.c.home_split : 0;
     d2_init(fit, all, act);   /* COLI_VK_DEV2: the experts after these on a second device */
+    if (!T.d2) T.home = 0;
     host_init(all);           /* and the rest in system RAM the device reads */
     /* hybrid steps: a decode step's or a verify's host pool experts of block types on the CPU,
      * in place, while the device computes the ones it holds (COLI_VK_HYBRID=0: the device
@@ -3562,6 +3606,8 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                 "uploads %llu, %.1f ms%s", T.d2_name, T.dres[1], T.dmax[1], human((double)p2.used, h2, sizeof h2),
                 human((double)T.d2_budget, b2, sizeof b2), T.d2_served, T.d2_steps, T.d2_big, T.d2_uploads, T.d2_ms,
                 T.d2 ? "" : " (stopped)");
+        if (T.d2 && T.home > 0)
+            fprintf(stderr, "; a home by layer (layers %d.. there): %llu of the dense chain's routed experts found on it", T.home, T.d2_chain);
     }
     ColiVkXbStats xs; coli_vk_xb_stats(&xs);
     if (xs.cooperative_matmuls)
@@ -3570,13 +3616,16 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
 }
 
 int vkt_devices(void) { return !T.on ? 0 : T.d2 ? 2 : 1; }
+/* the home by layer in force: the first main layer of the second device, 0 none (not asked, or no second device) */
+int vkt_home(void) { return T.on && T.d2 ? T.home : 0; }
 
 unsigned vkt_epoch(void) { return T.epoch; }
-/* one expert's entry (zero where it is not on the primary device): 1 resident there, 0 not, -1 an error */
+/* one expert's entry (zero where it is not on the primary device; a home by layer: on its layer's device): 1 resident
+ * there, 0 not, -1 an error */
 static int dev_entry(int layer, int e, uint32_t *o) {
     VSlot *v = slot(layer, e);
     memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
-    if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex) return 0;
+    if (v->state != VS_RESIDENT || v->dev != home_dev(layer) || !v->ex) return 0;
     return coli_vk_xb_expert_entry(v->ex, o) ? 1 : -1;
 }
 int vkt_dev_table(int layer, uint32_t *ent) {
@@ -3670,8 +3719,9 @@ void vkt_dev_count(int layer, int S, int K, const int *idx) {
         VSlot *v = slot(layer, e);
         if (v->heat < 0xFFFFFFFFu) v->heat++;
         v->last = T.tick;
-        if (v->state != VS_RESIDENT || v->dev != 0) continue;
+        if (v->state != VS_RESIDENT || v->dev != home_dev(layer)) continue;
         T.served++; T.chain_served++;
+        if (v->dev) T.d2_chain++;
         if (layer >= T.main_layers) T.extra_served++;
         if (!v->host) T.vram_routed++;
         if (S > VKT_UP_ROWS) continue;

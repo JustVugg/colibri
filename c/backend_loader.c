@@ -113,6 +113,13 @@ typedef void           (*fn_host_free)(int device, void *p);
 typedef int            (*fn_slot_fill_s4)(int device, void *dev_w, const void *w, size_t nw, float *dev_s, const float *s, size_t ns);
 typedef int            (*fn_tensor_at_g)(ColiCudaTensor **tensor, void *dev_w, float *dev_s, int I, int O, int device, int gs);
 typedef int            (*fn_tensor_at_f8)(ColiCudaTensor **tensor, void *dev_w, float *dev_s, int I, int O, int device);
+typedef void          *(*fn_e4m3t_upload)(int device, const unsigned char *q, const unsigned char *s, int O, int I);
+typedef int            (*fn_e4m3t_mv)(void *h, float *y, int ystride, const float *x, int xstride, int S);
+typedef void           (*fn_e4m3t_free)(void *h);
+typedef void          *(*fn_bf16t_upload)(int device, const unsigned short *w, int O, int I);
+typedef int            (*fn_bf16t_mv)(void *h, float *y, int ystride, const float *x, int xstride, int S);
+typedef void           (*fn_bf16t_free)(void *h);
+typedef int            (*fn_tensor_upload_e4t)(ColiCudaTensor **tensor, const unsigned char *q, const unsigned char *s, int O, int I, int device);
 typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
 typedef const CuTierOps *(*fn_tier_ops)(void);
 typedef int            (*fn_e8_set_grid)(const void *grid);
@@ -211,6 +218,9 @@ static struct {
     fn_tensor_upload_at tensor_upload_at;   /* optional: a block-format tensor in an arena's slot */
     fn_slot_fill_s4 slot_fill_s4; fn_tensor_at_g tensor_at_g;   /* optional: a native int4 expert in an arena's slot */
     fn_tensor_at_f8 tensor_at_f8;   /* optional: an fp8 expert's matrix over an arena's slot */
+    fn_e4m3t_upload e4m3t_upload; fn_e4m3t_mv e4m3t_mv; fn_e4m3t_free e4m3t_free;   /* optional: DeepSeek V4.1's FP8 matrices on the device */
+    fn_bf16t_upload bf16t_upload; fn_bf16t_mv bf16t_mv; fn_bf16t_free bf16t_free;   /* optional: BF16 matrices (the lm-head) on the device */
+    fn_tensor_upload_e4t tensor_upload_e4t;   /* optional: an fmt 9 tensor for the dense chain */
     fn_host_alloc host_alloc; fn_host_free host_free;           /* optional: page-locked staging for the tier's uploads */
     fn_chain_ops chain_ops;                 /* optional: the dense chain (cuda_chain.h); NULL = none */
     fn_tier_ops tier_ops;                   /* optional: the routed-expert tier (cu_tier_ops.h); NULL = none */
@@ -1484,6 +1494,13 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(host_free, fn_host_free)
     RESOLVE_OPT(tensor_at_g, fn_tensor_at_g)
     RESOLVE_OPT(tensor_at_f8, fn_tensor_at_f8)
+    RESOLVE_OPT(e4m3t_upload, fn_e4m3t_upload)
+    RESOLVE_OPT(e4m3t_mv, fn_e4m3t_mv)
+    RESOLVE_OPT(e4m3t_free, fn_e4m3t_free)
+    RESOLVE_OPT(bf16t_upload, fn_bf16t_upload)
+    RESOLVE_OPT(bf16t_mv, fn_bf16t_mv)
+    RESOLVE_OPT(bf16t_free, fn_bf16t_free)
+    RESOLVE_OPT(tensor_upload_e4t, fn_tensor_upload_e4t)
     RESOLVE_OPT(chain_ops, fn_chain_ops)
     RESOLVE_OPT(tier_ops, fn_tier_ops)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
@@ -1702,6 +1719,35 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
 int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs){
     if(!g_cuda.available || !g_cuda.tensor_upload_g){ return 0; }
     return g_cuda.tensor_upload_g(tensor, weights, scales, fmt, I, O, device, gs);
+}
+
+/* DeepSeek V4.1's FP8 / BF16 matrices on the device and the dense chain's fmt 9 tensor: optional, a DLL
+ * predating them answers NULL/0 and the engine keeps those matrices on the CPU. */
+void *coli_cuda_e4m3t_upload(int device, const unsigned char *q, const unsigned char *s, int O, int I){
+    if(!g_cuda.available || !g_cuda.e4m3t_upload) return NULL;
+    return g_cuda.e4m3t_upload(device, q, s, O, I);
+}
+int coli_cuda_e4m3t_mv(void *h, float *y, int ystride, const float *x, int xstride, int S){
+    if(!g_cuda.available || !g_cuda.e4m3t_mv) return 0;
+    return g_cuda.e4m3t_mv(h, y, ystride, x, xstride, S);
+}
+void coli_cuda_e4m3t_free(void *h){
+    if(g_cuda.available && g_cuda.e4m3t_free) g_cuda.e4m3t_free(h);
+}
+void *coli_cuda_bf16t_upload(int device, const unsigned short *w, int O, int I){
+    if(!g_cuda.available || !g_cuda.bf16t_upload) return NULL;
+    return g_cuda.bf16t_upload(device, w, O, I);
+}
+int coli_cuda_bf16t_mv(void *h, float *y, int ystride, const float *x, int xstride, int S){
+    if(!g_cuda.available || !g_cuda.bf16t_mv) return 0;
+    return g_cuda.bf16t_mv(h, y, ystride, x, xstride, S);
+}
+void coli_cuda_bf16t_free(void *h){
+    if(g_cuda.available && g_cuda.bf16t_free) g_cuda.bf16t_free(h);
+}
+int coli_cuda_tensor_upload_e4t(ColiCudaTensor **tensor, const unsigned char *q, const unsigned char *s, int O, int I, int device){
+    if(!g_cuda.available || !g_cuda.tensor_upload_e4t) return 0;
+    return g_cuda.tensor_upload_e4t(tensor, q, s, O, I, device);
 }
 
 /* Gated delta layer on the device: every entry point is optional, a DLL

@@ -1737,7 +1737,8 @@ FAMILIES = (
         # tools yes (DSML, see v41_dsml.py), grammars no: the engine reads the six-field
         # SUBMIT header and has no constrained decoder, so a grammar has to be refused
         # at the gateway rather than desync the wire.
-        capabilities=FamilyCapabilities(True, False, False, True, image=True),
+        # logprobs_echo: the engine's prompt read-out (v41_echo, a normal prefill keeping every row's logits)
+        capabilities=FamilyCapabilities(True, False, False, True, image=True, logprobs_echo=True),
         has_gateway_adapter=True,
         # coli run stays unwired, for the reason qwen36 gives above and one more:
         # cmd_run dispatches per arch after this gate, and with no deepseek_v41

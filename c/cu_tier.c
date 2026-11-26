@@ -108,6 +108,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_dev_table cut_dev_table
 #define vkt_dev_table_hybrid cut_dev_table_hybrid
 #define vkt_devices cut_devices
+#define vkt_home cut_home
 #define vkt_epoch cut_epoch
 #define vkt_expert_bytes cut_expert_bytes
 #define vkt_give_back cut_give_back

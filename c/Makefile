@@ -1729,6 +1729,15 @@ sycl/tests/%$(EXE): sycl/tests/%.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl
 	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@
 cuda_chain_test$(EXE): sycl/tests/test_cuda_chain.dp.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
 	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@
+# DeepSeek V4.1's layer ops on the SYCL chain (sycl/cuda_dsv4c.dp.hpp, cuda_dsv4c.cuh's port) against
+# the CPU's references: tests/test_cuda_dsv4c.cu's SYCL build, with cuda-dsv4c-check's reference object
+tests/cuda_dsv4c_ref.o: tests/cuda_dsv4c_ref.c hyper_connections.h sparse_attn.h
+	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -c $< -o $@
+cuda_dsv4c_test$(EXE): sycl/tests/test_cuda_dsv4c.dp.cpp tests/cuda_dsv4c_ref.o $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
+	"$(ICPX)" $(ICPXFLAGS) $< tests/cuda_dsv4c_ref.o $(SYCL_FAT_OBJ) -o $@
+.PHONY: sycl-dsv4c-check
+sycl-dsv4c-check: cuda_dsv4c_test$(EXE)
+	./cuda_dsv4c_test$(EXE)
 backend_cuda_test$(EXE): sycl/tests/test_backend_cuda.dp.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
 	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@
 sycl-test: sycl-profile-test sycl-host-sync-test sycl-matmul-plan-test cuda_chain_test$(EXE) backend_cuda_test$(EXE) $(SYCL_GPU_TEST_BIN)

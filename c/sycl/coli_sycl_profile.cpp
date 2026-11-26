@@ -141,6 +141,19 @@ static const std::vector<sycl::device> &gpu_list(void) {
      * initialises: this is the process's first runtime call, so it is set here, never over a
      * value the environment chose (Dockerfile.sycl sets it for the image as well) */
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
+    /* COLI_SYCL_TEST_CPU=n (tests on a machine without a card): the list is the runtime's CPU device n times, each
+     * entry a logical device with its own context and queues (two entries: a second card's paths), no GPU read */
+    if (const char *tc = getenv("COLI_SYCL_TEST_CPU")) {
+        const int n = atoi(tc);
+        try {
+            std::vector<sycl::device> cpus = sycl::device::get_devices(sycl::info::device_type::cpu);
+            for (int i = 0; i < n && i < 8 && !cpus.empty(); i++) list.push_back(cpus[0]);
+        } catch (const sycl::exception &e) {
+            std::fprintf(stderr, "[SYCL] device discovery (COLI_SYCL_TEST_CPU): %s\n", e.what());
+            list.clear();
+        }
+        if (n > 0) return list;
+    }
     try {
         std::vector<sycl::device> all = sycl::device::get_devices(sycl::info::device_type::gpu);
         bool have_l0 = false;
@@ -192,6 +205,12 @@ extern "C" void coli_sycl_print_profiles(void) {
                query<sycl::info::platform::name>(d.get_platform(), std::string("?")).c_str(),
                query<sycl::info::device::driver_version>(d, std::string("?")).c_str());
     }
+}
+
+int coli_sycl_test_devices(void) {
+    static int n = -1;
+    if (n < 0) { const char *tc = getenv("COLI_SYCL_TEST_CPU"); n = tc && atoi(tc) > 0 ? atoi(tc) : 0; }
+    return n;
 }
 
 int coli_sycl_available_device_count(void) {
@@ -577,8 +596,29 @@ void coli_sycl_fprof_frame(double host_ms, double submit_ms, double wait_ms) {
         k.n++;
         if (t[i].ok) k.ns += t[i].e - t[i].s; else k.untimed++;
     }
-    if (g_fp->level >= 2 && !g_fp->dumped && b.frames == 8) {   /* one frame command by command: the eighth of its bucket */
-        g_fp->dumped = 1;
+    static long dump_n = -1;   /* COLI_SYCL_FRAME_PROF_DUMP=<n>: the n-th frame of its bucket (default 8) */
+    if (dump_n < 0) { const char *e = getenv("COLI_SYCL_FRAME_PROF_DUMP"); dump_n = e && atol(e) > 0 ? atol(e) : 8; }
+    /* COLI_SYCL_FRAME_PROF_DUMP_CMDS=<c>[,<c>..]: only a frame of c commands; a list (up to 4): the n-th frame of each
+     * of those counts (a one-row and a batched decode layer's frames in one run). Not set: the first count to get there. */
+    static long dump_cs[4]; static int dump_nc = -1;
+    if (dump_nc < 0) {
+        dump_nc = 0;
+        const char *e = getenv("COLI_SYCL_FRAME_PROF_DUMP_CMDS");
+        while (e && *e && dump_nc < 4) {
+            char *end; const long v = strtol(e, &end, 10);
+            if (end == e) break;
+            if (v > 0) dump_cs[dump_nc++] = v;
+            e = *end == ',' ? end + 1 : end;
+            if (*end != ',') break;
+        }
+    }
+    int want = -1;
+    if (g_fp->level >= 2 && b.frames == (unsigned long long)dump_n) {
+        if (!dump_nc) { if (!g_fp->dumped) want = 0; }
+        else for (int k = 0; k < dump_nc; k++) if (evs.size() == (size_t)dump_cs[k] && !(g_fp->dumped & (1 << k))) want = k;
+    }
+    if (want >= 0) {   /* one frame command by command */
+        g_fp->dumped |= 1 << want;
         std::fprintf(stderr, "[SYCL] frame profile: frame %llu (%zu commands) command by command: index, kind, start (us from the "
                              "frame's first), duration (us), idle before it (us)\n", g_fp->frames, evs.size());
         unsigned long long pe = 0;

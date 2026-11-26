@@ -33,6 +33,7 @@ size_t cut_expert_bytes(int hidden, int inter, VktFmt gate_up, VktFmt down);
 int  cut_step_rows(int S, int block);
 int  cut_stream_prefetch(int layer, int S);
 int  cut_devices(void);
+int  cut_home(void);
 int  cut_layers(void);
 int  cut_ram_first(int layer, int eid);
 void cut_ram_gave(void);
@@ -81,6 +82,7 @@ static inline size_t cut_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(vo
 static inline int  cut_step_rows(int S,int b){return S<b?S:b;}
 static inline int  cut_stream_prefetch(int l,int S){(void)l;(void)S;return 0;}
 static inline int  cut_devices(void){return 0;}
+static inline int  cut_home(void){return 0;}
 static inline int  cut_layers(void){return 0;}
 static inline int  cut_ram_first(int l,int e){(void)l;(void)e;return 0;}
 static inline void cut_ram_gave(void){}

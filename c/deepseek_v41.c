@@ -88,6 +88,7 @@
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "spec_draft.h" /* the verify depth from DSpark's confidence (SpecGate) */
+#include "platform_defaults.h"   /* the measured configuration for unset switches (main: V41_AMX on an AMX CPU) */
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -834,18 +835,190 @@ static int mv_block_rows(int I) {
     return block < 1 ? 1 : block;
 }
 
+static void mv8_rows_cpu(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows);
+#if defined(COLI_CUDA) && defined(COLI_SYCL)
+/* V41_TRUNK_GPU=1 (SYCL, off by default): the native FP8 trunk's matrices (W8: e4m3 with 32x32 ue8m0 tiles) on the
+ * tier's first device, each uploaded on first use and computed there by coli_cuda_e4m3t_mv with mv8_rows_cpu's
+ * bits (c/sycl/backend_cuda.dp.cpp says how). Decode-sized calls only (rows <= V41_TRUNK_GPU_ROWS, default 32),
+ * from the thread that opened the device, outside OpenMP regions; anything else, or a matrix the device refuses
+ * (V41_TRUNK_GPU_GB, default no cap, or out of memory), stays the CPU's. V41_E4_CHECK=n: the first n calls are
+ * computed on the CPU too and compared byte for byte (a count on stderr at exit; any difference printed). */
+typedef struct { const void *q; int O, I, no, bf; void *h; } V41E4;   /* bf: a BF16 matrix (coli_cuda_bf16t) */
+static V41E4 *g_e4_map; static size_t g_e4_cap;
+static int g_e4_on, g_e4_rows = 32, g_e4_dev, g_b16_on, g_e4_fp8, g_e4_head_only;   /* g_e4_fp8: the FP8 trunk too (V41_TRUNK_GPU) */
+static pthread_t g_e4_thread;
+static size_t g_e4_used, g_e4_budget = (size_t)-1;
+static unsigned long long g_e4_calls, g_e4_mats, g_e4_chk_left, g_e4_chk_calls, g_e4_chk_bad;
+static unsigned long long g_b16_calls, g_b16_mats; static size_t g_b16_used;
+static void mvb_cpu(float *y, const WB *w, const float *x);
+static void v41_e4_report(void) {
+    if (!g_e4_on) return;
+    fprintf(stderr, "[v41] trunk on the device (V41_TRUNK_GPU): %llu matrices, %.2f GiB, %llu calls", g_e4_mats,
+            g_e4_used / 1073741824.0, g_e4_calls);
+    if (g_b16_on) fprintf(stderr, "; BF16 (V41_BF16_GPU): %llu matrices, %.2f GiB, %llu calls", g_b16_mats, g_b16_used / 1073741824.0, g_b16_calls);
+    if (g_e4_chk_calls) fprintf(stderr, "; checked %llu calls against the CPU: %llu values differ", g_e4_chk_calls, g_e4_chk_bad);
+    fprintf(stderr, "\n");
+}
+static void v41_e4_start(int dev) {
+    const char *e = getenv("V41_TRUNK_GPU"), *bf0 = getenv("V41_BF16_GPU"), *hd0 = getenv("V41_HEAD_GPU");
+    g_e4_fp8 = e && atoi(e) > 0;
+    const int head = hd0 && atoi(hd0) > 0;
+    if (!g_e4_fp8 && !(bf0 && atoi(bf0) > 0) && !head) return;
+    g_e4_cap = 4096; g_e4_map = calloc(g_e4_cap, sizeof *g_e4_map);
+    if (!g_e4_map) return;
+    const char *r = getenv("V41_TRUNK_GPU_ROWS"); if (r && atoi(r) > 0) g_e4_rows = atoi(r);
+    const char *gb = getenv("V41_TRUNK_GPU_GB"); if (gb && atof(gb) > 0) g_e4_budget = (size_t)(atof(gb) * 1073741824.0);
+    const char *ck = getenv("V41_E4_CHECK"); if (ck && atoll(ck) > 0) g_e4_chk_left = (unsigned long long)atoll(ck);
+    const char *bf = getenv("V41_BF16_GPU"); g_b16_on = bf && atoi(bf) > 0;
+    /* V41_HEAD_GPU=1: the lm head alone on the device (BF16, mvb's bits), nothing else of the trunk */
+    if (head && !g_b16_on) { g_b16_on = 1; g_e4_head_only = !g_e4_fp8; }
+    g_e4_dev = dev; g_e4_thread = pthread_self(); g_e4_on = 1;
+    atexit(v41_e4_report);
+    fprintf(stderr, "[v41] trunk on device %d:%s%s (rows <= %d%s)\n", dev, g_e4_fp8 ? " FP8 (V41_TRUNK_GPU)" : "",
+            g_e4_head_only ? " the lm head (V41_HEAD_GPU)" : g_b16_on ? " BF16 (V41_BF16_GPU)" : "", g_e4_rows, g_e4_chk_left ? ", checked against the CPU" : "");
+}
+static V41E4 *v41_e4_find(const void *q, int O, int I, int bf) {
+    size_t i = ((uintptr_t)q >> 4) * 11400714819323198485ull % g_e4_cap;
+    for (size_t k = 0; k < g_e4_cap; k++, i = (i + 1) % g_e4_cap) {
+        V41E4 *e = &g_e4_map[i];
+        if (!e->q) { e->q = q; e->O = O; e->I = I; e->bf = bf; return e; }
+        if (e->q == q && e->O == O && e->I == I && e->bf == bf) return e;
+    }
+    return NULL;   /* full: the CPU's */
+}
+static V41E4 *v41_e4_entry(const W8 *w) { return v41_e4_find(w->q, w->O, w->I, 0); }
+static int v41_e4_mv(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
+    if (!g_e4_on || !g_e4_fp8 || rows > g_e4_rows || (w->I & 31) || omp_in_parallel() || !pthread_equal(pthread_self(), g_e4_thread)) return 0;
+    V41E4 *e = v41_e4_entry(w);
+    if (!e || e->no) return 0;
+    if (!e->h) {
+        const size_t b = (size_t)w->O * w->I + (size_t)((w->O + 31) / 32) * (w->I / 32);
+        if (g_e4_used + b > g_e4_budget || !(e->h = coli_cuda_e4m3t_upload(g_e4_dev, w->q, w->s, w->O, w->I))) { e->no = 1; return 0; }
+        g_e4_used += b; g_e4_mats++;
+    }
+    if (!coli_cuda_e4m3t_mv(e->h, y, ystride, x, xstride, rows)) return 0;
+    g_e4_calls++;
+    if (g_e4_chk_left) {
+        g_e4_chk_left--; g_e4_chk_calls++;
+        float *ref = xmalloc((size_t)rows * w->O * sizeof(float), "trunk check");
+        mv8_rows_cpu(ref, w->O, w, x, xstride, rows);
+        for (int r = 0; r < rows; r++)
+            for (int o = 0; o < w->O; o++) {
+                float a = y[(size_t)r * ystride + o], c = ref[(size_t)r * w->O + o];
+                if (memcmp(&a, &c, 4)) {
+                    if (g_e4_chk_bad++ < 8) fprintf(stderr, "[v41] V41_E4_CHECK: O %d I %d row %d out %d: device %a, CPU %a\n", w->O, w->I, r, o, a, c);
+                    y[(size_t)r * ystride + o] = c;   /* the CPU's value goes on */
+                }
+            }
+        free(ref);
+    }
+    return 1;
+}
+#define V41_E4(...) if (v41_e4_mv(__VA_ARGS__)) return;
+/* at start, before the tier fills the card: a matrix up now, or refused for good (counted) */
+static size_t v41_e4_preload(const W8 *w) {
+    if (!g_e4_on || !g_e4_fp8 || !w->q || w->gx || (w->I & 31) || w->O < 1) return 0;
+    V41E4 *e = v41_e4_entry(w);
+    if (!e || e->no || e->h) return 0;
+    const size_t b = (size_t)w->O * w->I + (size_t)((w->O + 31) / 32) * (w->I / 32);
+    if (g_e4_used + b > g_e4_budget || !(e->h = coli_cuda_e4m3t_upload(g_e4_dev, w->q, w->s, w->O, w->I))) { e->no = 1; return 0; }
+    g_e4_used += b; g_e4_mats++;
+    return b;
+}
+/* V41_BF16_GPU: a BF16 matrix (mvb's) on the device, uploaded at start only (v41_b16_preload); same rules */
+static int v41_b16_mv(float *y, int ystride, const WB *w, const float *x, int xstride, int rows) {
+    if (!g_b16_on || !g_e4_on || rows > g_e4_rows || (w->I & 7) || omp_in_parallel() || !pthread_equal(pthread_self(), g_e4_thread)) return 0;
+    V41E4 *e = v41_e4_find(w->w, w->O, w->I, 1);
+    if (!e || !e->h) { if (e) e->no = 1; return 0; }
+    if (!coli_cuda_bf16t_mv(e->h, y, ystride, x, xstride, rows)) return 0;
+    g_b16_calls++;
+    if (g_e4_chk_left) {
+        g_e4_chk_left--; g_e4_chk_calls++;
+        float *ref = xmalloc((size_t)w->O * sizeof(float), "bf16 check");
+        for (int r = 0; r < rows; r++) {
+            mvb_cpu(ref, w, x + (size_t)r * xstride);
+            for (int o = 0; o < w->O; o++) {
+                float a = y[(size_t)r * ystride + o], c = ref[o];
+                if (memcmp(&a, &c, 4)) {
+                    if (g_e4_chk_bad++ < 8) fprintf(stderr, "[v41] V41_E4_CHECK (BF16): O %d I %d row %d out %d: device %a, CPU %a\n", w->O, w->I, r, o, a, c);
+                    y[(size_t)r * ystride + o] = c;
+                }
+            }
+        }
+        free(ref);
+    }
+    return 1;
+}
+static size_t v41_b16_preload(const WB *w) {
+    if (!g_b16_on || !g_e4_on || !w->w || w->gx || (w->I & 7) || w->O < 1) return 0;
+    V41E4 *e = v41_e4_find(w->w, w->O, w->I, 1);
+    if (!e || e->no || e->h) return 0;
+    const size_t b = (size_t)w->O * w->I * 2;
+    if (g_e4_used + b > g_e4_budget || !(e->h = coli_cuda_bf16t_upload(g_e4_dev, w->w, w->O, w->I))) { e->no = 1; return 0; }
+    g_e4_used += b; g_b16_used += b; g_b16_mats++;
+    return b;
+}
+#define V41_B16(...) if (v41_b16_mv(__VA_ARGS__)) return;
+#else
+#define V41_B16(...)
+#define V41_E4(...)
+static void v41_e4_start(int dev) { (void)dev; }
+#endif
+#include "v41_mv8_512.h"   /* the FP8 trunk on AVX-512 with the AVX2 loop's bits (V41_MV8_512=0 keeps AVX2) */
+#if V41_MV8_512_HAVE
+static int v41_mv8_512_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V41_MV8_512");
+        __builtin_cpu_init();
+        on = !(e && *e == '0') && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+             __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("fma");
+    }
+    return on;
+}
+#endif
+#include "v41_amx.h"   /* V41_AMX: the prompt pass's products on AMX-BF16 tiles (opt-in, not the AVX2 bits) */
+#if V41_AMX_HAVE
+#define V41_AMX_FP8(y, ys, w, x, xs, rows) \
+    if ((rows) >= 2 && !(w)->gx) { V41AmxFp8 c8_ = { (w)->q, (w)->s }; \
+        if (v41_amx_gemm(y, ys, x, xs, rows, (w)->I, (w)->O, v41_amx_dec_fp8, &c8_)) return; }
+#define V41_AMX_BF16(y, ys, w, x, xs, rows) \
+    if ((rows) >= 2 && !(w)->gx && (w)->w) { V41AmxBf16 cb_ = { (w)->w }; \
+        if (v41_amx_gemm(y, ys, x, xs, rows, (w)->I, (w)->O, v41_amx_dec_bf16, &cb_)) return; }
+#else
+#define V41_AMX_FP8(...)
+#define V41_AMX_BF16(...)
+#endif
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
     if (w->gx) { V41_CU(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows) v41_gx_rows(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->q);
 #endif
+    V41_E4(y, ystride, w, x, xstride, rows)
+    V41_AMX_FP8(y, ystride, w, x, xstride, rows)
+    mv8_rows_cpu(y, ystride, w, x, xstride, rows);
+}
+static void mv8_rows_cpu(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     int block = mv_block_rows(I);
     for (int r0 = 0; r0 < rows; r0 += block) {
         int nr = rows - r0 < block ? rows - r0 : block;
+#if V41_MV8_512_HAVE
+        const int pairs = !(I % FP8_TILE) && FP8_TILE == 32 && v41_mv8_512_on();
+#else
+        const int pairs = 0;
+#endif
         #pragma omp parallel for schedule(static)
         for (int o = 0; o < w->O; o++) {
+#if V41_MV8_512_HAVE
+            /* v41_mv8_512.h: output o and o+1 in one zmm, the same operations as below (an odd o is its partner's;
+             * an odd count's last output stays below) */
+            if (pairs) {
+                if (o & 1) continue;
+                if (o + 1 < w->O) { v41_mv8_pair(y, ystride, w->q, w->s, I, o, x, xstride, r0, nr); continue; }
+            }
+#endif
             const uint8_t *row = w->q + (size_t)o * I;
             const uint8_t *scale = w->s + (size_t)(o / FP8_TILE) * tiles_i;
             float sum[MV_ROWS_MAX];
@@ -918,6 +1091,7 @@ static void mvb(float *y, const WB *w, const float *x) {
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
     v41_dho_host(w->w);
 #endif
+    V41_B16(y, w->O, w, x, w->I, 1)
     mvb_cpu(y, w, x);
 }
 /* mvb for `rows` positions: one call on the device (an S-row GEMM instead of a GEMV
@@ -929,6 +1103,8 @@ static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xst
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->w);
 #endif
+    V41_B16(y, ystride, w, x, xstride, rows)
+    V41_AMX_BF16(y, ystride, w, x, xstride, rows)
     for (int r = 0; r < rows; r++) mvb_cpu(y + (size_t)r * ystride, w, x + (size_t)r * xstride);
 }
 
@@ -1456,6 +1632,7 @@ typedef struct {
     int32_t *candidates; int candidate_topk, candidate_width, candidate_rows;
 } V41Seq;
 static int g_v41_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
+static int g_v41_mux_cur;          /* the slot the Model holds, -1 when every one is parked (serve_mux) */
 
 /* ------------------------------------------------------------ rope --------- */
 
@@ -1954,6 +2131,77 @@ static void scratch_put(uint8_t *p, int64_t n) {
     if (p) compat_aligned_free(p);
 }
 
+/* What a slot's window holds of one read's tensor: the config's bytes, or a GGUF layer's
+ * (its experts share a size; -1 when this tensor's differs). A read of more is refused. */
+static int64_t expert_read_cap(const Model *m, const ExpertRead *r) {
+    int64_t cap = r->gx_layer >= 0 ? m->gx_len[3 * r->gx_layer + r->part / 2] : expert_part_bytes(&m->c, r->part);
+    if (r->gx_layer >= 0 && r->t->nbytes != cap) cap = -1;   /* a GGUF layer's experts share a size */
+    return cap;
+}
+/* One of an expert's reads into its slot's window; the bytes read. Called by several threads
+ * at once (expert_fetch's team, the RAM fill's readers): it touches the slot's window and the
+ * scratch pool (its own lock), and for a request's read (`turn`) the mirrors' counters, which
+ * a turn's line is made of and the serving thread reads between turns. */
+static uint64_t expert_read_one(Model *m, const ExpertRead *r, int turn) {
+    int64_t pad = r->t->off % ST_DIRECT_ALIGN;
+    if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
+        /* A GGUF matrix the slot holds in another form: read into a pooled scratch
+         * buffer, then interleaved by 16 rows or laid out as FP4 and scales. */
+        int64_t raw_n = 0;
+        uint8_t *raw = scratch_get(r->t->nbytes + 2 * ST_DIRECT_ALIGN, &raw_n);
+        st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
+                          r->t->nbytes, 1, expert_direct(), "pread expert");
+        const int k = r->part / 2, held = m->gx_h[3 * r->gx_layer + k];
+        int64_t shape[2];
+        v41_gx_shape(&m->c, k, shape);
+        if (held < 0) coli_mxfp4_unblock(r->slot->base[r->part + 1], r->slot->base[r->part], raw + pad,
+                                         shape[0] * shape[1] / 32);
+        else gq_r16_pack(held, r->slot->base[r->part], raw + pad, (int)shape[0], (int)shape[1]);
+        scratch_put(raw, raw_n);
+    } else
+    /* The payload pointer carries the slack st_read_range_rep needs to read
+     * from the enclosing block boundary, so an O_DIRECT transfer lands the
+     * data exactly where the slot wants it and nothing is copied afterwards. */
+    st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes,
+                      r->slot->base[r->part] + pad, r->t->nbytes, 1, expert_direct(),
+                      "pread expert");
+    /* Which drive actually answered. A partial mirror leaves shards on the
+     * primary, so the replica the route picked is not always the one that read. */
+    if (turn) {
+        int rep = r->rep;
+        if (st_fd_rep(&m->S, r->t->fd, rep) < 0) rep = 0;
+        __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
+    }
+    return (uint64_t)r->t->nbytes;
+}
+/* The slot's payload pointer of a read that has landed (and of a GGUF matrix's scales). */
+static void expert_publish_one(const Model *m, const ExpertRead *r) {
+    if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {   /* the copy's own */
+        *slot_part(r->slot, r->part) = r->slot->base[r->part];
+        *slot_part(r->slot, r->part + 1) = m->gx_h[3 * r->gx_layer + r->part / 2] < 0 ? r->slot->base[r->part + 1] : NULL;
+    } else {
+        *slot_part(r->slot, r->part) = r->slot->base[r->part] + (r->t->off % ST_DIRECT_ALIGN);
+        if (r->gx_layer >= 0) *slot_part(r->slot, r->part + 1) = NULL;
+    }
+}
+
+/* The RAM fill (v41_pl_start, further down): what expert_fetch and the slot lookups share
+ * with it. `run` is the serving thread's (a fill is under way); `demand` counts the requests'
+ * own fetches in flight, which the fill's readers let pass; `have` is one byte an expert of
+ * the backbone, set once it is in its layer's slots; `poke` tells the serving thread that
+ * the readers have something for it. */
+static struct {
+    int run, demand, poke;
+    uint64_t demand_ms;   /* when a request's fetch last ended (now_s, ms) */
+    uint8_t *have;
+    int E;
+} g_pl;
+/* The readers stay off the drive this long after a request's fetch: a cold request reads a
+ * layer's experts, computes for a millisecond or two and reads the next layer's, and a reader
+ * starting in between would have its reads in the drive's queue ahead of them. */
+#define V41_PL_QUIET_MS 20
+
 /* Read `n` reserved experts at once. The slot ids are stamped only after every
  * read has landed, so a slot never advertises an expert it does not yet hold. */
 static void expert_fetch(Model *m, const char *kind, int layer,
@@ -1969,9 +2217,7 @@ static void expert_fetch(Model *m, const char *kind, int layer,
      * more than that must not be read into it -- same refusal st_read_raw_cap
      * applied when the read went by name. */
     for (int i = 0; i < total; i++) {
-        int64_t cap = list[i].gx_layer >= 0 ? m->gx_len[3 * list[i].gx_layer + list[i].part / 2]
-                                            : expert_part_bytes(&m->c, list[i].part);
-        if (list[i].gx_layer >= 0 && list[i].t->nbytes != cap) cap = -1;   /* a GGUF layer's experts share a size */
+        const int64_t cap = expert_read_cap(m, &list[i]);
         if (list[i].t->nbytes < 0 || list[i].t->nbytes > cap) {
             fprintf(stderr, "%s: expert tensor declares %lld bytes, the slot holds %lld — "
                             "refusing (untrusted container)\n", list[i].t->name,
@@ -1979,6 +2225,8 @@ static void expert_fetch(Model *m, const char *kind, int layer,
             exit(1);
         }
     }
+    const int filling = g_pl.run;   /* the RAM fill's readers wait while a request reads */
+    if (filling) __atomic_fetch_add(&g_pl.demand, 1, __ATOMIC_RELAXED);
     double started = now_s();
     const int depth = expert_read_depth();
     const int threads = depth < total ? depth : total;
@@ -2000,51 +2248,17 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     for (;;) {
         const int i = __atomic_fetch_add(&next_read, 1, __ATOMIC_RELAXED);
         if (i >= total) break;
-        const ExpertRead *r = &list[i];
-        int64_t pad = r->t->off % ST_DIRECT_ALIGN;
-        if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
-            /* A GGUF matrix the slot holds in another form: read into a pooled scratch
-             * buffer, then interleaved by 16 rows or laid out as FP4 and scales. */
-            int64_t raw_n = 0;
-            uint8_t *raw = scratch_get(r->t->nbytes + 2 * ST_DIRECT_ALIGN, &raw_n);
-            st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
-                              r->t->nbytes, 1, expert_direct(), "pread expert");
-            const int k = r->part / 2, held = m->gx_h[3 * r->gx_layer + k];
-            int64_t shape[2];
-            v41_gx_shape(&m->c, k, shape);
-            if (held < 0) coli_mxfp4_unblock(r->slot->base[r->part + 1], r->slot->base[r->part], raw + pad,
-                                             shape[0] * shape[1] / 32);
-            else gq_r16_pack(held, r->slot->base[r->part], raw + pad, (int)shape[0], (int)shape[1]);
-            scratch_put(raw, raw_n);
-        } else
-        /* The payload pointer carries the slack st_read_range_rep needs to read
-         * from the enclosing block boundary, so an O_DIRECT transfer lands the
-         * data exactly where the slot wants it and nothing is copied afterwards. */
-        st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes,
-                          r->slot->base[r->part] + pad, r->t->nbytes, 1, expert_direct(),
-                          "pread expert");
-        /* Which drive actually answered. A partial mirror leaves shards on the
-         * primary, so the replica the route picked is not always the one that read. */
-        int rep = r->rep;
-        if (st_fd_rep(&m->S, r->t->fd, rep) < 0) rep = 0;
-        __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
-        bytes += (uint64_t)r->t->nbytes;
+        bytes += expert_read_one(m, &list[i], 1);
     }
+    }
+    if (filling) {
+        __atomic_store_n(&g_pl.demand_ms, (uint64_t)(now_s() * 1000.0), __ATOMIC_RELAXED);
+        __atomic_fetch_sub(&g_pl.demand, 1, __ATOMIC_RELAXED);
     }
     /* Publish the payload pointers only now. A slot that advertises an expert has
      * to address that expert, and until the read landed the window base was the
      * only pointer that meant anything. */
-    for (int i = 0; i < total; i++) {
-        const ExpertRead *r = &list[i];
-        if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {   /* the copy's own */
-            *slot_part(r->slot, r->part) = r->slot->base[r->part];
-            *slot_part(r->slot, r->part + 1) = m->gx_h[3 * r->gx_layer + r->part / 2] < 0 ? r->slot->base[r->part + 1] : NULL;
-        } else {
-            *slot_part(r->slot, r->part) = r->slot->base[r->part] + (r->t->off % ST_DIRECT_ALIGN);
-            if (r->gx_layer >= 0) *slot_part(r->slot, r->part + 1) = NULL;
-        }
-    }
+    for (int i = 0; i < total; i++) expert_publish_one(m, &list[i]);
     m->expert_bytes += bytes;
     m->t_disk += now_s() - started;
     const int gi = v41_gx_index(m, kind, layer);
@@ -2052,8 +2266,219 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         slot[i]->eid = eid[i];
         for (int k = 0; k < 3; k++) slot[i]->gt[k] = gi >= 0 ? m->gx_h[3 * gi + k] : -1;
     }
+    if (g_pl.have && !strcmp(kind, "layers"))   /* the fill's readers skip these */
+        for (int i = 0; i < n; i++)
+            if (eid[i] >= 0 && eid[i] < g_pl.E) __atomic_store_n(&g_pl.have[(size_t)layer * g_pl.E + eid[i]], 1, __ATOMIC_RELAXED);
     free(list);
 }
+
+/* ------------------------------------------------------------ the RAM fill ----
+ *
+ * A start leaves the expert cache empty, and an expert is read from the disk the first time
+ * a request routes to it: on a 510 GB checkpoint the first answers wait for the drive (measured:
+ * 1.2-4.7 tok/s and 24-31 s to a short prompt's first token, against 14-16 tok/s and 0.6 s
+ * once the experts are in RAM). Where the cache holds every expert and the machine has the
+ * RAM for them (v41_pl_start checks both, and does nothing otherwise), a few reader threads
+ * read the experts no request has asked for yet, in the background, from the moment the
+ * engine is ready.
+ *
+ * The cache has one owner, the serving thread, and it stays so: no lock was added to it. A
+ * reader never touches a layer's slots. It reads an expert into a spare slot of its own (six
+ * windows, as a cache slot's), and queues it; the serving thread places it, where it already
+ * is in the cache's code (the top of a slot lookup, one atomic load when there is nothing)
+ * and while it waits for a command. Placing is an exchange of window pointers with the
+ * layer's next unused slot: nothing is copied, no slot in use moves, and the spare leaves
+ * with that slot's untouched windows for the next read. An expert a request read meanwhile
+ * is dropped there. With room for every expert no slot is ever evicted, so a placed expert
+ * stays. A request that wants an expert the readers have not reached reads it as before;
+ * the readers wait while it does and for V41_PL_QUIET_MS after (g_pl.demand, demand_ms), so
+ * the drive answers the request first.
+ *
+ * V41_RAM_FILL=0: off. V41_RAM_FILL_READERS: the reader threads (4, at most 16).
+ * V41_RAM_FILL_PACE_US: a reader's pause before each expert (0), to slow the fill down.
+ * V41_RAM_FILL_WAIT=1: the engine says READY only once the fill is complete. */
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+#define V41_PL_READERS_MAX 16
+typedef struct {
+    int layer, eid, nread;
+    uint64_t bytes;
+    Slot s;
+    ExpertRead rd[V41_EXPERT_TENSORS];
+} PlSpare;
+static struct {
+    Model *m;
+    int L, readers, pace_us, stop;               /* stop: atomic */
+    int *order, n_order, next;                   /* layer * E + eid in the fill's order; next: atomic */
+    PlSpare *sp; int n_sp;
+    int *freeq, nfree, *readyq, nready, live;    /* under mx */
+    pthread_mutex_t mx; pthread_cond_t cv;
+    pthread_t th[V41_PL_READERS_MAX]; int n_th;
+    double t0;
+    uint64_t bytes;
+    int installed, dup, dropped;
+} g_plw = { .mx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+static void *v41_pl_reader(void *arg) {
+    (void)arg;
+    Model *m = g_plw.m;
+#if defined(__linux__) && defined(CPU_SETSIZE)
+    if (getenv("OMP_PROC_BIND")) {   /* a thread is born with its creator's CPUs, and OMP_PROC_BIND bound that one to a place */
+        cpu_set_t all; CPU_ZERO(&all);
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+        for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
+        (void)sched_setaffinity(0, sizeof all, &all);
+    }
+#endif
+    for (;;) {
+        if (__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE)) break;
+        const int i = __atomic_fetch_add(&g_plw.next, 1, __ATOMIC_RELAXED);
+        if (i >= g_plw.n_order) break;
+        const int flat = g_plw.order[i], layer = flat / g_pl.E, eid = flat % g_pl.E;
+        if (g_plw.pace_us > 0) usleep((useconds_t)g_plw.pace_us);
+        if (__atomic_load_n(&g_pl.have[flat], __ATOMIC_RELAXED)) continue;   /* a request read it meanwhile */
+        pthread_mutex_lock(&g_plw.mx);
+        while (!g_plw.nfree && !__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE)) pthread_cond_wait(&g_plw.cv, &g_plw.mx);
+        const int si = g_plw.nfree ? g_plw.freeq[--g_plw.nfree] : -1;
+        pthread_mutex_unlock(&g_plw.mx);
+        if (si < 0) break;
+        PlSpare *sp = &g_plw.sp[si];
+        sp->layer = layer; sp->eid = eid; sp->bytes = 0;
+        sp->nread = expert_read_list(m, "layers", layer, eid, &sp->s, expert_route(layer, eid), sp->rd);
+        int ok = !__atomic_load_n(&g_pl.have[flat], __ATOMIC_RELAXED);   /* read by a request while this waited for a spare */
+        for (int k = 0; k < sp->nread && ok; k++)   /* a tensor its window cannot hold: left to the request that wants it, which refuses it */
+            if (sp->rd[k].t->nbytes < 0 || sp->rd[k].t->nbytes > expert_read_cap(m, &sp->rd[k])) ok = 0;
+        for (int k = 0; k < sp->nread && ok; k++) {
+            while (!__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE)) {   /* a request is reading, or just was: the drive is its */
+                if (__atomic_load_n(&g_pl.demand, __ATOMIC_RELAXED) > 0) { usleep(500); continue; }
+                const uint64_t last = __atomic_load_n(&g_pl.demand_ms, __ATOMIC_RELAXED), now = (uint64_t)(now_s() * 1000.0);
+                if (last && now >= last && now - last < V41_PL_QUIET_MS) { usleep(1000); continue; }
+                break;
+            }
+            if (__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE)) { ok = 0; break; }
+            sp->bytes += expert_read_one(m, &sp->rd[k], 0);
+        }
+        if (ok) {
+            for (int k = 0; k < sp->nread; k++) expert_publish_one(m, &sp->rd[k]);
+            const int gi = v41_gx_index(m, "layers", layer);
+            for (int k = 0; k < 3; k++) sp->s.gt[k] = gi >= 0 ? m->gx_h[3 * gi + k] : -1;
+        }
+        pthread_mutex_lock(&g_plw.mx);
+        if (ok) { g_plw.readyq[g_plw.nready++] = si; __atomic_store_n(&g_pl.poke, 1, __ATOMIC_RELEASE); }
+        else g_plw.freeq[g_plw.nfree++] = si;
+        pthread_mutex_unlock(&g_plw.mx);
+    }
+    pthread_mutex_lock(&g_plw.mx);
+    if (--g_plw.live == 0) __atomic_store_n(&g_pl.poke, 1, __ATOMIC_RELEASE);   /* the serving thread closes the fill */
+    pthread_mutex_unlock(&g_plw.mx);
+    return NULL;
+}
+
+/* The readers have left and everything they read is placed: the fill's line, and its memory back. */
+static void v41_pl_finish(Model *m) {
+    for (int i = 0; i < g_plw.n_th; i++) pthread_join(g_plw.th[i], NULL);
+    g_plw.n_th = 0;
+    const double dt = now_s() - g_plw.t0;
+    int in_ram = 0;
+    for (int i = 0; i < g_plw.L; i++) in_ram += m->cache[i].n;
+    if (!__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE))
+        fprintf(stderr, "[v41] RAM fill: done, %d experts (%.1f GiB) in %.1f s, %.2f GiB/s with %d readers; "
+                        "%d of the model's %d experts in RAM (%d read by a request meanwhile%s)\n",
+                g_plw.installed, g_plw.bytes / 1073741824.0, dt, dt > 0 ? g_plw.bytes / 1073741824.0 / dt : 0.0,
+                g_plw.readers, in_ram, g_plw.L * g_pl.E, g_plw.dup, g_plw.dropped ? "; some found no slot" : "");
+    for (int i = 0; i < g_plw.n_sp; i++)
+        for (int part = 0; part < V41_EXPERT_TENSORS; part++) compat_aligned_free(g_plw.sp[i].s.base[part]);
+    free(g_plw.sp); free(g_plw.freeq); free(g_plw.readyq); free(g_plw.order);
+    g_plw.sp = NULL; g_plw.freeq = g_plw.readyq = g_plw.order = NULL; g_plw.n_sp = 0;
+    uint8_t *have = g_pl.have;
+    g_pl.have = NULL; g_pl.run = 0;
+    free(have);
+}
+
+/* The serving thread places what the readers queued (see the note above). */
+static void v41_pl_install_now(Model *m) {
+    for (;;) {
+        int idx[32], n = 0;
+        pthread_mutex_lock(&g_plw.mx);
+        while (g_plw.nready && n < 32) idx[n++] = g_plw.readyq[--g_plw.nready];
+        const int live = g_plw.live;
+        if (!g_plw.nready) __atomic_store_n(&g_pl.poke, 0, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&g_plw.mx);
+        for (int j = 0; j < n; j++) {
+            PlSpare *sp = &g_plw.sp[idx[j]];
+            LCache *cache = &m->cache[sp->layer];
+            int held = 0;
+            for (int i = 0; i < cache->n && !held; i++) held = cache->slot[i].eid == sp->eid;
+            if (held) { g_plw.dup++; continue; }
+            if (cache->n >= cache->cap || !cache->slot[cache->n].base[0]) { g_plw.dropped++; continue; }
+            Slot *c = &cache->slot[cache->n];
+            for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
+                uint8_t *fresh = c->base[part];
+                c->base[part] = sp->s.base[part];
+                *slot_part(c, part) = *slot_part(&sp->s, part);
+                sp->s.base[part] = fresh;
+                *slot_part(&sp->s, part) = fresh;
+            }
+            for (int k = 0; k < 3; k++) c->gt[k] = sp->s.gt[k];
+            c->vk_rows = NULL;
+            c->used = 0;                 /* never routed to: the first a full cache would give up */
+            c->eid = sp->eid;
+            cache->n++;
+            __atomic_store_n(&g_pl.have[(size_t)sp->layer * g_pl.E + sp->eid], 1, __ATOMIC_RELAXED);
+            g_plw.installed++; g_plw.bytes += sp->bytes;   /* not the turn's bytes (m->expert_bytes): no request read these */
+        }
+        if (n) {
+            pthread_mutex_lock(&g_plw.mx);
+            for (int j = 0; j < n; j++) g_plw.freeq[g_plw.nfree++] = idx[j];
+            pthread_cond_broadcast(&g_plw.cv);
+            pthread_mutex_unlock(&g_plw.mx);
+            continue;
+        }
+        if (!live) v41_pl_finish(m);
+        return;
+    }
+}
+static inline void v41_pl_install(Model *m) {
+    if (__atomic_load_n(&g_pl.poke, __ATOMIC_ACQUIRE)) v41_pl_install_now(m);
+}
+/* A serve loop with nothing to decode: the fill goes on being placed until a command is there. */
+static void v41_pl_idle(Model *m) {
+    while (g_pl.run) {
+        v41_pl_install(m);
+        if (!g_pl.run) return;
+        fd_set readable;
+        struct timeval soon = {0, 20000};
+        FD_ZERO(&readable);
+        FD_SET(STDIN_FILENO, &readable);
+        const int got = select(STDIN_FILENO + 1, &readable, NULL, NULL, &soon);
+        if (got > 0 || (got < 0 && errno != EINTR)) return;   /* a command or the input's end: the caller's read sees it */
+    }
+}
+/* V41_RAM_FILL_WAIT=1: the whole fill before READY. */
+static void v41_pl_wait(Model *m) {
+    while (g_pl.run) {
+        v41_pl_install_now(m);
+        if (g_pl.run) usleep(20000);
+    }
+}
+/* The process ends (or the serve loop did): the readers leave before anything they read from is closed. */
+static void v41_pl_stop(void) {
+    if (!g_plw.n_th) return;
+    __atomic_store_n(&g_plw.stop, 1, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&g_plw.mx);
+    pthread_cond_broadcast(&g_plw.cv);
+    pthread_mutex_unlock(&g_plw.mx);
+    for (int i = 0; i < g_plw.n_th; i++)
+        if (!pthread_equal(pthread_self(), g_plw.th[i])) pthread_join(g_plw.th[i], NULL);
+    g_plw.n_th = 0;
+}
+static void v41_pl_start(Model *m);
+#else
+static inline void v41_pl_install(Model *m) { (void)m; }
+static inline void v41_pl_idle(Model *m) { (void)m; }
+static inline void v41_pl_stop(void) {}
+static inline void v41_pl_start(Model *m) { (void)m; }
+#endif
 
 /* One byte per expert: routed in this turn or not, for the dashboard's HITS line. */
 static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -2105,6 +2530,7 @@ static int v41_victim(const Model *m, const LCache *cache, const char *kind, int
     return oldest;
 }
 static Slot *expert_slot_at(Model *m, LCache *cache, const char *kind, int layer, int eid) {
+    v41_pl_install(m);   /* the RAM fill's experts into their slots, before this lookup */
     if (!strcmp(kind, "layers")) ehit_mark(m, layer, eid);
     for (int i = 0; i < cache->n; i++)
         if (cache->slot[i].eid == eid) {
@@ -2139,6 +2565,7 @@ static void expert_slots_at(Model *m, LCache *cache, const char *kind, int layer
     int miss_eid[64];
     Slot *miss_slot[64];
     int misses = 0;
+    v41_pl_install(m);   /* the RAM fill's experts into their slots, before these lookups */
     for (int k = 0; k < topk; k++) {
         int eid = chosen[k];
         if (!strcmp(kind, "layers")) ehit_mark(m, layer, eid);
@@ -3188,6 +3615,25 @@ static void swiglu_into(const Cfg *c, float *gate, const float *up, int64_t coun
 /* One of an expert's matrices: FP4 and scales (type -1), or a GGUF's ggml blocks. */
 static void expert_mat(float *y, const uint8_t *w, const uint8_t *scales, int type,
                        const float *x, int rows, int I, int O) {
+#if V41_AMX_HAVE
+    if (type < 0 && rows >= 2) { V41Mx4 mx = { w, scales }; if (v41_amx_gemm(y, O, x, I, rows, I, O, v41_amx_dec_mxfp4, &mx)) return; }
+#endif
+#if V41_MV8_512_HAVE
+    /* v41_mv8_512.h: matmul_mxfp4's bits, two outputs a zmm, each group decoded once for up to 8 rows; from 2 rows
+     * (one row stays matmul_mxfp4's: there the pairs measured 11 % slower, tests/bench_mv8_512.c) */
+    if (type < 0 && rows >= 2 && !(I % 32) && O >= 2 && v41_mv8_512_on()) {
+        const int pairs = O / 2;
+        #pragma omp parallel for schedule(static)
+        for (int p = 0; p < pairs; p++) v41_mx4_pair(y, x, w, scales, rows, I, O, 2 * p);
+        if (O & 1) {   /* the odd last output: matmul_mxfp4 itself on that one row of weights */
+            float *t = xmalloc((size_t)rows * sizeof(float), "expert tail");
+            matmul_mxfp4(t, x, w + (size_t)(O - 1) * (I / 2), scales + (size_t)(O - 1) * (I / 32), rows, I, 1);
+            for (int r = 0; r < rows; r++) y[(size_t)r * O + O - 1] = t[r];
+            free(t);
+        }
+        return;
+    }
+#endif
     if (type < 0) matmul_mxfp4(y, x, w, scales, rows, I, O);
     else v41_gx_rows(y, O, w, type, O, I, x, I, rows);
 }
@@ -5004,7 +5450,7 @@ static int argmax(const float *values, int n) {
  * own conversation bound (attention_run reads the cross-layer state from the Model,
  * so it is bound whole: pointers, not copies). Nothing drafts. */
 static V41Seq *g_v41_mux_seq;   /* [slots]: the conversations the Model does not hold */
-static int g_v41_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
+/* g_v41_mux_cur: declared beside g_v41_mux_slots (the CUDA chain's per-slot state reads it) */
 
 static void v41_seq_swap(Model *m, V41Seq *q) {
 #define V41_SWAP(T,a,b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
@@ -5064,6 +5510,97 @@ static void v41_seq_alloc(Model *m, V41Seq *q, int with_state) {
     }
 }
 
+#ifdef COLI_CUDA
+/* V41_CHAIN_ROWS=1 (deepseek_v41_cuchain.h's v41u_forward_rows): a decode step's rows of the active
+ * conversations through the chain together, each row's sequence books as forward_full keeps them for a
+ * one-row step (the engram push, the head, the record, the position). 1: done, logits [n, V], every
+ * conversation one position on, slots[n - 1] bound; 0: not taken or refused, every conversation's
+ * host state as it was (the caller takes the row at a time, M2).
+ * V41_CHAIN_ROWS_CHECK=<steps>: for the first steps the batched result is computed but not applied (no
+ * state pulled, no device validity raised, the engram pushes taken back, the slots' device copies
+ * lowered to their positions), then the row at a time runs the step for real and the two sets of
+ * logits are compared (v41u_rows_compare; the exit report's summary). Its routed experts go through
+ * the cache and the tier twice, so a checked run's hit counts and the tier's heat are not a plain run's. */
+/* the head of n rows: one device call (V41_HEAD_GPU / V41_BF16_GPU, mvb_cpu's bits), else mvb row by row */
+static void v41_head_rows(float *lg, int V, const WB *w, const float *x, int dim, int n) {
+    V41_B16(lg, V, w, x, dim, n)
+    for (int t = 0; t < n; t++) mvb(lg + (size_t)t * V, w, x + (size_t)t * dim);
+}
+static int v41_rows_chain(Model *m, const int *slots, const int *ids, int n, float *logits) {
+    if (!v41u_rows_wanted(m, slots, n)) return 0;
+    Cfg *c = &m->c;
+    const int dim = c->dim, hc = c->hc_mult, V = c->vocab;
+    int pos[V41U_ROWS_MAX];
+    for (int t = 0; t < n; t++) {
+        v41_mux_bind(m, slots[t]);
+        pos[t] = m->pos;
+        if (pos[t] + 1 > c->max_positions) return 0;   /* the row at a time says CONTEXT_EXCEEDED */
+    }
+    const int check = v41u_rows_check_take();
+    m->rollback_save = 0; m->pub_rows = 0;
+    for (int t = 0; t < n; t++) {   /* forward_full's push, before the hashes read the history */
+        v41_mux_bind(m, slots[t]);
+        if (m->engram.active) engram_push(&m->engram, ids + t, 1, NULL);
+    }
+    float *h = xmalloc((size_t)n * hc * dim * sizeof(float), "residual streams");
+    float *pre_mix = xmalloc((size_t)n * hc * sizeof(float), "pre mix");
+    float *lg = check ? xmalloc((size_t)n * V * sizeof(float), "checked logits") : logits;
+    for (int t = 0; t < n; t++) {
+        wb_row_f32(&m->embed, ids[t], h + (size_t)t * hc * dim);
+        for (int copy = 1; copy < hc; copy++)
+            memcpy(h + ((size_t)t * hc + copy) * dim, h + (size_t)t * hc * dim, (size_t)dim * sizeof(float));
+    }
+    int lost = 0;
+    const int done = v41u_forward_rows(m, slots, pos, n, h, pre_mix, !check, &lost);
+    if (done) {   /* the head per row, forward_full's arithmetic */
+        const double th = now_s();
+        float *collapsed = xmalloc((size_t)dim * sizeof(float), "collapsed stream");
+        float *normed = xmalloc((size_t)n * dim * sizeof(float), "final norm");
+        for (int t = 0; t < n; t++) {
+            const float *mix = pre_mix + (size_t)t * hc;
+            for (int i = 0; i < dim; i++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++) sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+                collapsed[i] = sum;
+            }
+            rms_into(normed + (size_t)t * dim, collapsed, m->norm.w, dim, c->norm_eps);
+        }
+        v41_head_rows(lg, V, &m->head, normed, dim, n);
+        free(normed); free(collapsed);
+        v41u_rows_head((now_s() - th) * 1e3);
+    }
+    free(h); free(pre_mix);
+    if (!done || check) {   /* nothing of the batched step stays: the pushes back, the device's copies from each position stale */
+        for (int t = 0; t < n; t++) {
+            v41_mux_bind(m, slots[t]);
+            if (m->engram.active) m->engram.history_len--;
+            v41u_lower(m, pos[t]);
+        }
+        if (!done) {
+            v41u_rows_fallback(lost);
+            if (check) free(lg);
+            return 0;
+        }
+        if (!v41u_mux_rows(m)) { free(lg); return 0; }
+        for (int t = 0; t < n; t++) {   /* the proven path, for real */
+            v41_mux_bind(m, slots[t]);
+            forward(m, ids + t, 1, logits + (size_t)t * V);
+        }
+        v41u_rows_compare(lg, logits, n, V);
+        free(lg);
+        return 1;
+    }
+    for (int t = 0; t < n; t++) {   /* forward_full's books for each row's one-row step; slots[n - 1] stays bound */
+        v41_mux_bind(m, slots[t]);
+        kv_prefix_record(&m->kvp, ids + t, pos[t], 1);
+        m->pos = pos[t] + 1;
+        m->last_start = m->last_from = pos[t]; m->last_rows = 1;
+        m->forwards++;
+    }
+    return 1;
+}
+#endif
+
 /* One decode step of several conversations: row t is the token ids[t] of the
  * conversation in slot slots[t], at its next position. The streams, their mixes,
  * the routed experts and the head run once over the n rows; the engram and the
@@ -5073,12 +5610,29 @@ static void v41_seq_alloc(Model *m, V41Seq *q, int with_state) {
 static void forward_rows(Model *m, const int *slots, const int *ids, int n, float *logits) {
     Cfg *c = &m->c;
     int dim = c->dim, hc = c->hc_mult;
+#ifdef COLI_CUDA
+    /* the CUDA chain holds every slot's state (deepseek_v41_cuchain.h, v41u_mux_rows): each row a
+     * one-row decode step of its own conversation through forward_full, as KV_SLOTS=1 runs one
+     * (the engram push, the chain or the CPU's layers, the head, the position and the record);
+     * the last row's slot stays bound, as below */
+    if (v41u_mux_rows(m) && v41_rows_chain(m, slots, ids, n, logits)) return;   /* V41_CHAIN_ROWS=1: the rows together */
+    if (v41u_mux_rows(m)) {
+        for (int t = 0; t < n; t++) {
+            v41_mux_bind(m, slots[t]);
+            forward(m, ids + t, 1, logits + (size_t)t * c->vocab);
+        }
+        return;
+    }
+#endif
     int *pos = xmalloc((size_t)n * sizeof(int), "row positions");
     for (int t = 0; t < n; t++) {
         v41_mux_bind(m, slots[t]);
         pos[t] = m->pos;
         if (pos[t] + 1 > c->max_positions) { fprintf(stderr, "CONTEXT_EXCEEDED %d %d\n", pos[t] + 1, c->max_positions); exit(1); }
         if (m->engram.active) engram_push(&m->engram, ids + t, 1, NULL);
+#ifdef COLI_CUDA
+        v41u_lower(m, pos[t]);   /* the CPU writes this slot's state from pos[t]: the device's copy past it is stale */
+#endif
     }
     m->rollback_save = 0; m->pub_rows = 0;
     float *h = xmalloc((size_t)n * hc * dim * sizeof(float), "residual streams");
@@ -5881,6 +6435,9 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
         int got = v41_ps_take(m, ids, n_prompt, reuse);
         if (got) { reuse = got; ps_from = 1; g_pin_use_logit = 0; g_pin_logit = NULL; }
     }
+    /* a read-out (logprobs) from a live prefix without its pin photo would start past position 0, which the gateway
+     * refuses by name (engine_pinned_prefix_not_echoed): such a request reads its whole prompt from nothing instead */
+    if (cmd->logprobs > 0 && reuse > 0 && !(g_pin_use_logit && g_pin_logit)) { kv_prefix_clear(&m->kvp); reuse = 0; }
     const int ps_keep = (ps_from || !reuse) && cmd->logprobs == 0 && !had_image;
     if (getenv("COLI_PREFIX_LOG") && !ps_from) {
         if (reuse)
@@ -5948,6 +6505,8 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
             if (g_pin_use_logit && g_pin_logit)
                 v41_echo(cmd->id, reuse, ids[reuse], g_pin_logit, c->vocab,
                          cmd->logprobs, tokenizer);
+            else if (reuse == 0)   /* nothing conditions position 0: colibri.c's and qwen36.c's " nan 0" frame */
+                v41_echo(cmd->id, 0, ids[0], NULL, c->vocab, 0, tokenizer);
             for (int p = 0; p + 1 < nfresh; p++)
                 v41_echo(cmd->id, reuse + p + 1, ids[reuse + p + 1],
                          all + (size_t)p * c->vocab, c->vocab, cmd->logprobs, tokenizer);
@@ -6077,6 +6636,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *snap) {
     fprintf(stderr, "[v41] serving %d conversations at once (KV_SLOTS)\n", n);
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        if (!active && !input_eof) v41_pl_idle(m);   /* the RAM fill is placed while no command waits */
         /* idle: wait for a command; decoding: take one only when one is there */
         if (!input_eof && (!active || coli_serve_stdin_ready())) {
             ColiServeCommand command;
@@ -6148,6 +6708,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *snap) {
 }
 
 static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
+    v41_pl_start(m);   /* the RAM fill, where the cache and the machine's RAM hold every expert (before READY) */
     if (g_v41_mux_slots > 1) { serve_mux(m, tokenizer, snap); coli_ps_report(&g_v41_ps); return; }
     Cfg *c = &m->c;
     coli_serve_stdio_init();
@@ -6167,6 +6728,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
 
     for (;;) {
         ColiServeCommand command;
+        v41_pl_idle(m);   /* the RAM fill is placed while no command waits */
         ColiServeReadResult result = coli_serve_read_command(stdin, &v41_wire, &command);
         if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) break;
         if (result == COLI_SERVE_READ_NOMEM) {
@@ -6490,31 +7052,103 @@ static size_t v41_cu_float(int O, int I) {
     return e && *e == '0' ? 0 : (size_t)O * I * 4;
 }
 static size_t v41_cu_w8(const W8 *w) {
-    if (!w->gx) return 0;
+    if (!w->gx) {   /* the native FP8 the CUDA chain takes as fmt 9 (deepseek_v41_cuchain.h's v41u_t8) */
+        const char *e = getenv("COLI_CUDA_CHAIN");
+        return (e && *e == '0') || !w->q || !w->s || !v41u_slots_ok() ? 0 : cud_bytes(9, w->O, w->I, 0);
+    }
     return cud_float(100 + w->gt) ? v41_cu_float(w->O, w->I) : cud_bytes(100 + w->gt, w->O, w->I, 0);
 }
 static size_t v41_cu_wb(const WB *w) {
     if (w->gx) return cud_float(100 + w->gt) ? v41_cu_float(w->O, w->I) : cud_bytes(100 + w->gt, w->O, w->I, 0);
     return w->w ? v41_cu_float(w->O, w->I) : 0;
 }
-static size_t v41_cu_dense_bytes(const Model *m) {
-    size_t b = v41_cu_wb(&m->head);
-    for (int i = 0; i < m->c.n_layers; i++) {
+#if defined(COLI_CUDA) && defined(COLI_SYCL)
+/* V41_TRUNK_GPU: every trunk matrix mv8_rows sees, up before the tier sizes itself on the card's free memory
+ * (wo_a as the group views attention's output builds); a matrix refused stays the CPU's */
+static void v41_e4_preload_model(Model *m) {
+    if (!g_e4_on) return;
+    Cfg *c = &m->c;
+    for (int i = 0; !g_e4_head_only && i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        const W8 *w[] = { &l->wq_a, &l->wq_b, &l->wkv, &l->wo_b, &l->idx_wq_b, &l->sh_w1, &l->sh_w3, &l->sh_w2, &l->eng_wkv };
+        for (size_t k = 0; k < sizeof w / sizeof *w; k++) v41_e4_preload(w[k]);
+        const WB *wb[] = { &l->comp_wkv, &l->comp_wgate, &l->idx_wk, &l->idx_wproj, &l->gate_w };
+        for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) v41_b16_preload(wb[k]);
+        if (l->wo_a.q && !l->wo_a.gx && c->o_groups > 0) {
+            const int per_group = c->n_heads * c->head_dim / c->o_groups;
+            for (int g = 0; g < c->o_groups; g++) {
+                W8 block = l->wo_a;
+                block.q = l->wo_a.q + (size_t)g * c->o_lora * per_group;
+                block.s = l->wo_a.s + (size_t)(g * c->o_lora / FP8_TILE) * ((per_group + FP8_TILE - 1) / FP8_TILE);
+                block.O = c->o_lora; block.I = per_group;
+                v41_e4_preload(&block);
+            }
+        }
+    }
+    v41_b16_preload(&m->head);
+    /* the scratch (rows x widest input, rows x widest output) and one launch of each extreme now, while the card has
+     * room: a later call never allocates; a failure here turns the trunk off (all the CPU's) before the tier starts */
+    V41E4 *wi = NULL, *wo = NULL;
+    for (size_t k = 0; k < g_e4_cap; k++) {
+        V41E4 *e = &g_e4_map[k];
+        if (!e->h) continue;
+        if (!wi || e->I > wi->I) wi = e;
+        if (!wo || e->O > wo->O) wo = e;
+    }
+    if (wi) {
+        const int S = g_e4_rows;
+        float *x = calloc((size_t)S * wi->I, sizeof *x), *y = malloc((size_t)S * wo->O * sizeof *y);
+        #define V41_WARM(e) ((e)->bf ? coli_cuda_bf16t_mv((e)->h, y, (e)->O, x, (e)->I, S) : coli_cuda_e4m3t_mv((e)->h, y, (e)->O, x, (e)->I, S))
+        const int ok = x && y && V41_WARM(wi) && V41_WARM(wo);
+        #undef V41_WARM
+        free(x); free(y);
+        if (!ok) {
+            for (size_t k = 0; k < g_e4_cap; k++)
+                if (g_e4_map[k].h) { (g_e4_map[k].bf ? coli_cuda_bf16t_free : coli_cuda_e4m3t_free)(g_e4_map[k].h); g_e4_map[k].h = NULL; g_e4_map[k].no = 1; }
+            fprintf(stderr, "[v41] V41_TRUNK_GPU: the warm-up launch failed: the trunk stays on the CPU\n");
+            g_e4_on = 0; g_e4_used = 0; g_e4_mats = 0; g_b16_on = 0; g_b16_used = 0; g_b16_mats = 0;
+            return;
+        }
+    }
+    fprintf(stderr, "[v41] V41_TRUNK_GPU: %llu trunk matrices on the device, %.2f GiB (BF16 %llu, %.2f GiB), before the tier\n", g_e4_mats + g_b16_mats, g_e4_used / 1073741824.0, g_b16_mats, g_b16_used / 1073741824.0);
+}
+#endif
+/* layers lo..hi-1's, and the head's with them when head (V41_CHAIN_SPLIT: a device's part) */
+static size_t v41_cu_dense_span(const Model *m, int lo, int hi, int head) {
+    /* the head: a GGUF's goes up through cud_mm (mvb's V41_CU). The native checkpoint's never does: it is the CPU's, or
+     * V41_HEAD_GPU's BF16 copy, up before the tier sizes itself -- counting its f32 rows here (2.47 GiB of V4.1-Flash)
+     * left that much of the card empty */
+    /* V41_DENSE_HEAD=1: count it as before (an A/B against runs made with the old budget: 117 experts fewer) */
+    static int old_head = -1;
+    if (old_head < 0) { const char *e = getenv("V41_DENSE_HEAD"); old_head = e && atoi(e) > 0; }
+    size_t b = head && (m->head.gx || old_head) ? v41_cu_wb(&m->head) : 0;
+    const int og = m->c.o_groups, ol = m->c.o_lora;
+    for (int i = lo; i < hi; i++) {
         const Layer *l = &m->L[i];
-        b += v41_cu_w8(&l->wq_a) + v41_cu_w8(&l->wq_b) + v41_cu_w8(&l->wkv) + v41_cu_w8(&l->wo_a) +
+        /* wo_a as the chain uploads it: its output groups, a matrix each (v41u_woa). A fmt 9 matrix carries a table and
+         * its own rows of tiles, so the groups take more than the one matrix (7 KiB a layer of V4.1-Flash): with the head
+         * out of the count that was the budget's last matrices refused, the routed experts back on the host */
+        size_t woa = v41_cu_w8(&l->wo_a);
+        if (woa && !l->wo_a.gx && og > 1 && ol > 0 && l->wo_a.O == og * ol) woa = (size_t)og * cud_bytes(9, ol, l->wo_a.I, 0);
+        b += v41_cu_w8(&l->wq_a) + v41_cu_w8(&l->wq_b) + v41_cu_w8(&l->wkv) + woa +
              v41_cu_w8(&l->wo_b) + v41_cu_w8(&l->idx_wq_b) + v41_cu_w8(&l->sh_w1) + v41_cu_w8(&l->sh_w3) +
              v41_cu_w8(&l->sh_w2) + v41_cu_w8(&l->eng_wkv) + v41_cu_wb(&l->comp_wkv) + v41_cu_wb(&l->comp_wgate) +
              v41_cu_wb(&l->idx_wk) + v41_cu_wb(&l->idx_wproj) + v41_cu_wb(&l->gate_w);
     }
-    return b;
+    /* and a margin: a matrix the count misses by a little must not turn the chain off on a card with gigabytes free
+     * (less than an expert of the tier's) */
+    return b ? b + ((size_t)8 << 20) : 0;
 }
+static size_t v41_cu_dense_bytes(const Model *m) { return v41_cu_dense_span(m, 0, m->c.n_layers, 1); }
+static size_t g_v41_cud2;   /* V41_CHAIN_SPLIT: the room the second device's layers' matrices take there */
 #endif
-/* what a prompt's chain allocates on the tier's device: the CUDA chain's at most (a GGUF on the
- * CUDA tier, one conversation, COLI_CUDA_CHAIN not 0); the tier leaves it */
+/* what a prompt's chain allocates on the tier's device: the CUDA chain's at most (a GGUF or the
+ * native FP8 on the CUDA tier, COLI_CUDA_CHAIN not 0; KV_SLOTS > 1 only with the decode steps on
+ * the chain, COLI_CUDA_V41_MIN=1: v41u_slots_ok, every slot's state counted); the tier leaves it */
 static size_t v41_tier_chain_bytes(Model *m) {
 #ifdef COLI_CUDA
     const char *e = getenv("COLI_CUDA_CHAIN");
-    if (xt_cuda() && m->gguf && !(e && *e == '0') && g_v41_mux_slots <= 1) return v41u_plan_bytes(m, m->c.max_positions);
+    if (xt_cuda() && (m->gguf || v41u_native(m)) && !(e && *e == '0') && v41u_slots_ok()) return v41u_plan_bytes(m, m->c.max_positions);
 #endif
     (void)m;
     return 0;
@@ -6687,6 +7321,10 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                     .ram_floor = expert * (size_t)c->n_activated * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .ram_later = v41_state_later(m) + v41_ps_plan(),
                     .dense_bytes = v41_tier_dense_bytes(m), .chain_bytes = v41_tier_chain_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
+#ifdef COLI_CUDA
+                    /* V41_CHAIN_SPLIT: the experts of the layers the chain runs on the second device live there only */
+                    .home_split = xt_cuda() ? g_v41u_split : 0, .dense_bytes2 = xt_cuda() && g_v41u_split ? g_v41_cud2 : 0,
+#endif
                     .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);
     rt_drop_row(c->n_layers);   /* no MTP row: the history is the backbone's */
@@ -6704,6 +7342,18 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
 #endif
     const int tier_on = XT(init)(&vc, rt_counts_all());
     free(lgu); free(ldn);   /* read during XT(init) only */
+#ifdef COLI_CUDA
+    if (xt_cuda() && g_v41u_split && (!tier_on || XT(home)() != g_v41u_split)) {
+        /* the tier did not take the second device (no room, not opened): one device as before, the whole trunk's
+         * budget back on the primary (what the tier left of the card may not hold it: the chain then declines) */
+        fprintf(stderr, "[CUDA] deepseek_v41 chain: V41_CHAIN_SPLIT=%d not in force (the tier holds no experts on a second device); "
+                        "one device as before\n", g_v41u_split);
+        g_v41u_split = 0;
+        cud_place(0);
+        g_cud.two = 0;
+        if (g_cud.on) g_cud.budget = v41_cu_dense_bytes(m);
+    }
+#endif
     if (!tier_on) { rt_destroy(); g_vk_usage[0] = 0; return; }
     atexit(XT(shutdown));
     int all = c->n_layers * c->n_routed;
@@ -6713,7 +7363,18 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
     if (n > 0) {
         double t0 = now_s();
         static const char *const part[V41_EXPERT_TENSORS] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
-        #pragma omp parallel for schedule(dynamic, 4)
+        /* V41_WARM_READERS=<n>: the warm start's reader threads. Unset: one an OpenMP thread, each reading an expert
+         * from the disk and uploading it -- the whole team on the disk and the bus at once, the start's burst. A few
+         * readers fill the card as full, later. */
+        const char *wre = getenv("V41_WARM_READERS");
+        int wr = wre && atoi(wre) > 0 ? atoi(wre) : 0;
+#ifdef _OPENMP
+        if (wr < 1 || wr > omp_get_max_threads()) wr = omp_get_max_threads();
+#else
+        (void)wr;
+#endif
+        if (wre && *wre) fprintf(stderr, "%s tier deepseek_v41: warm start with %d readers (V41_WARM_READERS)\n", XT_TAG, wr);
+        #pragma omp parallel for schedule(dynamic, 4) num_threads(wr)
         for (int i = 0; i < n; i++) {
             if (m->gx) {   /* a GGUF's: the file's rows */
                 uint8_t *rows = NULL;
@@ -6739,6 +7400,187 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
         XT(warm_report)("deepseek_v41", n, now_s() - t0);
     }
     free(pl); free(pe);
+}
+#endif
+
+/* The RAM fill's start (the note above v41_pl_reader), from serve_loop before READY: the two
+ * checks, the order, the spare slots, the readers.
+ *
+ * The checks. The cache must hold every expert of every backbone layer (the cap), or a fill
+ * would only evict what it read. And the machine must have the RAM now: the experts not yet
+ * in the slots, at the slots' size, against what the system says is available
+ * (compat_meminfo_gb: MemAvailable, or a container's room when that is less) less this
+ * process's mapped weights (MemAvailable counts their pages as memory it could take back,
+ * and they are in use) and a margin (5 % of the machine, 4 GB at least, and the state the
+ * conversations still allocate). A RAM budget (RAM_GB, the gateway's --ram) is kept too:
+ * what the process holds now and the fill must fit in it. Either check failing leaves the
+ * engine as it was, with one line saying which.
+ *
+ * The order: the experts the card does not hold first (the card serves its own), in each
+ * group the history's hottest first where the tier has one (route_trace.h), then an expert
+ * of each layer in turn. */
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+typedef struct { int flat, turn; uint32_t heat; uint8_t dev; } PlOrd;
+static int v41_pl_cmp(const void *a, const void *b) {
+    const PlOrd *x = a, *y = b;
+    if (x->dev != y->dev) return (int)x->dev - (int)y->dev;
+    if (x->heat != y->heat) return x->heat > y->heat ? -1 : 1;
+    return x->turn - y->turn;
+}
+/* This process's resident set and the file-backed part of it, GB; 0 where /proc does not say. */
+static void v41_pl_rss(double *rss_gb_now, double *file_gb) {
+    *rss_gb_now = *file_gb = 0;
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char ln[256]; double kb;
+    while (fgets(ln, sizeof ln, f)) {
+        if (sscanf(ln, "VmRSS: %lf", &kb) == 1) *rss_gb_now = kb * 1024.0 / 1e9;
+        else if (sscanf(ln, "RssFile: %lf", &kb) == 1) *file_gb = kb * 1024.0 / 1e9;
+    }
+    fclose(f);
+}
+static void v41_pl_start(Model *m) {
+    const Cfg *c = &m->c;
+    const char *sw = getenv("V41_RAM_FILL");
+    if (g_pl.run || (sw && *sw == '0') || g_v41_dry || !m->cache || c->n_routed < 1 || c->n_layers < 1) return;
+#ifdef V41_CLUSTER
+    if (g_cluster_n) return;   /* the workers hold the experts, no slot here is read */
+#endif
+    const int L = c->n_layers, E = c->n_routed;
+    int cap_min = E, in_ram = 0;
+    for (int i = 0; i < L; i++) {
+        if (!m->cache[i].slot) return;
+        if (m->cache[i].cap < cap_min) cap_min = m->cache[i].cap;
+        in_ram += m->cache[i].n;
+    }
+    const char *as = "they are read from the disk as requests want them, as before";
+    if (cap_min < E) {
+        fprintf(stderr, "[v41] RAM fill: off, the expert cache holds %d of a layer's %d experts (its cap): %s\n", cap_min, E, as);
+        return;
+    }
+    const int missing = L * E - in_ram;
+    if (missing < 1) return;
+    size_t slot_bytes = 0;
+    for (int part = 0; part < V41_EXPERT_TENSORS; part++) slot_bytes += (size_t)slot_part_bytes(m, part) + ST_DIRECT_ALIGN;
+    const double need = (double)missing * (double)slot_bytes / 1e9;
+    double total = 0, avail = 0, rss = 0, mapped = 0;
+    compat_meminfo_gb(&total, &avail);
+    v41_pl_rss(&rss, &mapped);
+    if (rss <= 0) rss = rss_gb();
+    double margin = total * 0.05;
+    if (margin < 4) margin = 4;
+    {   /* the conversations past the first: windows and compressed KV the RAM does not count yet */
+        double later = 0;
+        for (int i = 0; i < L; i++) {
+            later += (double)c->window * c->head_dim * sizeof(float);
+            if (c->kv_source[i]) {
+                const int ratio = c->compress_ratio[i];
+                later += (double)(c->max_positions / (ratio > 0 ? ratio : 1)) * (double)(c->head_dim + c->index_head_dim) * sizeof(float);
+            }
+        }
+        margin += later * (g_v41_mux_slots > 1 ? g_v41_mux_slots - 1 : 0) / 1e9;
+    }
+    const double room = avail - mapped;
+    if (avail <= 0 || need + margin > room) {
+        fprintf(stderr, "[v41] RAM fill: off, the %d experts not in RAM are %.1f GB and %.1f GB are free for them "
+                        "(%.1f GB available, less %.1f GB of this process's mapped weights, a %.1f GB margin kept): %s\n",
+                missing, need, room > margin ? room - margin : 0.0, avail, mapped, margin, as);
+        return;
+    }
+    const char *rg = getenv("RAM_GB");
+    const double budget = rg && *rg ? atof(rg) : 0;
+    if (budget > 0 && rss + need > budget) {
+        fprintf(stderr, "[v41] RAM fill: off, the %d experts not in RAM are %.1f GB and the process holds %.1f GB: over "
+                        "the RAM budget of %.0f GB (--ram): %s\n", missing, need, rss, budget, as);
+        return;
+    }
+    int readers = 4;
+    const char *re = getenv("V41_RAM_FILL_READERS");
+    if (re && *re) readers = atoi(re);
+    if (readers < 1) readers = 1;
+    if (readers > V41_PL_READERS_MAX) readers = V41_PL_READERS_MAX;
+    const char *pe = getenv("V41_RAM_FILL_PACE_US");
+    g_plw.pace_us = pe && *pe ? atoi(pe) : 0;
+    if (g_plw.pace_us < 0) g_plw.pace_us = 0;
+    if (g_plw.pace_us > 1000000) g_plw.pace_us = 1000000;
+    /* the order */
+    PlOrd *ord = malloc((size_t)missing * sizeof *ord);
+    uint8_t *have = calloc((size_t)L * E, 1);
+    const int n_sp = 2 * readers + 2;
+    PlSpare *sp = calloc((size_t)n_sp, sizeof *sp);
+    int *order = malloc((size_t)missing * sizeof(int)), *freeq = malloc((size_t)n_sp * sizeof(int)), *readyq = malloc((size_t)n_sp * sizeof(int));
+    int ok = ord && have && sp && order && freeq && readyq;
+    for (int i = 0; ok && i < n_sp; i++) {
+        sp[i].s.eid = -1; sp[i].s.gt[0] = sp[i].s.gt[1] = sp[i].s.gt[2] = -1;
+        for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
+            void *window = NULL;
+            if (posix_memalign(&window, ST_DIRECT_ALIGN, (size_t)slot_part_bytes(m, part) + ST_DIRECT_ALIGN) != 0) { ok = 0; break; }
+            sp[i].s.base[part] = window;
+            *slot_part(&sp[i].s, part) = window;
+        }
+    }
+    if (!ok) {
+        for (int i = 0; sp && i < n_sp; i++)
+            for (int part = 0; part < V41_EXPERT_TENSORS; part++) compat_aligned_free(sp[i].s.base[part]);
+        free(ord); free(have); free(sp); free(order); free(freeq); free(readyq);
+        fprintf(stderr, "[v41] RAM fill: off, no memory for its readers: %s\n", as);
+        return;
+    }
+    for (int i = 0; i < L; i++)
+        for (int k = 0; k < m->cache[i].n; k++)
+            if (m->cache[i].slot[k].eid >= 0 && m->cache[i].slot[k].eid < E) have[(size_t)i * E + m->cache[i].slot[k].eid] = 1;
+    int n = 0, on_dev = 0, hot = 0;
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    uint32_t **heat = XT(ready)() ? rt_counts_all() : NULL;
+#endif
+    for (int i = 0; i < L; i++)
+        for (int e = 0; e < E && n < missing; e++) {
+            if (have[(size_t)i * E + e]) continue;
+            PlOrd *o = &ord[n++];
+            o->flat = i * E + e; o->turn = e * L + i; o->heat = 0; o->dev = 0;
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+            o->dev = XT(resident)(i, e) ? 1 : 0;
+            if (heat && heat[i]) o->heat = heat[i][e];
+#endif
+            on_dev += o->dev; hot += o->heat > 0;
+        }
+    qsort(ord, (size_t)n, sizeof *ord, v41_pl_cmp);
+    for (int i = 0; i < n; i++) order[i] = ord[i].flat;
+    free(ord);
+    for (int i = 0; i < n_sp; i++) freeq[i] = i;
+    g_plw.m = m; g_plw.L = L; g_plw.readers = readers; g_plw.stop = 0;
+    g_plw.order = order; g_plw.n_order = n; g_plw.next = 0;
+    g_plw.sp = sp; g_plw.n_sp = n_sp; g_plw.freeq = freeq; g_plw.nfree = n_sp; g_plw.readyq = readyq; g_plw.nready = 0;
+    g_plw.bytes = 0; g_plw.installed = g_plw.dup = g_plw.dropped = 0;
+    g_pl.E = E; g_pl.have = have; g_pl.demand = 0; g_pl.poke = 0; g_pl.demand_ms = 0;
+    g_plw.t0 = now_s();
+    g_plw.live = 0; g_plw.n_th = 0;
+    (void)expert_direct();   /* decided here, once, before the readers ask */
+    pthread_mutex_lock(&g_plw.mx);
+    for (int i = 0; i < readers; i++)
+        if (!pthread_create(&g_plw.th[g_plw.n_th], NULL, v41_pl_reader, NULL)) { g_plw.n_th++; g_plw.live++; }
+    pthread_mutex_unlock(&g_plw.mx);
+    if (!g_plw.n_th) {
+        for (int i = 0; i < n_sp; i++)
+            for (int part = 0; part < V41_EXPERT_TENSORS; part++) compat_aligned_free(sp[i].s.base[part]);
+        free(have); free(sp); free(order); free(freeq); free(readyq);
+        g_pl.have = NULL; g_plw.sp = NULL; g_plw.order = g_plw.freeq = g_plw.readyq = NULL; g_plw.n_sp = 0;
+        fprintf(stderr, "[v41] RAM fill: off, its reader threads did not start: %s\n", as);
+        return;
+    }
+    g_plw.readers = g_plw.n_th;
+    g_pl.run = 1;
+    static int at_exit;
+    if (!at_exit) { at_exit = 1; atexit(v41_pl_stop); }
+    const char *wt = getenv("V41_RAM_FILL_WAIT");
+    const int wait = wt && *wt && *wt != '0';
+    char hist[64] = "";
+    if (hot) snprintf(hist, sizeof hist, ", the history's %d hottest first", hot);
+    fprintf(stderr, "[v41] RAM fill: %d experts (%.1f GB) into RAM %s, %d readers (V41_RAM_FILL_READERS), the %d the card "
+                    "holds last%s; %.1f GB free for them with a %.1f GB margin kept (V41_RAM_FILL=0: off)\n",
+            n, need, wait ? "before READY (V41_RAM_FILL_WAIT)" : "in the background, a request's own reads first",
+            g_plw.readers, on_dev, hist, room - margin, margin);
+    if (wait) v41_pl_wait(m);
 }
 #endif
 
@@ -6818,6 +7660,21 @@ int main(int argc, char **argv) {
             g_v41_mux_slots = (int)v;
         }
     }
+#if V41_AMX_HAVE
+    {   /* the CPU's measured default (platform_defaults.h): V41_AMX=2 where the CPU has AMX-BF16 (measured on a 60-core Xeon:
+         * the prompt pass -24..31 %, decode unchanged, the texts identical, the teacher-forced NLL within 0.0015). Not
+         * the AVX2 bits, so a platform default and not the code's: an explicit V41_AMX (0 turns it off) and
+         * COLI_PLATFORM_DEFAULTS=0 win; v41_amx_on still asks the kernel for the tile state and stands down if refused. */
+        unsigned ea = 0, eb = 0, ec = 0, ed = 0;
+        if (__get_cpuid_count(7, 0, &ea, &eb, &ec, &ed) && (ed & (1u << 24)) && (ed & (1u << 22)) && (eb & (1u << 16))) {
+            static const ColiDefaultKV v41_cpu[] = { {"V41_AMX", "2"} };
+            char got[64];
+            if (coli_platform_defaults_apply(v41_cpu, 1, got, sizeof got))
+                fprintf(stderr, "[v41] CPU defaults for the switches left unset (AMX-BF16 here; COLI_PLATFORM_DEFAULTS=0 "
+                                "keeps the code's own): %s\n", got);
+        }
+    }
+#endif
     int cap = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 8;
     const char *ref_path = argc > 2 ? argv[2] : NULL;
     int engram_rows = getenv("V41_ENGRAM_ROWS") ? atoi(getenv("V41_ENGRAM_ROWS")) : 65536;
@@ -6873,11 +7730,34 @@ int main(int argc, char **argv) {
         const char *cu = getenv("COLI_CUDA");
         int dev = 0;
         if (cu && atoi(cu) && !vkt_ready() && c->n_routed > 0 && cut_wanted()) {
-            if (!coli_cuda_init(&dev, 1)) fprintf(stderr, "[CUDA] deepseek_v41: no CUDA device, the routed experts stay on the CPU\n");
+            /* COLI_VK_DEV2 (the tier's second device): the engine opens a second device for it,
+             * COLI_GPUS's second entry (else device 1), the primary staying device 0; when that
+             * cannot be opened, the primary alone as before */
+            const char *d2 = getenv("COLI_VK_DEV2");
+            int two[2] = { 0, 1 }, opened = 0;
+            if (d2 && *d2) {   /* COLI_VK_DEV2 here: auto or 1, the tier's second opened device (cu_xb.dp.cpp) */
+                const char *gl = getenv("COLI_GPUS"), *cm = gl ? strchr(gl, ',') : NULL;
+                if (cm) { cm++; while (*cm == ' ') cm++; if (*cm >= '0' && *cm <= '9') two[1] = atoi(cm); }
+                if (two[1] != 0) opened = coli_cuda_init(two, 2);
+                if (!opened) fprintf(stderr, "[CUDA] deepseek_v41: COLI_VK_DEV2=%s: device %d not opened, the tier on one device\n", d2, two[1]);
+            }
+            if (!opened && !coli_cuda_init(&dev, 1)) fprintf(stderr, "[CUDA] deepseek_v41: no CUDA device, the routed experts stay on the CPU\n");
             else {
                 g_v41_cu = 1;
                 xt_use_cuda(1);
-                g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0), v41_cu_dense_bytes(&m));
+                /* V41_CHAIN_SPLIT: the layers from g_v41u_split on, their matrices and their experts, on the second device */
+                g_v41u_split = v41u_split_decide(&m, opened);
+                g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0),
+                                     v41_cu_dense_span(&m, 0, g_v41u_split ? g_v41u_split : c->n_layers, 1));
+                if (g_v41u_split && !g_cud.on) g_v41u_split = 0;
+                if (g_v41u_split) {
+                    g_v41_cud2 = v41_cu_dense_span(&m, g_v41u_split, c->n_layers, 0);
+                    cud_second(coli_cuda_device_at(1), g_v41_cud2);
+                }
+                v41_e4_start(coli_cuda_device_at(0));   /* V41_TRUNK_GPU: before the tier, which then sizes itself on what is left */
+#ifdef COLI_SYCL
+                v41_e4_preload_model(&m);
+#endif
                 vk_tier_start(&m, snap, cap);
                 if (!cut_ready()) { xt_use_cuda(0); g_v41_cu = 0; g_cud.on = 0; }
             }
@@ -6885,7 +7765,14 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    v41_amx_warm();   /* V41_AMX_WARM: the first AMX use as a ramp, after the tier's fill and before anything is served */
+
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {
+        /* unbuffered, as qwen36/qwen38: serve_mux asks select() whether a command waits
+         * (coli_serve_stdin_ready), and select cannot see commands stdio already read
+         * ahead into its buffer -- requests sent together then waited until every active
+         * one had finished, and ran one at a time */
+        setvbuf(stdin, NULL, _IONBF, 0);
         char path[1024];
         snprintf(path, sizeof(path), "%s/tokenizer.json", snap);
         Tok tokenizer;
@@ -6898,6 +7785,7 @@ int main(int argc, char **argv) {
         const char *seed = getenv("SEED");
         srand(seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)time(NULL));
         serve_loop(&m, &tokenizer, snap);
+        v41_pl_stop();   /* the RAM fill's readers, were they still reading */
         vk_report();
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
         XT(report)("run", m.hits, m.miss);

@@ -83,6 +83,9 @@ extern "C" void coli_sycl_print_profiles(void);
  * OpenCL view of the same cards is not listed twice): the ordinals the engine's COLI_GPUS /
  * COLI_GPU name, before any is opened. 0 when the runtime finds no GPU. Host only. */
 extern int coli_sycl_available_device_count(void);
+/* COLI_SYCL_TEST_CPU's count (tests: the CPU device as that many logical devices), 0 when unset: the chain's
+ * device check (cuda_chain.dp.cpp, CC_OWN) runs only then. Host only. */
+extern int coli_sycl_test_devices(void);
 /* Opens the devices of `devices` (ordinals, as coli_cuda_init takes them): a context and an
  * in-order queue per device (the backend's stream), a second in-order queue for the chain's copies
  * (cuda_chain.cu's c->cs), the profile. Repeating the same list keeps everything; a different list

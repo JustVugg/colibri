@@ -11,18 +11,25 @@
  * expert_act.comp's and expert_act_v4.comp's.
  *
  * Not here yet, declined as a Vulkan device without them declines: the dense chain's
- * expert table (xb_expert_entry 0), a second device, streaming's sub-batches and the
+ * expert table (xb_expert_entry 0), streaming's sub-batches and the
  * grouped step (gemm_rows 0), the low-bit formats 200-203 (no device form).
  *
  * On SYCL (c/sycl/MIGRATION.md): the device is coli_cuda_init's first (coli_sycl.h: its context,
  * its profile), the two streams are two in-order queues of this unit's own on that context (with
  * profiling, for the batch's elapsed time), the pools are USM device memory of that context, the
  * host pool is off (no mapped host memory the device reads: C.mapped 0), and cu_gemv_k runs at the
- * profile's sub-group through the SG dispatch. */
+ * profile's sub-group through the SG dispatch.
+ *
+ * The second device (COLI_VK_DEV2, vk_tier.c's d2), as cu_xb.cu's C2: a device the engine opened
+ * too (coli_cuda_init with two), its own queues, block table, e2m1 table and scratch, pool 3 in its
+ * memory, its batch beside the primary's. Nothing ever crosses between the two devices: a tensor
+ * goes up from the host to the device whose pool holds it, a copy between pools of different
+ * devices is refused, and each batch reads only its own device's memory. */
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>   /* dim3 */
 #include "backend_cuda.h"
 #define COLI_CUDA_CHAIN_NO_WRAPPERS
+#include "cuda_chain.h"   /* CcExpert: the dense chain's table entry (cu_xb_expert_entry) */
 #include "backend_gpu_compat.h"
 #include "coli_sycl.h"     /* the tier's device: coli_cuda_init's, through the profile module */
 #include "backend_sycl.h"  /* the error protocol, the shuffles, the SG launch */
@@ -109,6 +116,21 @@ static struct {
     std::vector<ColiVkTensor *> pending;   /* freed while a batch was in flight */
     ColiVkXbStats st;
 } C;
+/* COLI_VK_DEV2: the tier's second device, pool 3 in its memory (cu_xb.cu's C2) */
+static struct {
+    int on, dev, xb, sg;
+    char name[256];
+    size_t total, smem_max;
+    sycl::queue *xs, *cs;
+    sycl::event *e0, *e1;
+    float *e2m1;
+    bd_u32 *tab;
+    size_t cap;
+    float *dX, *dG, *dU, *dY, *dW, *hX, *hY, *hW;
+    int inflight, nrows;
+} C2;
+/* the queue a pool's memory is allocated and freed through: its device's */
+static sycl::queue &pq(int k) { return k == 3 ? *C2.xs : *C.xs; }
 
 /* cudaSetDevice: nothing to select, the queues name the device */
 static int cu_set(void) { return C.ready; }
@@ -117,9 +139,10 @@ static sycl::queue &dq(void) { return *C.xs; }
 static inline void sync_barrier(sycl::event *e, sycl::queue *q) { *e = q->ext_oneapi_submit_barrier(); }
 /* this unit's books for coli_sycl_mem_info: the device pools' blocks (the host pool is off) */
 static size_t xb_booked_bytes(int device) {
-    if (!C.ready || device != C.dev) return 0;
+    if (!C.ready) return 0;
     size_t b = 0;
-    for (int k = 0; k < CU_POOLS; k++) if (!C.pool[k].host) b += (size_t)C.pool[k].p.total;
+    if (device == C.dev) { for (int k = 0; k < CU_POOLS; k++) if (!C.pool[k].host && k != 3) b += (size_t)C.pool[k].p.total; }
+    else if (C2.on && device == C2.dev) b = (size_t)C.pool[3].p.total;
     return b;
 }
 static int cu_open(void) try {
@@ -178,9 +201,14 @@ static int cu_mem_budget(double *used_gb, double *budget_gb) try {
 }
 catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_mem_budget"); }
 static int cu_dev_info(int dev, ColiVkDevInfo *out) try {
-    if (dev != 0 || !C.ready) return 0;
+    if (!C.ready || (dev != 0 && !(dev == 1 && C2.on))) return 0;
     size_t fr = 0, tot = 0;
     memset(out, 0, sizeof *out);
+    if (dev == 1) {
+        out->name = C2.name; out->local_bytes = C2.total; out->buf_align = CU_ALIGN;
+        if (coli_sycl_mem_info(C2.dev, &fr, &tot, nullptr)) { out->has_budget = 1; out->free_bytes = fr; }
+        return 1;
+    }
     out->name = C.name; out->integrated = C.integrated; out->shares_ram = C.integrated;
     out->local_bytes = C.total; out->buf_align = CU_ALIGN;
     if (cu_set() && cu_mem_info(&fr, &tot)) {
@@ -189,13 +217,47 @@ static int cu_dev_info(int dev, ColiVkDevInfo *out) try {
     return 1;
 }
 catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_dev_info"); }
-static int cu_dev2_open_env(void) { return 0; }
+/* COLI_VK_DEV2=auto: the engine's second opened device; =<n>: its n-th opened device (n >= 1).
+ * Never the primary's own (no second logical device on one card here). Its queues, its tables. */
+static int cu_dev2_open_env(void) try {
+    if (C2.on) return 1;
+    const char *e = getenv("COLI_VK_DEV2");
+    if (!e || !*e || !cu_open()) return 0;
+    const int n = coli_cuda_device_count();
+    int idx = -1;
+    if (!strcmp(e, "auto")) idx = n >= 2 ? 1 : -1;
+    else { char *end = NULL; long v = strtol(e, &end, 10); if (end != e && *end == 0 && v >= 1 && v < n) idx = (int)v; }
+    if (idx < 0) return 0;
+    const int dev = coli_cuda_device_at(idx);
+    if (dev == C.dev || !coli_sycl_is_open(dev)) return 0;
+    const coli_sycl_profile &pr = coli_sycl_profile_for(dev);
+    const sycl::property_list props = {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()};
+    if (COLI_SYCL_TRY(C2.xs = new sycl::queue(coli_sycl_context(dev), coli_sycl_device(dev), props)) != 0 ||
+        COLI_SYCL_TRY(C2.cs = new sycl::queue(coli_sycl_context(dev), coli_sycl_device(dev), props)) != 0) return 0;
+    C2.e0 = new sycl::event(); C2.e1 = new sycl::event();
+    std::vector<bd_u32> t(BDT_WORDS);
+    bdtab_fill(t.data(), NULL);
+    static const float e2m1[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    if (COLI_SYCL_ALLOC(C2.tab, (bd_u32 *)sycl::malloc_device((size_t)BDT_WORDS * 4, *C2.xs), (size_t)BDT_WORDS * 4) != 0 ||
+        COLI_SYCL_TRY(C2.xs->memcpy(C2.tab, t.data(), (size_t)BDT_WORDS * 4).wait()) != 0 ||
+        COLI_SYCL_ALLOC(C2.e2m1, sycl::malloc_device<float>(8, *C2.xs), 8) != 0 ||
+        COLI_SYCL_TRY(C2.xs->memcpy(C2.e2m1, e2m1, sizeof e2m1).wait()) != 0) return 0;
+    C2.dev = dev;
+    snprintf(C2.name, sizeof C2.name, "%s", pr.device_name);
+    C2.total = pr.global_mem_bytes;
+    C2.smem_max = pr.slm_bytes ? pr.slm_bytes : 48 * 1024;
+    C2.sg = pr.sg_default == 32 ? 32 : 16;
+    { std::lock_guard<std::mutex> lk(C.mx); C.pool[3].on = 1; }
+    C2.on = 1;
+    return 1;
+}
+catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_dev2_open_env"); }
 
 /* ---------------------------------------------------------------- the pools */
 static size_t cu_block_bytes(size_t def) { return def; }
 static size_t cu_block_bytes_dev(int dev, size_t def) { (void)dev; return def; }
 static size_t cu_buffer_alignment(void) { return CU_ALIGN; }
-static int pool_of(int dev) { return dev == 0 ? 1 : dev == 2 ? 5 : -1; }
+static int pool_of(int dev) { return dev == 0 ? 1 : dev == 1 ? (C2.on ? 3 : -1) : dev == 2 ? 5 : -1; }
 
 /* a range of `bytes` in pool k, a block added when none holds it. C.mx held. */
 static int pool_take(int k, size_t bytes, VkaRange *r) try {
@@ -209,16 +271,15 @@ static int pool_take(int k, size_t bytes, VkaRange *r) try {
     if (!vka_pool_can_grow(&P->p, cap) || cap < bytes) { P->p.refusals++; return 0; }
     void *m = NULL;
     if (P->host ? COLI_SYCL_ALLOC(m, (void *)sycl::malloc_host(
-                                       cap, dq()), cap) != 0
+                                       cap, pq(k)), cap) != 0
                 : COLI_SYCL_ALLOC(m, (void *)sycl::malloc_device(
-                                       cap, dq()), cap) != 0) {
+                                       cap, pq(k)), cap) != 0) {
         P->p.refusals++;
         return 0;
     }
     int b = vka_pool_add_block(&P->p, cap, m);
     if (b < 0) {
-        if (P->host) sycl::free(m, dq());
-        else sycl::free(m, dq());
+        sycl::free(m, pq(k));
         return 0;
     }
     if ((int)P->mem.size() <= b) P->mem.resize(b + 1, NULL);
@@ -230,8 +291,7 @@ static void pool_give(int k, VkaRange r) {
     CuPool *P = &C.pool[k];
     if (vka_free(&P->p, r)) {
         void *m = P->mem[r.block];
-        if (P->host) sycl::free(m, dq());
-            else sycl::free(m, dq());
+        sycl::free(m, pq(k));
         P->mem[r.block] = NULL;
         vka_pool_drop_block(&P->p, r.block);
     }
@@ -345,15 +405,19 @@ static int cu_tier_tensor_like(int dev, ColiVkTensor **t, const ColiVkTensor *sr
 /* the host images up, all n before it returns */
 static int cu_tensor_commit(ColiVkTensor *const *t, int n) try {
     if (!cu_set()) return 0;
-    int ok = 1;
-    for (int i = 0; i < n; i++) {
-        ColiVkTensor *x = t[i];
-        if (!x || !x->img) continue;
-        ok &= COLI_SYCL_TRY(C.cs->memcpy(x->w, x->img, x->wbytes)) == 0 &&
-              COLI_SYCL_TRY(
-                  C.cs->memcpy(x->s, x->img + x->wbytes, x->sbytes)) == 0;
+    int ok = 1, two = 0;
+    for (int d = 0; d < 2; d++) {   /* the primary's tensors on its copy queue, then pool 3's on the second's */
+        if (d && !two) break;
+        sycl::queue *cs = d ? C2.cs : C.cs;
+        for (int i = 0; i < n; i++) {
+            ColiVkTensor *x = t[i];
+            if (!x || !x->img) continue;
+            if ((x->pool == 3) != d) { two |= x->pool == 3; continue; }
+            ok &= COLI_SYCL_TRY(cs->memcpy(x->w, x->img, x->wbytes)) == 0 &&
+                  COLI_SYCL_TRY(cs->memcpy(x->s, x->img + x->wbytes, x->sbytes)) == 0;
+        }
+        ok &= COLI_SYCL_TRY(cs->wait()) == 0;
     }
-    ok &= COLI_SYCL_TRY(C.cs->wait()) == 0;
     for (int i = 0; i < n; i++) if (t[i]) { free(t[i]->img); t[i]->img = NULL; }
     return ok;
 }
@@ -382,12 +446,15 @@ static int cu_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src,
     for (int i = 0; i < n && ok; i++) {
         ColiVkTensor *d = dst[i]; const ColiVkTensor *s = src[i];
         if (!d || !s || d->wcap < s->wbytes || d->scap < s->sbytes) { ok = 0; break; }
+        if ((d->pool == 3) != (s->pool == 3)) { ok = 0; break; }   /* never between the two devices */
         d->fmt = s->fmt; d->I = s->I; d->O = s->O; d->gs = s->gs; d->rowWords = s->rowWords;
         d->wbytes = s->wbytes; d->sbytes = s->sbytes;
-        ok = COLI_SYCL_TRY(C.cs->memcpy(d->w, s->w, s->wbytes)) == 0 &&
-             COLI_SYCL_TRY(C.cs->memcpy(d->s, s->s, s->sbytes)) == 0;
+        sycl::queue *cs = d->pool == 3 ? C2.cs : C.cs;
+        ok = COLI_SYCL_TRY(cs->memcpy(d->w, s->w, s->wbytes)) == 0 &&
+             COLI_SYCL_TRY(cs->memcpy(d->s, s->s, s->sbytes)) == 0;
     }
     ok &= COLI_SYCL_TRY(C.cs->wait()) == 0;
+    if (C2.on) ok &= COLI_SYCL_TRY(C2.cs->wait()) == 0;
     return ok;
 }
 catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_tensor_copy"); }
@@ -395,7 +462,7 @@ catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_tensor_copy"); 
 static void cu_tensor_free(ColiVkTensor *t) {
     if (!t) return;
     std::lock_guard<std::mutex> lk(C.mx);
-    if (C.inflight) { C.pending.push_back(t); return; }
+    if (C.inflight || C2.inflight) { C.pending.push_back(t); return; }
     tensor_release(t);
 }
 static size_t cu_tensor_bytes(const ColiVkTensor *t) { return t ? t->wcap + t->scap : 0; }
@@ -499,10 +566,10 @@ void cu_gemv_k(float *__restrict__ y, const float *__restrict__ x,
 }
 template <int FMT>
 static void cu_gemv_t(float *y, const float *x, const ColiVkTensor *t, int S,
-                      sycl::queue * st) {
-    const int wpb = 256 / C.sg;   /* rows a block: a sub-group each */
+                      sycl::queue * st, int sg, const float *e2m1) {
+    const int wpb = 256 / sg;   /* rows a block: a sub-group each */
     const unsigned bx = (unsigned)((t->O + wpb - 1) / wpb);
-    const float *cu_e2m1_ptr_ct1 = C.e2m1;
+    const float *cu_e2m1_ptr_ct1 = e2m1;
     auto t_w_ct2 = (const unsigned *)t->w;
     auto t_s_ct3 = t->s;
     auto t_I_ct4 = t->I;
@@ -510,33 +577,37 @@ static void cu_gemv_t(float *y, const float *x, const ColiVkTensor *t, int S,
     auto t_rowWords_ct6 = t->rowWords;
     auto t_gs_ct7 = t->gs;
     if (S == 1)
-        COLI_SG_LAUNCH(*st, C.sg, sycl::range<3>(1, 1, bx), 256, 0,
+        COLI_SG_LAUNCH(*st, sg, sycl::range<3>(1, 1, bx), 256, 0,
                        cu_gemv_k<FMT, 1, SG>(y, x, t_w_ct2, t_s_ct3, t_I_ct4, t_O_ct5, t_rowWords_ct6, t_gs_ct7, 1, cu_e2m1_ptr_ct1));
     else
-        COLI_SG_LAUNCH(*st, C.sg, sycl::range<3>(1, (unsigned)((S + CU_NR - 1) / CU_NR), bx), 256, 0,
+        COLI_SG_LAUNCH(*st, sg, sycl::range<3>(1, (unsigned)((S + CU_NR - 1) / CU_NR), bx), 256, 0,
                        cu_gemv_k<FMT, CU_NR, SG>(y, x, t_w_ct2, t_s_ct3, t_I_ct4, t_O_ct5, t_rowWords_ct6, t_gs_ct7, S, cu_e2m1_ptr_ct1));
 }
 static int g_exact;   /* GQ_EXACT=1: a GGUF's blocks in the float form, as the CPU's reference */
 /* y [S x O] = x [S x I] W^T on the batch's stream; 0 = the format has no kernel here */
-static int cu_gemv(float *y, const float *x, const ColiVkTensor *t, int S,
-                   sycl::queue * st) try {
+/* on a device's queue with its tables (the primary's: cu_gemv; the second's: cu_xb_issue2) */
+static int cu_gemv_on(const bd_u32 *tab, size_t smem, int sg, const float *e2m1, float *y, const float *x,
+                      const ColiVkTensor *t, int S, sycl::queue *st) try {
     if (cu_bd_fmt(t->fmt))
-        return bd_gemv_launch(y, x, (const bd_u32 *)t->w, C.tab, t->fmt, t->I, t->O, t->rowWords, S, C.smem_max, g_exact, C.sg, st);
+        return bd_gemv_launch(y, x, (const bd_u32 *)t->w, tab, t->fmt, t->I, t->O, t->rowWords, S, smem, g_exact, sg, st);
     switch (t->fmt) {
-    case 1: cu_gemv_t<1>(y, x, t, S, st); break;
-    case 2: cu_gemv_t<2>(y, x, t, S, st); break;
-    case 4: cu_gemv_t<4>(y, x, t, S, st); break;
-    case 5: cu_gemv_t<5>(y, x, t, S, st); break;
-    case 7: cu_gemv_t<7>(y, x, t, S, st); break;
-    case 10: cu_gemv_t<10>(y, x, t, S, st); break;
-    case 11: cu_gemv_t<11>(y, x, t, S, st); break;
-    case 12: cu_gemv_t<12>(y, x, t, S, st); break;
-    case 13: cu_gemv_t<13>(y, x, t, S, st); break;
+    case 1: cu_gemv_t<1>(y, x, t, S, st, sg, e2m1); break;
+    case 2: cu_gemv_t<2>(y, x, t, S, st, sg, e2m1); break;
+    case 4: cu_gemv_t<4>(y, x, t, S, st, sg, e2m1); break;
+    case 5: cu_gemv_t<5>(y, x, t, S, st, sg, e2m1); break;
+    case 7: cu_gemv_t<7>(y, x, t, S, st, sg, e2m1); break;
+    case 10: cu_gemv_t<10>(y, x, t, S, st, sg, e2m1); break;
+    case 11: cu_gemv_t<11>(y, x, t, S, st, sg, e2m1); break;
+    case 12: cu_gemv_t<12>(y, x, t, S, st, sg, e2m1); break;
+    case 13: cu_gemv_t<13>(y, x, t, S, st, sg, e2m1); break;
     default: return 0;
     }
     return 1;   /* a submit that fails throws (sycl_caught): cudaPeekAtLastError's check always passes here */
 }
 catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_gemv"); }
+static int cu_gemv(float *y, const float *x, const ColiVkTensor *t, int S, sycl::queue *st) {
+    return cu_gemv_on(C.tab, C.smem_max, C.sg, C.e2m1, y, x, t, S, st);
+}
 
 /* ---------------------------------------------------------------- the activations */
 __dpct_inline__ float cu_bf16r(float v) {
@@ -626,7 +697,13 @@ auto &amax = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[128]>(
 
 /* ---------------------------------------------------------------- the expert batch */
 static int cu_xb_init(int D, int I, int act, float limit, float a, float b) {
-    if (!cu_open() || D < 1 || I < 1 || C.inflight) return 0;
+    if (!cu_open() || D < 1 || I < 1 || C.inflight || C2.inflight) return 0;
+    if (C2.on && C2.cap && (D != C.D || I != C.I)) {   /* the second device's scratch too, and its batch until xb_init_dev(1) again */
+        sycl::queue &q = *C2.xs;
+        sycl::free(C2.dX, q); sycl::free(C2.dG, q); sycl::free(C2.dU, q); sycl::free(C2.dY, q); sycl::free(C2.dW, q);
+        sycl::free(C2.hX, q); sycl::free(C2.hY, q); sycl::free(C2.hW, q);
+        C2.dX = C2.dG = C2.dU = C2.dY = C2.dW = C2.hX = C2.hY = C2.hW = NULL; C2.cap = 0; C2.xb = 0;
+    }
     if (C.xb && (D != C.D || I != C.I)) {   /* another geometry (a tier started again): the scratch anew */
         sycl::free(C.dX, dq());
             sycl::free(C.dG, dq());
@@ -644,10 +721,13 @@ static int cu_xb_init(int D, int I, int act, float limit, float a, float b) {
     return 1;
 }
 static int cu_xb_init_dev(int dev, int D, int I, int act, float limit, float a, float b) {
-    return dev == 0 ? cu_xb_init(D, I, act, limit, a, b) : 0;
+    if (dev == 0) return cu_xb_init(D, I, act, limit, a, b);
+    if (dev != 1 || !C2.on || C2.inflight || !C.xb || D != C.D || I != C.I || act != C.act) return 0;   /* the primary's geometry */
+    C2.xb = 1;
+    return 1;
 }
 static int cu_xb_ready(void) { return C.xb; }
-static int cu_xb_ready_dev(int dev) { return dev == 0 && C.xb; }
+static int cu_xb_ready_dev(int dev) { return dev == 0 ? C.xb : dev == 1 && C2.on && C2.xb; }
 static int cu_xb_queue_shared(void) { return 0; }
 static ColiVkExpert *cu_xb_expert(ColiVkTensor *g, ColiVkTensor *u, ColiVkTensor *d) {
     if (!C.xb || !g || !u || !d || g->fmt != u->fmt) return NULL;
@@ -664,7 +744,27 @@ static void cu_xb_expert_free(ColiVkExpert *e) {
 static void cu_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
     *g = e ? e->g : NULL; *u = e ? e->u : NULL; *d = e ? e->d : NULL;
 }
-static int cu_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry) { (void)e; (void)entry; return 0; }
+/* An expert's entry for the dense chain's routed experts (vk_tier.c's vkt_dev_table, then cc_moe's table): the
+ * CcExpert of its three tensors when all three are in one device's memory (the primary's pool 1, or the second
+ * device's pool 3: the tier asks for a second-device expert only with a home by layer, for the chain that runs that
+ * layer there) -- weights and the scales as the tier stores them (fmt 7: one float 2^(s-127) a 32 inputs: cc_moe with
+ * CcMoe.gs 32) -- else a zero entry, which cc_moe skips and the engine computes on the CPU (the host pool's experts).
+ * Returns 1 (an entry written) for both; the table's count then counts the zero entries of the host pool too. */
+static int cu_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry) {
+    static_assert(sizeof(CcExpert) <= 32 * sizeof(uint32_t), "a CcExpert fits COLI_VK_XB_ENTRY words");
+    if (!entry) return 0;
+    std::memset(entry, 0, 32 * sizeof(uint32_t));
+    /* a device's own memory: the primary's (pool 1), or the second device's (pool 3) for a chain that runs there and
+     * reads its tables there (the tier's home by layer names each layer's experts on that layer's device only) */
+    if (!e || !e->g || !e->u || !e->d) return 1;
+    const int pl = e->g->pool;
+    if ((pl != 1 && pl != 3) || e->u->pool != pl || e->d->pool != pl) return 1;
+    CcExpert x;
+    std::memset(&x, 0, sizeof x);
+    x.g = e->g->w; x.u = e->u->w; x.d = e->d->w; x.gs = e->g->s; x.us = e->u->s; x.ds = e->d->s;
+    std::memcpy(entry, &x, sizeof x);
+    return 1;
+}
 
 /* the scratch for `rows` rows: x, gate (then the activation), up, y and the route weights on
  * the device, x, y and the weights in page-locked RAM. Not while a batch is in flight. */
@@ -708,6 +808,8 @@ catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_grow"); }
 static int cu_xb_issue_w(ColiVkExpert *const *ex, const int *rows, int count,
                          const float *const *xrows, const float *wrows) try {
     if (!C.xb || C.inflight || count < 1 || !cu_set()) return 0;
+    for (int c = 0; c < count; c++)   /* the primary's residents only: never the second device's memory */
+        if (rows[c] && (!ex[c] || ex[c]->g->pool == 3 || ex[c]->u->pool == 3 || ex[c]->d->pool == 3)) return 0;
     int tot = 0;
     for (int c = 0; c < count; c++) tot += rows[c];
     if (tot < 1 || !cu_grow(tot)) return 0;
@@ -779,23 +881,98 @@ static int cu_xb_issue_w(ColiVkExpert *const *ex, const int *rows, int count,
     return 1;
 }
 catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_xb_issue_w"); }
+/* the second device's scratch: cu_grow's on its queue */
+static int cu_grow2(int rows) try {
+    if ((size_t)rows <= C2.cap) return 1;
+    size_t n = C2.cap ? C2.cap : 64;
+    while (n < (size_t)rows) n *= 2;
+    sycl::queue &q = *C2.xs;
+    sycl::free(C2.dX, q); sycl::free(C2.dG, q); sycl::free(C2.dU, q); sycl::free(C2.dY, q); sycl::free(C2.dW, q);
+    sycl::free(C2.hX, q); sycl::free(C2.hY, q); sycl::free(C2.hW, q);
+    C2.dX = C2.dG = C2.dU = C2.dY = C2.dW = C2.hX = C2.hY = C2.hW = NULL; C2.cap = 0;
+    const size_t D = (size_t)C.D, I = (size_t)C.I;
+    if (COLI_SYCL_ALLOC(C2.dX, (float *)sycl::malloc_device(n * D * 4, q), n * D * 4) != 0 ||
+        COLI_SYCL_ALLOC(C2.dG, (float *)sycl::malloc_device(n * I * 4, q), n * I * 4) != 0 ||
+        COLI_SYCL_ALLOC(C2.dU, (float *)sycl::malloc_device(n * I * 4, q), n * I * 4) != 0 ||
+        COLI_SYCL_ALLOC(C2.dY, (float *)sycl::malloc_device(n * D * 4, q), n * D * 4) != 0 ||
+        COLI_SYCL_ALLOC(C2.dW, (float *)sycl::malloc_device(n * 4, q), n * 4) != 0 ||
+        COLI_SYCL_ALLOC(C2.hX, (float *)sycl::malloc_host(n * D * 4, q), n * D * 4) != 0 ||
+        COLI_SYCL_ALLOC(C2.hY, (float *)sycl::malloc_host(n * D * 4, q), n * D * 4) != 0 ||
+        COLI_SYCL_ALLOC(C2.hW, (float *)sycl::malloc_host(n * 4, q), n * 4) != 0)
+        return 0;
+    C2.cap = n;
+    return 1;
+}
+catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_grow2"); }
+/* the second device's batch: cu_xb_issue_w's on its queue with its tables, its residents (pool 3) only */
+static int cu_xb_issue2(ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
+                        const float *wrows) try {
+    if (!C2.on || !C2.xb || C2.inflight || count < 1) return 0;
+    for (int c = 0; c < count; c++)
+        if (rows[c] && (!ex[c] || ex[c]->g->pool != 3 || ex[c]->u->pool != 3 || ex[c]->d->pool != 3)) return 0;
+    int tot = 0;
+    for (int c = 0; c < count; c++) tot += rows[c];
+    if (tot < 1 || !cu_grow2(tot)) return 0;
+    const size_t D = (size_t)C.D, I = (size_t)C.I;
+    for (int j = 0; j < tot; j++) {
+        memcpy(C2.hX + (size_t)j * D, xrows[j], D * 4);
+        C2.hW[j] = wrows ? wrows[j] : 1.f;
+    }
+    sycl::queue *st = C2.xs;
+    int ok = COLI_SYCL_TRY(sync_barrier(C2.e0, st)) == 0 &&
+             COLI_SYCL_TRY(st->memcpy(C2.dX, C2.hX, (size_t)tot * D * 4)) == 0 &&
+             (C.act != 2 || COLI_SYCL_TRY(st->memcpy(C2.dW, C2.hW, (size_t)tot * 4)) == 0);
+    for (int c = 0, r0 = 0; c < count && ok; r0 += rows[c], c++) {
+        const int n = rows[c];
+        if (!n) continue;
+        const ColiVkExpert *e = ex[c];
+        float *g = C2.dG + (size_t)r0 * I, *u = C2.dU + (size_t)r0 * I;
+        ok = cu_gemv_on(C2.tab, C2.smem_max, C2.sg, C2.e2m1, g, C2.dX + (size_t)r0 * D, e->g, n, st) &&
+             cu_gemv_on(C2.tab, C2.smem_max, C2.sg, C2.e2m1, u, C2.dX + (size_t)r0 * D, e->u, n, st);
+        if (!ok) break;
+        const long ne = (long)n * (long)I;
+        const int act = C.act; const float lim = C.limit, aa = C.a, bb = C.b;
+        st->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((ne + 255) / 256)) * sycl::range<3>(1, 1, 256),
+                                           sycl::range<3>(1, 1, 256)),
+                         [=](sycl::nd_item<3>) { cu_act_k(g, u, ne, act, lim, aa, bb); });
+        if (act == 2) {
+            const float *w = C2.dW + r0;
+            st->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, (unsigned)n, (unsigned)((I + 127) / 128)) * sycl::range<3>(1, 1, 128),
+                                               sycl::range<3>(1, 1, 128)),
+                             [=](sycl::nd_item<3>) { cu_act_v4_k(g, w, n, (int)I); });
+        }
+        ok = cu_gemv_on(C2.tab, C2.smem_max, C2.sg, C2.e2m1, C2.dY + (size_t)r0 * D, g, e->d, n, st);
+    }
+    ok = ok && COLI_SYCL_TRY(st->memcpy(C2.hY, C2.dY, (size_t)tot * D * 4)) == 0 &&
+         COLI_SYCL_TRY(sync_barrier(C2.e1, st)) == 0;
+    if (!ok) { st->wait(); return 0; }
+    { std::lock_guard<std::mutex> lk(C.mx); C2.inflight = 1; }
+    C2.nrows = tot;
+    return 1;
+}
+catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_xb_issue2"); }
 static int cu_xb_issue_dev(int dev, ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
                            const float *wrows) {
-    return dev == 0 ? cu_xb_issue_w(ex, rows, count, xrows, wrows) : 0;
+    return dev == 0 ? cu_xb_issue_w(ex, rows, count, xrows, wrows) : dev == 1 ? cu_xb_issue2(ex, rows, count, xrows, wrows) : 0;
 }
 static int cu_xb_join(const float **yrows, double *device_ms) try {
     if (!C.inflight) return 0;
     int e = COLI_SYCL_TRY(C.e1->wait_and_throw());
     float ms = 0.f;
     if (e == 0) try {   /* the batch's bounds on a profiling queue: cudaEventElapsedTime's figure */
-        ms = (C.e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
-              C.e0->get_profiling_info<sycl::info::event_profiling::command_start>()) / 1000000.0f;
+        /* signed: the barrier's start can read after the end mark (two events), and the
+         * unsigned difference then wrapped to ~1.8e13 ms, which the tier's balance reads */
+        const long long d = (long long)(C.e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
+                                        C.e0->get_profiling_info<sycl::info::event_profiling::command_start>());
+        ms = d > 0 ? (float)d / 1000000.0f : 0.f;
     } catch (sycl::exception const &) { ms = 0.f; }
     {
         std::lock_guard<std::mutex> lk(C.mx);
         C.inflight = 0;
-        for (ColiVkTensor *t : C.pending) tensor_release(t);
-        C.pending.clear();
+        if (!C2.inflight) {
+            for (ColiVkTensor *t : C.pending) tensor_release(t);
+            C.pending.clear();
+        }
     }
     if (e != 0) return 0;
     for (int j = 0; j < C.nrows; j++) yrows[j] = C.hY + (size_t)j * C.D;
@@ -804,8 +981,36 @@ static int cu_xb_join(const float **yrows, double *device_ms) try {
     return 1;
 }
 catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_xb_join"); }
-static int cu_xb_join_dev(int dev, const float **yrows, double *device_ms) { return dev == 0 ? cu_xb_join(yrows, device_ms) : 0; }
-static int cu_xb_busy_dev(int dev) { return dev == 0 && C.inflight; }
+static int cu_xb_join2(const float **yrows, double *device_ms) try {
+    if (!C2.inflight) return 0;
+    int e = COLI_SYCL_TRY(C2.e1->wait_and_throw());
+    float ms = 0.f;
+    if (e == 0) try {
+        /* signed: the barrier's start can read after the end mark (two events), and the
+         * unsigned difference then wrapped to ~1.8e13 ms, which the tier's balance reads */
+        const long long d = (long long)(C2.e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
+                                        C2.e0->get_profiling_info<sycl::info::event_profiling::command_start>());
+        ms = d > 0 ? (float)d / 1000000.0f : 0.f;
+    } catch (sycl::exception const &) { ms = 0.f; }
+    else C2.xb = 0;   /* the device stopped answering: the tier stops using it */
+    {
+        std::lock_guard<std::mutex> lk(C.mx);
+        C2.inflight = 0;
+        if (!C.inflight) {
+            for (ColiVkTensor *t : C.pending) tensor_release(t);
+            C.pending.clear();
+        }
+    }
+    if (e != 0) return 0;
+    for (int j = 0; j < C2.nrows; j++) yrows[j] = C2.hY + (size_t)j * C.D;
+    if (device_ms) *device_ms = ms;
+    return 1;
+}
+catch (sycl::exception const &exc) { return sycl_caught(exc, "cu_xb_join2"); }
+static int cu_xb_join_dev(int dev, const float **yrows, double *device_ms) {
+    return dev == 0 ? cu_xb_join(yrows, device_ms) : dev == 1 ? cu_xb_join2(yrows, device_ms) : 0;
+}
+static int cu_xb_busy_dev(int dev) { return dev == 0 ? C.inflight : dev == 1 && C2.inflight; }
 static void cu_xb_stats(ColiVkXbStats *st) {
     *st = C.st;
     st->timestamps = 1; st->queue_shared = 0; st->gemm_rows = 0;   /* no streaming yet */

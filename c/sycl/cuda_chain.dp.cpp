@@ -49,6 +49,8 @@
  * no transfer, no synchronization. */
 extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
+extern "C" int coli_cuda_tensor_gemm_grp_async(ColiCudaTensor *const *t, int ng, float *y_dev, int y_row, const float *x_dev,
+                                               int x_row, int x_grp, int S, void *stream);
 extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream);
 extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *ids_dev, float *y_dev, const float *x_dev, int n, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
@@ -73,6 +75,8 @@ struct CcSync {
     sycl::event up_ev[CC_UP_MARKS];       /* host_up: the copies' marks, a ring on the copy queue */
     sycl::event up_after;                 /* the frame's point a host_up waits for */
     sycl::event stg_ev[CC_STAGE_N];       /* cc_write: the copy that last read each staging slot */
+    sycl::event mark;                     /* cc_mark: the point of the open frame the host asks about (cc_reached) */
+    int mark_set = 0;
 };
 struct CcCtx {
     int device, up, lost, in_frame;
@@ -101,6 +105,65 @@ double cc_now_ms(void) {
 }
 CcCtx *cur(void) { return g_cur >= 0 ? &g_cc[g_cur] : nullptr; }
 CcCtx *ctx_of(int device) { for (int i = 0; i < g_ncc; i++) if (g_cc[i].device == device) return &g_cc[i]; return nullptr; }
+/* The device check (COLI_SYCL_TEST_CPU: logical devices on the CPU device, tests only; nothing otherwise). With two
+ * devices an engine runs some layers' frames on each (deepseek_v41_cuchain.h, V41_CHAIN_SPLIT), and every buffer,
+ * table and expert a frame's op reads or writes must be that device's: on cards another device's address is not
+ * mapped and the kernel faults (a GPU page fault on the second card, seen once), while on the CPU device, where every
+ * logical device's memory is the host's, the same mistake computes the right answer. So here each op says whose
+ * its arguments are before it records anything: a buffer by the device it was made on (and, asked of the runtime, the
+ * context that owns its memory), a raw device pointer by the owning context. A foreign one aborts with the op's name
+ * and the argument. */
+int cc_own_which(const void *ptr) {   /* the chain device whose context owns ptr, -1 none of them */
+    for (int i = 0; i < g_ncc; i++) {
+        if (!g_cc[i].up || !g_cc[i].stream) continue;
+        try { if (sycl::get_pointer_type(ptr, g_cc[i].stream->get_context()) != sycl::usm::alloc::unknown) return g_cc[i].device; }
+        catch (...) {}
+    }
+    return -1;
+}
+void cc_own_ptr(CcCtx *c, const char *op, const char *what, const void *ptr) {
+    if (!c || !ptr || !c->stream) return;
+    int mine = 0;
+    try { mine = sycl::get_pointer_type(ptr, c->stream->get_context()) != sycl::usm::alloc::unknown; } catch (...) { mine = 0; }
+    if (mine) return;
+    std::fprintf(stderr, "[SYCL] device check (COLI_SYCL_TEST_CPU): %s: %s (%p) is not device %d's memory, where this frame runs "
+                         "(it is device %d's)\n", op, what, ptr, c->device, cc_own_which(ptr));
+    std::fflush(stderr);
+    std::abort();
+}
+void cc_own_check(CcCtx *c, const char *op, const char *names, const CcBuf *const *b, int n) {
+    if (!c) return;
+    for (int k = 0; k < n; k++) {
+        if (!b[k]) continue;
+        if (b[k]->dev != c->device) {
+            std::fprintf(stderr, "[SYCL] device check (COLI_SYCL_TEST_CPU): %s: buffer argument %d of (%s) was made on device %d, "
+                                 "this frame runs on device %d\n", op, k + 1, names, b[k]->dev, c->device);
+            std::fflush(stderr);
+            std::abort();
+        }
+        cc_own_ptr(c, op, "a buffer's memory", b[k]->d);
+    }
+}
+#define CC_OWN(c, op, ...) do { if (coli_sycl_test_devices()) { const CcBuf *const own_[] = { __VA_ARGS__ }; \
+        cc_own_check((c), op, #__VA_ARGS__, own_, (int)(sizeof own_ / sizeof *own_)); } } while (0)
+/* a layer's table of experts (cc_moe's): every entry's tensors and scales this device's (E entries from t_off) */
+void cc_own_tensor(CcCtx *c, const char *op, const ColiCudaTensor *t) {
+    if (!coli_sycl_test_devices() || !c || !t || coli_cuda_tensor_device(t) == c->device) return;
+    std::fprintf(stderr, "[SYCL] device check (COLI_SYCL_TEST_CPU): %s: the matrix is on device %d, this frame runs on device %d\n",
+                 op, coli_cuda_tensor_device(t), c->device);
+    std::fflush(stderr);
+    std::abort();
+}
+void cc_own_table(CcCtx *c, const char *op, const CcBuf *tab, int t_off, int E) {
+    if (!coli_sycl_test_devices() || !c || !tab || E < 1 || t_off < 0 || ((size_t)t_off + (size_t)E) * sizeof(CcExpert) > tab->bytes) return;
+    const CcExpert *t = (const CcExpert *)tab->d + t_off;   /* the CPU device: its memory is the host's */
+    for (int e = 0; e < E; e++) {
+        const void *q[6] = { t[e].g, t[e].u, t[e].d, t[e].gs, t[e].us, t[e].ds };
+        static const char *const nm[6] = { "an expert's gate weights", "an expert's up weights", "an expert's down weights",
+                                           "an expert's gate scales", "an expert's up scales", "an expert's down scales" };
+        for (int k = 0; k < 6; k++) if (q[k]) cc_own_ptr(c, op, nm[k], q[k]);
+    }
+}
 /* every call: the context, up and not lost (the queues carry their device: no cudaSetDevice) */
 int cc_fail(CcCtx *c, const char *what, const char *why);
 /* An asynchronous error (a command the runtime reports as failed, delivered to the queue's
@@ -222,6 +285,11 @@ __attribute__((noinline)) static float cc_rstd(float ss, float n, float eps) {
     const float ms = n > 0.f ? ss / n : ss;
     return sycl::rsqrt(ms + eps);
 }
+/* NV: the elements a work-item holds in registers (D <= 256 NV). 8 is the kernel as it was (up to 2048 a row, longer
+ * rows through the loops); 20 takes a row of up to 5120 the same way (DeepSeek V4.1's two FFN/attention input norms a
+ * layer, D 5120: 25 us a launch through the loops against 6 us for the short rows, by a frame profile) -- the values,
+ * the order of the sum and the products are the loops', so the bits are. COLI_SYCL_NORM_NV=8: as before. */
+template <int NV>
 static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w,
                       float *__restrict__ y, CcNorm p) {
     auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -240,17 +308,17 @@ static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w,
     /* up to 2048 a row: x and the weights in registers, loaded together before the sum (the
      * weights used to be read after it, a second trip to memory on the step's path); the same
      * values in the same order, so the same bits */
-    const bool fit = p.D <= 8 * 256;
-    float xv[8], wv8[8];
+    const bool fit = p.D <= NV * 256;
+    float xv[NV], wv8[NV];
     if (fit) {
         #pragma unroll
-        for (int k = 0; k < 8; k++) {
+        for (int k = 0; k < NV; k++) {
             const int i = tid + 256 * k;
             xv[k] = i < p.D ? x[xb + i] : 0.f;
             wv8[k] = wt && i < p.D ? w[wb + i] : 0.f;
         }
         #pragma unroll
-        for (int k = 0; k < 8; k++)
+        for (int k = 0; k < NV; k++)
             if (tid + 256 * k < p.D) { float v = pre ? xv[k] * wv8[k] : xv[k]; acc += v * v; }
     } else
         for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
@@ -263,7 +331,7 @@ static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w,
     float r = cc_rstd(red[0], (p.flags & 4) ? 0.f : (float)p.D, p.eps);   /* the .cu's 1.f / sqrtf, see cc_rstd */
     if (fit) {
         #pragma unroll
-        for (int k = 0; k < 8; k++) {
+        for (int k = 0; k < NV; k++) {
             const int i = tid + 256 * k;
             if (i >= p.D) continue;
             float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + wv8[k] : wv8[k]);
@@ -843,6 +911,7 @@ static int cc_attn_xmx_ok(const CcCtx *c, const CcAttn *p, int G, int kv_f16, in
 template <typename KT>
 static int cc_attn_xmx(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p, int G,
                        int win, const float *sk, int so, int ring, const int *sel) {
+    CC_OWN(cur(), "cc_attn_xmx", q, kc, vc, o, gate);
     coli_sycl_attn a;
     a.q = fp(q); a.kc = kvp<KT>(kc); a.vc = kvp<KT>(vc); a.kv_f16 = sizeof(KT) == 2; a.o = fpw(o); a.gate = fp(gate);
     a.p = *p; a.G = G; a.win = win; a.snk = sk; a.sink_off = so; a.ring = ring; a.sel = sel;
@@ -2064,6 +2133,7 @@ static void cc_free(CcBuf *b) {
     std::free(b);
 }
 static int cc_reserve(CcBuf **b, size_t bytes, int kind) {
+    if (*b) CC_OWN(cur(), "cc_reserve", *b);   /* a bank's buffer asked for on the other device */
     if (*b && (*b)->bytes >= bytes && (*b)->kind == kind) return 1;
     CcBuf *n = cc_buf(bytes, kind);
     if (!n) return 0;
@@ -2147,6 +2217,7 @@ static int cc_copy_k_on(void) {
 }
 static int cc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_copy", dst, src);
     if (!c || !dst || !src) return 0;
     if (!n) return 1;
     if ((doff + n) * 4 > dst->bytes || (soff + n) * 4 > src->bytes) return 0;
@@ -2169,6 +2240,7 @@ static int cc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
 }
 static int cc_zero(CcBuf *dst, size_t off, size_t n) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_zero", dst);
     if (!c || !dst) return 0;
     if (!n) return 1;
     if ((off + n) * 4 > dst->bytes) return 0;
@@ -2232,6 +2304,7 @@ static int cc_grid_run(const CcRegion *r, int n) {
 }
 static int cc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_copy_regions", dst, src);
     if (!c || !dst || !src || (n > 0 && !r)) return 0;
     for (int i = 0; i < n; i++)
         if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
@@ -2275,6 +2348,7 @@ static int cc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
  * cc_ptr. */
 static int cc_write(CcBuf *dst, size_t off, const void *src, size_t bytes) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_write", dst);
     if (!c || !dst || !src) return 0;
     if (!bytes) return 1;
     if (off * 4 + bytes > dst->bytes) return 0;
@@ -2296,6 +2370,7 @@ static int cc_write(CcBuf *dst, size_t off, const void *src, size_t bytes) {
 }
 static int cc_read(CcBuf *src, size_t off, void *dst, size_t bytes) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_read", src);
     if (!c || !src || !dst) return 0;
     if (!bytes) return 1;
     if (off * 4 + bytes > src->bytes) return 0;
@@ -2309,6 +2384,8 @@ static int cc_read(CcBuf *src, size_t off, void *dst, size_t bytes) {
 /* ---- ops --------------------------------------------------------------------------- */
 static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_matmul", x, y);
+    cc_own_tensor(c, "cc_matmul", t);
     if (!c || !t || !x || !y || S < 1) return 0;
     int fmt, I, O;
     if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device) return 0;
@@ -2322,8 +2399,28 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     }
     return 1;
 }
+static int cc_matmul_grp(ColiCudaTensor *const *t, int n, CcBuf *x, size_t xo, int x_row, int x_grp, CcBuf *y, size_t yo, int y_row, int S) {
+    CcCtx *c = live();
+    CC_OWN(c, "cc_matmul_grp", x, y);
+    if (!c || !t || n < 1 || !x || !y || S < 1) return 0;
+    int fmt, I, O;
+    if (!t[0] || !coli_cuda_tensor_shape(t[0], &fmt, &I, &O) || coli_cuda_tensor_device(t[0]) != c->device) return -1;
+    if ((xo + (size_t)(S - 1) * x_row + (size_t)(n - 1) * x_grp + I) * 4 > x->bytes ||
+        (yo + (size_t)(S - 1) * y_row + (size_t)n * O) * 4 > y->bytes) return 0;
+    const int r = coli_cuda_tensor_gemm_grp_async(t, n, y->d + yo, y_row, x->d + xo, x_row, x_grp, S, (void *)c->stream);
+    if (r == 0) { cc_mark_lost(c); return 0; }
+    if (r < 0) return -1;
+    g_st.matmuls++; g_st.ops++;
+    if (coli_sycl_fprof_flag) {
+        char k[64];
+        std::snprintf(k, sizeof k, "matmul %d x %dx%d fmt%d (grouped)", n, O, I, fmt);
+        coli_sycl_fprof_name(k);
+    }
+    return 1;
+}
 static int cc_addnorm(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_addnorm", x, t, w, y);
     if (!c || !x || !t || !w || !y || !p || p->rows < 1 || p->D < 1) return 0;
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_ADDNORM"); on = !(e && *e == '0'); }
@@ -2340,6 +2437,7 @@ static int cc_addnorm(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p
 }
 static int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf *y, int S) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_matmul_glu", x, y);
     if (!c || !wg || !wu || !x || !y || S < 1) return 0;
     int fmt, I, O, fu, Iu, Ou;
     if (!coli_cuda_tensor_shape(wg, &fmt, &I, &O) || !coli_cuda_tensor_shape(wu, &fu, &Iu, &Ou) ||
@@ -2351,16 +2449,23 @@ static int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf
     if (coli_sycl_fprof_flag) coli_sycl_fprof_name("matmul_glu");
     return 1;
 }
+static int cc_norm_nv20(void) {   /* read at each launch: the test runs both kernels in one process */
+    const char *e = getenv("COLI_SYCL_NORM_NV");
+    return !(e && atoi(e) == 8);
+}
 static int cc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_norm", x, w, y);
     if (!c || !x || !y || !p || p->nseg < 1 || p->D < 1 || p->per_row < 1) return 0;
     if (!(p->flags & CC_NORM_NOW) && !w) return 0;
     const float *xp = fp(x), *wp = fp(w); float *yp = fpw(y); const CcNorm pp = *p;
-    CC_K(c, dim3(grid1((size_t)p->nseg, 1)), 256, cc_norm_k(xp, wp, yp, pp));
+    if (p->D > 8 * 256 && p->D <= 20 * 256 && cc_norm_nv20()) CC_K(c, dim3(grid1((size_t)p->nseg, 1)), 256, cc_norm_k<20>(xp, wp, yp, pp));
+    else CC_K(c, dim3(grid1((size_t)p->nseg, 1)), 256, cc_norm_k<8>(xp, wp, yp, pp));
     return launched(c, "norm");
 }
 static int cc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_rope", x, cs);
     if (!c || !x || !cs || !p || p->nseg < 1 || p->half_ < 1 || p->per_row < 1) return 0;
     float *xp = fpw(x); const float *cp = fp(cs); const CcRope pp = *p;
     CC_K(c, dim3(grid1((size_t)p->nseg * p->half_, 64)), 64, cc_rope_k(xp, cp, pp));
@@ -2368,6 +2473,7 @@ static int cc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
 }
 static int cc_rope_f16(CcBuf *x, CcBuf *v, CcBuf *cs, const CcRope *p, int seg) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_rope_f16", x, v, cs);
     if (!c || !x || !v || !cs || !p || p->nseg < 1 || p->half_ < 1 || p->per_row < 1 || seg < 2 * p->half_) return 0;
     float *xp = fpw(x), *vp = fpw(v); const float *cp = fp(cs); const CcRope pp = *p;
     CC_K(c, dim3(grid1((size_t)p->nseg * seg, 128)), 128, cc_rope_f16_k(xp, vp, cp, pp, seg));
@@ -2795,6 +2901,7 @@ static int cc_adec_fit(CcCtx *c, size_t need) {
 template <typename KT>
 static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_attn_t", q, kc, vc, o, gate, sel);
     if (!c || !q || !kc || !vc || !o || !p || p->S < 1 || p->H < 1 || p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256) return 0;
     if (p->has_gate && !gate) return 0;
     if (p->sel_row > 0 && !sel) return 0;
@@ -2915,10 +3022,12 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     return launched(c, "attn");
 }
 static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
+    CC_OWN(cur(), "cc_attn", q, kc, vc, o, gate, sel);
     return cc_attn_t<float>(q, kc, vc, o, gate, sel, p);
 }
 static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_dnconv", in, w, ring, out, snap);
     if (!c || !in || !w || !ring || !out || !p || p->S < 1 || p->CD < 1 || p->CK < 2 || p->CK > 9) return 0;
     if (p->snap_row >= 0 && !snap) return 0;
     const float *ip = fp(in), *wp = fp(w); float *rp = fpw(ring), *op = fpw(out), *sp = fpw(snap); const CcDnConv pp = *p;
@@ -2933,6 +3042,7 @@ static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, 
 }
 static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_dnrec", cv, ab, z, st, prm, y, snap);
     if (!c || !cv || !ab || !z || !st || !prm || !y || !p || p->S < 1 || p->VH < 1 || p->KH < 1 || p->VH % p->KH ||
         p->VD < 1 || p->VD > 128) return 0;
     if (p->snap_row >= 0 && !snap) return 0;
@@ -3029,6 +3139,7 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
 }
 static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ew", y, a, b, cb, e);
     if (!c || !y || !p || p->n < 1) return 0;
     switch (p->op) {
     case CC_EW_ADD: case CC_EW_SWIGLU: if (!a || !b) return 0; break;
@@ -3051,6 +3162,7 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
 }
 static int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_qsa", src, w, pk, cs, sc, sel);
     if (!c || !src || !pk || !p || p->ID < 1 || p->ID > 256 || p->R < 1) return 0;
     const float *srcp = fp(src), *wp = fp(w), *csp = fp(cs); float *pkp = fpw(pk), *scp = fpw(sc); const CcQsa pp = *p;
     if (p->mode == 0) {
@@ -3075,6 +3187,7 @@ static int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *
 }
 static int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ple", keys, hyp, val, prm, gated, normv, conv, ring);
     if (!c || !hyp || !gated || !normv || !p || p->S < 1 || p->C < 1 || p->H < 1) return 0;
     const float *kp = fp(keys), *vp = fp(val), *pp_ = fp(prm), *cp = fp(conv);
     float *hp = fpw(hyp), *gp = fpw(gated), *np = fpw(normv), *rp = fpw(ring); const CcPle pp = *p;
@@ -3089,6 +3202,7 @@ static int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated,
 }
 static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_route", l, bias, ids, w);
     if (!c || !l || !ids || !w || !p || p->S < 1 || p->E < 1 || p->E > CC_ROUTE_EMAX || p->K < 1 || p->K > CC_ROUTE_KMAX ||
         p->K > p->E || p->kind < 0 || p->kind > 2 || p->has_bias < 0 || p->has_bias > 2 || (p->has_bias && !bias) || !(p->temp > 0.f) ||
         (p->n_group > 1 && (p->n_group > 64 || p->E % p->n_group || p->topk_group < 1 || p->topk_group > p->n_group))) return 0;
@@ -3100,6 +3214,8 @@ static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *
 }
 static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_moe", tab, x, ids, w, hid, y, hy);
+    if (p) cc_own_table(c, "cc_moe", tab, p->t_off, p->E);
     if (!c || !tab || !ids || !hid || !p || p->parts < 1 || p->parts > 3 || p->S < 1 || p->K < 1) return 0;
     if ((p->parts & 1) && !x) return 0;
     if ((p->parts & 2) && (!w || !y || (p->h_off >= 0 && !hy))) return 0;
@@ -3115,6 +3231,7 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
 /* a hyper-connection read's up projection and mix (coli_cuda_tensor_gemm_hcmix_async): -1 not taken */
 static int cc_matmul_hcmix(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn, CcBuf *y, int n, int H, int C, float fc) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_matmul_hcmix", x, hn, y);
     if (!c || !t || !x || !hn || !y || n < 1 || H < 1 || C < 1) return -1;
     int fmt = 0, I = 0, O = 0;
     if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device || O != C * H ||
@@ -3128,6 +3245,7 @@ static int cc_matmul_hcmix(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn,
  * taken, the device as it was */
 static int cc_moe_cols(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, const CcMoe *p, int cols) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_moe_cols", tab, x, ids, w, hid, y);
     if (!c || !tab || !x || !ids || !w || !hid || !y || !p || p->parts != 3 || p->S < 1 || p->K < 1 || p->lay_S || p->lay_s0 ||
         p->h_off >= 0 || cols < 128 || cols % 128) return -1;
     if (cc_moe_hid_floats(p->S, p->K, cols < p->D ? cols : p->D, p->I, p->E) * 4 > hid->bytes ||
@@ -3142,6 +3260,7 @@ static int cc_moe_cols(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, C
 /* Host tasks, not kernels: see the host synchronization contract above. */
 static int cc_signal(CcBuf *flag, size_t word, unsigned v) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_signal", flag);
     if (!c || !flag || flag->kind != CC_DOWN || (word + 1) * 4 > flag->bytes) return 0;
     unsigned *f = (unsigned *)flag->d + word;
     const auto state = coli_sycl_host_state(c->device);
@@ -3150,14 +3269,41 @@ static int cc_signal(CcBuf *flag, size_t word, unsigned v) {
 }
 static int cc_wait_host(CcBuf *flag, size_t word, unsigned v) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_wait_host", flag);
     if (!c || !flag || flag->kind != CC_UP || (word + 1) * 4 > flag->bytes) return 0;
     const unsigned *f = (const unsigned *)flag->d + word;
     const auto state = coli_sycl_host_state(c->device);
     (void)cc_try(c, "wait host", [&] { coli_sycl_fprof_ev(c->stream->submit([=](sycl::handler &h) { h.host_task([=] { state->wait(f, v); }); })); });
     return launched(c, "wait host");
 }
+/* mark / reached: the hybrid step's "the routes are down" without a host task. cc_signal's host task holds every
+ * later command of the in-order queue until the runtime has seen the routes' kernel end, run the task and released them:
+ * the card sat idle 20-100 us a layer between the router and the resident experts (by a frame profile), and the host
+ * learned of the routes only through that hop. A mark is a barrier event at this point of the frame -- complete once
+ * every earlier command is, exactly what the host task waited for -- and holds nothing: the frame's later commands
+ * follow at once, and the host asks the event's status (reached: 1 complete, 0 not yet, -1 lost or no mark). No device
+ * access to host memory beyond the kernels' own stores, no atomics, no kernel that waits: the contract above stands.
+ * The rows the kernels before the mark wrote to DOWN memory are there when it is complete (their events completed). */
+static int cc_mark(void) {
+    CcCtx *c = live();
+    if (!c) return 0;
+    if (!cc_try(c, "mark", [&] { c->sy->mark = c->stream->ext_oneapi_submit_barrier(); })) return 0;
+    if (coli_sycl_fprof_flag) { coli_sycl_fprof_ev(c->sy->mark); coli_sycl_fprof_name("mark"); }
+    c->sy->mark_set = 1;
+    return 1;
+}
+static int cc_reached(void) {
+    CcCtx *c = live();
+    if (!c || !c->sy->mark_set) return -1;
+    int done = 0;
+    if (!cc_try(c, "mark status", [&] {
+            done = c->sy->mark.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete; }))
+        return -1;
+    return done;
+}
 static int cc_moe_stage_op(CcBuf *b, size_t slot_bytes, int slots) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_moe_stage_op", b);
     if (!c || (b && (b->kind != CC_DEV || slots < 1 || CC_MOE_STAGE_MAP + (size_t)slots * slot_bytes > b->bytes))) return 0;
     return coli_cuda_moe_stage(c->device, b ? (void *)b->d : nullptr, b ? slot_bytes : 0, b ? slots : 0);
 }
@@ -3171,6 +3317,7 @@ static void cc_stats(CcStats *st) { if (st) *st = g_st; }
  * complete, so the first fetch starts at once. */
 static int cc_fetch(CcBuf *dst, const CcFetch *r, int n) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_fetch", dst);
     if (!c || !dst || dst->kind != CC_DEV || n < 0 || (n && !r)) return 0;
     for (int i = 0; i < n; i++) if (!r[i].src || r[i].dst > dst->bytes || r[i].bytes > dst->bytes - r[i].dst) return 0;
     if (!cc_try(c, "fetch's reader", [&] { c->cs->ext_oneapi_submit_barrier({c->sy->ev_free}); })) return 0;
@@ -3247,6 +3394,7 @@ static const void *cc_dev_addr(const CcBuf *b) { return b ? (const void *)b->d :
 template <typename KT>
 static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w, int ring) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_attn_w2_t", q, kc, vc, o, gate, snk);
     if (!w) return 0;
     const CcAttn *p = &w->a;
     if (!c || !q || !kc || !vc || !o || p->S < 1 || p->H < 1 || p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256 ||
@@ -3300,9 +3448,11 @@ static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, C
     return launched(c, "attn (window, sinks)");
 }
 static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w, int ring) {
+    CC_OWN(cur(), "cc_attn_w2", q, kc, vc, o, gate, snk);
     return cc_attn_w2_t<float>(q, kc, vc, o, gate, snk, w, ring);
 }
 static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w) {
+    CC_OWN(cur(), "cc_attn_w", q, kc, vc, o, gate, snk);
     return cc_attn_w2(q, kc, vc, o, gate, snk, w, 0);
 }
 
@@ -3331,6 +3481,7 @@ static void cc_dnrec_mx_k(const float *__restrict__ cv, const float *__restrict_
 }
 /* the buffers of n conversations as a kernel's table: all there, all different (two rows on one state would race) */
 static int cc_mx_table(CcBuf *const *b, int n, CcMxP *t) {
+    if (coli_sycl_test_devices() && b && n > 0) cc_own_check(cur(), "cc_mx_table", "b[0..n)", b, n);
     for (int j = 0; j < CC_MX_N; j++) t->p[j] = nullptr;
     for (int j = 0; j < n; j++) {
         if (!b[j] || !(t->p[j] = fpw(b[j]))) return 0;
@@ -3340,6 +3491,7 @@ static int cc_mx_table(CcBuf *const *b, int n, CcMxP *t) {
 }
 static int cc_dnconv_mx(CcBuf *in, CcBuf *w, CcBuf *const *ring, int n, CcBuf *out, const CcDnConv *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_dnconv_mx", in, w, out);
     if (!c || !in || !w || !ring || !out || !p) return 0;
     /* what cc_dnconv gives cc_dnconv_k: one row, no snapshot */
     if (n < 2 || n > CC_MX_N || p->S != 1 || p->snap_row >= 0 || p->CD < 1 || p->CK < 2 || p->CK > 9) return -1;
@@ -3352,6 +3504,7 @@ static int cc_dnconv_mx(CcBuf *in, CcBuf *w, CcBuf *const *ring, int n, CcBuf *o
 }
 static int cc_dnrec_mx(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *const *st, int n, CcBuf *prm, CcBuf *y, const CcDnRec *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_dnrec_mx", cv, ab, z, prm, y);
     if (!c || !cv || !ab || !z || !st || !prm || !y || !p) return 0;
     if (n < 2 || n > CC_MX_N || p->S != 1 || p->snap_row >= 0 || p->VH < 1 || p->KH < 1 || p->VH % p->KH ||
         p->VD < 1 || p->VD > 128) return -1;
@@ -3381,6 +3534,7 @@ static int cc_dnrec_mx(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *const *st,
 static int cc_lfm3(void) { return 1; }   /* dnconv's order 2, ew's HEADGATE */
 static int cc_pick(CcBuf *logits, CcBuf *out, int n) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_pick", logits, out);
     if (!c || !logits || !out || n < 1 || (size_t)n * 4 > logits->bytes || out->bytes < 8) return 0;
     const float *lg = fp(logits); void *op = out->d;
     CC_KSG(c, dim3(1), 256, 0, cc_pick_k<SG>(lg, op, n));
@@ -3388,6 +3542,7 @@ static int cc_pick(CcBuf *logits, CcBuf *out, int n) {
 }
 static int cc_pick_rows(CcBuf *logits, size_t off, CcBuf *out, int n, int rows) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_pick_rows", logits, out);
     if (!c || !logits || !out || n < 1 || rows < 1 || (off + (size_t)rows * n) * 4 > logits->bytes || out->bytes < (size_t)rows * 8) return 0;
     const float *lg = fp(logits) + off; void *op = out->d;
     CC_KSG(c, dim3((unsigned)rows), 256, 0, cc_pick_k<SG>(lg, op, n));
@@ -3395,6 +3550,7 @@ static int cc_pick_rows(CcBuf *logits, size_t off, CcBuf *out, int n, int rows) 
 }
 static int cc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_matmul_rows", ids, x, y);
     if (!c || !t || !ids || !x || !y || n < 1) return 0;
     int fmt, I, O; const void *w = nullptr; const float *sc = nullptr;
     if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device || (fmt != 0 && fmt != 1 && fmt < 100)) return 0;
@@ -3435,6 +3591,7 @@ static void cc_copy_grid_h_k(sycl::half *__restrict__ d,
 }
 static int cc_copy_regions_h(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_copy_regions_h", dst, src);
     if (!c || !dst || !src || !dst->d || !src->d || dst == src || (n > 0 && !r)) return 0;
     for (int i = 0; i < n; i++)
         if ((r[i].dst + r[i].n) * 2 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
@@ -3455,9 +3612,11 @@ static int cc_copy_regions_h(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
 }
 /* attn_h, attn_wh: attn and attn_wr over a float16 cache (its offsets in halves) */
 static int cc_attn_h(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
+    CC_OWN(cur(), "cc_attn_h", q, kc, vc, o, gate, sel);
     return cc_attn_t<sycl::half>(q, kc, vc, o, gate, sel, p);
 }
 static int cc_attn_wh(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w, int ring) {
+    CC_OWN(cur(), "cc_attn_wh", q, kc, vc, o, gate, snk);
     return cc_attn_w2_t<sycl::half>(q, kc, vc, o, gate, snk, w, ring);
 }
 static int cc_kvh(void) { return 1; }
@@ -3492,6 +3651,7 @@ static void cc_attn_dec_mx_k(const float *__restrict__ q, CcMxKV t, float *__res
 static int cc_attn_h_mx(CcBuf *q, CcBuf *const *kc, CcBuf *const *vc, const int *pos, const int *cap, int n, CcBuf *o,
                         CcBuf *gate, const CcAttn *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_attn_h_mx", q, o, gate);
     if (!c || !q || !kc || !vc || !pos || !cap || !o || !p) return 0;
     if (n < 2 || n > CC_MX_ATTN_N || p->S != 1 || p->sel_row > 0 || p->H < 1 || p->KVH < 1 || p->H % p->KVH ||
         p->hd < 1 || p->hd > 256 || (p->has_gate && !gate)) return -1;
@@ -3551,6 +3711,7 @@ static void cc_copy_grid_h_mx_k(CcMxG t, const float *__restrict__ s) {
 }
 static int cc_copy_regions_h_mx(CcBuf *const *dst, int n, CcBuf *src, const CcRegion *r, int per) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_copy_regions_h_mx", src);
     if (!c || !dst || !src || !src->d || !r) return 0;
     if (n < 2 || n > CC_MX_N || per < 1) return -1;
     CcMxG t;
@@ -3863,6 +4024,7 @@ static void cc_enc_rel_k(const float *x, const float *pt, float *y, CcEncRel p) 
 }
 static int cc_enc_norm(CcBuf *a, CcBuf *b, CcBuf *prm, CcBuf *y, const CcEncNorm *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_enc_norm", a, b, prm, y);
     if (!c || !a || !prm || !y || !p || p->rows < 1 || p->D < 1 || p->D > 4096 || ((p->flags & CC_ENC_ADD) && !b)) return 0;
     if (!c->fp64) return 0;   /* the sums are doubles, as the engines' (laya.c, gliner_decide.c) */
     float *ap = fpw(a), *yp = fpw(y); const float *bp = fp(b), *pp_ = fp(prm); const CcEncNorm pp = *p;
@@ -3871,6 +4033,7 @@ static int cc_enc_norm(CcBuf *a, CcBuf *b, CcBuf *prm, CcBuf *y, const CcEncNorm
 }
 static int cc_enc_bias(CcBuf *y, CcBuf *prm, const CcEncBias *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_enc_bias", y, prm);
     if (!c || !y || !p || p->n < 1 || p->O < 1 || (p->b_off >= 0 && !prm)) return 0;
     float *yp = fpw(y); const float *pp_ = fp(prm); const CcEncBias pp = *p;
     CC_K(c, dim3(grid1((size_t)p->n, 256)), 256, cc_enc_bias_k(yp, pp_, pp));
@@ -3878,6 +4041,7 @@ static int cc_enc_bias(CcBuf *y, CcBuf *prm, const CcEncBias *p) {
 }
 static int cc_enc_geglu(CcBuf *a, CcBuf *prm, CcBuf *y, const CcEncGeglu *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_enc_geglu", a, prm, y);
     if (!c || !a || !y || !p || p->n < 1 || p->I < 1 || (p->b_off >= 0 && !prm)) return 0;
     const float *ap = fp(a), *pp_ = fp(prm); float *yp = fpw(y); const CcEncGeglu pp = *p;
     CC_K(c, dim3(grid1((size_t)p->n, 256)), 256, cc_enc_geglu_k(ap, pp_, yp, pp));
@@ -3885,6 +4049,7 @@ static int cc_enc_geglu(CcBuf *a, CcBuf *prm, CcBuf *y, const CcEncGeglu *p) {
 }
 static int cc_enc_rope(CcBuf *x, CcBuf *tab, CcBuf *pos, const CcEncRope *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_enc_rope", x, tab, pos);
     if (!c || !x || !tab || !pos || !p || p->n < 1 || p->H < 1 || p->hd < 2) return 0;
     float *xp = fpw(x); const float *tp = fp(tab); const int *psp = (const int *)pos->d; const CcEncRope pp = *p;
     CC_K(c, dim3(grid1((size_t)p->n, 256)), 256, cc_enc_rope_k(xp, tp, psp, pp));
@@ -3892,6 +4057,7 @@ static int cc_enc_rope(CcBuf *x, CcBuf *tab, CcBuf *pos, const CcEncRope *p) {
 }
 static int cc_enc_addrow(CcBuf *y, CcBuf *tab, CcBuf *idx, const CcEncAddRow *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_enc_addrow", y, tab, idx);
     if (!c || !y || !tab || !idx || !p || p->n < 1 || p->D < 1) return 0;
     float *yp = fpw(y); const float *tp = fp(tab); const int *ip = (const int *)idx->d; const CcEncAddRow pp = *p;
     CC_K(c, dim3(grid1((size_t)p->n, 256)), 256, cc_enc_addrow_k(yp, tp, ip, pp));
@@ -3899,6 +4065,7 @@ static int cc_enc_addrow(CcBuf *y, CcBuf *tab, CcBuf *idx, const CcEncAddRow *p)
 }
 static int cc_enc_attn(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBuf *rng, CcBuf *ridx, CcBuf *pos, const CcEncAttn *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_enc_attn", qkv, c2p, p2c, o, rng, ridx, pos);
     int rel = p ? p->flags & (CC_ENC_C2P | CC_ENC_P2C) : 0;
     if (!c || !qkv || !o || !rng || !p || p->S < 1 || p->H < 1 || p->hd < 1 || p->hd > CC_EHD || (p->S + CC_EBQ - 1) / CC_EBQ > 65535 ||
         (rel && (!ridx || !pos)) || ((p->flags & CC_ENC_C2P) && !c2p) || ((p->flags & CC_ENC_P2C) && !p2c)) return 0;
@@ -3910,6 +4077,7 @@ static int cc_enc_attn(CcBuf *qkv, CcBuf *c2p, CcBuf *p2c, CcBuf *o, CcBuf *rng,
 }
 static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_enc_rel", x, pt, y);
     if (!c || !x || !pt || !y || !p || p->S < 1 || p->H < 1 || p->hd < 1 || p->nr < 1 || p->H > 65535 ||
         (p->S + CC_EBQ - 1) / CC_EBQ > 65535) return 0;
     const float *xp = fp(x), *ptp = fp(pt); float *yp = fpw(y); const CcEncRel pp = *p;
@@ -3923,6 +4091,7 @@ static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
 static int cc_preload(void) {
     return live() ? 1 : 0;
 }
+#include "cuda_dsv4c.dp.hpp"   /* DeepSeek V4.1's layer ops (cuda_dsv4c.cuh's port) */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3955,10 +4124,9 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_preload,
     cc_moe_cols,
     cc_matmul_hcmix,
-    /* upstream's operations for other models (DeepSeek V4.1, GLM-5.3, Kimi K3, DFlash2, Inkling) and the banked
+    cc_mhc, cc_ds_attn, cc_ds_rope, cc_ds_compress, cc_ds_score, cc_ds_cand, cc_ds_topk, cc_ds_engram,
+    /* upstream's operations for other models (GLM-5.3, Kimi K3, DFlash2, Inkling) and the banked
      * fetch: not in this module; the engine finds them empty and keeps its other path */
-    nullptr /* mhc */, nullptr /* ds_attn */, nullptr /* ds_rope */, nullptr /* ds_compress */,
-    nullptr /* ds_score */, nullptr /* ds_cand */, nullptr /* ds_topk */, nullptr /* ds_engram */,
     nullptr /* kda_conv */, nullptr /* kda_rec */, nullptr /* mla_core */, nullptr /* mla_rope */,
     nullptr /* mla_lnorm */, nullptr /* mla_hgemv */, nullptr /* dsa_pool_keys */, nullptr /* dsa_pool_select */,
     nullptr /* dsa_select */, nullptr /* mla_hgemv_q8 */, nullptr /* ares_mix */, nullptr /* situ */,
@@ -3968,5 +4136,9 @@ static const ColiCudaChainOps g_cc_ops = {
     nullptr /* fetch_done_at */,
     cc_dnconv_mx, cc_dnrec_mx,
     cc_attn_h_mx, cc_copy_regions_h_mx,
+    cc_matmul_grp,
+    cc_ds_attn_rows,
+    cc_moe_tail,
+    cc_mark, cc_reached,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
