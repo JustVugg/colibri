@@ -268,5 +268,156 @@ class TuiScreenTest(unittest.TestCase):
         self.assertEqual(s.close(), 0)
 
 
+LONG_CODE = ("def greet(name):\n    message = 'hello ' + name + ', this line is long on purpose so that the screen wraps it "
+             "at the edge of the window, and the copy has to give it back whole'\n    return message")
+LONG_ANSWER = ("Here is the code:\n\n```python\n" + LONG_CODE + "\n```\n\n" +
+               "\n".join("Line %d of the explanation, past the bottom of the screen." % i for i in range(1, 61)) +
+               "\n\n```sh\necho done\n```\nThe end.")
+
+
+def tiny_png(w=8, h=6):
+    import struct
+    import zlib
+    raw = b"".join(b"\x00" + bytes(v for x in range(w) for v in (x * 30, y * 40, 200)) for y in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+class LongAnswerServer(FakeServer):
+    """A chat model whose answer is longer than the screen and holds two code blocks."""
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
+        self.seen.append(("POST", self.path, self.headers.get("Authorization"), body))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        for i in range(0, len(LONG_ANSWER), 50):
+            d = {"content": LONG_ANSWER[i:i + 50]}
+            self.wfile.write(b"data: " + json.dumps({"choices": [{"index": 0, "delta": d}]}).encode() + b"\n\n")
+        self.wfile.write(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        self.close_connection = True
+
+
+class ImageServer(FakeServer):
+    """An image model (Qwen-Image): /v1/models says image_generation, chat is refused as coli serve refuses it."""
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self.seen.append(("GET", self.path, None, None))
+            self.reply({"object": "list", "data": [{"id": "qwen-image", "capabilities": ["image_generation"]}]})
+        else:
+            super().do_GET()
+
+    def do_POST(self):
+        import base64
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
+        self.seen.append(("POST", self.path, self.headers.get("Authorization"), body))
+        if self.path != "/v1/images/generations":
+            data = json.dumps({"error": {"message": "`qwen-image` is an image generation model and does not chat"}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.reply({"created": 1, "data": [{"b64_json": base64.b64encode(tiny_png()).decode(), "revised_prompt": None}],
+                    "colibri": {"width": 8, "height": 6, "seed": 77, "steps": 4, "timings": {}}})
+
+
+def osc52(s, seconds=5):
+    """the text of the next OSC 52 the TUI writes (the terminal's clipboard), from s.out as it is now. The
+    screen itself is not read for this: each frame writes only the cells that changed, so a word on it
+    can arrive cut by cursor moves."""
+    import base64
+    end = time.time() + seconds
+    while time.time() < end and not (b"\x1b]52;c;" in s.out and b"\x07" in s.out[s.out.find(b"\x1b]52;c;"):]):
+        s.pump(0.1)
+    start = s.out.index(b"\x1b]52;c;") + 7
+    return base64.b64decode(s.out[start:s.out.index(b"\x07", start)]).decode()
+
+
+def wait_until(cond, s, seconds=10):
+    end = time.time() + seconds
+    while time.time() < end and not cond():
+        s.pump(0.1)
+    return cond()
+
+
+@unittest.skipUnless(CC and not WINDOWS, "needs a C compiler and a POSIX pseudo-terminal")
+class TuiCopyAndPictureTest(unittest.TestCase):
+    """A drag copies the cells on the screen: an answer longer than the screen comes out cut, a code line
+    the screen wrapped comes out as two. ctrl+y and ctrl+k (and each answer's and code block's copy
+    button) copy what the model wrote. An image model's turn goes to /v1/images/generations and the
+    picture is drawn in half blocks and saved."""
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.exe, r = build(cls.dir.name)
+        if r.returncode:
+            raise AssertionError(r.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def serve(self, handler, env=None):
+        handler.seen = []
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        url = "http://127.0.0.1:%d" % httpd.server_address[1]
+        s = Screen(self.exe, ["--server", url, "--lang", "en", "--no-sixel"],
+                   {"DISPLAY": "", "WAYLAND_DISPLAY": "", **(env or {})})
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return s, httpd
+
+    def test_the_whole_answer_and_its_last_code_block(self):
+        s, httpd = self.serve(LongAnswerServer)
+        try:
+            self.assertTrue(s.wait_for("tiny-model"), s.out[-400:])
+            s.type("write a function\r")
+            self.assertTrue(wait_until(lambda: any(x[0] == "POST" for x in LongAnswerServer.seen), s))
+            s.pump(2.0)                                     # the stream's end
+            s.out = b""
+            s.type("\x19")                                  # ctrl+y: the last answer
+            self.assertEqual(osc52(s), LONG_ANSWER)
+            s.out = b""
+            s.type("\x0b")                                  # ctrl+k: its last code block
+            self.assertEqual(osc52(s), "echo done")
+            s.type("\x11")
+            self.assertEqual(s.close(), 0)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_an_image_model_draws_and_saves_the_picture(self):
+        with tempfile.TemporaryDirectory() as home:
+            s, httpd = self.serve(ImageServer, {"HOME": home})
+            try:
+                self.assertTrue(s.wait_for("qwen-image"), s.out[-400:])
+                s.type("a red hummingbird\r")
+                pics = os.path.join(home, "colibri-images")
+                self.assertTrue(wait_until(lambda: os.path.isdir(pics) and os.listdir(pics), s), s.out[-600:])
+                s.pump(1.0)
+                posts = [x for x in ImageServer.seen if x[0] == "POST"]
+                self.assertEqual([p[1] for p in posts], ["/v1/images/generations"])
+                req = json.loads(posts[0][3])
+                self.assertEqual((req["model"], req["prompt"], req["response_format"], req["n"]),
+                                 ("qwen-image", "a red hummingbird", "b64_json", 1))
+                self.assertIn("▀".encode(), s.out)     # the picture, in half blocks
+                saved = os.listdir(os.path.join(home, "colibri-images"))
+                self.assertEqual(len(saved), 1)
+                path = os.path.join(home, "colibri-images", saved[0])
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), tiny_png())
+                s.out = b""
+                s.type("\x19")                              # ctrl+y on a picture: its file
+                self.assertEqual(osc52(s), path)
+                s.type("\x11")
+                self.assertEqual(s.close(), 0)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
 if __name__ == "__main__":
     unittest.main()
