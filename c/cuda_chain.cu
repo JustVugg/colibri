@@ -5982,11 +5982,13 @@ static int cc_gr_read(ColiCudaTensor *down, ColiCudaTensor *up, ColiCudaTensor *
 
 /* ---- device-side doorbell wait_ge / flag_set (Q38_CC_DOORBELL_GRAPH) --------------------- */
 __global__ static void cc_flag_set_k(volatile unsigned *f, const int *stp, int sw, unsigned add) {
+    COLI_PDL_WAIT();
     __threadfence_system();
     *f = (unsigned)stp[sw] + add;
     __threadfence_system();
 }
 __global__ static void cc_wait_ge_k(volatile unsigned *f, const int *stp, int sw, unsigned add, unsigned long long ns) {
+    COLI_PDL_WAIT();
     const unsigned v = (unsigned)stp[sw] + add;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     unsigned long long t0, t;
