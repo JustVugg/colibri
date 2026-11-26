@@ -4117,9 +4117,9 @@ $(AUTODEP_DEPS): ;
 -include $(wildcard $(AUTODEP_DEPS))
 
 # Read side of the same class: buffer sized from the tensor, read with config dims.
-tests/test_colibri_read_trust$(EXE): tests/test_colibri_read_trust.c colibri.c
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_inkling_read_trust$(EXE): tests/test_inkling_read_trust.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ)
-	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
-tests/test_olmoe_read_trust$(EXE): tests/test_olmoe_read_trust.c olmoe.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_colibri_read_trust$(EXE): tests/test_colibri_read_trust.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/test_inkling_read_trust$(EXE): tests/test_inkling_read_trust.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/test_olmoe_read_trust$(EXE): tests/test_olmoe_read_trust.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
