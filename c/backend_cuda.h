@@ -44,8 +44,8 @@ extern "C" {
  * same arrangement colibri.c uses for metal_fused_fmt_ok.
  *
  * NOT a statement about which formats the CUDA BACKEND supports: quant_matmul
- * has its own explicit branches for fmt=6 (E8/IQ3) and fmt=7 (MXFP4) that
- * never route through weight_at (and its own fmt=8 branch for the dense path
+ * has its own explicit branches for fmt=6 (E8/IQ3), fmt=7 (MXFP4) and fmt=9 (bf16:
+ * not admitted here, it rides coli_cuda_matmul's own branch) that never route through weight_at (and its own fmt=8 branch for the dense path
  * -- weight_at's fmt=8 branch serves the absorb kernels, which share the same
  * c_e4m3 LUT). This predicate is scoped to weight_at's own dispatch, which is
  * what the absorb and grouped-expert kernels decode through.
@@ -206,8 +206,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tens
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
- * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=grouped int4.
+ * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=grouped int4,
+ * plus 9=bf16, which this backend decodes in a device branch of its own: a
+ * checkpoint whose dense side (attention projections, gated residual, shared
+ * expert, router, lm_head) is bf16 end to end carries no scales at all, and
+ * bf16 -> f32 is the identity on the top 16 bits.
  * gs is the group size for fmt=4 (0 for all other formats).
+ * Formats 0, 6 and 9 are scale-free: pass scales = NULL for them.
  * The first successful call uploads W and its scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
