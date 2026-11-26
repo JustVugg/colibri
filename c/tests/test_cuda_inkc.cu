@@ -14,6 +14,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include "../backend_gpu_compat.h"
 #include "../backend_cuda.h"
 #include "../cuda_chain.h"
 
@@ -67,6 +68,28 @@ static void test_sconv(int C, int CK, int S1, int S2) {
     check(ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30, 2e-6, what);
     T->free(bx); T->free(bw); T->free(br);
 }
+static void test_sconv_fused(int C, int CK, int S1, int S2) {
+    int S = S1 + S2, P = CK - 1, xo = 3, wo = 5, ro = 2;
+    std::vector<float> x = fvec((size_t)xo + (size_t)S * C, 1.f), w = fvec((size_t)wo + (size_t)C * CK, 0.5f), ring = fvec((size_t)ro + (size_t)C * P + 1, 1.f);
+    std::vector<float> ref((size_t)S * C);
+    for (int c = 0; c < C; c++) {
+        std::vector<float> col(P + S);
+        for (int j = 0; j < P; j++) col[j] = ring[ro + c * P + j];
+        for (int t = 0; t < S; t++) col[P + t] = x[xo + (size_t)t * C + c];
+        for (int t = 0; t < S; t++) {
+            float acc = 0.f;
+            for (int j = 0; j < CK; j++) acc += w[wo + (size_t)c * CK + j] * col[t + j];
+            ref[(size_t)t * C + c] = (acc + col[P + t]) / 2.5f;
+        }
+    }
+    CcBuf *bx = upf(x), *bw = upf(w), *br = upf(ring);
+    CcSconv p1 = {0, S1, C, CK, xo, C, wo, ro, 0, 2.5f}, p2 = {0, S2, C, CK, xo + S1 * C, C, wo, ro, 0, 2.5f};
+    int ok = T->begin() && T->sconv(bx, bw, br, &p1) && T->submit(1) && T->begin() && T->sconv(bx, bw, br, &p2) && T->submit(1);
+    std::vector<float> y = down(bx, xo, (size_t)S * C);
+    char what[96]; snprintf(what, sizeof what, "sconv fused %d channels, %d taps, rows %d + %d", C, CK, S1, S2);
+    check(ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30, 2e-6, what);
+    T->free(bx); T->free(bw); T->free(br);
+}
 
 static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink) {
     int H = 4, KVH = 2, kvd = KVH * hd, Tn = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8, soff = toff + S + 3;
@@ -111,7 +134,9 @@ static void test_relattn(int S, int pos_base, int window, int cap, int hd, int d
     int ok = T->begin() && T->relattn(bq, bk, bv, bo, bs, brr, bp, bt, &p) && T->submit(1);
     std::vector<float> y = down(bo, 0, ref.size());
     char what[128]; snprintf(what, sizeof what, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d", S, pos_base, window, cap, hd, dr, ext, sink);
-    check(ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30, 2e-5, what);
+    const char *fe = getenv("COLI_CUDA_RELATTN_FLASH");
+    const int flash_used = !(fe && *fe == '0') && S >= 16 && hd == 128 && dr <= 16;
+    check(ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30, flash_used ? 2e-3 : 2e-5, what);
     CcBuf *all[] = {bq, bk, bv, bs, brr, bp, bt, bo};
     for (CcBuf *b : all) T->free(b);
 }
@@ -203,14 +228,113 @@ static void test_loopgate(int rows, int D, int inplace) {
     T->free(ba); T->free(bb); T->free(bc); T->free(be); if (!inplace) T->free(by);
 }
 
+/* Inkling-2 prefill MoE (> CC_MOE_FRAME_ROWS): fmt=4 gs=64 SiTU-GLU (act=1) with expert global scales,
+ * exercising hcm_moe_i4 (COLI_CUDA_MOE_BK64=1) and hcg_moe_gu_ink_k/hcg_moe_dn_ink_k (BK64=0). */
+static void test_ink2_moe_prefill(int S, int D, int I, int E, int K) {
+    const int gs = 64, ngD = D / gs, ngI = I / gs;
+    std::vector<float> x = fvec((size_t)S * D, 1.f);
+    std::vector<int> ids((size_t)S * K);
+    std::vector<float> rw((size_t)S * K);
+    for (int s = 0; s < S; s++) {
+        for (int k = 0; k < K; k++) {
+            ids[(size_t)s * K + k] = (int)((rnd() + k * 7) % E);
+            rw[(size_t)s * K + k] = 0.2f + 0.6f * (float)(rnd() % 1000) / 1000.f;
+        }
+        if (K >= 2 && ids[(size_t)s * K + 1] == ids[(size_t)s * K]) ids[(size_t)s * K + 1] = (ids[(size_t)s * K] + 1) % E;
+    }
+    const float ca = 10.f, cb = 10.f;
+    std::vector<std::vector<float>> Gf(E), Uf(E), Df(E);
+    std::vector<void *> own;
+    const size_t esc_off = ((size_t)E * sizeof(CcExpert) + 255) & ~(size_t)255;
+    std::vector<uint8_t> tab_bytes(esc_off + (size_t)E * 2 * sizeof(float), 0);
+    CcExpert *tab = (CcExpert *)tab_bytes.data();
+    float *esc = (float *)(tab_bytes.data() + esc_off);
+    int okc = 1;
+    auto pack_i4g64 = [&](int R, int C, std::vector<float> &deq, void **dq, void **ds) {
+        const int ng = C / gs;
+        std::vector<uint8_t> qb((size_t)R * (C / 2));
+        std::vector<float> sc((size_t)R * ng);
+        deq.resize((size_t)R * C);
+        for (int r = 0; r < R; r++) for (int g = 0; g < ng; g++) {
+            float s = 0.05f + 0.15f * (float)(rnd() % 100) / 100.f;
+            sc[(size_t)r * ng + g] = s;
+            for (int j = 0; j < gs; j += 2) {
+                int q0 = (int)(rnd() % 15) - 7, q1 = (int)(rnd() % 15) - 7;
+                qb[(size_t)r * (C / 2) + (size_t)g * (gs / 2) + j / 2] = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4));
+                deq[(size_t)r * C + (size_t)g * gs + j] = q0 * s;
+                deq[(size_t)r * C + (size_t)g * gs + j + 1] = q1 * s;
+            }
+        }
+        if (cudaMalloc(dq, qb.size()) != cudaSuccess || cudaMalloc(ds, sc.size() * 4) != cudaSuccess ||
+            cudaMemcpy(*dq, qb.data(), qb.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(*ds, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) okc = 0;
+        own.push_back(*dq); own.push_back(*ds);
+    };
+    for (int e = 0; e < E; e++) {
+        void *gq = NULL, *gsd = NULL, *uq = NULL, *usd = NULL, *dq = NULL, *dsd = NULL;
+        pack_i4g64(I, D, Gf[e], &gq, &gsd);
+        pack_i4g64(I, D, Uf[e], &uq, &usd);
+        pack_i4g64(D, I, Df[e], &dq, &dsd);
+        tab[e] = {gq, uq, dq, (const float *)gsd, (const float *)usd, (const float *)dsd, 0, 0};
+        esc[2 * e] = 0.8f + 0.4f * (float)(rnd() % 100) / 100.f;
+        esc[2 * e + 1] = 0.8f + 0.4f * (float)(rnd() % 100) / 100.f;
+    }
+    std::vector<float> ref((size_t)S * D, 0.f);
+    for (int s = 0; s < S; s++) {
+        for (int k = 0; k < K; k++) {
+            int e = ids[(size_t)s * K + k];
+            float eg = esc[2 * e], ed = esc[2 * e + 1];
+            std::vector<double> h(I);
+            for (int i = 0; i < I; i++) {
+                double gv = 0, uv = 0;
+                for (int d = 0; d < D; d++) {
+                    gv += (double)x[(size_t)s * D + d] * Gf[e][(size_t)i * D + d];
+                    uv += (double)x[(size_t)s * D + d] * Uf[e][(size_t)i * D + d];
+                }
+                gv *= eg; uv *= eg;
+                double sig = 1.0 / (1.0 + exp(-gv));
+                h[i] = tanh(gv / ca) * ca * sig * (tanh(uv / cb) * cb);
+            }
+            for (int d = 0; d < D; d++) {
+                double acc = 0;
+                for (int i = 0; i < I; i++) acc += h[i] * Df[e][(size_t)d * I + i];
+                ref[(size_t)s * D + d] += (float)((double)rw[(size_t)s * K + k] * acc * ed);
+            }
+        }
+    }
+    CcBuf *bt = T->buf(tab_bytes.size(), CC_DEV);
+    CcBuf *bx = upf(x);
+    CcBuf *bi = T->buf((size_t)S * K * sizeof(int), CC_DEV);
+    CcBuf *bw = upf(rw);
+    CcBuf *bh = T->buf(cc_moe_hid_floats(S, K, D, I, E) * sizeof(float), CC_DEV);
+    CcBuf *by = T->buf((size_t)S * D * sizeof(float), CC_DEV);
+    CcMoe mp = {};
+    mp.S = S; mp.K = K; mp.D = D; mp.I = I; mp.E = E; mp.fmt = 4; mp.gs = gs; mp.act = 1; mp.parts = 3;
+    mp.x_row = D; mp.i_row = K; mp.w_row = K; mp.y_row = D; mp.h_off = -1;
+    mp.esc_off = (int)esc_off; mp.act_a = ca; mp.act_b = cb;
+    int ok = okc && bt && bx && bi && bw && bh && by &&
+             T->begin() && T->write(bt, 0, tab_bytes.data(), tab_bytes.size()) &&
+             T->write(bi, 0, ids.data(), ids.size() * sizeof(int)) &&
+             T->moe(bt, bx, bi, bw, bh, by, NULL, &mp) && T->submit(1);
+    std::vector<float> y = down(by, 0, (size_t)S * D);
+    char what[96]; snprintf(what, sizeof what, "ink2 moe prefill S %d D %d I %d E %d K %d (fmt 4 gs 64 SiTU-GLU)", S, D, I, E, K);
+    check(ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30, 2e-3, what);
+    for (void *p : own) cudaFree(p);
+    T->free(bt); T->free(bx); T->free(bi); T->free(bw); T->free(bh); T->free(by);
+    (void)ngD; (void)ngI;
+}
+
 int main(void) {
+    int dev = 0;
+    if (!coli_cuda_init(&dev, 1)) { printf("cuda-inkc-check: no CUDA device on this machine\n"); return 1; }
     T = coli_cuda_chain_ops();
-    if (!T || !T->init(0) || !T->ready()) { printf("cuda-inkc-check: no CUDA chain on this machine\n"); return 1; }
+    if (!T || !T->init(dev) || !T->ready()) { printf("cuda-inkc-check: no CUDA chain on this machine\n"); return 1; }
     if (T->size < offsetof(ColiCudaChainOps, ink2_dconv) + sizeof T->ink2_dconv || !T->sconv || !T->relattn) {
         printf("cuda-inkc-check: the module has no Inkling ops\n"); return 1;
     }
     printf("sconv\n");
     test_sconv(37, 4, 3, 1); test_sconv(6144, 4, 1, 1); test_sconv(9, 1, 2, 2); test_sconv(5, 9, 6, 3);
+    test_sconv_fused(128, 4, 24, 20);
     printf("relattn\n");
     test_relattn(1, 0, 0, 64, 16, 4, 32, 0);
     test_relattn(5, 200, 0, 300, 32, 16, 64, 0);
@@ -220,6 +344,9 @@ int main(void) {
     test_relattn(3, 513, 512, 512, 128, 16, 512, 1);
     test_relattn(2, 9, 0, 64, 256, 64, 8, 1);
     test_relattn(1, 1500, 0, 1501, 128, 16, 512, 1);   /* a decode step at 1500 positions: twelve tiles split and joined */
+    test_relattn(1, 2500, 0, 2501, 128, 16, 512, 1);   /* >2048 positions: strided split-K loop */
+    test_relattn(64, 0, 0, 128, 128, 16, 512, 1);      /* FlashRelAttn prefill global */
+    test_relattn(32, 100, 64, 64, 128, 16, 64, 1);     /* FlashRelAttn prefill sliding window */
     test_relattn(8, 700, 0, 708, 64, 8, 64, 0);
     printf("loop gate\n");
     {
@@ -229,9 +356,13 @@ int main(void) {
     }
     test_loopgate(1, 2048, 0); test_loopgate(3, 300, 1);
     printf("ink2 mix, clip, dconv\n");
-    test_mix(1, 64, 0); test_mix(3, 4608, 8); test_mix(2, 300, 15);
+    test_mix(1, 64, 0); test_mix(3, 4608, 8); test_mix(2, 2304, 4); test_mix(2, 300, 15);
     test_clip(3, 4, 128, 1, 2.f); test_clip(2, 2, 16, 0, 0.5f); test_clip(1, 48, 300, 1, 22.6f);
     test_dconv(2, 16, 4, 3, 1); test_dconv(8, 128, 4, 1, 1); test_dconv(1, 8, 9, 5, 4); test_dconv(3, 4, 1, 2, 2);
+    test_dconv(2, 128, 4, 24, 20);
+    printf("ink2 moe prefill\n");
+    test_ink2_moe_prefill(40, 256, 256, 4, 2);
+    test_ink2_moe_prefill(160, 256, 256, 4, 2);
     printf(fails ? "cuda-inkc-check: %d FAILED\n" : "cuda-inkc-check: all passed\n", fails);
     return fails ? 1 : 0;
 }

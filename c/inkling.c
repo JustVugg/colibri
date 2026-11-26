@@ -316,6 +316,7 @@ static inline void ink_glu(const Cfg *c, float *g, const float *u, int64_t n) {
 static inline void ink2_head_post(const Cfg *c, float *lo, int64_t n) {
     if (!c->v2 || c->logit_cap <= 0) return;
     const float cap = c->logit_cap;
+    #pragma omp parallel for schedule(static) if (n >= 16384)
     for (int64_t i = 0; i < n; i++) lo[i] = tanhf(lo[i] / cap) * cap;
 }
 
@@ -2844,7 +2845,9 @@ static int  ink_vk_load_batch(void *ctx, int layer, const int *e, int n, VktExpe
 static int ink_ctx_max(void);
 static size_t ink_kv_later(const Model *m) {
     const Cfg *c = &m->c;
-    int t = ink_ctx_max() + 8;
+    int t = ink_ctx_max();
+    if (t > 65536) t = 65536;
+    t += 8;
     size_t b = 0;
     for (int i = 0; i < c->n_state; i++)   /* the loop's later passes keep their own (Inkling-2-Mini) */
         b += 2 * (size_t)L_KV(c, i) * (size_t)kv_ring_rows(c, i, t) * (size_t)L_HD(c, i) * sizeof(float);
@@ -3939,6 +3942,25 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     return step_mm(m, ids, S, pos0, tf_out, NULL, 0);
 }
 
+#ifdef COLI_CUDA
+/* Fast 1-token greedy decode step on the CUDA chain: picks argmax on GPU via cc_pick
+ * (skipping the 800 KB logit D2H copy, 200K CPU tanhf() softcap, and CPU argmax). */
+static int step_greedy(Model *m, int tok, int pos0, int *tok_out) {
+    if (!g_cu_chain || m->mux_rows) return 0;
+    Cfg *c = &m->c; int D = c->hidden;
+    float xbuf[8192];
+    float *x = D <= 8192 ? xbuf : falloc(D);
+    wt_row_f32(m->embed, (int64_t)tok * D, x, D);
+    if (m->embed_norm) rmsnorm_row(x, x, m->embed_norm, D, c->eps);
+    int took = ink2cc_forward_ex(m, x, 1, pos0, 0, NULL, tok_out);
+    if (x != xbuf) free(x);
+    if (took != 1) return 0;
+    m->kv_len = pos0 + 1;
+    kv_prefix_record(&m->kvp, &tok, pos0, 1);
+    return 1;
+}
+#endif
+
 #include "inkling2_mtp.h"   /* Inkling-2's drafter (INK2_MTP=1) */
 
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
@@ -4047,6 +4069,9 @@ static void kv_alloc(Model *m, int max_t) {
      * Every layer that does reach the copy IS linear: rows != old_rows only
      * happens when old_rows == old_max (a wrapped ring keeps rows == window
      * forever), and keep <= old_max <= rows there, so the copy fits. */
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     float **oldK = m->K, **oldV = m->V;
     int old_max = m->max_t;
     int keep = (m->K && m->kv_len > 0 && m->kv_len <= max_t) ? m->kv_len : 0;
@@ -4167,18 +4192,36 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
         }
         ink2m_report(m);
     }
-    for (int s = 0; s < n_new && logit; s++) {
-        int best = 0; float bv = logit[0];
-        for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+    {
+        int next_tk = -1;
+        int fast_greedy = 0;
+#ifdef COLI_CUDA
+        fast_greedy = g_cu_chain && !m->mux_rows && !getenv("COLI_LOGIT_DUMP");
+#endif
+        for (int s = 0; s < n_new && (logit || next_tk >= 0); s++) {
+            int best;
+            if (next_tk >= 0) {
+                best = next_tk;
+                next_tk = -1;
+            } else {
+                best = 0; float bv = logit[0];
+                for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+                free(logit); logit = NULL;
+            }
+            if (s == 0) t1 = now_s();
+            if (best == c->eos) { printf("\n[eos after %d tokens]", s); break; }
+            int nb = tok_decode(T, &best, 1, buf, sizeof(buf)-1);
+            buf[nb] = 0; fputs(buf, stdout); fflush(stdout);
+            int one = best;
+            len++;
+            if (s == n_new - 1) break;
+#ifdef COLI_CUDA
+            if (fast_greedy && step_greedy(m, one, len - 1, &next_tk)) continue;
+            fast_greedy = 0;
+#endif
+            logit = step(m, &one, 1, len - 1, NULL);
+        }
         free(logit);
-        if (s == 0) t1 = now_s();
-        if (best == c->eos) { printf("\n[eos after %d tokens]", s); break; }
-        int nb = tok_decode(T, &best, 1, buf, sizeof(buf)-1);
-        buf[nb] = 0; fputs(buf, stdout); fflush(stdout);
-        int one = best;
-        len++;
-        if (s == n_new - 1) break;
-        logit = step(m, &one, 1, len - 1, NULL);
     }
     double dt = now_s() - t1;
     int gen = len - np;
@@ -4241,22 +4284,45 @@ static int pi_desc(const void *a, const void *b) {
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
     coli_logit_dump(logit, n);
     int best = 0;
-    for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
+    float max_l = logit[0];
+    for (int i = 1; i < n; i++) if (logit[i] > max_l) { max_l = logit[i]; best = i; }
     if (temp <= 0.f) return best;
-    PI *c = malloc((size_t)n * sizeof(PI));
-    double sum = 0;
+    const float inv_t = 1.f / temp;
+    const float cutoff = max_l - 18.f * temp;
+    PI stack_c[1024];
+    PI *c = stack_c;
+    int cap = 1024, m = 0;
+    double sum = 0.0;
     for (int i = 0; i < n; i++) {
-        c[i].p = expf((logit[i] - logit[best]) / temp);
-        c[i].i = i; sum += c[i].p;
+        float li = logit[i];
+        if (li < cutoff) continue;
+        if (m == cap) {
+            int ncap = cap * 2;
+            PI *nc = (c == stack_c) ? (PI *)malloc((size_t)ncap * sizeof(PI)) : (PI *)realloc(c, (size_t)ncap * sizeof(PI));
+            if (!nc) { if (c != stack_c) free(c); return best; }
+            if (c == stack_c) memcpy(nc, stack_c, (size_t)cap * sizeof(PI));
+            c = nc; cap = ncap;
+        }
+        float p = expf((li - max_l) * inv_t);
+        c[m].p = p; c[m].i = i; m++;
+        sum += p;
     }
-    qsort(c, n, sizeof(PI), pi_desc);
-    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum;
-    double acc = 0; int k = 0;
-    while (k < n && acc < cut) acc += c[k++].p;
-    double r = rng_next() * acc, run = 0;
+    if (m <= 0) { if (c != stack_c) free(c); return best; }
+    if (top_p <= 0.f || top_p >= 1.f) {
+        double r = rng_next() * sum, run = 0.0;
+        int pick = c[0].i;
+        for (int i = 0; i < m; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
+        if (c != stack_c) free(c);
+        return pick;
+    }
+    qsort(c, (size_t)m, sizeof(PI), pi_desc);
+    double cut = top_p * sum;
+    double acc = 0.0; int k = 0;
+    while (k < m && acc < cut) acc += c[k++].p;
+    double r = rng_next() * acc, run = 0.0;
     int pick = c[0].i;
     for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
-    free(c);
+    if (c != stack_c) free(c);
     return pick;
 }
 
@@ -4568,6 +4634,9 @@ static InkPsState *ink_ps_state_save(Model *m, size_t *bytes) {
  * host too) */
 static void ink_ps_save(Model *m, const int *ids, int P) {
     if (!ink_ps_on() || P < g_ink_ps.B || m->kvp.tainted || m->kv_len != P || !m->K) return;
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_state * sizeof *parts + 1);
     if (!parts) return;
     const int np = ink_ps_parts(m, parts);
@@ -4870,27 +4939,45 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
             const int last = blk[nblk - 1];
             nblk = ink2m_step(m, last, fed, blk); fed += nblk; forwards++;
         }
-    } else
-    for (int s = 0; s < q->max_tok && !cancelled; s++) {
-        apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
-        int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
-        char lptail[1024]; lptail[0] = 0;
-        if (q->logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, logit, c->unpad_vocab, tk, q->logprobs);
-        free(logit); logit = NULL;
-        if (tk == c->eos) { limited = 0; break; }
-        if (nhist < 128) hist[nhist++] = tk;
-        else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
-        int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
-        if (q->logprobs > 0) coli_serve_write_data_lp(stdout,q->id,buf,(size_t)nb,lptail);
-        else coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
-        gen++; len++;
-        while (coli_stdin_readable()) {
-            int r = serve_read_cmd(stdin, stdout, q->id);
-            if (r < 0) { free(ids); return -1; }
-            if (r > 0) { cancelled = 1; limited = 0; }
+    } else {
+        int fast_greedy = 0;
+#ifdef COLI_CUDA
+        fast_greedy = (q->temp <= 0.f && rep == 1.f && q->logprobs == 0 && !m->mux_rows && g_cu_chain && !getenv("COLI_LOGIT_DUMP"));
+#endif
+        int next_tk = -1;
+        for (int s = 0; s < q->max_tok && !cancelled; s++) {
+            int tk;
+            char lptail[1024]; lptail[0] = 0;
+            if (next_tk >= 0) {
+                tk = next_tk;
+                next_tk = -1;
+            } else {
+                apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
+                tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
+                if (q->logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, logit, c->unpad_vocab, tk, q->logprobs);
+                free(logit); logit = NULL;
+            }
+            if (tk == c->eos) { limited = 0; break; }
+            if (!fast_greedy) {
+                if (nhist < 128) hist[nhist++] = tk;
+                else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
+            }
+            int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
+            if (q->logprobs > 0) coli_serve_write_data_lp(stdout,q->id,buf,(size_t)nb,lptail);
+            else coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
+            gen++; len++;
+            while (coli_stdin_readable()) {
+                int r = serve_read_cmd(stdin, stdout, q->id);
+                if (r < 0) { free(ids); return -1; }
+                if (r > 0) { cancelled = 1; limited = 0; }
+            }
+            if (cancelled || s == q->max_tok - 1) break;
+#ifdef COLI_CUDA
+            if (fast_greedy && step_greedy(m, tk, len - 1, &next_tk)) { forwards++; continue; }
+            fast_greedy = 0;
+#endif
+            logit = step(m, &tk, 1, len - 1, NULL); forwards++;
         }
-        if (cancelled || s == q->max_tok - 1) break;
-        logit = step(m, &tk, 1, len - 1, NULL); forwards++;
     }
     free(logit);
     double dt = now_s() - t0;

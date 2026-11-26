@@ -4619,8 +4619,8 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
     if ((p->parts & 2) && (!w || !y || (p->h_off >= 0 && !hy))) return 0;
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;
     if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
-    /* CC_INK2_MOE's (a decode step's rows; the scales' pairs inside the table's buffer): refused here, not a lost device */
-    if (p->act < 0 || p->act > 1 || p->esc_off < 0 || ((p->act || p->esc_off) && LS > CC_MOE_FRAME_ROWS) ||
+    /* CC_INK2_MOE: act 1 & esc_off supported on prompt chunks for fmt=4 (Inkling-2 grouped MoE); other formats decode only */
+    if (p->act < 0 || p->act > 1 || p->esc_off < 0 || ((p->act || p->esc_off) && p->fmt != 4 && LS > CC_MOE_FRAME_ROWS) ||
         (p->act == 1 && !(p->act_a > 0.f && p->act_b > 0.f)) ||
         (p->esc_off && (p->esc_off % 8 || p->E < 1 || (size_t)p->esc_off + (size_t)(p->t_off + p->E) * 8 > tab->bytes))) return 0;
     if (LS > CC_MOE_FRAME_ROWS && p->E < 1) return 0;
@@ -5340,6 +5340,11 @@ static int cc_preload(void) {
 #include "cuda_glm53c.cuh"  /* GLM-5.3's layer ops */
 #include "cuda_k3c.cuh"     /* Kimi K3's residual mix and activation */
 /* COLI_CUDA_RELATTN_SPLIT=0: a decode step's Inkling-2 attention a block a (head, row) (cuda_inkc.cuh) */
+static int cc_relattn_flash_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_RELATTN_FLASH"); on = !(e && *e == '0'); }
+    return on;
+}
 static int cc_relattn_split(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_RELATTN_SPLIT"); on = !(e && *e == '0'); }
