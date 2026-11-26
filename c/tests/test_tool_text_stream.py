@@ -34,11 +34,29 @@ class ToolTextStreamTest(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def test_text_before_a_call_at_every_cut(self):
+        # a family other than GLM's whose calls use the same box (MiMo): its text stops at the call
         reply = "Let me look. " + CALL + " trailing"
-        for a in range(1, len(reply)):
-            for b in (a, min(len(reply) - 1, a + 3)):
-                with self.subTest(cuts=(a, b)):
-                    self.assertEqual(run(reply, sorted({a, b})), ("Let me look. ", None))
+        with patch.object(gw, "ARCH", "mimo"):
+            for a in range(1, len(reply)):
+                for b in (a, min(len(reply) - 1, a + 3)):
+                    with self.subTest(cuts=(a, b)):
+                        self.assertEqual(run(reply, sorted({a, b})), ("Let me look. ", None))
+
+    def test_the_glm_form_keeps_its_prose_at_every_cut(self):
+        # #2469: GLM-5.2 and GLM-5.3 stream the prose around and after their calls as a whole
+        # reply gives it, the prefix once, the calls' syntax never, and the calls from that parse
+        reply = "Before " + CALL + " between " + CALL + " after"
+        whole, whole_calls = gw.parse_tool_calls(reply, TOOLS)
+        for arch in ("glm", "glm53"):
+            with patch.object(gw, "ARCH", arch):
+                for a in range(1, len(reply)):
+                    for b in (a, min(len(reply) - 1, a + 5)):
+                        with self.subTest(arch=arch, cuts=(a, b)):
+                            text, calls = run(reply, sorted({a, b}))
+                            self.assertEqual(text, whole)
+                            self.assertNotIn("<tool_call>", text)
+                            self.assertEqual([(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls],
+                                             [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in whole_calls])
 
     def test_a_reply_with_no_call_is_all_text_at_every_cut(self):
         reply = "A < b, and <tool is not a call: <tool_cal"   # a tail that looks like a marker's start

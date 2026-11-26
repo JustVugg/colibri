@@ -1340,12 +1340,15 @@ class ToolTextStream:
 
     def __init__(self, emit, tools, sideband):
         self.emit = emit
+        self.tools = tools
         self.sideband = sideband
         self.qwen = (QwenToolStream(emit, tools) if chat_flavor() in
                      ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
         self.buf = ""
         self.in_tool = False
         self.hold = _tool_hold()
+        self.raw = []                    # the answer as fed: the GLM form's prose after a call (finish)
+        self.emitted = 0                 # its characters released so far, from the start
 
     def feed(self, chunk):
         if self.qwen is not None:
@@ -1354,6 +1357,7 @@ class ToolTextStream:
         if self.sideband.seen:
             self.emit(chunk)
             return
+        self.raw.append(chunk)
         if self.in_tool:
             return                       # tool markers never reach the client as text
         self.buf += chunk
@@ -1361,21 +1365,35 @@ class ToolTextStream:
         if cut >= 0:
             if cut:
                 self.emit(self.buf[:cut])
+                self.emitted += cut
             self.buf = ""
             self.in_tool = True
             return
         flush = max(0, len(self.buf) - self.hold)
         if flush:
             self.emit(self.buf[:flush])
+            self.emitted += flush
             self.buf = self.buf[flush:]
 
     def finish(self):
-        """The end of the reply: the held tail goes out when no call began. Returns the Qwen
-        form's calls, parsed as they streamed, or None when the caller parses the reply."""
+        """The end of the reply: the held tail goes out when no call began. In the GLM form
+        (GLM-5.2, GLM-5.3) the prose around and after complete calls goes out too, as the
+        parser keeps it (#2469: only the text before the first call reached a streamed
+        reply, all of it a whole one); the streamed prefix is not repeated and the calls'
+        markers and arguments stay out. Returns the Qwen form's calls, parsed as they
+        streamed, the GLM form's from that parse, or None when the caller parses the reply."""
         if self.qwen is not None:
             return self.qwen.finish()
         if not self.in_tool and self.buf:
             self.emit(self.buf)
+        elif self.in_tool and ARCH in ("glm", "glm53") and chat_flavor() not in ("muse", "mistral_large4"):
+            content, calls, _boxes, spans = parse_tool_calls_spans("".join(self.raw), self.tools)
+            for begin, end, target in spans or ():
+                first = max(begin, self.emitted)
+                if first < end:
+                    self.emit(content[target + first - begin:target + end - begin])
+            self.buf = ""
+            return calls                 # the parse the caller would make (one parse, one log line)
         self.buf = ""
         return None
 
