@@ -7389,6 +7389,7 @@ def _write_all(stream, data, frame):
 # gets back into the /v1/systemone reply, the same reply an LLM gives there.
 
 MAX_DECISION_BYTES = 16 << 20
+MAX_TRANSCRIPT_BYTES = 16 << 20
 
 
 def decision_text(value):
@@ -7535,6 +7536,11 @@ def engine_decides(engine):
 def engine_chats(engine):
     """False only for an engine that said chat=0: it has no generating endpoint."""
     return getattr(engine, "chats", True) is not False
+
+
+def engine_transcribes(engine):
+    """True when the engine announced transcribe=1 and can serve audio transcription."""
+    return getattr(engine, "transcribes", False) is True
 
 
 class _Pending:
@@ -7695,6 +7701,7 @@ class Engine:
         # means it has nothing else: the generating endpoints answer 400.
         self.decides = self.caps.get("decide") == "1"
         self.chats = self.caps.get("chat") != "0"
+        self.transcribes = self.caps.get("transcribe") == "1"
         # decide_record=raw: the engine renders the request the way its own reference
         # does (Clef), so the record carries the caller's values, not the gateway's
         # defaults (systemone_decision_record). None: the default form.
@@ -7955,6 +7962,18 @@ class Engine:
                         entry = self.pending.get(request_id)
                     if entry is not None and entry.failed is None:
                         entry.events.put(("decision", data))
+                elif kind == "TRANSCRIPT" and len(fields) == 3:
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    if not 0 <= size <= MAX_TRANSCRIPT_BYTES:
+                        raise RuntimeError("invalid engine TRANSCRIPT size")
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine TRANSCRIPT terminator")
+                    with self.pending_lock:
+                        entry = self.pending.get(request_id)
+                    if entry is not None and entry.failed is None:
+                        entry.events.put(("transcript", data))
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
@@ -8141,6 +8160,71 @@ class Engine:
                 except (UnicodeDecodeError, ValueError) as error:
                     raise RuntimeError(f"the engine sent an unreadable DECISION ({error})") from error
                 return parsed, value
+            elif kind == "accept":
+                continue
+            else:
+                raise value
+
+    def transcribe(self, audio, filename, opts, cancelled=None, cache_slot=0):
+        """One TRANSCRIBE round trip: audio bytes in, transcript JSON back."""
+        import base64
+        if not self.transcribes:
+            raise APIError(400, "This engine does not support audio transcription.",
+                           "model", "unsupported_endpoint")
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
+        payload_obj = {
+            "filename": str(filename or "audio.wav"),
+            "audio_b64": base64.b64encode(bytes(audio)).decode("ascii"),
+        }
+        if isinstance(opts, dict):
+            for k in ("language", "prompt", "response_format"):
+                v = opts.get(k)
+                if v is not None:
+                    payload_obj[k] = v
+            if opts.get("temperature") is not None:
+                payload_obj["temperature"] = float(opts["temperature"])
+        payload = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        pending = _Pending(False)
+        with self.pending_lock:
+            if self.closed:
+                raise RuntimeError("colibri engine is shutting down")
+            if self.dispatcher_error is not None:
+                raise RuntimeError(f"colibri engine dispatcher stopped: {self.dispatcher_error}") \
+                    from self.dispatcher_error
+            if self.process.poll() is not None:
+                raise RuntimeError("colibri engine is not running")
+            request_id = str(self.next_request_id)
+            self.next_request_id += 1
+            self.pending[request_id] = pending
+        try:
+            with self.write_lock:
+                if self.process.poll() is not None:
+                    raise RuntimeError("colibri engine is not running")
+                try:
+                    _write_all(self.process.stdin,
+                               f"TRANSCRIBE {request_id} {cache_slot} {len(payload)}\n".encode()
+                               + payload + b"\n", "TRANSCRIBE")
+                    self.process.stdin.flush()
+                except OSError as error:
+                    raise RuntimeError(f"failed to write TRANSCRIBE to the engine ({error})") from error
+        except Exception:
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
+            raise
+        transcript = None
+        while True:
+            kind, value = pending.events.get()
+            if kind == "transcript":
+                transcript = value
+            elif kind == "done":
+                if transcript is None:
+                    raise RuntimeError("the engine finished a TRANSCRIBE without a TRANSCRIPT")
+                try:
+                    parsed = json.loads(transcript.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError) as error:
+                    raise RuntimeError(f"the engine sent an unreadable TRANSCRIPT ({error})") from error
+                return parsed
             elif kind == "accept":
                 continue
             else:
@@ -8486,6 +8570,7 @@ ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_erro
 # pointer to /v1/systemone when the model is a decision engine (chat=0).
 GENERATING_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages",
                         "/v1/messages/count_tokens")
+AUDIO_TRANSCRIPTION_ENDPOINTS = ("/v1/audio/transcriptions",)
 IMAGE_OPTION_KEYS = ("default_width", "default_height", "default_steps", "min_side",
                      "max_side", "multiple")
 
@@ -8618,14 +8703,19 @@ class APIServer(ThreadingHTTPServer):
         return seen
 
     def capabilities(self):
-        """What the served model does, for /v1/models and /health: an image model
-        draws (image_generation); every text engine answers POST /v1/systemone
-        (systemone), and a decision engine does only that (decision)."""
+        """What the served model does, for /v1/models and /health."""
         if is_image_engine(self.engine):
             return ["image_generation"]
-        if engine_decides(self.engine) and not engine_chats(self.engine):
-            return ["systemone", "decision"]
-        return ["chat", "systemone"]
+        caps = []
+        if engine_chats(self.engine):
+            caps.extend(["chat", "systemone"])
+        elif engine_decides(self.engine):
+            caps.extend(["systemone", "decision"])
+        if engine_transcribes(self.engine):
+            caps.append("transcribe")
+        if not caps:
+            caps.append("chat")
+        return caps
 
     def jev_model_card(self):
         """The served model as Jev's GET /v1/models lists it. colibri does not know a
@@ -8639,16 +8729,12 @@ class APIServer(ThreadingHTTPServer):
                 "release_date": time.strftime("%Y-%m-%d", time.gmtime(self.created))}
 
     def input_modalities(self):
-        """What a request to this server may carry: text, plus image when BOTH the
-        family has a placeholder expansion and the engine said it loaded its tower.
-        The family alone is not the truth (a glm53 export can declare vision_config
-        and ship no model.visual.* tensors, and the engine then serves text), and
-        the engine alone is not either (a tower the gateway cannot feed is no
-        modality). An engine that announced nothing is text: the card under-claims
-        rather than promising a picture nobody checked."""
+        """What a request to this server may carry."""
         modalities = ["text"]
         if family_by_id(ARCH).capabilities.image and getattr(self.engine, "vision", None) is True:
             modalities.append("image")
+        if engine_transcribes(self.engine):
+            modalities.append("audio")
         return modalities
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, *args, **kwargs):
@@ -9058,6 +9144,89 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Request body must be a JSON object.")
         return body
 
+    def _read_raw_body(self, max_body=MAX_BODY):
+        if self.headers.get_all("Transfer-Encoding"):
+            self.close_connection = True
+            raise APIError(400, "Transfer-Encoding is not supported; send one Content-Length.")
+        if len(self.headers.get_all("Content-Length", [])) > 1:
+            self.close_connection = True
+            raise APIError(400, "Multiple Content-Length headers are not supported.")
+        try:
+            length = _content_length(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True
+            raise APIError(400, "Invalid Content-Length header.")
+        if length < 1 or length > max_body:
+            raise APIError(400, f"Request body must be between 1 and {max_body} bytes.")
+        raw = self.rfile.read(length)
+        self._body_read = len(raw) == length
+        return raw
+
+    def _parse_multipart_form(self, raw, content_type):
+        """Minimal multipart/form-data parser for audio transcription requests."""
+        m = _re.search(r'boundary="?([^";]+)"?', content_type or "")
+        if not m:
+            raise APIError(400, "Multipart request missing boundary.", "content-type")
+        boundary = m.group(1).encode("utf-8", "ignore")
+        delim = b"--" + boundary
+        parts = raw.split(delim)
+        fields = {}
+        files = {}
+        for part in parts:
+            if not part or part in (b"--\r\n", b"--", b"\r\n"):
+                continue
+            if part.startswith(b"\r\n"):
+                part = part[2:]
+            if part.endswith(b"--\r\n"):
+                part = part[:-4]
+            elif part.endswith(b"\r\n"):
+                part = part[:-2]
+            header_blob, sep, body = part.partition(b"\r\n\r\n")
+            if not sep:
+                continue
+            headers = {}
+            for line in header_blob.decode("utf-8", "ignore").split("\r\n"):
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            disp = headers.get("content-disposition", "")
+            name_m = _re.search(r'name="([^"]*)"', disp)
+            if not name_m:
+                continue
+            name = name_m.group(1)
+            filename_m = _re.search(r'filename="([^"]*)"', disp)
+            if filename_m:
+                files[name] = {
+                    "filename": filename_m.group(1),
+                    "content_type": headers.get("content-type", "application/octet-stream"),
+                    "data": body,
+                }
+            else:
+                fields[name] = body.decode("utf-8", "ignore")
+        return fields, files
+
+    def read_transcription_request(self):
+        ctype = self.headers.get("Content-Type", "")
+        max_body = 64 << 20  # audio uploads can be larger than JSON chat requests
+        raw = self._read_raw_body(max_body=max_body)
+        if "multipart/form-data" in ctype.lower():
+            fields, files = self._parse_multipart_form(raw, ctype)
+            body = dict(fields)
+            file = files.get("file")
+            if file is None:
+                raise APIError(400, "Missing `file` in multipart transcription request.", "file")
+            body["_file"] = file
+            return body
+        try:
+            body = json.loads(raw, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise APIError(400, "Request body must be valid JSON or multipart/form-data.")
+        except (ValueError, RecursionError):
+            raise APIError(400, "Request body exceeds the supported JSON parsing limits.")
+        if not isinstance(body, dict):
+            raise APIError(400, "Request body must be a JSON object.")
+        return body
+
     def check_model(self, body):
         model = body.get("model")
         if model != self.server.model_id:
@@ -9198,27 +9367,39 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             self._check_host()
             self.require_auth()
+            path = urlsplit(self.path).path
             try:
-                body = self.read_json()
+                if path in AUDIO_TRANSCRIPTION_ENDPOINTS:
+                    body = self.read_transcription_request()
+                else:
+                    body = self.read_json()
             except TimeoutError:
                 # Only request intake is on this deadline. A later timeout
                 # from the engine keeps the existing structured 500 response.
                 self.close_connection = True
                 self.log_error("request read deadline exceeded")
                 return
-            path = urlsplit(self.path).path
             # A client written for Jev sends "jev-latest": on that route the
             # served model answers whatever name was asked for.
+            # Transcription clients (OpenAI Whisper API, local-speech-llama, etc.)
+            # often send model="asr"/"whisper-1"; accept common aliases.
+            if path in AUDIO_TRANSCRIPTION_ENDPOINTS:
+                m = body.get("model")
+                if m in (None, "", "asr", "whisper-1", "whisper"):
+                    body["model"] = self.server.model_id
             if path != "/v1/systemone":
                 self.check_model(body)
-            if is_image_engine(self.server.engine) and path in TEXT_ENDPOINTS:
+            if is_image_engine(self.server.engine) and path in (*TEXT_ENDPOINTS, *AUDIO_TRANSCRIPTION_ENDPOINTS):
                 raise APIError(400, f"`{self.server.model_id}` is an image generation model and "
-                                    "does not chat: POST /v1/images/generations instead.",
+                                    "does not chat/transcribe: POST /v1/images/generations instead.",
                                "model", "unsupported_endpoint")
             if not engine_chats(self.server.engine) and path in GENERATING_ENDPOINTS:
                 raise APIError(400, f"`{self.server.model_id}` is a decision model: it answers typed "
                                     "questions with calibrated probabilities and does not generate "
                                     "text. POST /v1/systemone instead.",
+                               "model", "unsupported_endpoint")
+            if path in AUDIO_TRANSCRIPTION_ENDPOINTS and not engine_transcribes(self.server.engine):
+                raise APIError(400, f"`{self.server.model_id}` does not support audio transcription.",
                                "model", "unsupported_endpoint")
             if path == "/v1/images/generations":
                 self.image_generation(body, request_id)
@@ -9230,6 +9411,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.systemone(body, request_id)
             elif path == "/v1/messages":
                 self.anthropic_messages(body, request_id)
+            elif path == "/v1/audio/transcriptions":
+                self.audio_transcription(body, request_id)
             elif path == "/v1/messages/count_tokens":
                 self.anthropic_count_tokens(body, request_id)
             else:
@@ -9703,6 +9886,58 @@ class APIHandler(BaseHTTPRequestHandler):
         if isinstance(engine_ms, (int, float)) and math.isfinite(engine_ms):
             headers["x-colibri-engine-ms"] = str(round(engine_ms, 1))
         self.send_json(200, reply, request_id, headers)
+
+    # ------------------------------------------------------------- audio
+    #
+    # POST /v1/audio/transcriptions (OpenAI-style). The engine must advertise
+    # transcribe=1 in CAPS and implement transcribe(audio_bytes, filename, opts).
+    # This is the compatibility surface for external local-voice projects.
+    def audio_transcription(self, body, request_id):
+        engine = self.server.engine
+        if not engine_transcribes(engine) or not hasattr(engine, "transcribe"):
+            raise APIError(400, f"`{self.server.model_id}` does not support audio transcription.",
+                           "model", "unsupported_endpoint")
+        upload = body.get("_file")
+        if not isinstance(upload, dict) or not isinstance(upload.get("data"), (bytes, bytearray)):
+            raise APIError(400, "Missing audio file.", "file")
+        audio = bytes(upload["data"])
+        if not audio:
+            raise APIError(400, "Empty audio file.", "file")
+        filename = str(upload.get("filename") or "audio.wav")
+        response_format = str(body.get("response_format") or "json").lower()
+        if response_format not in ("json", "text", "verbose_json"):
+            raise APIError(400, "`response_format` must be json, text, or verbose_json.",
+                           "response_format")
+        opts = {
+            "language": body.get("language"),
+            "prompt": body.get("prompt"),
+            "temperature": body.get("temperature"),
+            "response_format": response_format,
+        }
+        started = time.time()
+        with self.server.scheduler.admit(self.client_disconnected, 0) as admission:
+            queue_wait, _slot = admission
+            result = engine.transcribe(audio, filename, opts, self.client_disconnected)
+        if not isinstance(result, dict):
+            text = "" if result is None else str(result)
+            result = {"text": text}
+        text = str(result.get("text", ""))
+        headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
+                   "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))}
+        if response_format == "text":
+            data = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        payload = {"text": text}
+        if response_format == "verbose_json":
+            payload.update({k: v for k, v in result.items() if k in ("language", "duration", "segments", "words")})
+        self.send_json(200, payload, request_id, headers)
 
     # ------------------------------------------------------------- images
     #

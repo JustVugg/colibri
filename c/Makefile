@@ -1724,6 +1724,26 @@ endif
 gliner_decide$(EXE): gliner_decide.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) gliner_decide.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
 
+# Qwen3-ASR speech-to-text (docs/plans/2026-11-22-qwen3-asr-port.md).
+# MVP scaffold: serve protocol + transcription endpoint wiring; model inference
+# (mel frontend, audio encoder, projector, Qwen3 decoder) is being implemented.
+ifneq ($(EXE),)
+.PHONY: qwen3_asr
+qwen3_asr: qwen3_asr$(EXE)
+endif
+qwen3_asr$(EXE): qwen3_asr.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) qwen3_asr.c $(VK_OBJ) -o qwen3_asr$(EXE) $(LDFLAGS)
+
+QWEN3_ASR_MODEL ?= $(HOME)/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e70fe206f11671096ffdd38061171dd6e5
+.PHONY: test-qwen3-asr
+test-qwen3-asr: qwen3_asr$(EXE)
+	@if [ ! -d "$(QWEN3_ASR_MODEL)" ]; then echo "skip: QWEN3_ASR_MODEL not found: $(QWEN3_ASR_MODEL)"; exit 0; fi
+	@if [ -f testdata/qwen3_asr_hello3_refs.json ]; then \
+		python3 tools/test_qwen3_asr_smoke.py --engine ./qwen3_asr$(EXE) --model "$(QWEN3_ASR_MODEL)" --manifest testdata/qwen3_asr_hello3_refs.json; \
+	else \
+		python3 tools/test_qwen3_asr_smoke.py --engine ./qwen3_asr$(EXE) --model "$(QWEN3_ASR_MODEL)"; \
+	fi
+
 # Tiny Laya checkpoint + the laya package's own answers on it. The generator is
 # numpy and deterministic; laya_tiny/ref.json is committed and comes from the
 # `laya` package (tools/make_laya_ref.py, maintainer-run, fixture SHA-256

@@ -1,0 +1,8 @@
+{
+  "model": "/home/dorin/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e70fe206f11671096ffdd38061171dd6e5",
+  "wav": "/tmp/opencode/bench_wavs/hello.wav",
+  "sr": 16000,
+  "n_samples": 53760,
+  "n_audio_tokens": 44,
+  "prompt_len": 62
+}

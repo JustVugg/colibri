@@ -34,6 +34,10 @@ typedef enum {
      * receives it: the gateway sends it only after the engine announced decide=1 in
      * its CAPS line. */
     COLI_SERVE_COMMAND_DECIDE,
+    /* TRANSCRIBE <id> <slot> <bytes>\n<payload>\n: audio transcription request.
+     * Payload is JSON: {"filename":"...","audio_b64":"...","language":..., ...}.
+     * The engine answers with a TRANSCRIPT frame followed by DONE. */
+    COLI_SERVE_COMMAND_TRANSCRIBE,
 } ColiServeCommandKind;
 
 typedef enum {
@@ -160,6 +164,8 @@ static inline void coli_serve_classify_line(
         command->kind = COLI_SERVE_COMMAND_IMAGE;
     else if (name_size == 6 && !memcmp(name, "DECIDE", 6))
         command->kind = COLI_SERVE_COMMAND_DECIDE;
+    else if (name_size == 10 && !memcmp(name, "TRANSCRIBE", 10))
+        command->kind = COLI_SERVE_COMMAND_TRANSCRIBE;
     else
         return;
     while (*cursor == ' ' || *cursor == '\t') cursor++;
@@ -244,6 +250,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     else if (!strcmp(fields[0], "CANCEL")) command->kind = COLI_SERVE_COMMAND_CANCEL;
     else if (!strcmp(fields[0], "IMAGE")) command->kind = COLI_SERVE_COMMAND_IMAGE;
     else if (!strcmp(fields[0], "DECIDE")) command->kind = COLI_SERVE_COMMAND_DECIDE;
+    else if (!strcmp(fields[0], "TRANSCRIBE")) command->kind = COLI_SERVE_COMMAND_TRANSCRIBE;
     else {
         free(line);
         return COLI_SERVE_READ_IGNORED;
@@ -296,6 +303,33 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         /* DECIDE <id> <slot> <bytes>\n<payload>\n. Same rule as IMAGE: the payload
          * is consumed whenever the header parses, so an engine that cannot decide
          * answers with an ERROR and the next frame still starts on a header. */
+        if (nfields != 4 ||
+            !coli_serve_parse_i32(fields[2], &command->slot) ||
+            !coli_serve_parse_u64(fields[3], &command->payload_bytes) ||
+            command->payload_bytes > profile->max_payload_bytes ||
+            command->slot < 0) {
+            free(line);
+            return COLI_SERVE_READ_BAD_REQUEST;
+        }
+        free(line);
+        command->payload = (unsigned char *)allocate((size_t)command->payload_bytes + 1);
+        if (!command->payload) return COLI_SERVE_READ_NOMEM;
+        if (command->payload_bytes &&
+            fread(command->payload, 1, (size_t)command->payload_bytes, input)
+                != (size_t)command->payload_bytes) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        command->payload[command->payload_bytes] = 0;
+        int terminator = fgetc(input);
+        if (terminator != '\n' && !(terminator == '\r' && fgetc(input) == '\n')) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        return COLI_SERVE_READ_OK;
+    }
+    if (command->kind == COLI_SERVE_COMMAND_TRANSCRIBE) {
+        /* TRANSCRIBE <id> <slot> <bytes>\n<payload>\n. Payload is JSON. */
         if (nfields != 4 ||
             !coli_serve_parse_i32(fields[2], &command->slot) ||
             !coli_serve_parse_u64(fields[3], &command->payload_bytes) ||

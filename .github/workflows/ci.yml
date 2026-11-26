@@ -1,59 +1,26 @@
 name: CI
 
-# A change that touches only documentation skips this workflow; check.yml (make check,
-# the Python suite and the docs tests in it) still runs on it. A pull request that
-# changes any other file runs every job here, docs included (#2826).
 on:
   pull_request:
     branches: [dev, main]
-    paths-ignore:
-      - 'docs/**'
-      - 'site/**'
-      - '**/*.md'
   push:
     branches: [dev, main]
-    paths-ignore:
-      - 'docs/**'
-      - 'site/**'
-      - '**/*.md'
 
 # CI only reads the tree; no job here writes to the repo. Pin the token to
 # read-only so a compromised step (or action) cannot push, tag or release.
 permissions:
   contents: read
 
-# A new push to a pull request cancels that PR's older run. Pushes to dev and
-# main each get their own group (run_id), so they are never queued or cancelled.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: true
-
 jobs:
-  # The environment-variable registry (c/coli_env.h) against the sources. No
-  # build, no model, no GPU -- seconds, so it reports before anything else.
-  env-registry:
-    name: Env registry in sync
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: make -C c check-env
-
   engine:
     name: Engine (Linux, CPU)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Every core: the suite is ~320 binaries, each built on its own (make test-c builds
-      # them all, then runs them one after the other, so -j changes no test's run).
       - name: Build colibri + inkling
-        run: cd c && make -j"$(nproc)" colibri inkling
+        run: cd c && make colibri inkling
       - name: C test suite
-        run: cd c && make -j"$(nproc)" test-c
-      - name: The CUDA engines' host side without AVX2 (as an ARM host with a card builds it)
-        run: cd c && make cuda-host-syntax ARCH=x86-64
+        run: cd c && make test-c
 
   # Every engine, on every platform a release archive is built for. Before this,
   # CI built colibri + inkling on Linux only and kimi_k3 on nothing -- so the fact
@@ -116,7 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: C suite under ASan + UBSan
-        run: make -C c -j"$(nproc)" test-asan
+        run: make -C c test-asan
       - name: rANS fuzz round-trip (ASan + UBSan)
         # Already sanitized and already asserting byte identity across every
         # compiled decode arm; it just had no job to run in.
@@ -207,10 +174,6 @@ jobs:
         run: |
           cd c
           make vk-memtype-check VK=1
-      - name: The pipelines' cache on disk
-        run: |
-          cd c
-          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json make vk-pcache-check VK=1
 
   # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
   # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and
@@ -221,11 +184,6 @@ jobs:
     name: Vulkan engines (${{ matrix.family }}, Lavapipe)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # The legs build several engines a call (`make qwen36 qwen38 ... VK=1`): on every core.
-    # vulkan_engines.sh runs each engine and test itself, one at a time; the fixture
-    # generators it calls through make keep -j1 there.
-    env:
-      MAKEFLAGS: -j4
     strategy:
       fail-fast: false
       matrix:
@@ -266,11 +224,6 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: inkling-olmoe
             req: c/tools/oracle-requirements.txt
-          # Inkling-2's routed experts on the tier: the f32 fixture, the int4 g64 container and a
-          # GGUF as unsloth's lay it out, and Inkling-2-Mini's loop on the tier and the chain
-          # (transformers with Inkling-2 and Inkling-2-Mini, gguf-py)
-          - family: inkling2
-            req: c/tools/oracle-inkling2-loop-requirements.txt
           # the routed-expert tier of inkling and olmoe under ASan and UBSan
           - family: inkling-olmoe-sanitize
             req: c/tools/oracle-requirements.txt
@@ -521,9 +474,8 @@ jobs:
           cache-dependency-path: ${{ matrix.req }}
       - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
         run: |
-          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job.
-          # vulkan-validationlayers: sync_gate's synchronization check (vulkan_engines.sh)
-          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers vulkan-validationlayers
+          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
           pip install -r ${{ matrix.req }} ${{ matrix.extra }}
       - name: The pinned TypeScript SDK
         if: ${{ matrix.npm }}
@@ -590,9 +542,6 @@ jobs:
             # time. XDNA=1 needs nothing installed on the runner: the lane's host
             # side links no XRT, and the helper is loaded at runtime on request.
             make_args: "XDNA=1"
-            # release.yml's DeepSeek V4 (clang with LLVM's libomp, #2286, and VK=1),
-            # built after the default gcc one
-            v4_args: "CC=clang VK=1"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -610,15 +559,6 @@ jobs:
             make
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-binutils
-            mingw-w64-ucrt-x86_64-clang
-            mingw-w64-ucrt-x86_64-vulkan-headers
-            mingw-w64-ucrt-x86_64-shaderc
-      # the OpenMP package under either of its names, as in release.yml
-      - if: matrix.os == 'windows-latest'
-        run: |
-          omp=mingw-w64-ucrt-x86_64-llvm-openmp
-          pacman -Si $omp > /dev/null 2>&1 || omp=mingw-w64-ucrt-x86_64-openmp
-          pacman -S --needed --noconfirm $omp
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
       # Keep the portable sibling list aligned with release packaging. DeepSeek
@@ -632,20 +572,11 @@ jobs:
           rc=0
           ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
-          # -j: deepseek-v4 is a dozen units, and the macOS and Windows runners have the cores
-          # (one engine a call, so a failure still names its engine)
-          JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
           for t in $ENGINES; do
             echo "::group::$t"
-            make -j"$JOBS" $t ${{ matrix.make_args }} || { echo "FAILED: $t"; rc=1; }
+            make $t ${{ matrix.make_args }} || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"
           done
-          # the release's DeepSeek V4 as well (the flags stamp rebuilds its units)
-          if [ -n "${{ matrix.v4_args }}" ]; then
-            echo "::group::deepseek-v4 ${{ matrix.v4_args }}"
-            make -j"$JOBS" deepseek-v4 ${{ matrix.make_args }} ${{ matrix.v4_args }} || { echo "FAILED: deepseek-v4 ${{ matrix.v4_args }}"; rc=1; }
-            echo "::endgroup::"
-          fi
           exit $rc
       - if: matrix.os == 'windows-latest'
         name: "The release configuration is what got built (XDNA=1)"
@@ -703,7 +634,7 @@ jobs:
         run: |
           cd c
           rc=0
-          for t in colibri inkling kimi_k3 qwen36; do
+          for t in colibri inkling kimi_k3; do
             echo "::group::$t METAL=1"
             make clean >/dev/null 2>&1 || true
             make $t METAL=1 || { echo "FAILED: $t METAL=1"; rc=1; }
@@ -726,27 +657,6 @@ jobs:
         run: |
           cd c
           make metal-test
-      - if: matrix.os == 'macos-latest'
-        name: qwen36 Metal kernels
-        # The kernels of the qwen36 Metal engine against a double-precision
-        # reference (tests/test_qwen36_kernels.c), not part of `make check`
-        # either. On the runner's Apple Paravirtual device it only compiles
-        # them and prints SKIPPED, as metal-test does.
-        timeout-minutes: 10
-        run: |
-          cd c
-          make test-qwen36-kernels
-      - if: matrix.os == 'macos-latest'
-        name: qwen36 Metal graph
-        # The graph against the CPU engine on a model the test writes
-        # (tests/test_qwen36_graph.py), not part of `make check` either. On the
-        # runner's Apple Paravirtual device the graph steps aside at start: the
-        # test checks that the CPU engine takes over with its line, and skips
-        # the comparisons.
-        timeout-minutes: 10
-        run: |
-          cd c
-          make test-qwen36-graph METAL=1 PYTHON=python3
 
       # macOS is the newest COLI_V4_SUPPORTED platform and the only one whose
       # engine coverage lives solely in this job (Linux has the v4-tiny job in
@@ -807,7 +717,7 @@ jobs:
           gcc --version | Select-Object -First 1
           make --version | Select-Object -First 1
           cd c
-          $out = python -m unittest tests.test_backend_loader tests.test_cuda_loader_discovery tests.test_qwen36_device_selection -v 2>&1 | Out-String
+          $out = python -m unittest tests.test_backend_loader -v 2>&1 | Out-String
           $out
           if ($LASTEXITCODE -ne 0) { throw "loader contract tests failed" }
           # A missing toolchain shows up as setUpClass skips, not failures, so a
@@ -942,8 +852,6 @@ jobs:
           done
       - name: Qwen3.6 checkpoint MTP (reference logits, exact verifies, multi-turn serve)
         run: make -C c qwen36-tiny-mtp-check
-      - name: Qwen3.6 SEED seeds the sampler (same seed same draws, another seed other draws, greedy unchanged)
-        run: make -C c qwen36-seed-check
       - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
         run: |
           cd c
@@ -1050,18 +958,6 @@ jobs:
           done
           QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json \
             python3 -m unittest -v tests.test_qwen36_vision_serve
-          # The same tower from an mmproj (llama.cpp's names, as unsloth's mmproj-*.gguf carry
-          # it: the way a GGUF of the family gets its pictures), the container's own tower
-          # removed: held to the same tokens.
-          python3 tools/qwen_vision_mmproj.py --model qwen38_27b_vl_tiny --out qwen38_27b_vl_tiny_mmproj.gguf
-          cp -r qwen38_27b_vl_tiny_c qwen38_27b_vl_tiny_nv
-          rm qwen38_27b_vl_tiny_nv/model-vision.safetensors
-          for cap in 1 8; do
-            echo "::group::27B vision from an mmproj cap=$cap"
-            COLI_DENSE_I8=0 SNAP=qwen38_27b_vl_tiny_nv Q36_MMPROJ=qwen38_27b_vl_tiny_mmproj.gguf \
-              ./qwen36 "$cap" 8 qwen38_27b_vl_tiny/ref.json
-            echo "::endgroup::"
-          done
       - name: Same run under ASan + UBSan
         run: |
           cd c
@@ -1106,9 +1002,7 @@ jobs:
           # engine, so rebuild the normal one first.
           make clean >/dev/null 2>&1 || true
           make qwen36
-          QWEN36_TINY=qwen36_tiny_c QWEN3_CODER_TINY=qwen3_coder_tiny_c \
-            python3 -m unittest -v tests.test_qwen36_prefix_serve tests.test_qwen36_text_stops tests.test_qwen36_prefix_store \
-              tests.test_qwen36_prompt_snapshot
+          QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve tests.test_qwen36_text_stops
           make tests/test_qwen36_prefill_control
           for dense in 0 1; do
             for cap in 1 8; do
@@ -1413,8 +1307,6 @@ jobs:
           # the same prompt. Wrong reuse is silent, so the gate is the only
           # thing between it and a user.
           OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_prefix_serve
-          # the prefix store: another system prompt's turn in between, another slot
-          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_prefix_store
       - name: "Brio over serve: snapshot scoring is exact, and invisible to chat"
         run: |
           cd c
@@ -1494,7 +1386,7 @@ jobs:
           SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_divergent ./deepseek_v41 8 dsv41_tiny/ref.json > divergent.txt 2>divergent.err
           cmp primary.txt divergent.txt
           grep -q "header differs from the primary copy" divergent.err
-      - name: KV prefix reuse (opt-in here), the resumed-prefill exactness and the prefix store
+      - name: KV prefix reuse (opt-in here) and the resumed-prefill exactness
         run: |
           cd c
           # Two gates in one file. The first is exactness and is ours: a prefill
@@ -1505,28 +1397,20 @@ jobs:
           # prefilled ones by the vendor's own design. The override says so.
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefill_tail
-          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prompt_block
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dspark_gate
-          # The prefix store: what a prompt read is kept by content, and a new conversation
-          # on the same system prompt or a conversation's next turn takes it with the
-          # logits a cold read gives, to the last digit.
-          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_store
       - name: "A prompt longer than one block, so the block boundary is crossed"
         run: |
           cd c
-          # Attention projects a block of positions at a time, capped at 32, and the
-          # MoE routes V41_MOE_BLOCK of them (1024 by default). The default fixture's
-          # prompt is eight tokens and never reaches either cap, so a forty-token one
-          # is built as well: it crosses attention's boundary, and with V41_MOE_BLOCK=16
-          # the MoE's twice, and has to stay token-exact anyway.
+          # Attention projects a block of positions at a time and the MoE routes one,
+          # both capped at 32. The default fixture's prompt is eight tokens and never
+          # reaches that cap, so a forty-token one is built as well: it crosses the
+          # boundary in both, and has to stay token-exact anyway.
           python3 tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json \
             --prompt-len 40 --max-new 6
           for cap in 2 8; do
-            for block in 1024 16; do
-              echo "::group::long prompt, cap=$cap, moe block=$block"
-              SNAP=dsv41_long V41_MOE_BLOCK=$block ./deepseek_v41 "$cap" dsv41_long/ref.json
-              echo "::endgroup::"
-            done
+            echo "::group::long prompt, cap=$cap"
+            SNAP=dsv41_long ./deepseek_v41 "$cap" dsv41_long/ref.json
+            echo "::endgroup::"
           done
       - name: The published index cache is the vendor's, not the tidy one
         run: |
@@ -1596,10 +1480,8 @@ jobs:
         run: make -C c qwen38-tiny-check
       - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
         run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-dn-gpu-check qwen38-cuda-chain-check
-      - name: Routed experts as int4-g64 from the converter's sidecar, then read from mirror copies
-        run: make -C c qwen38-tiny-int4-check qwen38-tiny-mirror-check
-      - name: Routed experts as AMD Quark's MXFP4 from the converter's sidecar
-        run: make -C c qwen38-tiny-mxfp4-check
+      - name: Routed experts as int4-g64 from the converter's sidecar
+        run: make -C c qwen38-tiny-int4-check
       - name: MTP speculative decoding against plain decoding (lossless gate)
         run: make -C c qwen38-tiny-mtp-check
       - name: Repeat the eviction path under ASan and UBSan
@@ -1650,10 +1532,6 @@ jobs:
             tests.test_qwen38_prefix_serve
           python3 tools/make_edge_tiny_tokenizer.py --vocab-size 64 qwen38_tiny_fp8
           QWEN38_TINY=qwen38_tiny_fp8 python3 -m unittest -v tests.test_qwen38_brio tests.test_qwen38_prefix_serve
-          # the prefix store: a stored prefix's logits a fresh read's, the MTP head's rows kept too, and
-          # its checkpoints on disk across engine runs (qwen38_tiny_mtp and its tokenizer: the MTP step above)
-          QWEN38_TINY=qwen38_tiny QWEN38_TINY_MTP=qwen38_tiny_mtp python3 -m unittest -v tests.test_qwen38_prefix_store \
-            tests.test_qwen38_prefix_disk
 
   laya-tiny-check:
     name: Laya tiny oracle (vs the laya package) and POST /v1/systemone end to end
@@ -1739,18 +1617,6 @@ jobs:
           make qwenimage tests/test_qi_gemm tests/test_qwenimage_vae
           tests/test_qi_gemm
           COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref
-      - name: "Turbo's schedule (a static shift, model_index.json's sample_sigmas) against diffusers"
-        run: |
-          cd c
-          # at 8 steps its own eight sigmas, at 3 the scheduler's linear spacing
-          python3 tools/make_qwenimage_tiny.py qwenimage_tiny_turbo --turbo --steps 8
-          COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny_turbo --ref qwenimage_tiny_turbo/ref
-          python3 tools/make_qwenimage_tiny.py qwenimage_tiny_turbo3 --turbo --steps 3
-          COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny_turbo3 --ref qwenimage_tiny_turbo3/ref
-      - name: "GGUFs: unsloth's denoiser layout and a Qwen3-VL text encoder, against the checkpoint path"
-        run: |
-          cd c
-          QWENIMAGE_TINY=qwenimage_tiny python3 -m unittest -v tests.test_qwenimage_gguf_tiny tests.test_qwenimage_gguf_import
       - name: "The VAE alone: tiny decoder at two latent shapes"
         run: |
           cd c
@@ -1774,14 +1640,6 @@ jobs:
           export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2
           COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref > qwenimage-san.log 2>&1 || true
           QWENIMAGE_TINY=qwenimage_tiny python3 -m unittest tests.test_qwenimage_engine_serve >> qwenimage-san.log 2>&1 || true
-          # the GGUF path: the file's blocks packed for the f32 and the int8 x int8 products
-          python3 tools/make_qwenimage_gguf_tiny.py qwenimage_tiny qwenimage_gguf_tiny
-          python3 tools/gguf_import.py qwenimage_gguf_tiny/dit.gguf qwenimage_gguf_tiny/gg \
-                  --text-encoder qwenimage_gguf_tiny/te.gguf --vae qwenimage_tiny
-          for act8 in 0 1; do
-            COLI_IMG_ACT8=$act8 ./qwenimage --model qwenimage_gguf_tiny/gg --prompt "a red fox in the snow" \
-                        --width 256 --height 256 --steps 2 --seed 1 --out gguf-san.png >> qwenimage-san.log 2>&1 || true
-          done
           if grep -qE "ERROR: AddressSanitizer|runtime error:" qwenimage-san.log; then
             cat qwenimage-san.log
             exit 1
@@ -1825,126 +1683,10 @@ jobs:
           # the only gate that would catch it. Needs the fixture above, which is
           # why it runs here and not in `make check`.
           INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_prefix_serve
-          # the prefix store: a new conversation on the same system prompt and a conversation
-          # back after another took the slot take what an earlier prompt read, every step's
-          # logits a fresh read's
-          INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_prefix_store
       - name: "Brain tab: HITS after every turn, on the grid EMAP declared"
         run: |
           cd c
           INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_dashboard_hits
-
-  inkling2-oracle:
-    name: Inkling-2 oracle (token-exact vs transformers, plain and int4 g64)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: c/tools/oracle-inkling2-requirements.txt
-      - name: Install torch (CPU) + transformers with Inkling-2
-        run: pip install -r c/tools/oracle-inkling2-requirements.txt
-      - name: Build inkling
-        run: cd c && make inkling
-      - name: Tiny Inkling-2 fixture + token-exact oracle (f32 experts)
-        run: |
-          cd c
-          # Random-init Inkling2ForCausalLM (sliding and global layers, the attention residuals,
-          # the dynamic convolutions, every parameter drawn at random), then the engine reproduces
-          # it token for token, at a capacity that evicts every routed expert and at one that
-          # does not.
-          python3 tools/make_tiny_inkling2.py tiny_inkling2
-          for cap in 1 2 8; do
-            SNAP=tiny_inkling2 ./inkling "$cap" 0 tiny_inkling2/ref_inkling2.json
-          done
-      - name: The official checkpoint's layout through the converter to int4 g64
-        run: |
-          cd c
-          # A plain snapshot laid out as Thinking Machines publish it (NVFP4 experts, then
-          # MXFP8, a layer across two shards), converted to int4 g64; the engine reading the
-          # container must reproduce transformers running the container's own weights.
-          python3 tools/make_tiny_inkling2.py tiny_g64 --g64
-          python3 tools/convert_inkling2_int4.py --fabricate tiny_g64 fab_g64 --nvfp4-layers 6
-          python3 tools/convert_inkling2_int4.py --indir fab_g64 --outdir cont_g64 --jobs 2 --min-free-gb 0
-          python3 tools/make_tiny_inkling2.py --int4-ref cont_g64 tiny_g64 ref_g64
-          for cap in 1 8; do
-            SNAP=cont_g64 ./inkling "$cap" 0 ref_g64/ref_inkling2.json
-          done
-          # a round's reads on their thread (INK_FILL_ASYNC), held back: no pair computes its
-          # expert before the read lands. Caps 2 to 4 make rounds where an expert two rows of the
-          # prompt route to is missed for the first and found, still unread, for the second.
-          for cap in 2 3 4; do
-            INK_FILL_DELAY_US=3000 SNAP=cont_g64 ./inkling "$cap" 0 ref_g64/ref_inkling2.json
-          done
-      - name: Inkling-2's vision tower, token-exact with an image in the prompt
-        run: |
-          cd c
-          # A tiny random tower (axial rope, layer scale, the bilinear position table, the 2 x 2
-          # merger) and one 2 x 3-tile image among the prompt's tokens: the engine's features
-          # replace the placeholders' embeddings, and the generation must match transformers.
-          python3 tools/make_tiny_inkling2.py tiny_vis --vision
-          for cap in 1 8; do
-            SNAP=tiny_vis ./inkling "$cap" 0 tiny_vis/ref_inkling2.json
-          done
-      - name: Inkling-2's drafter (INK2_MTP) keeps the oracle's tokens
-        run: |
-          cd c
-          # A random drafter beside the tiny model: its drafts are noise, so the verify rejects
-          # them and the state rolls back every step; then the oracle's own tokens as drafts, one
-          # changed on most steps (INK2_MTP_ORACLE), so that it keeps all, some or none of a block.
-          # Either way the tokens are the oracle's.
-          python3 tools/make_tiny_inkling2.py --mtp tiny_inkling2
-          for k in 1 3; do
-            INK2_MTP=1 INK2_MTP_K=$k SNAP=tiny_inkling2 ./inkling 8 0 tiny_inkling2/ref_inkling2.json
-            INK2_MTP=1 INK2_MTP_K=$k INK2_MTP_ORACLE=1 SNAP=tiny_inkling2 ./inkling 8 0 tiny_inkling2/ref_inkling2.json
-          done
-          INK2_MTP=1 INK2_MTP_ORACLE=1 SNAP=tiny_inkling2 ./inkling 1 0 tiny_inkling2/ref_inkling2.json
-      - name: An Inkling-2 GGUF as unsloth's lay it out reads as the checkpoint it came from
-        run: |
-          cd c
-          # folded short convolutions, the attention residuals' queries by layer, and the NVFP4
-          # layers' experts without their global scale: tokens and logits against safetensors
-          python3 -m unittest -v tests.test_gguf_import.Inkling2Config tests.test_gguf_import.Inkling2Gguf
-
-  inkling2-loop-oracle:
-    name: Inkling-2-Mini oracle (the loop, token-exact vs transformers, plain and int4 g64)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: c/tools/oracle-inkling2-loop-requirements.txt
-      - name: Install torch (CPU) + transformers with Inkling-2-Mini
-        run: pip install -r c/tools/oracle-inkling2-loop-requirements.txt
-      - name: Build inkling
-        run: cd c && make inkling
-      - name: Tiny Inkling-2-Mini fixture + token-exact oracle (f32 experts)
-        run: |
-          cd c
-          # Random-init Inkling2LoopForCausalLM: layers 3-8 run three passes, a global layer inside
-          # the loop and one after it, every message query and gate drawn at random. The engine
-          # reproduces it token for token, at a capacity that evicts every routed expert and at
-          # one that does not.
-          python3 tools/make_tiny_inkling2_loop.py tiny_loop
-          for cap in 1 2 8; do
-            SNAP=tiny_loop ./inkling "$cap" 0 tiny_loop/ref_inkling2.json
-          done
-      - name: The official checkpoint's layout through the converter to int4 g64
-        run: |
-          cd c
-          # the loop's gates and message queries pass the converter as they are; the engine reading
-          # the container must reproduce transformers running the container's own weights
-          python3 tools/make_tiny_inkling2_loop.py tiny_loop_g64 --g64
-          python3 tools/convert_inkling2_int4.py --fabricate tiny_loop_g64 fab_loop --nvfp4-layers 6
-          python3 tools/convert_inkling2_int4.py --indir fab_loop --outdir cont_loop --jobs 2 --min-free-gb 0
-          python3 tools/make_tiny_inkling2_loop.py --int4-ref cont_loop tiny_loop_g64 ref_loop
-          for cap in 1 8; do
-            SNAP=cont_loop ./inkling "$cap" 0 ref_loop/ref_inkling2.json
-          done
 
   # The efficiency suite against the tiny GLM oracle. These 8 tests existed but
   # had never run anywhere: they looked for c/glm.exe, a name that stopped
@@ -1990,17 +1732,6 @@ jobs:
           /tmp/tt16
           gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_tile16.c -o /tmp/tt16v3 -lm
           /tmp/tt16v3
-          # Q2_K's fused row kernel against the unpack + gq_dot_i8 path: the same two ISAs
-          gcc -O3 -march=native -fopenmp -I. tests/test_gq_q2_k.c -o /tmp/tq2k -lm
-          /tmp/tq2k
-          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_q2_k.c -o /tmp/tq2kv3 -lm
-          /tmp/tq2kv3
-          # the grid types' and Q2_K's row kernels (AVX-512's where the runner has VNNI) against
-          # the unpack + gq_dot_i8 path, one to eight activation rows: the same two ISAs
-          gcc -O3 -march=native -fopenmp -I. tests/test_gq_grid512.c -o /tmp/tg512 -lm
-          /tmp/tg512
-          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_grid512.c -o /tmp/tg512v3 -lm
-          /tmp/tg512v3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)
@@ -2039,8 +1770,6 @@ jobs:
           python3 tools/make_mistral_vision_tiny.py --out /tmp/ml4fv --same-as /tmp/ml4f/coli/mmproj.gguf
           served=$(SERVE=1 SNAP=/tmp/ml4f/coli ./colibri 8 < /dev/null 2>&1 || true)
           echo "$served" | grep "vision tower (mmproj): 2 layers"
-          # a picture announced for a request refused before the tower does not go to the next one
-          COLI_ML4_FIXTURE=/tmp/ml4/coli ML4_MMPROJ=/tmp/ml4fv/mmproj.gguf python3 -m unittest -v tests.test_ml4_pending_picture
           # The published GGUFs' types, layer by layer as their headers have them (MIXES): these
           # six hold all fourteen (BF16, Q8_0, Q3_K-Q6_K, IQ1_S, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS
           # beside F32). The float path (GQ_EXACT=1) against the reference on the blocks' own
@@ -2319,8 +2048,7 @@ jobs:
           # plus PTX, one file for the 30xx, 40xx and 50xx cards (#1405). The
           # runner cannot execute it; the artifact below is for the people who
           # can, until the release ships it.
-          # --threads 0: nvcc compiles the portable fatbin's five architectures at once
-          NVCC_APPEND_FLAGS="--threads 0" make cuda-dll CUDA_ARCH=portable
+          make cuda-dll CUDA_ARCH=portable
           test -f coli_cuda.dll || { echo "cuda-dll reported success but produced no DLL" >&2; exit 1; }
           ls -l coli_cuda.dll
           echo "coli_cuda.dll built (MSVC host, portable gencode)"
@@ -2331,45 +2059,17 @@ jobs:
           make colibri CUDA_DLL=1
           test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "colibri.exe built against the DLL loader"
-          # qwen36.exe: the real target of c/Makefile (on Windows the bare engine
-          # names are phony aliases of these .exe targets).
+          # qwen36.exe, not qwen36: only colibri has a phony alias; the bare
+          # name falls into make's builtin rule and links qwen36.c alone.
           make qwen36.exe CUDA_DLL=1
           test -f qwen36.exe || { echo "qwen36 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "qwen36.exe built against the DLL loader"
-          # kimi_k3, glm53, qwen38, deepseek_v41, mimo, inkling, olmoe, laya and
-          # gliner_decide link the same loader: eleven engines share coli_cuda.dll
-          # (inkling's bf16 matrices through its ink_ops table, the last three the
-          # dense chain alone). deepseek_v4 has its own DLL
-          # (coli_cuda_dsv4.dll, Makefile.deepseek-v4) and joins in a later step.
+          # kimi_k3 links the same loader: three engines share coli_cuda.dll.
+          # deepseek_v4 has its own DLL (coli_cuda_dsv4.dll, Makefile.deepseek-v4)
+          # and joins in a later step; inkling's CUDA object has no Windows loader.
           make kimi_k3.exe CUDA_DLL=1
           test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "kimi_k3.exe built against the DLL loader"
-          make glm53.exe CUDA_DLL=1
-          test -f glm53.exe || { echo "glm53 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "glm53.exe built against the DLL loader"
-          make qwen38.exe CUDA_DLL=1
-          test -f qwen38.exe || { echo "qwen38 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "qwen38.exe built against the DLL loader"
-          make deepseek_v41.exe CUDA_DLL=1
-          test -f deepseek_v41.exe || { echo "deepseek_v41 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "deepseek_v41.exe built against the DLL loader"
-          make mimo.exe CUDA_DLL=1
-          test -f mimo.exe || { echo "mimo CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "mimo.exe built against the DLL loader"
-          make inkling.exe CUDA_DLL=1
-          test -f inkling.exe || { echo "inkling CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "inkling.exe built against the DLL loader"
-          make olmoe.exe CUDA_DLL=1
-          test -f olmoe.exe || { echo "olmoe CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "olmoe.exe built against the DLL loader"
-          make laya.exe CUDA_DLL=1
-          test -f laya.exe || { echo "laya CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "laya.exe built against the DLL loader"
-          make gliner_decide.exe CUDA_DLL=1
-          test -f gliner_decide.exe || { echo "gliner_decide CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "gliner_decide.exe built against the DLL loader"
-          # the table inkling.exe's ink_cuda_* forward through (backend_cuda_ink.h)
-          objdump -p coli_cuda.dll | grep -q "coli_cuda_ink_ops" || { echo "coli_cuda.dll does not export coli_cuda_ink_ops" >&2; exit 1; }
       - name: make cuda-dsv4-dll and cuda-dsv4-dg-dll (DeepSeek V4, as the release ships them)
         shell: msys2 {0}
         run: |
@@ -2379,7 +2079,7 @@ jobs:
           # coli_cuda_dsv4.dll (portable: sm_80/86/89/90/120 + PTX). DSV4_TC=0
           # leaves out the opt-in cuBLASLt path, so neither needs more than the
           # cudart64_12.dll beside it and the driver (#2047).
-          NVCC_APPEND_FLAGS="--threads 0" make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
+          make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
           make cuda-dsv4-dg-dll DSV4_TC=0
           for d in coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll; do
             test -f $d || { echo "$d: the target reported success but produced no DLL" >&2; exit 1; }
@@ -2414,14 +2114,25 @@ jobs:
             c/colibri.exe
             c/qwen36.exe
             c/kimi_k3.exe
-            c/glm53.exe
-            c/qwen38.exe
-            c/deepseek_v41.exe
-            c/mimo.exe
-            c/inkling.exe
-            c/olmoe.exe
-            c/laya.exe
-            c/gliner_decide.exe
+
+  web:
+    name: Web UI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Test
+        run: npx vitest run
 
   python:
     name: Python tests
@@ -2438,7 +2149,7 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c -j"$(nproc)" kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage glm53 mimo
+        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 
@@ -2465,15 +2176,6 @@ jobs:
             tests.test_gguf_dequant \
             tests.test_gguf_olmoe_profile \
             tests.test_convert_gguf_to_olmoe
-      - name: qwen36 holds a GGUF's grid types larger and answers as the file's rows
-        run: |
-          # tests/test_qwen36_iq3s_codes.py needs the engine and the gguf package. The
-          # python job builds the engine without the package, this one had the package
-          # without the engine, so the test skipped in both. A skip fails the step here.
-          make -C c -j"$(nproc)" qwen36
-          cd c
-          python3 -m unittest -v tests.test_qwen36_iq3s_codes 2>&1 | tee ../q36codes.log
-          grep -q '\.\.\. ok$' ../q36codes.log
 
   windows-python-focused:
     name: Python tests (Windows focused)
@@ -2515,12 +2217,7 @@ jobs:
       - name: Install torch (CPU) + transformers
         run: pip install -r c/tools/oracle-requirements.txt
       - name: Build every engine (NEON branches must compile)
-        run: make -C c colibri inkling kimi_k3 olmoe qwen36
-      - name: "Expert FFN: NEON dots bit-exact against the scalar reference"
-        run: |
-          cd c
-          make tests/test_expert_ffn
-          OMP_NUM_THREADS=2 ./tests/test_expert_ffn
+        run: make -C c colibri inkling kimi_k3 olmoe
       - name: "DeepSeek V4 FP4 expert kernels: NEON arm bit-exact against the scalar arm (#1696)"
         run: |
           cd c

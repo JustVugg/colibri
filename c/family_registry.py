@@ -40,6 +40,9 @@ class FamilyCapabilities:
     # command) and generates nothing. The engine confirms it at start-up with
     # `CAPS decide=1 chat=0`, which is what the gateway routes on.
     decision: bool = False
+    # Audio transcription / speech-to-text: the engine announces transcribe=1
+    # and serves POST /v1/audio/transcriptions through the gateway.
+    transcribe: bool = False
     # The numeric logprobs/echo channel (the SUBMIT `logprobs=` key): the engine
     # emits one ECHO frame per prompt position it read out, position 0 included
     # (" nan 0"), so the gateway can serve a run that starts at 0 -- which is what
@@ -1325,6 +1328,29 @@ def _qwen38_resident_inventory(name, size, _config, dtype=None):
     return elements * 4
 
 
+def _qwen3_asr_geometry(config, context, _model_dir):
+    """Dense audio encoder + dense Qwen3 decoder; no routed experts."""
+    tc = config.get("text_config") or config.get("thinker_config", {}).get("text_config") or config
+    ac = config.get("audio_config") or config.get("thinker_config", {}).get("audio_config") or {}
+    layers = _required_int(tc, "num_hidden_layers", "qwen3_asr")
+    hidden = _required_int(tc, "hidden_size", "qwen3_asr")
+    kv_heads = _required_int(tc, "num_key_value_heads", "qwen3_asr")
+    head_dim = _required_int(tc, "head_dim", "qwen3_asr")
+    # KV cache for text decoder: 2 (K,V) * layers * kv_heads * head_dim * fp16
+    kv = layers * kv_heads * head_dim * 2 * 2 * max(1, int(context))
+    # Audio encoder activations/workspace are rough placeholders until engine lands.
+    enc_layers = int(ac.get("encoder_layers", ac.get("num_hidden_layers", 24)) or 24)
+    enc_d = int(ac.get("d_model", 1024) or 1024)
+    workspace = enc_layers * enc_d * 4096 * 4
+    return PlannerGeometry(kv, 0, workspace, 0, dense=True)
+
+
+def _qwen3_asr_expert_inventory(_name, _size, config, _dtype=None):
+    tc = config.get("text_config") or config.get("thinker_config", {}).get("text_config") or config
+    _required_int(tc, "num_hidden_layers", "qwen3_asr")
+    return 0
+
+
 COMMON_CAP = FamilyCapabilities(False, False, False, True)
 
 FAMILIES = (
@@ -1941,6 +1967,39 @@ FAMILIES = (
         modality="decision",
         tokenizer_file="tokenizer.json",
         checkpoint_files=("config.json", "encoder_config/config.json"),
+    ),
+    FamilyDescriptor(
+        id="qwen3_asr",
+        model_types=("qwen3_asr",),
+        display_name="Qwen3-ASR-1.7B",
+        display_scale="1.7B",
+        display_variants=(
+            DisplayVariant((("num_hidden_layers", 28), ("hidden_size", 2048)),
+                           "Qwen3-ASR-1.7B", "1.7B"),
+            DisplayVariant((("num_hidden_layers", 28), ("hidden_size", 1024)),
+                           "Qwen3-ASR-0.6B", "0.6B", model_id="qwen3-asr-0.6b-colibri"),
+        ),
+        engine_artifact="qwen3_asr",
+        engine_aliases=(),
+        engine_group="qwen3_asr",
+        internal_arch="qwen3_asr",
+        build_target="qwen3_asr",
+        process_names=("qwen3_asr",),
+        default_model_id="qwen3-asr-1.7b-colibri",
+        cli_adapter="qwen3_asr",
+        gateway_adapter="qwen3_asr",
+        planner_id="qwen3_asr_dense",
+        planner_geometry=_qwen3_asr_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_qwen3_asr_expert_inventory,
+        config_section="thinker_config",
+        limits=FamilyLimits(8192, 65536, 256, 1024, 1, 0, "Q3ASR_MAXT"),
+        capabilities=FamilyCapabilities(False, False, True, False, transcribe=True),
+        has_gateway_adapter=True,
+        has_cli_adapter=False,
+        modality="text",
+        tokenizer_file="vocab.json",
+        checkpoint_files=("config.json",),
     ),
 )
 
