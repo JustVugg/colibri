@@ -8439,6 +8439,15 @@ MAX_BODY = _positive_env("COLI_MAX_BODY", MAX_BODY)
 
 class APIServer(ThreadingHTTPServer):
     daemon_threads = True
+    # On Windows SO_REUSEADDR allows a second `coli serve` / `coli web` to bind
+    # an already-listening port (and hijack 127.0.0.1 over 0.0.0.0) instead of
+    # failing fast before loading the engine.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     # SEC: ThreadingHTTPServer spawns one thread per TCP connection with no
     # ceiling, and each carries a default 8 MiB stack. Opening connections and

@@ -303,7 +303,7 @@ def _cancel_on_disconnect(h, conn):
                     # reading its response; do not cancel that valid request.
                     return
                 continue
-            except ConnectionResetError:
+            except ConnectionError:
                 disconnected.set()
             except (OSError, ValueError):
                 return
@@ -432,8 +432,8 @@ def serve(h, backend):
                     h.send_header("Content-Length", str(len(out)))
                     h.end_headers()
                     h.wfile.write(out)
-            except (BrokenPipeError, ConnectionResetError):
-                pass   # Codex went away: closing upstream stops the engine
+            except ConnectionError:
+                h.close_connection = True   # Codex went away: closing upstream stops the engine
         finally:
             resp.close()
 
