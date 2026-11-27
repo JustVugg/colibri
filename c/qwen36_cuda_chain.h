@@ -888,6 +888,12 @@ static void q36cc_room_from_tier(Q36CChain *ch, size_t need) {
         if (fr >= need || !qt_chain_give_back(need - fr, q36cc_tensor_addr)) return;
     }
 }
+/* the room the planned places past the chain's own take (q36_places_plan), for the tier's reserve */
+static size_t q36cc_places_bytes(Model *m) {
+    size_t b = 0, fr = 0, tot = 0;
+    if (g_q36_mux_slots > 1 && coli_kv_plan() && coli_cuda_mem_info(0, &fr, &tot)) q36_places_plan(m, q36cc_kves(), fr, &b);
+    return b;
+}
 /* room for `bytes` more (and 512 MiB): the least recently used places' KV mirrors go first */
 static int q36cc_conv_room(Q36CChain *ch, Model *m, int keep, size_t bytes) {
     const size_t margin = (size_t)512 << 20;
@@ -898,7 +904,7 @@ static int q36cc_conv_room(Q36CChain *ch, Model *m, int keep, size_t bytes) {
             if (j == keep || v->used == ch->conv_clock || !v->cap || j == ch->conv_cur) continue;
             if (k < 0 || v->used < ch->conv[k].used) k = j;
         }
-        if (k < 0) {   /* no other place's mirrors left to take: the expert tier's memory */
+        if (k < 0 || coli_kv_plan()) {   /* no other place's mirrors left to take (planned: none taken): the expert tier's memory */
             if (q36cc_conv_avail(ch) < bytes + margin) q36cc_room_from_tier(ch, bytes + margin);
             return q36cc_conv_avail(ch) >= bytes + margin;
         }
@@ -917,7 +923,7 @@ static int q36cc_conv_grow(Q36CChain *ch, Model *m, int k, int need) {
     Cfg *c = &m->c; int KV = c->kv_heads, kvd = c->k_head_dim;
     int cap = v->cap ? 2 * v->cap : Q36CC_CONV_ROWS;
     if (cap < need) cap = (need + 1023) / 1024 * 1024;
-    if (cap > m->kv_cap) cap = m->kv_cap;
+    if (cap > m->kv_cap || coli_kv_plan()) cap = m->kv_cap;   /* planned: the whole context at once */
     if (cap < need) return 0;
     if (!q36cc_conv_room(ch, m, k, q36cc_conv_kv_bytes(m, cap) - q36cc_conv_kv_bytes(m, v->cap))) return 0;
     for (int i = 0; i < c->n_layers; i++) {
@@ -941,11 +947,12 @@ static int q36cc_conv_new(Q36CChain *ch, Model *m) {
     const char *e = getenv("COLI_VK_CHAIN_MUX");
     int most = e && *e ? 1 + atoi(e) : g_q36_mux_slots;
     if (most > g_q36_mux_slots) most = g_q36_mux_slots;
+    if (g_q36_places_plan > 0 && most > g_q36_places_plan) most = g_q36_places_plan;
     if (ch->conv_full || ch->nconv >= most) return -1;
     size_t nr = q36_rec_cells(c) * sizeof(float);
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float), dn = 0;
     for (int i = 0; i < L; i++) if (!c->is_attn[i]) dn += nr + nc;
-    int cap0 = m->kv_cap < Q36CC_CONV_ROWS ? m->kv_cap : Q36CC_CONV_ROWS;
+    int cap0 = m->kv_cap < Q36CC_CONV_ROWS || coli_kv_plan() ? m->kv_cap : Q36CC_CONV_ROWS;
     size_t need = dn + q36cc_conv_kv_bytes(m, cap0), avail = q36cc_free_bytes(ch);
     Q36ccConv v = {.slot = -1, .dn_where = Q36CC_HOST};
     int ok = need + ((size_t)512 << 20) <= avail;

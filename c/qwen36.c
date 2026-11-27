@@ -8316,6 +8316,40 @@ static void serve_echo(const char *id, int pos, int token, const float *lo, int 
 static float *g_hidden_sink = NULL;
 
 static void q36_seq_swap(Model *m, Q36Seq *q);   /* below: a chain swaps a conversation in to rebuild it */
+/* KV_SLOTS > 1 with COLI_KV_PLAN (coli_kv_plan.h): the conversations whose places on the device hold
+ * their whole context from the start. A place past the chain's own takes its DeltaNet state and its KV
+ * mirrors at the context's length when it opens and keeps them: no place grows, shrinks or takes
+ * another's mirrors while conversations run. Before, a place started at 2048 positions and doubled as
+ * its conversation grew, taking the room from the least recently used places' mirrors and then from
+ * the expert tier, mid-answer. As many places as half the device's free memory holds when the tier is
+ * sized (the tier keeps that room out of its experts); past them a conversation takes the least
+ * recently used place, its state through the host, as when the device has no room for one more.
+ * es: the mirrors' element size; avail: the device's free memory then. */
+static int g_q36_places_plan = -1;
+static size_t q36_place_bytes(Model *m, int ctx, size_t es) {
+    Cfg *c = &m->c; int R = q36_ring_for(c, ctx);
+    size_t b = 0, nr = q36_rec_cells(c) * sizeof(float), nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float);
+    for (int i = 0; i < c->n_layers; i++)
+        b += c->is_attn[i] ? 2 * (size_t)c->kv_heads * c->k_head_dim * es * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx)
+                           : nr + nc;
+    return b;
+}
+#define Q36_PLACE_MARGIN ((size_t)512 << 20)   /* q36c_conv_new's and q36cc_conv_new's */
+/* the places planned (the chain's own counted), and what the ones past it take */
+static int q36_places_plan(Model *m, size_t es, size_t avail, size_t *bytes) {
+    const int n = g_q36_mux_slots;
+    if (bytes) *bytes = 0;
+    if (n < 2 || !coli_kv_plan()) return n;
+    const size_t per = q36_place_bytes(m, qwen36_max_ctx(), es);
+    int p = 1;
+    while (p < n && (size_t)p * per + Q36_PLACE_MARGIN <= avail / 2) p++;
+    g_q36_places_plan = p;
+    if (bytes && p > 1) *bytes = (size_t)(p - 1) * per + Q36_PLACE_MARGIN;
+    fprintf(stderr, "[qwen36] KV plan: %d of KV_SLOTS=%d conversations keep their whole context (%d positions) on the "
+                    "device, %.2f GiB each%s\n", p, n, qwen36_max_ctx(), per / 1073741824.0,
+            p < n ? "; the others' state goes through the host when they come back (a shorter --ctx holds more)" : "");
+    return p;
+}
 #ifdef COLI_VULKAN
 #include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
@@ -12239,7 +12273,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .ram_later = q36_kv_later(m) + q36_ps_plan(m),
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
-                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, coli_kv_plan() || qwen36_max_ctx() < Q36C_KV_START ? qwen36_max_ctx() : Q36C_KV_START) : 0,
+                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, coli_kv_plan() || qwen36_max_ctx() < Q36C_KV_START ? qwen36_max_ctx() : Q36C_KV_START)
+                                                + q36c_places_bytes(m) : 0,
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_release, .load_ctx = m,
                     .layer_gate_up = lgu, .layer_down = ldn};
@@ -12705,7 +12740,7 @@ int main(int argc, char **argv) {
      * its budget: out of the tier's allowance, or the tier fills the card and the chain's
      * prompt scratch and KV mirror find no room (Muse Spark's f32 router: 496 MiB) */
     if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
-        qt_reserve(q36cc_own_bytes(&m) + q36cc_mirror_bytes(&m, qwen36_max_ctx()));   /* and the KV mirrors of a model whose chain needs them whole */
+        qt_reserve(q36cc_own_bytes(&m) + q36cc_mirror_bytes(&m, qwen36_max_ctx()) + q36cc_places_bytes(&m));   /* and the KV mirrors of a model whose chain needs them whole, and the planned places' */
         q36_gguf_stage_reserve(&m);   /* and a GGUF's prompt staging, where the card holds fewer than all its experts */
     }
 #endif

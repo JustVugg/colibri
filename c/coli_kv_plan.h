@@ -14,10 +14,9 @@
 #ifndef COLI_KV_PLAN_H
 #define COLI_KV_PLAN_H
 #include <stdlib.h>
-static inline int coli_kv_plan(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("COLI_KV_PLAN"); on = !(e && *e == '0'); }
-    return on;
+static inline int coli_kv_plan(void) {   /* read at each call: the tests switch it between cases */
+    const char *e = getenv("COLI_KV_PLAN");
+    return !(e && *e == '0');
 }
 /* The host's cache at the whole context: planned, and `bytes` at most half of the RAM free now (avail, bytes;
  * 0 when unknown: allowed). Windows commits what is allocated, touched or not: a cache past the commit room

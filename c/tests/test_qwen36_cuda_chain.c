@@ -916,6 +916,38 @@ done:
        "mirror slack, clamped growth under pressure, per-head K/V, cleared ring and exact size");
 }
 
+/* COLI_KV_PLAN (coli_kv_plan.h): the mirror holds the whole context (Q36_MAXT) from its first need, and a
+ * host cache that grows after it finds it there: no frame, no new buffer, the same bytes */
+static void mirror_plan_case(void) {
+    enum { layers = 3, heads = 2, width = 4 };
+    Model m = {0};
+    Q36CChain ch = {0};
+    uint8_t attn[layers] = {1, 1, 1}, window[layers] = {0, 0, 0};
+    CcBuf *keys[layers] = {0}, *values[layers] = {0};
+    int rows[layers] = {0}, valid[layers] = {0};
+    m.c.n_layers = layers; m.c.kv_heads = heads; m.c.k_head_dim = width;
+    m.c.is_attn = attn; m.c.win_layer = window; m.max_t = m.kv_cap = 512;
+    ch.kc = keys; ch.vc = values; ch.kv_rows = rows; ch.kv_valid = valid; ch.device_profile = Q36_GPU_L4;
+    ColiCudaChainOps saved = fake_chain_table;
+    size_t baseline = fake_chain_dev_bytes;
+    fake_chain_table.size = sizeof fake_chain_table; fake_chain_table.kvh = mirror_halves;
+    fake_chain_table.buf = mirror_marked_buf;
+    const int top = qwen36_max_ctx();
+    int ok = top > 2048 && q36cc_mirror(&ch, &m) && ch.cap == top && rows[0] == top && rows[2] == top;
+    if (ok) {
+        CcBuf *first = keys[0], *last = values[layers - 1];
+        int frames = fake_chain_frames;
+        size_t held = fake_chain_dev_bytes;
+        m.max_t = m.kv_cap = 2000;
+        ok = q36cc_mirror(&ch, &m) && ch.cap == top && keys[0] == first && values[layers - 1] == last &&
+             fake_chain_frames == frames && fake_chain_dev_bytes == held;
+    }
+    for (int i = 0; i < layers; i++) { cc_free(keys[i]); cc_free(values[i]); }
+    fake_chain_table = saved;
+    ck(ok && fake_chain_dev_bytes == baseline,
+       "planned (COLI_KV_PLAN): the mirror at the whole context from its first need, a host that grows after it no frame");
+}
+
 static void test_step_kernel_mask(Model *m, Model *ref, Q36CChain *ch, const int *ids) {
     const size_t saved_size = fake_chain_table.size;
     fake_chain_table.size = sizeof fake_chain_table;
@@ -1565,6 +1597,7 @@ int main(int argc, char **argv) {
 
     printf(" Q. warmstart pre-allocates scratch and mirror growth preserves valid KV rows in VRAM\n");
     {
+        setenv("COLI_KV_PLAN", "0", 1);   /* the growth itself; the plan's case below */
         unsetenv("CUDA_EXPERT_GB"); unsetenv("COLI_PLACE"); fake_planar_rows = 0;
         fake_chain_table.size = CC_OPS_BASE_SIZE;   /* this fixture keeps its routed experts on the host */
         ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "tier up for warmstart and mirror growth");
@@ -1597,6 +1630,9 @@ int main(int argc, char **argv) {
                 for (int ring = 0; ring < 2; ring++) host_growth_requests(&w, &mr, mode, ring);
             mirror_growth_cases(0);
             mirror_growth_cases(1);
+            unsetenv("COLI_KV_PLAN");
+            mirror_plan_case();
+            setenv("COLI_KV_PLAN", "0", 1);
             if (saved) { setenv("Q36_MAXT", saved, 1); free(saved); } else unsetenv("Q36_MAXT");
         }
 
@@ -1611,6 +1647,7 @@ int main(int argc, char **argv) {
         g_cuda_chain = 0;
         qt_shutdown();
         fake_chain_table.size = CC_OPS_BASE_SIZE;
+        unsetenv("COLI_KV_PLAN");
     }
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
     printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history; the MTP head and the CPU's layers read a long prompt a chunk at a time\n");

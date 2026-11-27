@@ -1007,6 +1007,12 @@ static void q36c_conv_free(Model *m, Q36cConv *v) {
 /* A place's mirrors start at Q36C_CONV_ROWS rows and double as its conversation grows
  * (q36c_conv_grow): a conversation takes the device memory its length needs, not the
  * context's. A sliding layer's ring keeps its rows. */
+/* the room the planned places past the chain's own take (q36_places_plan), for the expert tier */
+static size_t q36c_places_bytes(Model *m) {
+    size_t b = 0;
+    if (g_q36_mux_slots > 1 && coli_kv_plan()) q36_places_plan(m, sizeof(float), vkc_dev_avail(), &b);
+    return b;
+}
 static size_t q36c_conv_kv_bytes(Model *m, Q36Chain *ch, int cap) {
     Cfg *c = &m->c; size_t b = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++)
@@ -1037,7 +1043,7 @@ static int q36c_conv_room(Q36Chain *ch, Model *m, int keep, size_t bytes) {
             if (j == keep || v->used == ch->conv_clock || !v->cap || j == ch->conv_cur) continue;
             if (k < 0 || v->used < ch->conv[k].used) k = j;
         }
-        if (k < 0) {
+        if (k < 0 || coli_kv_plan()) {   /* planned: another place's mirrors stay its own */
             const size_t av = q36c_conv_avail();
             return vkt_give_back(bytes + margin - av) > 0 && q36c_conv_avail() >= bytes + margin;
         }
@@ -1058,7 +1064,7 @@ static int q36c_conv_grow(Q36Chain *ch, Model *m, int k, int need) {
     Cfg *c = &m->c; int KV = c->kv_heads, kvd = c->k_head_dim;
     int cap = v->cap ? 2 * v->cap : Q36C_CONV_ROWS;
     if (cap < need) cap = (need + 1023) / 1024 * 1024;
-    if (cap > m->kv_cap) cap = m->kv_cap;
+    if (cap > m->kv_cap || coli_kv_plan()) cap = m->kv_cap;   /* planned: the whole context at once */
     if (cap < need) return 0;
     size_t more = q36c_conv_kv_bytes(m, ch, cap) - q36c_conv_kv_bytes(m, ch, v->cap);
     if (!q36c_conv_room(ch, m, k, more)) return 0;
@@ -1083,7 +1089,7 @@ static int q36c_conv_grow(Q36Chain *ch, Model *m, int k, int need) {
 static void q36c_conv_shrink(Q36Chain *ch, Model *m, int k, int need) {
     Q36cConv *v = &ch->conv[k];
     const int keep = need > Q36C_CONV_ROWS ? need : Q36C_CONV_ROWS;
-    if (!v->cap || v->cap <= 2 * keep) return;
+    if (!v->cap || v->cap <= 2 * keep || coli_kv_plan()) return;   /* planned: a place keeps its context */
     Cfg *c = &m->c;
     size_t freed = 0, again = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) {
@@ -1101,11 +1107,12 @@ static int q36c_conv_new(Q36Chain *ch, Model *m) {
     const char *e = getenv("COLI_VK_CHAIN_MUX");   /* places beside the chain's own, as colibri's */
     int most = e && *e ? 1 + atoi(e) : g_q36_mux_slots;
     if (most > g_q36_mux_slots) most = g_q36_mux_slots;
+    if (g_q36_places_plan > 0 && most > g_q36_places_plan) most = g_q36_places_plan;
     if (ch->conv_full || ch->nconv >= most) return -1;
     size_t nr = q36_rec_cells(c) * sizeof(float);
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float), dn = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) if (!c->is_attn[i]) dn += nr + nc;
-    int cap0 = m->kv_cap < Q36C_CONV_ROWS ? m->kv_cap : Q36C_CONV_ROWS;
+    int cap0 = m->kv_cap < Q36C_CONV_ROWS || coli_kv_plan() ? m->kv_cap : Q36C_CONV_ROWS;
     size_t need = dn + q36c_conv_kv_bytes(m, ch, cap0), avail = vkc_dev_avail();
     Q36cConv v = {.slot = -1, .dn_where = Q36C_HOST};
     int ok = need + ((size_t)512 << 20) <= avail;
