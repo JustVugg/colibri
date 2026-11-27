@@ -967,20 +967,26 @@ void vkc_restart_if_lost(const char *engine) {
     char mark[1024] = "";
     const char *home = getenv("HOME");
     if (!home || !*home) home = getenv("USERPROFILE");
-    if (home && *home) snprintf(mark, sizeof mark, "%s/colibri-logs/lost-restart", home);
+    if (home && *home) { snprintf(mark, sizeof mark, "%s/colibri-logs", home); (void)coli_ev_mkdir(mark); }
+    if (*mark) { size_t l = strlen(mark); snprintf(mark + l, sizeof mark - l, "/lost-restart"); }
     time_t now = time(NULL);
-    if (*mark) {
-        FILE *f = fopen(mark, "r");
-        long long last = 0;
-        if (f) { if (fscanf(f, "%lld", &last) != 1) last = 0; fclose(f); }
-        if (last > 0 && now - (time_t)last < 600) {
-            if (!said++) coli_event("[VK] %s: the device was lost again within ten minutes of a restart for that; the CPU runs "
-                                    "from here on (COLI_VK_LOST_RESTART=0 always keeps it)", engine);
-            return;
-        }
-        f = fopen(mark, "w");
-        if (f) { fprintf(f, "%lld\n", (long long)now); fclose(f); }
+    FILE *f = *mark ? fopen(mark, "r") : NULL;
+    long long last = 0;
+    if (f) { if (fscanf(f, "%lld", &last) != 1) last = 0; fclose(f); }
+    if (last > 0 && now - (time_t)last < 600) {
+        if (!said++) coli_event("[VK] %s: the device was lost again within ten minutes of a restart for that; the CPU runs "
+                                "from here on (COLI_VK_LOST_RESTART=0 always keeps it)", engine);
+        return;
     }
+    /* the time kept, or no restart: without it a device lost at every start would restart the engine for ever */
+    f = *mark ? fopen(mark, "w") : NULL;
+    if (!f || fprintf(f, "%lld\n", (long long)now) < 0) {
+        if (f) fclose(f);
+        if (!said++) coli_event("[VK] %s: the device was lost; %s cannot be written, so the engine stays (the CPU runs from "
+                                "here on) rather than risk restarting for ever", engine, *mark ? mark : "the home folder");
+        return;
+    }
+    fclose(f);
     coli_event("[VK] %s: the device was lost; the engine exits so that the gateway starts it again on a fresh device", engine);
     fflush(stdout); fflush(stderr);
     _Exit(75);   /* C99: no atexit handlers (the device is gone), the same on Windows */
@@ -1088,7 +1094,18 @@ int vkc_submit(int wait) {
     {   /* COLI_VK_CHAIN_FAULT=n (tests): the primary device's n-th submission fails as a lost
          * device would; COLI_VK_CHAIN_FAULT2 the second device's */
         static long fault[2] = {-2, -2};
-        if (fault[g_kd] == -2) { const char *e = getenv(g_kd ? "COLI_VK_CHAIN_FAULT2" : "COLI_VK_CHAIN_FAULT"); fault[g_kd] = e && *e ? atol(e) : -1; }
+        if (fault[g_kd] == -2) {
+            const char *e = getenv(g_kd ? "COLI_VK_CHAIN_FAULT2" : "COLI_VK_CHAIN_FAULT");
+            fault[g_kd] = e && *e ? atol(e) : -1;
+            /* COLI_VK_CHAIN_FAULT_ONCE=file: only a process that finds no such file (it makes it), so the engine
+             * the gateway starts again after the loss runs on a working device, as after a driver's reset */
+            const char *once = getenv("COLI_VK_CHAIN_FAULT_ONCE");
+            if (fault[g_kd] > 0 && once && *once) {
+                FILE *fo = fopen(once, "r");
+                if (fo) { fclose(fo); fault[g_kd] = -1; }
+                else if ((fo = fopen(once, "w"))) fclose(fo);
+            }
+        }
         if (fault[g_kd] > 0 && (long)KC.st.frames + 1 >= fault[g_kd])
             { lose(g_kd ? "queue submit (COLI_VK_CHAIN_FAULT2)" : "queue submit (COLI_VK_CHAIN_FAULT)", VK_ERROR_DEVICE_LOST); return 0; }
     }
