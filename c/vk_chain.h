@@ -915,6 +915,7 @@ int vkc_vae_ready(void);
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, gemms, barriers, bytes_up, bytes_down;
     unsigned long long stage_relieved;   /* staging refused, the frames so far done and their staging back (vkc_write) */
+    unsigned long long gov_shrinks;      /* frames past COLI_VK_FRAME_MS: the next ones made smaller (the frame governor) */
     double wait_ms;               /* host time blocked in fence waits */
     size_t dev_bytes;             /* live chain buffers */
     unsigned long long attn_blocked;   /* attention calls through chain_attnb (blocks of rows) */

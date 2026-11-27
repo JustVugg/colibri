@@ -99,6 +99,8 @@ typedef struct {
     unsigned long long serial;
     uint64_t wait_h, sig_g;           /* hybrid steps: the host's value this frame waits for, the value it signals */
     VkQueryPool qp; int nq; unsigned char kind[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF: a timestamp after each op */
+    VkQueryPool gq; int gq_set;       /* the frame's start and end on the device, for the frame governor (frame_gov) */
+    int nops, nattn, ncopy; double copy_mb;   /* the ops recorded in it, of them attention; its copies (the governor's line) */
     uint32_t shape[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF=2: a matmul's (fmt, O, I) slot in prof_sh, else 0 */
 } VkcFrame;
 
@@ -109,6 +111,8 @@ typedef struct {
     VkDevice dev;
     VkQueue queue;
     uint64_t fence_ns;                /* a frame's wait before the device counts as lost (vkc_init) */
+    int gov_on, gov_shrink, gov_fast; double gov_ms, gov_max_ms;   /* the frame governor (COLI_VK_FRAME_MS) */
+    float gq_period; uint64_t gq_mask;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
@@ -339,6 +343,7 @@ static void buf_release(VkcBuf *b) {
 
 /* a frame that may still read b must finish first */
 static int frame_wait(VkcFrame *f);
+static double frame_gov_ms(void);
 static void vkc_free_here(VkcBuf *b) {
     if (!KC.dev) { free(b); return; }
     if (!KC.lost)
@@ -781,6 +786,23 @@ int vkc_init(void) {
             }
         }
     }
+    {   /* the frame governor's two timestamps a frame (frame_gov) */
+        uint32_t nqf = 0; vkGetPhysicalDeviceQueueFamilyProperties((VkPhysicalDevice)KC.core.phys, &nqf, NULL);
+        VkQueueFamilyProperties qf[16]; if (nqf > 16) nqf = 16;
+        vkGetPhysicalDeviceQueueFamilyProperties((VkPhysicalDevice)KC.core.phys, &nqf, qf);
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        uint32_t bits = KC.core.qfam < nqf ? qf[KC.core.qfam].timestampValidBits : 0;
+        KC.gov_ms = frame_gov_ms();
+        if (KC.gov_ms > 0 && bits && pp.limits.timestampPeriod > 0) {
+            KC.gq_period = pp.limits.timestampPeriod; KC.gq_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+            KC.gov_on = 1;
+            for (int i = 0; i < VKC_FRAMES && KC.gov_on; i++) {
+                VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
+                if (vkCreateQueryPool(KC.dev, &qi, NULL, &KC.fr[i].gq) != VK_SUCCESS) { KC.fr[i].gq = VK_NULL_HANDLE; KC.gov_on = 0; }
+            }
+        }
+    }
     for (int k = 0; k < 3; k++) {
         KC.pool[k].memtype = memtype_of(k);
         KC.pool[k].mapped = memtype_host_visible(KC.pool[k].memtype);
@@ -826,6 +848,52 @@ static long chain_spin_us(void) {
     }
     return v;
 }
+/* ---- the frame governor (COLI_VK_FRAME_MS) ---------------------------------------------
+ * A submission the device runs too long is killed by its driver and the device is lost: Windows'
+ * TDR at 2 s, amdgpu's job timeout at 10 s (#3149: a 64K prompt of Inkling-2 on an RX 9060 XT,
+ * "ring gfx timeout", then the CPU for the rest of the request), and the CPU takes everything
+ * from there on. The chain's work a submission had fixed sizes: the attention's slices
+ * (COLI_VK_ATTN_SLICE), a frame every few layers (COLI_VK_CHAIN_SPLIT), set on fast GPUs. Each
+ * frame's time on the device is now read from two timestamps when it comes back: past
+ * COLI_VK_FRAME_MS (400; 0 = off) the next frames are made smaller, a level a time (the
+ * attention's budget halved, a frame every 2 layers, then every one), and after 64 frames under
+ * a quarter of it one level back. The same ops in the same order cut at other places: the
+ * bytes do not move. A frame past the limit says so on stderr and in the event log, with what it
+ * held, so that a run that comes close to a driver's timeout leaves a line saying which. */
+#define FRAME_GOV_LEVELS 6
+static double frame_gov_ms(void) {
+    const char *e = getenv("COLI_VK_FRAME_MS");
+    double v = e && *e ? atof(e) : 400.0;
+    return v < 0 ? 0 : v;
+}
+static void frame_gov(const VkcFrame *f, double ms) {
+    if (ms > KC.gov_max_ms) KC.gov_max_ms = ms;
+    if (!KC.gov_on) return;
+    if (ms > KC.gov_ms) {
+        KC.gov_fast = 0;
+        if (KC.gov_shrink < FRAME_GOV_LEVELS) {
+            KC.gov_shrink++;
+            KC.st.gov_shrinks++;
+            /* a line for a level never reached before or a frame well past the longest one said: the governor's
+             * swings between two levels say nothing new */
+            static int top; static double said_ms;
+            const int news = KC.gov_shrink > top || ms > 1.5 * said_ms;
+            if (KC.gov_shrink > top) top = KC.gov_shrink;
+            if (ms > said_ms) said_ms = ms;
+            if (news) coli_event("[VK] chain: a frame ran %.0f ms on the device (%d ops, %d of them attention; %d copies, %.1f MiB; "
+                       "COLI_VK_FRAME_MS %.0f): the next frames smaller (level %d of %d)", ms, f->nops, f->nattn, f->ncopy, f->copy_mb,
+                       KC.gov_ms, KC.gov_shrink, FRAME_GOV_LEVELS);
+        } else if (ms > 4 * KC.gov_ms) {
+            static int said;
+            if (said++ < 8)
+                coli_event("[VK] chain: a frame ran %.0f ms on the device (%d ops, %d of them attention; %d copies, %.1f MiB) at the "
+                           "smallest frames; a driver's timeout is near (COLI_VK_CHAIN_ROWS lowers the prompt's chunk)",
+                           ms, f->nops, f->nattn, f->ncopy, f->copy_mb);
+        }
+    } else if (ms < KC.gov_ms / 4 && KC.gov_shrink > 0 && ++KC.gov_fast >= 64) {
+        KC.gov_shrink--; KC.gov_fast = 0;
+    }
+}
 static int frame_wait(VkcFrame *f) {
     if (!f->inflight) return 1;
     /* A hybrid step's host part, which a frame still running may wait for. Only then: vkc_begin
@@ -841,6 +909,12 @@ static int frame_wait(VkcFrame *f) {
     KC.st.wait_ms += vkc_now_ms() - t0; KC.st.waits++;
     f->inflight = 0;
     if (r != VK_SUCCESS) { lose("fence wait", r); return 0; }
+    if (f->gq_set) {
+        uint64_t ts[2];
+        f->gq_set = 0;
+        if (vkGetQueryPoolResults(KC.dev, f->gq, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            frame_gov(f, (double)((ts[1] - ts[0]) & KC.gq_mask) * KC.gq_period / 1e6);
+    }
     if (KC.prof && f->qp && f->nq > 1) {
         uint64_t ts[VKC_PROF_Q];
         if (vkGetQueryPoolResults(KC.dev, f->qp, 0, (uint32_t)f->nq, sizeof ts, ts, sizeof ts[0],
@@ -933,6 +1007,11 @@ int vkc_begin(void) {
         vkCmdPipelineBarrier(f->cmd, VK_PIPELINE_STAGE_HOST_BIT, ALL_STAGES, 0, 1, &hb, 0, NULL, 0, NULL);
     }
     track_reset();
+    f->nops = f->nattn = f->ncopy = 0; f->copy_mb = 0;
+    if (KC.gov_on && f->gq) {
+        vkCmdResetQueryPool(f->cmd, f->gq, 0, 2);
+        vkCmdWriteTimestamp(f->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, f->gq, 0);
+    }
     if (KC.prof && f->qp) {
         vkCmdResetQueryPool(f->cmd, f->qp, 0, VKC_PROF_Q);
         f->nq = 0;
@@ -949,6 +1028,7 @@ int vkc_submit(int wait) {
      * submitted before the value it waits for */
     if (f->wait_h && g_hyb_flush) g_hyb_flush();
     barrier_now(f->cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    if (KC.gov_on && f->gq) { vkCmdWriteTimestamp(f->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f->gq, 1); f->gq_set = 1; }
     vkEndCommandBuffer(f->cmd);
     f->open = 0; KC.cur = -1;
     if (KC.lost) return 0;
@@ -1010,7 +1090,9 @@ int vkc_hybrid_host_signal(uint64_t h) {
 int vkc_split_layers(void) {
     static int n = -1;
     if (n < 0) { const char *e = getenv("COLI_VK_CHAIN_SPLIT"); n = e && *e ? atoi(e) : 4; if (n < 0) n = 0; }
-    return n;
+    if (!KC.gov_shrink) return n;
+    const int base = n ? n : 4;   /* the frame governor: a frame every base >> level layers, one at least */
+    return base >> KC.gov_shrink > 0 ? base >> KC.gov_shrink : 1;
 }
 int vkc_layer_recorded(int *layers) {
     const int every = vkc_split_layers();
@@ -1066,11 +1148,12 @@ static int record(VkPipeline pipe, const VkcBind *bd, int n, const void *pc, siz
     VkcFrame *f = open_frame();
     if (KC.misuse) { KC.misuse = 0; return 0; }
     if (!f || KC.lost || !gx || !gy || !gz) return f && !KC.lost;
+    f->nops++; f->nattn += KC.kind == PK_ATTN;
     VkBuffer rd[VKC_BIND], wr[VKC_BIND]; int nr = 0, nw = 0;
     VkDescriptorBufferInfo bi[VKC_BIND];
     VkWriteDescriptorSet w[VKC_BIND];
     VkDescriptorSet set = alloc_set(f);
-    if (!set) { fprintf(stderr, "[VK] chain: out of descriptor sets\n"); return 0; }
+    if (!set) { fprintf(stderr, "[VK] chain: out of descriptor sets\n"); kc_refused("a descriptor set (the frame's pools are full)", 0); return 0; }
     for (int i = 0; i < VKC_BIND; i++) {
         if (i < n && bd[i].buf) {
             bi[i] = (VkDescriptorBufferInfo){bd[i].buf, bd[i].off, bd[i].range ? bd[i].range : VK_WHOLE_SIZE};
@@ -1115,6 +1198,7 @@ static int copy_bytes(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t
     if (dst->d != g_kd || src->d != g_kd) { fprintf(stderr, "[VK] chain: a copy across devices\n"); return 0; }
     VkBuffer r = src->buf, w = dst->buf;
     hazard(f, &r, 1, &w, 1);
+    f->ncopy++; f->copy_mb += bytes / 1048576.0;
     VkBufferCopy c = {soff, doff, bytes};
     vkCmdCopyBuffer(f->cmd, src->buf, dst->buf, 1, &c);
     prof_mark(f, PK_COPY);
@@ -1872,9 +1956,9 @@ static void kab_shutdown(void) {
  * integrated GPU keeps the budget alone (0) until one is measured: the budget is there for
  * the slow GPUs a driver's timeout catches (the 780M above; Windows' TDR at 2 s). */
 static long long attn_slice_budget(void) {
-    const char *e = getenv("COLI_VK_ATTN_SLICE");
-    long long v = e && *e ? atoll(e) : (1LL << 32);
-    return v < 0 ? 0 : v;
+    static long long v = -2;
+    if (v == -2) { const char *e = getenv("COLI_VK_ATTN_SLICE"); v = e && *e ? atoll(e) : (1LL << 32); if (v < 0) v = 0; }
+    return v ? v >> KC.gov_shrink : 0;   /* the frame governor's level halves it */
 }
 long long vkc_attn_slice_budget(void) { return attn_slice_budget(); }
 static int attn_slice_wg(void) {
@@ -3195,7 +3279,7 @@ static int record_indirect(VkPipeline pipe, const VkcBind *bd, int n, const void
     KC.st.barriers++;
     /* record's own work with an empty grid, then the indirect dispatch in its place */
     VkDescriptorSet set = alloc_set(f);
-    if (!set) { fprintf(stderr, "[VK] chain: out of descriptor sets\n"); return 0; }
+    if (!set) { fprintf(stderr, "[VK] chain: out of descriptor sets\n"); kc_refused("a descriptor set (the frame's pools are full)", 0); return 0; }
     VkBuffer rd[VKC_BIND], wr[VKC_BIND]; int nr = 0, nw = 0;
     VkDescriptorBufferInfo bi[VKC_BIND];
     VkWriteDescriptorSet w[VKC_BIND];
@@ -3941,6 +4025,7 @@ void vkc_shutdown(void) {
         free(f->pools);
         if (f->fence) vkDestroyFence(KC.dev, f->fence, NULL);
         if (f->qp) vkDestroyQueryPool(KC.dev, f->qp, NULL);
+        if (f->gq) vkDestroyQueryPool(KC.dev, f->gq, NULL);
     }
     if (KC.tsem_g) p_vkDestroySemaphore(KC.dev, KC.tsem_g, NULL);
     if (KC.tsem_h) p_vkDestroySemaphore(KC.dev, KC.tsem_h, NULL);
