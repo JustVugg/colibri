@@ -1,0 +1,208 @@
+# ab.sh 3: per run, the CLI line and the drafter books (INK2_MTP lines of stderr)
+code off r1: [prefill 0.8s | 512 tokens in 12.3s = 41.57 tok/s | RSS 3.2 GB]
+code dev r1: [prefill 1.0s | 512 tokens in 12.6s = 40.52 tok/s | RSS 3.1 GB]
+code dev r1: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+code dev r1: [inkling2] INK2_MTP: 20 steps, 0 of 22 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.16 s, verifying 0.65 s, the kept rows again 0.01 s
+code fix r1: [prefill 0.9s | 512 tokens in 10.8s = 47.37 tok/s | RSS 3.9 GB]
+code fix r1: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+code fix r1: [inkling2] INK2_MTP: 151 steps, 255 of 344 drafts kept (1.69 a step, 2.69 tokens a step), drafting 1.86 s, verifying 6.31 s, the kept rows again 0.03 s
+code fixbf16 r1: [prefill 0.9s | 512 tokens in 10.4s = 49.01 tok/s | RSS 3.7 GB]
+code fixbf16 r1: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+code fixbf16 r1: [inkling2] INK2_MTP: 171 steps, 289 of 372 drafts kept (1.69 a step, 2.69 tokens a step), drafting 2.15 s, verifying 6.97 s, the kept rows again 0.03 s
+prose off r1: [prefill 0.7s | 512 tokens in 12.1s = 42.17 tok/s | RSS 2.7 GB]
+prose dev r1: [prefill 0.8s | 512 tokens in 12.4s = 41.13 tok/s | RSS 3.9 GB]
+prose dev r1: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+prose dev r1: [inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.16 s, verifying 0.65 s, the kept rows again 0.01 s
+prose fix r1: [prefill 0.8s | 512 tokens in 10.5s = 48.80 tok/s | RSS 4.1 GB]
+prose fix r1: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+prose fix r1: [inkling2] INK2_MTP: 125 steps, 230 of 286 drafts kept (1.84 a step, 2.84 tokens a step), drafting 1.55 s, verifying 5.27 s, the kept rows again 0.02 s
+prose fixbf16 r1: [prefill 0.7s | 512 tokens in 10.9s = 47.00 tok/s | RSS 3.2 GB]
+prose fixbf16 r1: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+prose fixbf16 r1: [inkling2] INK2_MTP: 128 steps, 214 of 275 drafts kept (1.67 a step, 2.67 tokens a step), drafting 1.61 s, verifying 5.26 s, the kept rows again 0.02 s
+code off r2: [prefill 0.7s | 512 tokens in 12.3s = 41.54 tok/s | RSS 2.9 GB]
+code dev r2: [prefill 0.9s | 512 tokens in 12.6s = 40.49 tok/s | RSS 3.1 GB]
+code dev r2: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+code dev r2: [inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.16 s, verifying 0.66 s, the kept rows again 0.01 s
+code fix r2: [prefill 0.9s | 512 tokens in 10.6s = 48.42 tok/s | RSS 3.1 GB]
+code fix r2: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+code fix r2: [inkling2] INK2_MTP: 168 steps, 270 of 350 drafts kept (1.61 a step, 2.61 tokens a step), drafting 1.98 s, verifying 6.70 s, the kept rows again 0.03 s
+code fixbf16 r2: [prefill 0.8s | 512 tokens in 10.6s = 48.30 tok/s | RSS 3.2 GB]
+code fixbf16 r2: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+code fixbf16 r2: [inkling2] INK2_MTP: 172 steps, 281 of 366 drafts kept (1.63 a step, 2.63 tokens a step), drafting 2.14 s, verifying 6.96 s, the kept rows again 0.03 s
+prose off r2: [prefill 0.6s | 512 tokens in 12.1s = 42.25 tok/s | RSS 2.9 GB]
+prose dev r2: [prefill 0.8s | 512 tokens in 12.4s = 41.11 tok/s | RSS 3.1 GB]
+prose dev r2: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+prose dev r2: [inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.17 s, verifying 0.65 s, the kept rows again 0.01 s
+prose fix r2: [prefill 0.8s | 512 tokens in 10.8s = 47.46 tok/s | RSS 3.2 GB]
+prose fix r2: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+prose fix r2: [inkling2] INK2_MTP: 130 steps, 220 of 286 drafts kept (1.69 a step, 2.69 tokens a step), drafting 1.59 s, verifying 5.39 s, the kept rows again 0.02 s
+prose fixbf16 r2: [prefill 0.7s | 512 tokens in 10.5s = 48.56 tok/s | RSS 3.3 GB]
+prose fixbf16 r2: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+prose fixbf16 r2: [inkling2] INK2_MTP: 124 steps, 232 of 286 drafts kept (1.87 a step, 2.87 tokens a step), drafting 1.58 s, verifying 5.25 s, the kept rows again 0.02 s
+code off r3: [prefill 0.8s | 512 tokens in 12.3s = 41.61 tok/s | RSS 3.0 GB]
+code dev r3: [prefill 0.9s | 512 tokens in 12.6s = 40.48 tok/s | RSS 3.2 GB]
+code dev r3: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+code dev r3: [inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.17 s, verifying 0.66 s, the kept rows again 0.01 s
+code fix r3: [prefill 0.9s | 512 tokens in 10.2s = 50.10 tok/s | RSS 4.2 GB]
+code fix r3: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+code fix r3: [inkling2] INK2_MTP: 184 steps, 326 of 441 drafts kept (1.77 a step, 2.77 tokens a step), drafting 2.31 s, verifying 7.71 s, the kept rows again 0.04 s
+code fixbf16 r3: [prefill 0.8s | 512 tokens in 11.6s = 43.93 tok/s | RSS 3.3 GB]
+code fixbf16 r3: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+code fixbf16 r3: [inkling2] INK2_MTP: 135 steps, 183 of 277 drafts kept (1.36 a step, 2.36 tokens a step), drafting 1.59 s, verifying 5.33 s, the kept rows again 0.03 s
+prose off r3: [prefill 0.6s | 512 tokens in 12.1s = 42.23 tok/s | RSS 3.0 GB]
+prose dev r3: [prefill 0.8s | 512 tokens in 12.4s = 41.10 tok/s | RSS 3.2 GB]
+prose dev r3: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+prose dev r3: [inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.17 s, verifying 0.65 s, the kept rows again 0.01 s
+prose fix r3: [prefill 0.8s | 512 tokens in 10.6s = 47.99 tok/s | RSS 3.2 GB]
+prose fix r3: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+prose fix r3: [inkling2] INK2_MTP: 128 steps, 222 of 284 drafts kept (1.73 a step, 2.73 tokens a step), drafting 1.57 s, verifying 5.32 s, the kept rows again 0.02 s
+prose fixbf16 r3: [prefill 0.8s | 512 tokens in 10.7s = 47.94 tok/s | RSS 3.3 GB]
+prose fixbf16 r3: [VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+prose fixbf16 r3: [inkling2] INK2_MTP: 125 steps, 223 of 279 drafts kept (1.78 a step, 2.78 tokens a step), drafting 1.59 s, verifying 5.23 s, the kept rows again 0.02 s
+done 20:49:28 Tctl +60.9°C
+
+# each run's tier and drafter lines, in full
+--- ab-code-dev-r1
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 20 steps, 0 of 22 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.16 s, verifying 0.65 s, the kept rows again 0.01 s
+[VK] INK2_MTP: the drafts: layers 0.124 s, the head on the host 0.014 s, lm_head 0.022 s; 20 rollbacks; steps with 0/1/2/3/4+ drafts 491/18/2/0/0
+--- ab-code-dev-r2
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.16 s, verifying 0.66 s, the kept rows again 0.01 s
+[VK] INK2_MTP: the drafts: layers 0.123 s, the head on the host 0.015 s, lm_head 0.024 s; 20 rollbacks; steps with 0/1/2/3/4+ drafts 491/18/1/1/0
+--- ab-code-dev-r3
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.17 s, verifying 0.66 s, the kept rows again 0.01 s
+[VK] INK2_MTP: the drafts: layers 0.124 s, the head on the host 0.015 s, lm_head 0.024 s; 20 rollbacks; steps with 0/1/2/3/4+ drafts 491/18/1/1/0
+--- ab-code-fix-r1
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 151 steps, 255 of 344 drafts kept (1.69 a step, 2.69 tokens a step), drafting 1.86 s, verifying 6.31 s, the kept rows again 0.03 s
+[VK] INK2_MTP: the drafts: layers 1.282 s, the head on the host 0.217 s, lm_head 0.345 s; 53 rollbacks; steps with 0/1/2/3/4+ drafts 107/29/51/71/0
+--- ab-code-fix-r2
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 168 steps, 270 of 350 drafts kept (1.61 a step, 2.61 tokens a step), drafting 1.98 s, verifying 6.70 s, the kept rows again 0.03 s
+[VK] INK2_MTP: the drafts: layers 1.404 s, the head on the host 0.203 s, lm_head 0.354 s; 55 rollbacks; steps with 0/1/2/3/4+ drafts 76/48/58/62/0
+--- ab-code-fix-r3
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 184 steps, 326 of 441 drafts kept (1.77 a step, 2.77 tokens a step), drafting 2.31 s, verifying 7.71 s, the kept rows again 0.04 s
+[VK] INK2_MTP: the drafts: layers 1.590 s, the head on the host 0.255 s, lm_head 0.441 s; 72 rollbacks; steps with 0/1/2/3/4+ drafts 3/1/109/74/0
+--- ab-code-fixbf16-r1
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+[inkling2] INK2_MTP: 171 steps, 289 of 372 drafts kept (1.69 a step, 2.69 tokens a step), drafting 2.15 s, verifying 6.97 s, the kept rows again 0.03 s
+[VK] INK2_MTP: the drafts: layers 1.462 s, the head on the host 0.224 s, lm_head 0.440 s; 54 rollbacks; steps with 0/1/2/3/4+ drafts 53/38/65/68/0
+--- ab-code-fixbf16-r2
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+[inkling2] INK2_MTP: 172 steps, 281 of 366 drafts kept (1.63 a step, 2.63 tokens a step), drafting 2.14 s, verifying 6.96 s, the kept rows again 0.03 s
+[VK] INK2_MTP: the drafts: layers 1.473 s, the head on the host 0.218 s, lm_head 0.434 s; 52 rollbacks; steps with 0/1/2/3/4+ drafts 60/44/62/66/0
+--- ab-code-fixbf16-r3
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+[inkling2] INK2_MTP: 135 steps, 183 of 277 drafts kept (1.36 a step, 2.36 tokens a step), drafting 1.59 s, verifying 5.33 s, the kept rows again 0.03 s
+[VK] INK2_MTP: the drafts: layers 1.082 s, the head on the host 0.161 s, lm_head 0.330 s; 54 rollbacks; steps with 0/1/2/3/4+ drafts 193/45/38/52/0
+--- ab-code-off-r1
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+--- ab-code-off-r2
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+--- ab-code-off-r3
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+--- ab-prose-dev-r1
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.16 s, verifying 0.65 s, the kept rows again 0.01 s
+[VK] INK2_MTP: the drafts: layers 0.124 s, the head on the host 0.016 s, lm_head 0.023 s; 20 rollbacks; steps with 0/1/2/3/4+ drafts 491/18/1/1/0
+--- ab-prose-dev-r2
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.17 s, verifying 0.65 s, the kept rows again 0.01 s
+[VK] INK2_MTP: the drafts: layers 0.126 s, the head on the host 0.014 s, lm_head 0.025 s; 20 rollbacks; steps with 0/1/2/3/4+ drafts 491/18/1/1/0
+--- ab-prose-dev-r3
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 20 steps, 0 of 23 drafts kept (0.00 a step, 1.00 tokens a step), drafting 0.17 s, verifying 0.65 s, the kept rows again 0.01 s
+[VK] INK2_MTP: the drafts: layers 0.126 s, the head on the host 0.013 s, lm_head 0.024 s; 20 rollbacks; steps with 0/1/2/3/4+ drafts 491/18/1/1/0
+--- ab-prose-fix-r1
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 125 steps, 230 of 286 drafts kept (1.84 a step, 2.84 tokens a step), drafting 1.55 s, verifying 5.27 s, the kept rows again 0.02 s
+[VK] INK2_MTP: the drafts: layers 1.074 s, the head on the host 0.173 s, lm_head 0.282 s; 36 rollbacks; steps with 0/1/2/3/4+ drafts 157/28/33/64/0
+--- ab-prose-fix-r2
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 130 steps, 220 of 286 drafts kept (1.69 a step, 2.69 tokens a step), drafting 1.59 s, verifying 5.39 s, the kept rows again 0.02 s
+[VK] INK2_MTP: the drafts: layers 1.112 s, the head on the host 0.174 s, lm_head 0.288 s; 38 rollbacks; steps with 0/1/2/3/4+ drafts 162/31/42/57/0
+--- ab-prose-fix-r3
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head int4 g64)
+[inkling2] INK2_MTP: 128 steps, 222 of 284 drafts kept (1.73 a step, 2.73 tokens a step), drafting 1.57 s, verifying 5.32 s, the kept rows again 0.02 s
+[VK] INK2_MTP: the drafts: layers 1.096 s, the head on the host 0.176 s, lm_head 0.284 s; 41 rollbacks; steps with 0/1/2/3/4+ drafts 161/30/40/58/0
+--- ab-prose-fixbf16-r1
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+[inkling2] INK2_MTP: 128 steps, 214 of 275 drafts kept (1.67 a step, 2.67 tokens a step), drafting 1.61 s, verifying 5.26 s, the kept rows again 0.02 s
+[VK] INK2_MTP: the drafts: layers 1.090 s, the head on the host 0.178 s, lm_head 0.322 s; 40 rollbacks; steps with 0/1/2/3/4+ drafts 171/33/43/52/0
+--- ab-prose-fixbf16-r2
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+[inkling2] INK2_MTP: 124 steps, 232 of 286 drafts kept (1.87 a step, 2.87 tokens a step), drafting 1.58 s, verifying 5.25 s, the kept rows again 0.02 s
+[VK] INK2_MTP: the drafts: layers 1.068 s, the head on the host 0.169 s, lm_head 0.332 s; 33 rollbacks; steps with 0/1/2/3/4+ drafts 158/28/30/66/0
+--- ab-prose-fixbf16-r3
+[inkling2] INK2_MTP: the drafter, 3 layers, blocks of 8, 3 drafts a step (INK2_MTP_K)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] INK2_MTP: the drafter on the chain (3 layers, blocks of 8, 3 drafts a step, its head the target's)
+[inkling2] INK2_MTP: 125 steps, 223 of 279 drafts kept (1.78 a step, 2.78 tokens a step), drafting 1.59 s, verifying 5.23 s, the kept rows again 0.02 s
+[VK] INK2_MTP: the drafts: layers 1.071 s, the head on the host 0.164 s, lm_head 0.338 s; 39 rollbacks; steps with 0/1/2/3/4+ drafts 164/32/32/61/0
+--- ab-prose-off-r1
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+--- ab-prose-off-r2
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+--- ab-prose-off-r3
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] tier inkling: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.36 GiB = 3072 experts of 3.8 MiB (fmt 140, down fmt 140; 12 layers in 6 forms other than most layers', every expert in a room of its own form's size (5 sizes)), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots

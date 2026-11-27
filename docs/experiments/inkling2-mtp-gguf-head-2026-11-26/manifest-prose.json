@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "hypothesis": "The drafts' int4 g64 lm_head read a GGUF head's blocks as F16; built from the target's own dequantized rows, the drafts agree with the target again and the adaptive drafter decodes faster than without it",
+  "commit": "ab98f29f8acef3a48dc37838c3d896c9acc9b908",
+  "model": "unsloth Inkling-2-Mini UD-Q3_K_XL GGUF (output head Q5_K), imported with tools/gguf_import.py --mode link; mtp/mtp.safetensors and config.json's mtp_config from the Hugging Face checkpoint",
+  "command": "make -C c inkling VK=1 in both trees; ab.sh 3 (cli.sh per run: a fresh copy of one .coli_usage history, SNAP=<import> ./inkling --chat -f <prompt> -n 512); arms interleaved: off, dev, fix, fix with INK2_MTP_HEAD=bf16",
+  "prompt_hash": "60a5fc3cebb48c9efb88d88661d4269be2d4fda5bb77c4d5e0598966371ae97f",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 7800X3D, 8 cores / 16 threads",
+    "ram": "32 GB DDR5",
+    "storage": "ZFS on LUKS2 over two NVMe SSDs (Samsung 980 PRO, WD Blue SN580)",
+    "os": "NixOS, Linux 7.2.9, gcc 16.2.0, Mesa 26.2.5 RADV, AMD Radeon RX 9060 XT 16 GB (every routed expert resident: 3072 in 12.36 GiB)"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "unsloth Inkling-2-Mini UD-Q3_K_XL GGUF (output head Q5_K), imported with tools/gguf_import.py --mode link; mtp/mtp.safetensors and config.json's mtp_config from the Hugging Face checkpoint",
+      "INK2_MTP": "1",
+      "COLI_VULKAN": "1",
+      "COLI_VK_STAGED": "1",
+      "CTX_MAX": 16384,
+      "OMP_NUM_THREADS": 8,
+      "cli": "./inkling --chat -f <prompt> -n 512 (greedy)",
+      "engine_build": "dev ab98f29f"
+    },
+    "samples": {
+      "tok_s": [
+        41.13,
+        41.11,
+        41.1
+      ],
+      "drafts_kept_of": [
+        [
+          0,
+          23
+        ],
+        [
+          0,
+          23
+        ],
+        [
+          0,
+          23
+        ]
+      ]
+    },
+    "median_tok_s": 41.11,
+    "quality": {
+      "method": "text against INK2_MTP=0 on the same build: identical (no draft kept)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/inkling2-mtp-gguf-head-2026-11-26/raw.txt",
+      "sha256": "d444dbe34c6ef2ad548cde571a7f357e1b0b0ac10be239fadf4e5fc68cd6a1ae"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "unsloth Inkling-2-Mini UD-Q3_K_XL GGUF (output head Q5_K), imported with tools/gguf_import.py --mode link; mtp/mtp.safetensors and config.json's mtp_config from the Hugging Face checkpoint",
+      "INK2_MTP": "1",
+      "COLI_VULKAN": "1",
+      "COLI_VK_STAGED": "1",
+      "CTX_MAX": 16384,
+      "OMP_NUM_THREADS": 8,
+      "cli": "./inkling --chat -f <prompt> -n 512 (greedy)",
+      "engine_build": "ab98f29f + this change"
+    },
+    "samples": {
+      "tok_s": [
+        48.8,
+        47.46,
+        47.99
+      ],
+      "drafts_kept_of": [
+        [
+          230,
+          286
+        ],
+        [
+          220,
+          286
+        ],
+        [
+          222,
+          284
+        ]
+      ]
+    },
+    "median_tok_s": 47.99,
+    "quality": {
+      "method": "the text is byte-identical to the drafter off in all 3 runs, and to INK2_MTP_HEAD=bf16; tests/test_inkling2_kernels, test_inkling_serve_framing, test_inkling_shared_batch, test_inkling_cache_index, test_inkling_read_trust pass (VK=1)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/inkling2-mtp-gguf-head-2026-11-26/raw.txt",
+      "sha256": "d444dbe34c6ef2ad548cde571a7f357e1b0b0ac10be239fadf4e5fc68cd6a1ae"
+    }
+  },
+  "reference": {
+    "INK2_MTP=0": {
+      "tok_s": [
+        42.17,
+        42.25,
+        42.23
+      ],
+      "median": 42.23
+    },
+    "INK2_MTP_HEAD=bf16 (this change)": {
+      "tok_s": [
+        47.0,
+        48.56,
+        47.94
+      ],
+      "median": 47.94,
+      "drafts_kept_of": [
+        [
+          214,
+          275
+        ],
+        [
+          232,
+          286
+        ],
+        [
+          223,
+          279
+        ]
+      ]
+    }
+  },
+  "outcome": "improvement"
+}
