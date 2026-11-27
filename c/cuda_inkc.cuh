@@ -254,9 +254,9 @@ static int cc_sconv(CcBuf *x, CcBuf *w, CcBuf *ring, const CcSconv *p) {
 /* chain_relattn_tile.comp on CUDA (its header has the contract and the layout): a block a KV head and rb consecutive
  * rows with that head's G query heads, each K and V row of a tile read once for the rb * G (row, head) pairs through
  * shared memory, each pair's arithmetic ccg_relattn_k's in its order: the same bits */
-template <int G, int ND, typename KT>
-__global__ static void __launch_bounds__(256) ccg_relattn_tile_k(const float *__restrict__ q, const KT *__restrict__ kc,
-        const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ kvs, const float *__restrict__ r,
+template <int G, int ND, typename KE>
+__global__ static void __launch_bounds__(256) ccg_relattn_tile_k(const float *__restrict__ q, const KE *__restrict__ kc,
+        const KE *__restrict__ vc, float *__restrict__ o, const float *__restrict__ kvs, const float *__restrict__ r,
         const float *__restrict__ relp, const float *__restrict__ tau, CcRelAttn p, int rb, int jc) {
     constexpr int PM = 24, RBM = PM / G, NA = (RBM + 7) / 8, NB = (RBM + 1) / 2, DC = 16, KVN = 4096;
     __shared__ float kv[KVN], qsh[PM * DC], sc[PM * 128], sm[PM], sl[PM], sn[PM], scr[PM];
@@ -457,9 +457,9 @@ __global__ static void __launch_bounds__(256) ccg_relattn_tile_k(const float *__
 /* chain_relattn_tile.comp's SPLIT on CUDA: a decode step's partials (ccg_relattn_k's with part, the same bits), a block a
  * KV head, a block of rows and the tile blockIdx.z of nc, the KV head's query heads at once: each K and V row read once
  * for them; pb_ptr: pos_base from the device (the graphs) */
-template <int G, int ND, typename KT>
-__global__ static void __launch_bounds__(256) ccg_relattn_split_k(const float *__restrict__ q, const KT *__restrict__ kc,
-        const KT *__restrict__ vc, const float *__restrict__ kvs, const float *__restrict__ r, const float *__restrict__ relp,
+template <int G, int ND, typename KE>
+__global__ static void __launch_bounds__(256) ccg_relattn_split_k(const float *__restrict__ q, const KE *__restrict__ kc,
+        const KE *__restrict__ vc, const float *__restrict__ kvs, const float *__restrict__ r, const float *__restrict__ relp,
         const float *__restrict__ tau, CcRelAttn p, int rb, int jc, float *__restrict__ part, const int *pb_ptr) {
     constexpr int PM = 24, NU = PM / 2, DC = 16, KVN = 4096;
     __shared__ float kv[KVN], qsh[PM * DC], sc[PM * 128];

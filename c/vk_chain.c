@@ -2009,8 +2009,9 @@ static void kab_shutdown(void) {
  * integrated GPU keeps the budget alone (0) until one is measured: the budget is there for
  * the slow GPUs a driver's timeout catches (the 780M above; Windows' TDR at 2 s). */
 static long long attn_slice_budget(void) {
-    static long long v = -2;
-    if (v == -2) { const char *e = getenv("COLI_VK_ATTN_SLICE"); v = e && *e ? atoll(e) : (1LL << 32); if (v < 0) v = 0; }
+    const char *e = getenv("COLI_VK_ATTN_SLICE");   /* read at each call, as the tests change it */
+    long long v = e && *e ? atoll(e) : (1LL << 32);
+    if (v < 0) v = 0;
     return v ? v >> KC.gov_shrink : 0;   /* the frame governor's level halves it */
 }
 long long vkc_attn_slice_budget(void) { return attn_slice_budget(); }
