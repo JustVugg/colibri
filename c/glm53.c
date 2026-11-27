@@ -4141,6 +4141,8 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
     return streams;
 }
 #ifdef COLI_VULKAN
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
+static int g53_slot_ctx_env(void);   /* below: a serve slot's context */
 #include "glm53_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 #ifdef COLI_CUDA
@@ -5840,9 +5842,16 @@ static size_t g53_tier_dense_bytes(const GModel *m) {
 #ifdef COLI_VULKAN
     if (!xt_cuda())   /* a partial chain: nothing more of the trunk goes up, but the chain's first
                        * forward allocates its scratch and the N layers' MLA caches */
-        return g_g53_partial ? g_g53c_lazy : g_vk_dense && !coli_vk_dense_device_only() ? glm53_dense_dev_bytes(m) : 0;
+        return g_g53_partial ? g_g53c_lazy : (g_vk_dense && !coli_vk_dense_device_only() ? glm53_dense_dev_bytes(m) : 0) +
+               (coli_kv_plan() ? g_g53c_mir_sum : 0);   /* planned: a whole chain's MLA mirrors too (coli_kv_plan.h) */
 #endif
     (void)m; return 0;
+}
+/* a serve slot's context as slots_init will read it (GLM53_MAXT, 8192) */
+static int g53_slot_ctx_env(void) {
+    const char *mt = getenv("GLM53_MAXT");
+    int t = mt ? atoi(mt) : 8192;
+    return t < 64 ? 64 : t;
 }
 /* The state a serve allocates once it runs: every slot's session at GLM53_MAXT
  * (session_open's latent, index keys and gates; the KDA layers' state), which the

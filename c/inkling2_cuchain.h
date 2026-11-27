@@ -120,6 +120,7 @@ static size_t ink2cc_plan_bytes(const Model *m) {
     const Cfg *c = &m->c;
     size_t D = (size_t)c->hidden, E = (size_t)c->n_experts, CK = (size_t)c->conv_k, K = (size_t)c->topk, b = 0, row = 0;
     int t = ink_ctx_max() + 8;
+    if (coli_kv_plan()) g_ink_kv_plan_t = t;   /* the mirrors' room at the whole context: the host's cache at it too (coli_kv_plan.h) */
     size_t kvm = 0;
     for (int v = 0; v < c->n_state; v++) { size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v); if (kvo > kvm) kvm = kvo; }
     for (int v = c->n_layers; v < c->n_state; v++) {                   /* the loop's later passes' state */

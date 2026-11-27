@@ -139,6 +139,15 @@ static size_t ink2c_plan_bytes(const Model *m) {
      * ink2c_mirror claim more via vkt_give_back. */
     int t = ink_ctx_max() + 8;
     if (t > 16392) t = 16392;
+    /* planned (coli_kv_plan.h): the whole served context where its mirrors take at most half of the device's free
+     * memory; then the host's cache is allocated at it too (g_ink_kv_plan_t, kv_alloc), so the mirrors are made
+     * once and never again. Past that half, the start's horizon and the growth, as before. */
+    if (coli_kv_plan()) {
+        const int full = ink_ctx_max() + 8;
+        size_t kvb = 0;
+        for (int v = 0; v < c->n_state; v++) kvb += 2 * (size_t)L_KV(c, v) * L_HD(c, v) * (size_t)kv_ring_rows(c, v, full) * 4;
+        if (kvb <= vkc_dev_avail() / 2) { t = full; g_ink_kv_plan_t = full; }
+    }
     for (int v = c->n_layers; v < c->n_state; v++) {                   /* the loop's later passes' state */
         size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v);
         b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2 + 2 * kvo * (size_t)kv_ring_rows(c, v, t) * 4;

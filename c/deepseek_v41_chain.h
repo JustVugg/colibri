@@ -742,7 +742,7 @@ static int v41c_plan(V41Chain *ch, Model *m, int ctx) {
         if (ch->sli[i] < 0) continue;
         int r = c->compress_ratio[i], host = c->max_positions / r, want = ctx / r > 0 ? ctx / r : 1, cap = ch->ccap[i];
         if (host > tcap) tcap = host;
-        if (cap < want) { cap = 64; while (cap < want) cap *= 2; if (cap > host) cap = host; grow = 1; }
+        if (cap < want) { cap = 64; while (cap < want) cap *= 2; if (coli_kv_plan()) cap = host; if (cap > host) cap = host; grow = 1; }
         need += (size_t)cap * hd * sizeof(float); held += (size_t)ch->ccap[i] * hd * sizeof(float);
     }
     if (!grow) return 1;
@@ -765,6 +765,7 @@ static int v41c_cache(V41Chain *ch, Model *m, int i, int rows) {
     if (ch->ccap[i] >= rows) return 1;
     int r = c->compress_ratio[i], host = c->max_positions / (r > 0 ? r : 1), own = v41c_own(ch, i);
     int cap = 64; while (cap < rows) cap *= 2;
+    if (coli_kv_plan()) cap = host;   /* planned: the whole context at the first, never grown (coli_kv_plan.h) */
     if (cap > host) cap = host;
     if (cap < rows) return 0;
     if (own && !ch->ks.on) {   /* under the split the compressed rows keep their ks.rows */

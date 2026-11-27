@@ -8749,9 +8749,15 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     layers_forward_rows_range(m,x,S,pos_base,NULL,NULL,layer_begin,layer_end);
 }
 
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
     KVState *k=m->kv;
+    {   /* planned (coli_kv_plan.h): a serve's whole context (CTX) at the first, where the RAM holds it (float32 rows
+         * counted: an upper bound for the int8 and float16 caches) */
+        int top=getenv("CTX")?atoi(getenv("CTX")):4096;
+        if(max_t<top && coli_kv_plan_host((double)top*(c->n_layers+1)*(c->kv_lora+c->qk_rope+c->index_hd)*4.0,compat_mem_available_gb()*1e9)) max_t=top;
+    }
 #ifdef COLI_CUDA
     if(m->kv_dev_L) for(int i=0;i<c->n_layers+1;i++){    /* dimensioni cambiate: ombra da rifare */
         if(m->kv_dev_L[i]){ coli_cuda_pipe_free(m->L[i<c->n_layers?i:0].kv_b.cuda_device,m->kv_dev_L[i]); m->kv_dev_L[i]=NULL; }

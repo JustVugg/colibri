@@ -310,6 +310,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_K3_CKPT_DIR",                 CE_STR   , CE_KIMI                                         , 0             , NULL},
     {"COLI_KEEP_F32",                    CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"COLI_KEEP_INT8",                   CE_STR   , CE_QWEN                                         , 0             , NULL},
+    {"COLI_KV_PLAN", CE_BOOL, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO, 0, NULL},
     {"COLI_KV_PREFIX", CE_BOOL, CE_DSV41 | CE_OLMOE | CE_QWEN | CE_QWEN38 | CE_MIMO, 0, NULL},
     {"COLI_KV_SHARE",                    CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_LANG", CE_STR, 0, 0, NULL},

@@ -802,8 +802,11 @@ static int v4c_setup(ColiV4Engine *engine) { return v4c_setup_dev(engine, 0); }
 
 /* room on the device for `rows` compressed rows (and keys) of layer i; growing drops them */
 static int v4c_cache(V4Chain *ch, V4cLayer *ly, int rows) {
+    /* planned (coli_kv_plan.h): the whole context's compressed rows at the first, never grown */
+    const int host = ly->ratio > 0 ? ch->engine->config.max_position_embeddings / ly->ratio + 1 : 0;
     if (ly->ratio > 0 && ly->ccap < rows && !ch->ks.on) {   /* under the split the rows keep their ks.rows */
         int cap = 64; while (cap < rows) cap *= 2;
+        if (coli_kv_plan() && host > cap) cap = host;
         vkc_free(ly->ckv);
         ly->ckv = vkc_buf((size_t)cap * ch->hd * sizeof(float), VKC_DEV);
         ly->kv_valid = 0; ly->ccap = ly->ckv ? cap : 0;
@@ -811,6 +814,7 @@ static int v4c_cache(V4Chain *ch, V4cLayer *ly, int rows) {
     }
     if (ly->idx && ly->icap < rows) {
         int cap = 64; while (cap < rows) cap *= 2;
+        if (coli_kv_plan() && host > cap) cap = host;
         vkc_free(ly->ikey);
         ly->ikey = vkc_buf((size_t)cap * ch->ID * sizeof(float), VKC_DEV);
         ly->ik_valid = 0; ly->icap = ly->ikey ? cap : 0;
@@ -864,7 +868,7 @@ static int v4c_plan(V4Chain *ch, int E) {
         int want = E / ly->ratio + 1, cap = ly->ccap, host = ch->engine->config.max_position_embeddings / ly->ratio + 1;
         if (host < want) host = want;
         if (host > tcap) tcap = host;
-        if (cap < want) { cap = 64; while (cap < want) cap *= 2; grow = 1; }
+        if (cap < want) { cap = 64; while (cap < want) cap *= 2; if (coli_kv_plan() && host > cap) cap = host; grow = 1; }
         need += (size_t)cap * hd * sizeof(float); held += (size_t)ly->ccap * hd * sizeof(float);
     }
     if (!grow) return 1;

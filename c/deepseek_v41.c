@@ -4824,6 +4824,7 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
 }
 
 #ifdef COLI_VULKAN
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
 #include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
 #ifdef COLI_CUDA

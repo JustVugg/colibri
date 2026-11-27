@@ -244,6 +244,7 @@ static int v41u_cache(V41U *ch, Model *m, int i, int rows) {
     if (ch->ccap[i] >= rows) return 1;
     int r = c->compress_ratio[i], host = c->max_positions / (r > 0 ? r : 1), cap = 64;
     while (cap < rows) cap *= 2;
+    if (coli_kv_plan()) cap = host;   /* planned: the whole context at the first, never grown (coli_kv_plan.h) */
     if (cap > host) cap = host;
     if (cap < rows) return 0;
     cc_free(ch->ckv[i]); cc_free(ch->ikey[i]);

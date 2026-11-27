@@ -114,6 +114,7 @@ static int g_g53c_fitted;
 static size_t g_g53c_lazy;                    /* what the chain allocates at its first forward: one chunk's
                                                * scratch and the N layers' MLA caches at their first size */
 static size_t *g_g53c_mir;                    /* each layer's MLA caches at their first size */
+static size_t g_g53c_mir_sum;                 /* the placed layers' (coli_kv_plan: the tier keeps them free) */
 /* the second device's chain (layers g_g53c_fit.n..), its fit; g_g53c_dev: the device
  * g53c_tensor uploads a new matrix to */
 static G53Chain *g_g53c2;
@@ -322,7 +323,9 @@ static void g53c_fit_plan(GModel *m) {
     size_t *lb = calloc(L ? L : 1, sizeof(size_t)), *mb = calloc(L ? L : 1, sizeof(size_t));
     size_t *mir = calloc(L ? L : 1, sizeof(size_t));
     if (!lb || !mb || !mir) { free(lb); free(mb); free(mir); return; }
-    const int cap0 = 256;   /* g53c_mirror's first size */
+    /* g53c_mirror's first size: 256, or planned (coli_kv_plan.h) a serve slot's whole context, its latent rows at
+     * most 32768 positions (past them the split keeps a window on the device; the index keys stay whole) */
+    const int ctx0 = coli_kv_plan() ? g53_slot_ctx_env() : 256, cap0 = ctx0 < 32768 ? ctx0 : 32768;
     for (int i = 0; i < L; i++) {
         lb[i] = 2 * vkc_fit_tensor(10, HD, nm, 0);
         mb[i] = 2 * coli_vk_tensor_payload(10, HD, nm, 0);
@@ -334,8 +337,8 @@ static void g53c_fit_plan(GModel *m) {
         }
         lb[i] += g53c_arena_floats(c, i) * sizeof(float);
         if (c->is_full[i])
-            mir[i] = vkc_fit_buf((size_t)cap0 * c->kv_lora * sizeof(float)) + 2 * vkc_fit_buf((size_t)cap0 * ID * sizeof(float)) +
-                     vkc_fit_buf((size_t)(cap0 / c->index_kpool + 1) * ID * sizeof(float));
+            mir[i] = vkc_fit_buf((size_t)cap0 * c->kv_lora * sizeof(float)) + 2 * vkc_fit_buf((size_t)ctx0 * ID * sizeof(float)) +
+                     vkc_fit_buf((size_t)(ctx0 / c->index_kpool + 1) * ID * sizeof(float));
         else
             lb[i] += vkc_fit_buf((size_t)3 * P * c->conv_k * sizeof(float)) +
                      vkc_fit_buf((size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float));
@@ -579,6 +582,7 @@ static int g53c_mirror(G53Chain *ch, const GModel *m, int need, int limit, int r
     const Cfg *c = &m->c; int lo = ch->lo, hi = lo + ch->n, ID = c->index_hd, pool = c->index_kpool;   /* the device's layers */
     if (ch->cap >= need) return 1;
     int cap = 256; while (cap < need) cap *= 2;
+    if (coli_kv_plan()) cap = limit;   /* planned: the slot's whole context at the first, never grown (coli_kv_plan.h) */
     if (cap > limit) cap = limit;
     if (cap < need) return 0;
     size_t row = (size_t)c->kv_lora * sizeof(float);
@@ -1009,6 +1013,7 @@ static void g53c_start(GModel *m) {
     }
     g_g53_partial = vkc_fit_partial(&g_g53c_fit);
     for (int i = 0; i < g_g53c_fit.n; i++) g_g53c_lazy += g_g53c_mir[i];   /* for the tier (glm53_vk_tier_start) */
+    for (int i = 0; i < g_g53c_fit.n; i++) g_g53c_mir_sum += g_g53c_mir[i];   /* a whole chain's mirrors, planned (g53_tier_dense_bytes) */
     vkc_fit_placed("glm53", &g_g53c_fit);
     g53_dho_finish(m, g_g53c_fit.n, g_g53c_fit.tail, g_g53_partial);
 }

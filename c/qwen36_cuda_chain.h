@@ -364,7 +364,7 @@ static size_t q36cc_mirror_at(Model *m, int ctx) {
 }
 static size_t q36cc_mirror_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
-    if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
+    if (ctx < 1 || !(c->win_layer || c->attn_sinks || coli_kv_plan())) return 0;   /* planned: every model's (coli_kv_plan.h) */
     size_t kv = q36cc_mirror_at(m, ctx), fr = 0, tot = 0;
     if (coli_cuda_mem_info(0, &fr, &tot) && tot && kv > tot / 2) kv = tot / 2;
     return kv;
@@ -713,6 +713,7 @@ static int q36cc_mirror(Q36CChain *ch, Model *m) {
     int need = m->kv_cap > Q36CC_CONV_ROWS ? m->kv_cap : Q36CC_CONV_ROWS;
     if (need > top) need = top;
     int cap = ch->cap;
+    if (cap < need && coli_kv_plan()) cap = top;   /* planned: the whole context at the first, never grown (coli_kv_plan.h) */
     if (cap < need) {
         cap = need + (need / 8 > 1024 ? need / 8 : 1024);
         cap = (cap + 1023) / 1024 * 1024;

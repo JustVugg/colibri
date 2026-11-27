@@ -349,6 +349,7 @@ static int g53u_mirror(G53U *ch, const GModel *m, int need, int limit) {
     const Cfg *c = &m->c; const int L = c->n_layers, ID = c->index_hd, pool = c->index_kpool;
     if (ch->cap >= need) return 1;
     int cap = 256; while (cap < need) cap *= 2;
+    if (coli_kv_plan()) cap = limit;   /* planned: the slot's whole context at the first, never grown (coli_kv_plan.h) */
     if (cap > limit) cap = limit;
     if (cap < need) return 0;
     for (int i = 0; i < L; i++) {

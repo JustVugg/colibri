@@ -18439,6 +18439,7 @@ static const float *v4_mainh_get(int64_t position) {
 #include "deepseek_v4_dspark.inc"
 
 #ifdef COLI_VULKAN
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
 #include "deepseek_v4_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
 

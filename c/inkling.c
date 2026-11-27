@@ -2638,6 +2638,10 @@ static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
     free(bg); free(bh);
 }
 
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
+/* the positions the plan (coli_kv_plan.h) holds the KV caches at from the first request (0: grown as requests
+ * ask, as before), set where the device's mirrors at the whole served context fit (ink2c_plan_bytes, ink2cc) */
+static int g_ink_kv_plan_t;
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* ---- the routed-expert tier (vk_tier.c on Vulkan; on CUDA, cu_tier.c: XT) ------
  * With the tier on, one MoE layer runs per block of rows: the block's resident
@@ -4706,7 +4710,15 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
      *     so ids alone cannot tell two different clips apart
      * Either the reused positions are token-identical or nothing is reused;
      * the emitted tokens are unchanged in both cases. */
-    kv_alloc(m, np + q->max_tok + 8);
+    {   /* planned (g_ink_kv_plan_t): the whole context at once, where the RAM holds it (coli_kv_plan_host) */
+        int want = np + q->max_tok + 8;
+        if (g_ink_kv_plan_t > want) {
+            double b = 0;
+            for (int i = 0; i < m->c.n_state; i++) b += 2.0 * L_KV(&m->c, i) * L_HD(&m->c, i) * 4.0 * kv_ring_rows(&m->c, i, g_ink_kv_plan_t);
+            if (coli_kv_plan_host(b * (g_ink_mux_slots > 1 ? g_ink_mux_slots : 1), compat_mem_available_gb() * 1e9)) want = g_ink_kv_plan_t;
+        }
+        kv_alloc(m, want);
+    }
     /* naud>0 taints this turn before the comparison, not after: a request that
      * brings its own audio must not match a text-only state either. */
     if (media) kv_prefix_taint(&m->kvp);

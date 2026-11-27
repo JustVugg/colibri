@@ -71,6 +71,7 @@ static int qwen36_max_ctx(void) {
 #include <unistd.h>
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
 #include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
 #include "cli_args.h"
 #include "st.h"
@@ -9619,6 +9620,14 @@ static void ensure_kv(Model *m){
      * new length paid the reallocation, the rows' copy and (a GPU chain) its KV mirrors' again
      * on every turn (LFM3-VL-2B on CUDA: a prompt of a new length 48 ms instead of 35). The
      * RAM plan reserves the whole context's cache already. */
+    /* planned (coli_kv_plan.h): the whole context's rows at the first allocation, so the rows never move */
+    if (m->max_t < qwen36_max_ctx()) {
+        const int top = qwen36_max_ctx(), R = q36_ring_for(c, top);
+        double b = 0;
+        for (int i = 0; i < c->n_layers; i++)
+            if (c->is_attn[i]) b += 2.0 * c->kv_heads * c->k_head_dim * (double)q36_kv_es() * (R && c->win_layer && c->win_layer[i] ? R : top);
+        if (coli_kv_plan_host(b, compat_mem_available_gb() * 1e9)) m->max_t = top;
+    }
 #ifdef COLI_CUDA
     if (!(g_cuda_chain && q36cc_prompt_cache_enabled(ch)))
 #endif
@@ -12224,7 +12233,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .ram_later = q36_kv_later(m) + q36_ps_plan(m),
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
-                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx() < Q36C_KV_START ? qwen36_max_ctx() : Q36C_KV_START) : 0,
+                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, coli_kv_plan() || qwen36_max_ctx() < Q36C_KV_START ? qwen36_max_ctx() : Q36C_KV_START) : 0,
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_release, .load_ctx = m,
                     .layer_gate_up = lgu, .layer_down = ldn};

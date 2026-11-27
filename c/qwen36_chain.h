@@ -730,7 +730,9 @@ static size_t q36c_late_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
     if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
     int R = q36_ring_for(c, ctx), hi = g_q36c_fit_on ? g_q36c_fit.n : c->n_layers;
-    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0, half = vkc_dev_avail() / 2;   /* as float32 (q36cc_mirror_at) */
+    /* as float32 (q36cc_mirror_at), or float16 where the mirrors will be (q36c_kvh_want) */
+    size_t es = q36c_kvh_want() ? 2 : sizeof(float);
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * es, kv = 0, half = vkc_dev_avail() / 2;
     for (int i = 0; i < hi && i < c->n_layers; i++)
         if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
     return kv > half ? half : kv;
@@ -762,7 +764,7 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
      * card's room a short conversation decoded at 61-71 tok/s against 75-91 before it (#2733). One
      * device, the chain's whole stack (the tier's room is the primary's). */
     size_t owed = 0;
-    if (ch->cap > 0 && ch->d == 0 && !q36c_of(m, 1) && ch->cap > 2 * (need > Q36C_KV_START ? need : Q36C_KV_START)) {
+    if (!coli_kv_plan() && ch->cap > 0 && ch->d == 0 && !q36c_of(m, 1) && ch->cap > 2 * (need > Q36C_KV_START ? need : Q36C_KV_START)) {
         for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             if (!c->is_attn[i]) continue;
             owed += vkc_bytes(ch->kc[i]) + vkc_bytes(ch->vc[i]);
@@ -777,6 +779,8 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
         if (ch->host_cap == m->kv_cap) return 1;
         /* the host's capacity moved: a sliding layer may have turned from its first rows into a
          * ring (q36c_ring), the rest keep theirs */
+    } else if (coli_kv_plan() && top >= need) {
+        cap = top;   /* planned: the whole context at the first forward, whole or split, never grown (coli_kv_plan.h) */
     } else {
         cap = need + (need / 8 > 1024 ? need / 8 : 1024);
         if (cap < Q36C_CONV_ROWS) cap = Q36C_CONV_ROWS;
