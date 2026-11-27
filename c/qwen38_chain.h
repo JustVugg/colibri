@@ -808,12 +808,27 @@ static void q38_embed_row(Model *m,int id,int abs_pos,float *out);
  * with them), then leave the chain off. The MTP head's own rows live on the host. With a
  * partial chain only the device's layers are rebuilt: the CPU's layers (and the PLE
  * layer's state and history when it is one of them) hold their own state already. */
+static int g_q38c_mode;   /* the chain's mode before a stop (q38c_retry brings it back) */
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. q38c_recover left the state on the host: the mirrors' rows, the index and pooled keys and the DeltaNet and
+ * PLE state go up from it at the next forward. One device. */
+static void q38c_retry(Model *m) {
+    Q38Chain *ch = q38c_of(m, 0);
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || q38c_of(m, 1) || !vkc_chain_retry("qwen38")) return;
+    Cfg *c = &m->c;
+    for (int i = ch->lo; i < ch->lo + ch->nl + (ch->mtp_on ? 1 : 0); i++)
+        if (q38c_attn_at(c, i)) { ch->kv_valid[i] = ch->pk_valid[i] = 0; }
+    if (ch->ks.on) for (int k = 0; k < ch->n_attn; k++) vkc_kv_lower(&ch->ks, k, 0);
+    ch->dn_where = Q38C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+    ch->failed = 0; g_vk_chain = g_q38c_mode ? g_q38c_mode : 1;
+}
 static void q38c_recover(Model *m, int upto) {
     Q38Chain *ch = (Q38Chain *)m->vkchain, *ch2 = (Q38Chain *)m->vkchain2;
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count;
     int nl = ch ? ch->nl : c->layers;
     if (ch && ch->ok && ch2 && ch2->ok) nl += ch2->nl;   /* the second device's layers ran in that forward too */
     int ple = c->ple_layer >= 0 && c->ple_layer < nl;
+    if (g_vk_chain) g_q38c_mode = g_vk_chain;
     g_vk_chain = 0;
     for (int d = 0; d < 2; d++) {
         Q38Chain *x = q38c_of(m, d);

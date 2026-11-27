@@ -155,11 +155,13 @@ static void q36c_fatal(const char *what) {
  * positions the prefix record names (a prefill on the CPU), and leave the chain off.
  * A partial chain rebuilds its N layers only: the CPU's layers hold their state on the
  * host already, at `upto` (a forward the device was lost in has not reached them). */
+static int g_q36c_mode;   /* the chain's mode before a stop (q36c_retry brings it back) */
 static void q36c_recover(Model *m, int upto) {
     Q36Chain *ch = (Q36Chain *)m->vkchain, *ch2 = (Q36Chain *)m->vkchain2;
     Cfg *c = &m->c; int D = c->hidden;
     int nd = ch && ch->ok ? ch->n : c->n_layers;
     if (ch && ch->ok && ch2 && ch2->ok) nd += ch2->n;   /* the second device's layers ran in that forward too */
+    if (g_vk_chain) g_q36c_mode = g_vk_chain;
     g_vk_chain = 0;
     for (int d = 0; d < 2; d++) {
         Q36Chain *x = q36c_of(m, d);
@@ -1979,7 +1981,7 @@ static void q36c_retry(Model *m) {
     for (int i = ch->lo; i < ch->lo + ch->n; i++)
         if (c->is_attn[i]) { ch->kv_valid[i] = 0; if (ch->ks.on) vkc_kv_lower(&ch->ks, ch->attn_ord[i], 0); }
     ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
-    ch->failed = 0; g_vk_chain = 1;
+    ch->failed = 0; g_vk_chain = g_q36c_mode ? g_q36c_mode : 1;
 }
 /* One decode step of several conversations in the chain (serve_mux, KV_SLOTS > 1): row s is
  * the token whose embedding is xh's row s, at rows[s].pos of rows[s].seq, every conversation

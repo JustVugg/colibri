@@ -4638,6 +4638,9 @@ static int ink_ps_marks(const Tok *T, const int *ids, int np, int from, int *mar
 
 static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out, float **logit_out,
                            InkReqClock *clk, int lone) {
+#ifdef COLI_VULKAN
+    if (m->c.v2) ink2c_retry(m);   /* a chain that stopped with the device alive comes back (vkc_chain_retry) */
+#endif
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));

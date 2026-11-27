@@ -451,9 +451,21 @@ static int ink2c_push_state(Ink2Chain *ch, Model *m) {
 }
 /* The device was lost with the newest state on it: rebuild the K/V cache and the convolution
  * states on the CPU from the `upto` positions the prefix record names, and leave the chain off. */
+static int g_ink2c_mode;   /* the chain's mode before a stop (ink2c_retry brings it back) */
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. ink2c_recover left the state on the host: every held row and the convolution states go up from it at the
+ * next forward (ink2c_push_state). */
+static void ink2c_retry(Model *m) {
+    Ink2Chain *ch = ink2c_of(m);
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || !vkc_chain_retry("inkling2")) return;
+    for (int i = 0; i < ch->NS; i++) { ch->dlo[i] = 0; ch->dhi[i] = m->kv_len; }
+    ch->cs_where = INK2C_HOST; ch->host_zero = 0;
+    ch->failed = 0; g_vk_chain = g_ink2c_mode ? g_ink2c_mode : 1;
+}
 static void ink2c_recover(Model *m, int upto) {
     Ink2Chain *ch = ink2c_of(m);
     Cfg *c = &m->c; int D = c->hidden;
+    if (g_vk_chain) g_ink2c_mode = g_vk_chain;
     g_vk_chain = 0;
     if (ch) ch->failed = 1;
     for (int i = 0; i < c->n_state; i++)
