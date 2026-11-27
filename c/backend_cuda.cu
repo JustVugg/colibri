@@ -1984,12 +1984,12 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
             coli_cuda_shutdown();return 0;
         }
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
-        {   /* the scratch the kernels take with cudaMallocAsync stays in the device's pool up to 64 MiB:
+        {   /* the scratch the kernels take with cudaMallocAsync stays in the device's pool up to 256 MiB:
              * with the default threshold of 0 every synchronization handed it back and the next
              * allocation went to the driver again (300 us between two MTP drafts on an RTX PRO 4000) */
             cudaMemPool_t pool;
             if(cudaDeviceGetDefaultMemPool(&pool,device)==cudaSuccess){
-                uint64_t keep=64ull<<20;
+                uint64_t keep=256ull<<20;
                 (void)cudaMemPoolSetAttribute(pool,cudaMemPoolAttrReleaseThreshold,&keep);
             }
             (void)cudaGetLastError();
@@ -2017,10 +2017,15 @@ extern "C" int coli_cuda_available_device_count(void) {
     return available;
 }
 
+static void hcm_half_shutdown(int device);
+static void moe_dedup_shutdown(int device);
+
 extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx, true)) continue;
+        hcm_half_shutdown(ctx->device);
+        moe_dedup_shutdown(ctx->device);
         if (ctx->bdtab) cudaFree(ctx->bdtab);
         if (ctx->mxfp4_weights) cudaFree(ctx->mxfp4_weights);
         if (ctx->mxfp4_scales) cudaFree(ctx->mxfp4_scales);
@@ -2194,6 +2199,16 @@ static void ledger_tensor(const ColiCudaTensor *t) {
     coli_ledger::add(t->weights, t->weight_bytes, kind, name + ".weight", {t->O, t->I}, ledger_dtype(t->fmt));
     if (t->scales) coli_ledger::add(t->scales, tensor_scale_bytes(t), kind, name + ".scale", {}, "float32");
 }
+/* Spread packed n rows of rb bytes into 16B-padded rows of pitch bytes in HBM (replaces slow pageable cudaMemcpy2D). */
+__global__ static void bd_pad_rows_k(uint32_t *__restrict__ dst, const uint32_t *__restrict__ src,
+                                     size_t pitch_w, size_t rb_w, int n) {
+    const int r = (int)blockIdx.x;
+    if (r >= n) return;
+    uint32_t *dr = dst + (size_t)r * pitch_w;
+    const uint32_t *sr = src + (size_t)r * rb_w;
+    for (size_t i = threadIdx.x; i < pitch_w; i += blockDim.x)
+        dr[i] = (i < rb_w) ? sr[i] : 0u;
+}
 /* n rows of rb bytes from the host into rows row0.. of row_words words; zero_pad: the whole
  * tensor's padding zeroed first (a new tensor's; a refill keeps what the upload wrote there) */
 static int bd_rows_copy_at(ColiCudaTensor *t, const void *weights, int row0, int n, int zero_pad) {
@@ -2201,20 +2216,42 @@ static int bd_rows_copy_at(ColiCudaTensor *t, const void *weights, int row0, int
     char *dst = static_cast<char *>(t->weights) + (size_t)row0 * pitch;
     if (pitch == rb) return cuda_ok(cudaMemcpy(dst, weights, rb * (size_t)n, cudaMemcpyHostToDevice), "block tensor upload") &&
                             upload_settled("block tensor upload");
+    if ((rb & 3u) == 0 && (pitch & 3u) == 0 && n > 0 && n <= 2147483647) {
+        void *tmp = nullptr;
+        const size_t packed_bytes = rb * (size_t)n;
+        if (cudaMalloc(&tmp, packed_bytes) == cudaSuccess && tmp) {
+            int ok = cuda_ok(cudaMemcpy(tmp, weights, packed_bytes, cudaMemcpyHostToDevice), "block tensor upload");
+            if (ok) {
+                if (zero_pad && (row0 != 0 || n != t->O))
+                    ok = cuda_ok(cudaMemset(t->weights, 0, t->weight_bytes), "block tensor padding");
+                if (ok) {
+                    bd_pad_rows_k<<<(unsigned)n, 256>>>(reinterpret_cast<uint32_t *>(dst),
+                                                        reinterpret_cast<const uint32_t *>(tmp),
+                                                        pitch >> 2, rb >> 2, n);
+                    ok = cuda_ok(cudaGetLastError(), "block tensor pad") && upload_settled("block tensor upload");
+                }
+            }
+            cudaFree(tmp);
+            return ok;
+        }
+        (void)cudaGetLastError();
+    }
     return (!zero_pad || cuda_ok(cudaMemset(t->weights, 0, t->weight_bytes), "block tensor padding")) &&
            cuda_ok(cudaMemcpy2D(dst, pitch, weights, rb, rb, (size_t)n, cudaMemcpyHostToDevice), "block tensor upload") &&
            upload_settled("block tensor upload");
 }
 static int bd_rows_copy(ColiCudaTensor *t, const void *weights, int zero_pad) { return bd_rows_copy_at(t, weights, 0, t->O, zero_pad); }
-/* a block-format tensor of O rows, its first n from weights (n < O: coli_cuda_tensor_upload_rows brings the rest) */
-static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int n) {
+/* a block-format tensor of O rows, its first n from weights (n < O: coli_cuda_tensor_upload_rows brings the rest).
+ * pad16: 16-byte pad Q6_K rows for G=16 cp.async.cg (dense streamed uploads only; whole-tensor uploads keep
+ * 4-byte word pitch matching coli_cuda_tensor_upload_at, CcExpert / moe_bd_launch, and host-pool layouts). */
+static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int n, int pad16) {
     DeviceContext *ctx = find_ctx(device);
     size_t rb = bd_file_row_bytes(fmt, I);
     if (!weights || !rb || O < 1 || !select_ctx(ctx) || !bd_table(ctx)) return 0;
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->ng = 1;
-    t->row_words = (int)((rb + 3) / 4);
+    t->row_words = (pad16 && fmt == 114) ? (int)(((rb + 15) / 16) * 4) : (int)((rb + 3) / 4);
     t->weight_bytes = (size_t)t->row_words * 4 * (size_t)O;
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) { coli_cuda_tensor_free(t); return 0; }
     t->weights_owned = 1;
@@ -2230,7 +2267,7 @@ extern "C" int coli_cuda_tensor_upload_rows(ColiCudaTensor **tensor, const void 
                                             int row0, int n) {
     if (!tensor) return 1;                   /* probe */
     if (!weights || fmt < 100 || n < 1 || row0 < 0 || n > O - row0) return 0;
-    if (!*tensor) return !row0 && bd_tensor_upload(tensor, weights, fmt, I, O, device, n);
+    if (!*tensor) return !row0 && bd_tensor_upload(tensor, weights, fmt, I, O, device, n, 1);
     ColiCudaTensor *t = *tensor;
     return t->fmt == fmt && t->I == I && t->O == O && t->device == device && t->weights && t->weights_owned &&
            select_ctx(find_ctx(device)) && bd_rows_copy_at(t, weights, row0, n, 0);
@@ -2258,32 +2295,37 @@ extern "C" int coli_cuda_tensor_upload_rows(ColiCudaTensor **tensor, const void 
  * from 4 (IQ2_XS 5120 x 17408 116.7 / 126.6 at 3, 135.6 / 129.8 at 4); IQ3_S from 4, rows of 2560
  * inputs from 5 (2560 x 10240 40.7 / 43.1 at 4). COLI_CUDA_BD_MMQ=n: from n rows for every matrix, 0
  * never. */
-static inline int bd_mmq_min(const ColiCudaTensor *t) {
+static inline int bd_mmq_min(const DeviceContext *ctx, const ColiCudaTensor *t) {
     static int v = -2;
     if (v == -2) { const char *e = std::getenv("COLI_CUDA_BD_MMQ"); v = e && *e ? (std::atoi(e) > 0 ? std::atoi(e) : 0) : -1; }
     if (v >= 0) return v;
     const int ty = t->fmt - 100;
     const size_t n = (size_t)t->I * t->O;
+    const bool wide_bw = ctx && ctx->compute_major >= 10 && ctx->sms >= 128;
     if (ty == 11) return 1;
-    if (ty == 19) return 3;
+    if (ty == 19 || ty == 29) return 3;
     if (ty == 16) return t->I <= 2560 && t->O >= 8192 ? 5 : 3;
     if (ty == 21) return t->I <= 2560 ? 5 : 4;
     if (ty == 10 || ty == 17 || ty == 18 || ty == 22) return 4;
-    if (ty == 14) return t->O >= 131072 || t->I <= 2560 ? 3 : 2;
-    if (ty == 8) return t->O >= 131072 || n < ((size_t)1 << 24) ? 3 : 2;
-    if (ty == 13) return t->O >= 16384 ? 3 : 4;
+    if (ty == 14) return t->O >= 131072 || t->I <= 2560 || (wide_bw && t->O < 4096) ? 3 : 2;
+    if (ty == 8) return t->O >= 131072 || n < ((size_t)1 << 24) || (wide_bw && t->O < 4096) ? 3 : 2;
+    if (ty == 13) return wide_bw ? (t->O >= 16384 ? 2 : (t->O >= 4096 ? 3 : 4)) : (t->O >= 16384 ? 3 : 4);
     if (ty == 12) return 3;
     return t->I <= 2560 ? 4 : 3;   /* IQ4_XS, IQ4_NL */
 }
 /* whether bd_mmg_k takes S rows of t (sm_80 on): its types, the GEMV's classes 8 or more, 2048 outputs or
  * more (a smaller matrix has too few blocks for it and stays on the GEMV) */
 static inline int bd_mmq_takes(const DeviceContext *ctx, const ColiCudaTensor *t, int S) {
-    const int m = bd_mmq_min(t);
+    const int m = bd_mmq_min(ctx, t);
     return ctx && m > 0 && S >= m && S <= BD_MMQ_MAX_S && t->fmt >= 100 && bd_mmq_has(t->fmt - 100) && t->O >= BD_MMQ_MIN_O &&
            t->I % 256 == 0 && bd_lpr(t->I) >= 8 && ctx->compute_major >= 8;
 }
 /* cuda_chain.cu's: x unchanged since this thread's last matmul on the stream (bd_xq_quant keeps its quantization) */
 extern "C" void coli_cuda_bd_x_same(int on) { g_bd_x_same = on; }
+/* the stream's scratch token (bd_xq_scratch_token), NULL before its first GEMV: cuda_chain.cu's graph_scratch */
+extern "C" const void *coli_cuda_bd_scratch_of(void *stream) {
+    return bd_xq_scratch_token((cudaStream_t)stream);
+}
 static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st);
 static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
     const bd_u32 *tab = bd_table(ctx);
@@ -2313,7 +2355,8 @@ extern "C" int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, si
     if (!tensor || *tensor || !dev) return 0;
     DeviceContext *ctx = find_ctx(device);
     size_t rb = bd_file_row_bytes(fmt, I);
-    if (!weights || !rb || O < 1 || !select_ctx(ctx) || !bd_table(ctx)) return 0;
+    if (!rb || O < 1 || !select_ctx(ctx) || !bd_table(ctx)) return 0;
+    if (!weights && (rb & 3)) return 0;   /* zero-copy wrap requires word-aligned raw rows already in dev */
     size_t rw = (rb + 3) / 4;
     if (rw * 4 * (size_t)O > cap) return 0;
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
@@ -2321,7 +2364,7 @@ extern "C" int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, si
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->ng = 1;
     t->row_words = (int)rw; t->weight_bytes = rw * 4 * (size_t)O;
     t->weights = dev; t->weights_owned = 0;
-    if (!bd_rows_copy(t, weights, 1)) { std::free(t); return 0; }
+    if (weights && !bd_rows_copy(t, weights, 1)) { std::free(t); return 0; }
     ledger_tensor(t);
     *tensor = t;
     return 1;
@@ -2349,7 +2392,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         int want_gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device && t->gs == want_gs;
     }
-    if (fmt >= 100) return bd_tensor_upload(tensor, weights, fmt, I, O, device, O);
+    if (fmt >= 100) return bd_tensor_upload(tensor, weights, fmt, I, O, device, O, 0);
     DeviceContext *ctx = find_ctx(device);
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
@@ -4443,8 +4486,8 @@ __global__ static void __launch_bounds__(256) hcg2_dense_k(float *__restrict__ y
 static int hcm_type(int fmt, int I) {
     int tt = fmt - 100;
     if (tt == 8 || tt == 1 || tt == 30) return I % 32 ? 0 : tt;   /* Q8_0, F16, BF16 */
-    if (tt == 12 || tt == 13 || tt == 14 || tt == 21 || tt == 22 || tt == 23) return I % 256 ? 0 : tt;   /* 22 IQ2_S: the routed experts' only (hcm_moe) */
-    if (tt == 16 || tt == 17 || tt == 18) return I % 256 ? 0 : tt;   /* IQ2_XXS, IQ2_XS, IQ3_XXS: the routed experts' only */
+    if (tt == 12 || tt == 13 || tt == 14 || tt == 21 || tt == 22 || tt == 23 || tt == 29) return I % 256 ? 0 : tt;   /* 22 IQ2_S: the routed experts' only (hcm_moe) */
+    if (tt == 16 || tt == 17 || tt == 18) return I % 256 ? 0 : tt;   /* IQ2_XXS, IQ2_XS: hcm_moe; IQ3_XXS: dense + hcm_moe */
     if (tt == 20) return I % 32 ? 0 : tt;   /* IQ4_NL */
     if (tt == 6 || tt == 7) return I % 32 ? 0 : tt;   /* Q5_0, Q5_1: the routed experts' only */
     if (tt == 42) return I % 64 ? 0 : tt;   /* Q2_0: the routed experts' only */
@@ -4507,53 +4550,59 @@ __device__ __forceinline__ void hcm_ld5(const bd_u32 *__restrict__ W, bd_u32 off
 }
 template<int T>
 __device__ __forceinline__ void hcm_fetch(HcmRaw &w, const bd_u32 *__restrict__ W, bd_u32 e0) {
-    if (T == 1 || T == 30) {   /* F16, BF16: the 16 values, bytes 2 e0 .. 2 e0 + 31 */
+    if constexpr (T == 1 || T == 30) {   /* F16, BF16: the 16 values, bytes 2 e0 .. 2 e0 + 31 */
         uint4 a = bd_w4(W, e0 >> 3), b = bd_w4(W, (e0 >> 3) + 1u);
         w.r[0] = a.x; w.r[1] = a.y; w.r[2] = a.z; w.r[3] = a.w; w.r[4] = b.x; w.r[5] = b.y; w.r[6] = b.z; w.r[7] = b.w;
-    } else if (T == 12 || T == 13) {
-        bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, p = e & 31u, base = b * (T == 12 ? 144u : 176u);
+    } else if constexpr (T == 12 || T == 13) {   /* Q4_K, Q5_K: branchless per-step loads (zero loop-carried branches) */
+        const bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, p = e & 31u, base = b * (T == 12 ? 144u : 176u);
         uint4 hd = bd_w4(W, base >> 4), q = bd_w4(W, (base + (T == 12 ? 16u : 48u) + 32u * c + p) >> 4);
         w.r[0] = hd.x; w.r[1] = hd.y; w.r[2] = hd.z; w.r[3] = hd.w; w.r[4] = q.x; w.r[5] = q.y; w.r[6] = q.z; w.r[7] = q.w;
-        if (T == 13) { uint4 h = bd_w4(W, (base + 16u + p) >> 4); w.r[8] = h.x; w.r[9] = h.y; w.r[10] = h.z; w.r[11] = h.w; }
-    } else if (T == 14) {
-        bd_u32 b = e0 >> 8, e = e0 & 255u, n = e >> 7, r = e & 127u, base = b * 210u;
+        if constexpr (T == 13) { uint4 h = bd_w4(W, (base + 16u + p) >> 4); w.r[8] = h.x; w.r[9] = h.y; w.r[10] = h.z; w.r[11] = h.w; }
+    } else if constexpr (T == 14) {   /* Q6_K: branchless per-step loads (zero loop-carried branches) */
+        const bd_u32 b = e0 >> 8, e = e0 & 255u, n = e >> 7, r = e & 127u, base = b * 210u;
         hcm_ld5(W, base + 64u * n + (r & 63u), w.r);
         hcm_ld5(W, base + 128u + 32u * n + (r & 31u), w.r + 5);
         w.r[10] = __ldg(W + ((base + 192u + (e >> 4)) >> 2)); w.r[11] = __ldg(W + ((base + 208u) >> 2));
-    } else if (T == 22) {   /* IQ2_S: the scale, the two chunks' grid indices and signs, their high bits, their 4-bit scale */
+    } else if constexpr (T == 29) {   /* IQ1_M: 56B super-block (4B aligned), branchless 4-load per-step fetch */
+        const bd_u32 b = e0 >> 8, k0 = (e0 & 255u) >> 3, base = b * 56u;
+        w.r[0] = __ldg(W + ((base + k0) >> 2));
+        w.r[1] = __ldg(W + ((base + 32u + (k0 >> 1)) >> 2));
+        w.r[2] = __ldg(W + ((base + 48u) >> 2));
+        w.r[3] = __ldg(W + ((base + 52u) >> 2));
+    } else if constexpr (T == 22) {   /* IQ2_S: the scale, the two chunks' grid indices and signs, their high bits, their 4-bit scale */
         bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 3, base = b * 82u;
         w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + ((base + 2u + k0) >> 2)); w.r[2] = __ldg(W + ((base + 34u + k0) >> 2));
         w.r[3] = __ldg(W + ((base + 66u + (k0 >> 2)) >> 2)); w.r[4] = __ldg(W + ((base + 74u + (e >> 5)) >> 2));
-    } else if (T == 23) {   /* IQ4_XS: the scale and the scales' words, the group's 16 bytes of nibbles (8-byte aligned) */
+    } else if constexpr (T == 23) {   /* IQ4_XS: the scale and the scales' words, the group's 16 bytes of nibbles (8-byte aligned) */
         bd_u32 b = e0 >> 8, base = b * 136u, q = base + 8u + 16u * ((e0 & 255u) >> 5);
         uint2 h = __ldg(reinterpret_cast<const uint2 *>(W + (base >> 2)));
         uint2 a = __ldg(reinterpret_cast<const uint2 *>(W + (q >> 2))), c = __ldg(reinterpret_cast<const uint2 *>(W + (q >> 2) + 2u));
         w.r[0] = h.x; w.r[1] = h.y; w.r[2] = a.x; w.r[3] = a.y; w.r[4] = c.x; w.r[5] = c.y;
-    } else if (T == 20) {   /* IQ4_NL: the group's 16 bytes of nibbles (words around them), its scale */
+    } else if constexpr (T == 20) {   /* IQ4_NL: the group's 16 bytes of nibbles (words around them), its scale */
         bd_u32 b = e0 >> 5, base = b * 18u;
         hcm_ld5(W, base + 2u, w.r);
         w.r[5] = __ldg(W + (base >> 2));
-    } else if (T == 21) {   /* IQ3_S: the scale, four grid indices, their high bits, the signs, the group's scale nibble */
+    } else if constexpr (T == 21) {   /* IQ3_S: the scale, four grid indices, their high bits, the signs, the group's scale nibble */
         bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 2, base = b * 110u, oi = base + 2u + k0;
         w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (oi >> 2)); w.r[2] = (oi & 2u) ? __ldg(W + (oi >> 2) + 1u) : 0u;
         w.r[3] = __ldg(W + ((base + 66u + (k0 >> 3)) >> 2)); w.r[4] = __ldg(W + ((base + 74u + (e >> 3)) >> 2));
         w.r[5] = __ldg(W + ((base + 106u + (e >> 6)) >> 2));
-    } else if (T == 42) {   /* Q2_0: the scale, the 16 weights' four bytes of 2-bit codes (two words where they straddle) */
+    } else if constexpr (T == 42) {   /* Q2_0: the scale, the 16 weights' four bytes of 2-bit codes (two words where they straddle) */
         bd_u32 b = e0 >> 6, base = b * 18u, o = base + 2u + ((e0 & 63u) >> 2);
         w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = (o & 2u) ? __ldg(W + (o >> 2) + 1u) : 0u;
-    } else if (T == 16) {   /* IQ2_XXS: the scale, the sub-block's 8 bytes (four grid indices, then four ksigns indices and its scale) */
+    } else if constexpr (T == 16) {   /* IQ2_XXS: the scale, the sub-block's 8 bytes (four grid indices, then four ksigns indices and its scale) */
         bd_u32 b = e0 >> 8, base = b * 66u, o = base + 2u + 8u * ((e0 & 255u) >> 5);
         w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = __ldg(W + (o >> 2) + 1u);
         w.r[3] = (o & 2u) ? __ldg(W + (o >> 2) + 2u) : 0u;
-    } else if (T == 17) {   /* IQ2_XS: the scale, the two chunks' 16-bit grid and ksigns indices, their scale byte */
+    } else if constexpr (T == 17) {   /* IQ2_XS: the scale, the two chunks' 16-bit grid and ksigns indices, their scale byte */
         bd_u32 b = e0 >> 8, e = e0 & 255u, base = b * 74u, o = base + 2u + 2u * (e >> 3), oc = base + 66u + (e >> 5);
         w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = (o & 2u) ? __ldg(W + (o >> 2) + 1u) : 0u;
         w.r[3] = __ldg(W + (oc >> 2));
-    } else if (T == 18) {   /* IQ3_XXS: the scale, the chunks' four grid indices, the sub-block's word of ksigns indices and scale */
+    } else if constexpr (T == 18) {   /* IQ3_XXS: the scale, the chunks' four grid indices, the sub-block's word of ksigns indices and scale */
         bd_u32 b = e0 >> 8, e = e0 & 255u, ib = e >> 5, base = b * 98u, o = base + 2u + 8u * ib + 2u * ((e & 31u) >> 3), oa = base + 66u + 4u * ib;
         w.r[0] = __ldg(W + (base >> 2)); w.r[1] = __ldg(W + (o >> 2)); w.r[2] = (o & 2u) ? __ldg(W + (o >> 2) + 1u) : 0u;
         w.r[3] = __ldg(W + (oa >> 2)); w.r[4] = (oa & 2u) ? __ldg(W + (oa >> 2) + 1u) : 0u;
-    } else if (T == 6 || T == 7) {   /* Q5_0, Q5_1: the block's 16 bytes of nibbles (words around them), its scale (and min), its high bits */
+    } else if constexpr (T == 6 || T == 7) {   /* Q5_0, Q5_1: the block's 16 bytes of nibbles (words around them), its scale (and min), its high bits */
         bd_u32 b = e0 >> 5, base = b * (T == 6 ? 22u : 24u), oh = base + (T == 6 ? 2u : 4u);
         hcm_ld5(W, oh + 4u, w.r);
         w.r[5] = __ldg(W + (base >> 2)); w.r[6] = __ldg(W + (oh >> 2)); w.r[7] = (oh & 2u) ? __ldg(W + (oh >> 2) + 1u) : 0u;
@@ -4566,7 +4615,25 @@ __device__ __forceinline__ void hcm_fetch(HcmRaw &w, const bd_u32 *__restrict__ 
 /* hcm_fetch's words as bd_dec16h's eight half2 */
 template<int T>
 __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out, const bd_u32 *__restrict__ tab = nullptr) {
-    if (T == 22) {   /* IQ2_S: two chunks of 8, each a grid row (bytes 8, 25, 43) with its signs, times d (0.5 + s) / 4 */
+    if constexpr (T == 29) {   /* IQ1_M: two chunks of 8, 8 * grid + dsign, times d * (2 * sc + 1) / 8 */
+        const bd_u32 k0 = (e0 & 255u) >> 3, s16 = k0 >> 1;
+        const bd_u32 qs2 = w.r[0] >> ((k0 & 2u) * 8u);
+        const bd_u32 qhb = (w.r[1] >> ((s16 & 3u) * 8u)) & 0xffu;
+        const bd_u32 s01 = w.r[2], s23 = w.r[3];
+        const float d = bd_h2f(((s01 >> 12) & 0xFu) | ((s01 >> 24) & 0xF0u) | ((s23 >> 4) & 0xF00u) | ((s23 >> 16) & 0xF000u));
+        const bd_u32 qq = s16 >> 2, scw = ((qq & 2u) ? s23 : s01) >> ((qq & 1u) ? 16u : 0u);
+        const float dl = d * (float)(2u * ((scw >> (3u * (s16 & 3u))) & 7u) + 1u) * 0.125f;
+        const __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(dl), z2 = __float2half2_rn(0.f);
+        #pragma unroll
+        for (int ll = 0; ll < 2; ll++) {
+            const bd_u32 h = (qhb >> (4 * ll)) & 15u;
+            const bd_u32 idx = ((qs2 >> (8 * ll)) & 255u) | ((h & 7u) << 8);
+            const uint2 gr = __ldg(reinterpret_cast<const uint2 *>(tab + BDT_IQ1S) + idx);
+            const bd_u32 sg = (h & 8u) ? 0xFFFFFFFFu : 0x01010101u;
+            bd_codes_h(bd_add4((gr.x & 0x1F1F1F1Fu) << 3, sg) ^ 0x80808080u, off, s2, z2, out + 4 * ll);
+            bd_codes_h(bd_add4((gr.y & 0x1F1F1F1Fu) << 3, sg) ^ 0x80808080u, off, s2, z2, out + 4 * ll + 2);
+        }
+    } else if constexpr (T == 22) {   /* IQ2_S: two chunks of 8, each a grid row (bytes 8, 25, 43) with its signs, times d (0.5 + s) / 4 */
         bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 3, base = b * 82u;
         bd_u32 oq = base + 2u + k0, os = base + 34u + k0, oh = base + 66u + (k0 >> 2), oc = base + 74u + (e >> 5);
         bd_u32 q2 = w.r[1] >> ((oq & 2u) * 8u), s2b = w.r[2] >> ((os & 2u) * 8u), qh = w.r[3] >> ((oh & 3u) * 8u), sc = w.r[4] >> ((oc & 3u) * 8u);
@@ -4579,25 +4646,19 @@ __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out,
             bd_codes_h(bdi_neg(gr.x, sg) ^ 0x80808080u, off, s2, z2, out + 4 * ll);
             bd_codes_h(bdi_neg(gr.y, sg >> 4) ^ 0x80808080u, off, s2, z2, out + 4 * ll + 2);
         }
-        return;
-    }
-    if (T == 23) {   /* IQ4_XS: the group's 6-bit scale less 32 times d, each nibble's kvalue (bdi_kv4) */
+    } else if constexpr (T == 23) {   /* IQ4_XS: the group's 6-bit scale less 32 times d, each nibble's kvalue (bdi_kv4) */
         bd_u32 e = e0 & 255u, ib = e >> 5, sh = 4u * ((e >> 4) & 1u);
         bd_u32 ls = ((((w.r[1] >> (8u * (ib >> 1))) & 255u) >> (4u * (ib & 1u))) & 15u) | (((w.r[0] >> (16u + 2u * ib)) & 3u) << 4);
         __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(bd_h2f(w.r[0]) * (float)((int)ls - 32)), z2 = __float2half2_rn(0.f);
         #pragma unroll
         for (int k = 0; k < 4; k++) bd_codes_h((bd_u32)bdi_kv4(w.r[2 + k], (int)sh) ^ 0x80808080u, off, s2, z2, out + 2 * k);
-        return;
-    }
-    if (T == 20) {   /* IQ4_NL: each nibble's kvalue (bdi_kv4) times d */
+    } else if constexpr (T == 20) {   /* IQ4_NL: each nibble's kvalue (bdi_kv4) times d */
         bd_u32 b = e0 >> 5, base = b * 18u, o = base + 2u, sh = 4u * ((e0 >> 4) & 1u);
         __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(bd_h2f(w.r[5] >> ((base & 2u) * 8u))), z2 = __float2half2_rn(0.f);
         #pragma unroll
         for (int k = 0; k < 4; k++)
             bd_codes_h((bd_u32)bdi_kv4(__funnelshift_r(w.r[k], w.r[k + 1], (o & 2u) * 8u), (int)sh) ^ 0x80808080u, off, s2, z2, out + 2 * k);
-        return;
-    }
-    if (T == 21) {   /* IQ3_S: four grid rows of 4 (bytes 1..15, odd) with their signs, times d (1 + 2 s) */
+    } else if constexpr (T == 21) {   /* IQ3_S: four grid rows of 4 (bytes 1..15, odd) with their signs, times d (1 + 2 s) */
         bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 2, base = b * 110u, oi = base + 2u + k0, oh = base + 66u + (k0 >> 3);
         bd_u32 os = base + 74u + (e >> 3), oc = base + 106u + (e >> 6);
         bd_u32 i4 = __funnelshift_r(w.r[1], w.r[2], (oi & 2u) * 8u), hb = ((w.r[3] >> ((oh & 3u) * 8u)) >> (k0 & 7u)) & 15u;
@@ -4609,34 +4670,28 @@ __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out,
             bd_u32 idx = ((i4 >> (8 * l)) & 255u) | (((hb >> l) & 1u) << 8);
             bd_codes_h(bdi_neg(__ldg(tab + BDT_IQ3S + idx), sg >> (4 * l)) ^ 0x80808080u, off, s2, z2, out + 2 * l);
         }
-        return;
-    }
-    if (T == 16 || T == 17) {   /* IQ2_XXS, IQ2_XS: two chunks of 8, each a grid row with its ksigns, times d (0.5 + s) / 4 */
-        bd_u32 b = e0 >> 8, e = e0 & 255u, base = b * (T == 16 ? 66u : 74u), q, sc, l0;
-        if (T == 16) {   /* the sub-block's grid indices (a byte each) and its word of four 7-bit ksigns indices, the scale on top */
+    } else if constexpr (T == 16 || T == 17) {   /* IQ2_XXS, IQ2_XS: two chunks of 8, each a grid row with its ksigns, times d (0.5 + s) / 4 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, base = b * (T == 16 ? 66u : 74u), q, sc;
+        if constexpr (T == 16) {   /* the sub-block's grid indices (a byte each) and its word of four 7-bit ksigns indices, the scale on top */
             bd_u32 o = base + 2u + 8u * (e >> 5);
             q = __funnelshift_r(w.r[1], w.r[2], (o & 2u) * 8u); sc = __funnelshift_r(w.r[2], w.r[3], (o & 2u) * 8u);
-            l0 = (e & 31u) >> 3;
         } else {         /* the two chunks' 16-bit words (a 9-bit grid index, a 7-bit ksigns index), the scale nibble */
             bd_u32 o = base + 2u + 2u * (e >> 3), oc = base + 66u + (e >> 5);
             q = __funnelshift_r(w.r[1], w.r[2], (o & 2u) * 8u); sc = w.r[3] >> ((oc & 3u) * 8u + 4u * ((e >> 4) & 1u));
-            l0 = 0u;
         }
         float d = bd_h2f(w.r[0] >> ((base & 2u) * 8u)) * (0.5f + (float)(T == 16 ? sc >> 28 : sc & 15u)) * 0.25f;
         __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
         #pragma unroll
         for (int ll = 0; ll < 2; ll++) {
-            bd_u32 l = l0 + (bd_u32)ll, gi, si;
-            if (T == 16) { gi = BDT_IQ2XXS / 2u + ((q >> (8u * l)) & 255u); si = (sc >> (7u * l)) & 127u; }
+            bd_u32 gi, si;
+            if constexpr (T == 16) { bd_u32 l = ((e & 31u) >> 3) + (bd_u32)ll; gi = BDT_IQ2XXS / 2u + ((q >> (8u * l)) & 255u); si = (sc >> (7u * l)) & 127u; }
             else { bd_u32 qv = (q >> (16 * ll)) & 0xffffu; gi = BDT_IQ2XS / 2u + (qv & 511u); si = qv >> 9; }
             const uint2 gr = __ldg(reinterpret_cast<const uint2 *>(tab) + gi);   /* the row in one load */
             const bd_u32 sg = __ldg(tab + BDT_KSIGNS + si);
             bd_codes_h(bdi_neg(gr.x, sg) ^ 0x80808080u, off, s2, z2, out + 4 * ll);
             bd_codes_h(bdi_neg(gr.y, sg >> 4) ^ 0x80808080u, off, s2, z2, out + 4 * ll + 2);
         }
-        return;
-    }
-    if (T == 18) {   /* IQ3_XXS: two chunks of 8, each two grid rows of 4 with its ksigns, times d (0.5 + s) / 2 */
+    } else if constexpr (T == 18) {   /* IQ3_XXS: two chunks of 8, each two grid rows of 4 with its ksigns, times d (0.5 + s) / 2 */
         bd_u32 b = e0 >> 8, e = e0 & 255u, ib = e >> 5, l0 = (e & 31u) >> 3, base = b * 98u;
         bd_u32 o = base + 2u + 8u * ib + 2u * l0, oa = base + 66u + 4u * ib;
         bd_u32 qw = __funnelshift_r(w.r[1], w.r[2], (o & 2u) * 8u), a = __funnelshift_r(w.r[3], w.r[4], (oa & 2u) * 8u);
@@ -4649,9 +4704,7 @@ __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out,
             bd_codes_h(bdi_neg(g0, sg) ^ 0x80808080u, off, s2, z2, out + 4 * ll);
             bd_codes_h(bdi_neg(g1, sg >> 4) ^ 0x80808080u, off, s2, z2, out + 4 * ll + 2);
         }
-        return;
-    }
-    if (T == 6 || T == 7) {   /* Q5_0, Q5_1: a nibble and a high bit each, less 16 then times d (Q5_0), times d plus m (Q5_1) */
+    } else if constexpr (T == 6 || T == 7) {   /* Q5_0, Q5_1: a nibble and a high bit each, less 16 then times d (Q5_0), times d plus m (Q5_1) */
         bd_u32 b = e0 >> 5, base = b * (T == 6 ? 22u : 24u), oh = base + (T == 6 ? 2u : 4u), o = oh + 4u, hf = (e0 >> 4) & 1u;
         bd_u32 qh = __funnelshift_r(w.r[6], w.r[7], (oh & 2u) * 8u) >> (16u * hf), dm = w.r[5] >> ((base & 2u) * 8u);
         __half2 off = __float2half2_rn(T == 6 ? 1040.f : 1024.f), s2 = __float2half2_rn(bd_h2f(dm)),
@@ -4661,9 +4714,7 @@ __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out,
             bd_u32 h4 = (qh >> (4u * k)) & 15u, hb = ((h4 & 1u) << 4) | ((h4 & 2u) << 11) | ((h4 & 4u) << 18) | ((h4 & 8u) << 25);
             bd_codes_h(((__funnelshift_r(w.r[k], w.r[k + 1], (o & 2u) * 8u) >> (4u * hf)) & 0x0F0F0F0Fu) | hb, off, s2, m2, out + 2 * k);
         }
-        return;
-    }
-    if (T == 42) {   /* Q2_0: code - 1, times d; a byte's four codes to a word's four bytes */
+    } else if constexpr (T == 42) {   /* Q2_0: code - 1, times d; a byte's four codes to a word's four bytes */
         bd_u32 b = e0 >> 6, base = b * 18u, o = base + 2u + ((e0 & 63u) >> 2);
         bd_u32 q4 = __funnelshift_r(w.r[1], w.r[2], (o & 2u) * 8u);
         __half2 off = __float2half2_rn(1025.f), s2 = __float2half2_rn(bd_h2f(w.r[0] >> ((base & 2u) * 8u))), z2 = __float2half2_rn(0.f);
@@ -4672,38 +4723,36 @@ __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out,
             bd_u32 x = (q4 >> (8 * k)) & 255u;
             bd_codes_h((x | (x << 6) | (x << 12) | (x << 18)) & 0x03030303u, off, s2, z2, out + 2 * k);
         }
-        return;
-    }
-    if (T == 1) {
+    } else if constexpr (T == 1) {
         #pragma unroll
         for (int k = 0; k < 8; k++) out[k] = w.r[k];
-    } else if (T == 30) {
+    } else if constexpr (T == 30) {
         #pragma unroll
         for (int k = 0; k < 8; k++) out[k] = bd_bf2h2(w.r[k]);
-    } else if (T == 12 || T == 13) {
-        bd_u32 e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, sh = hi ? 4u : 0u;
-        uint4 hd = make_uint4(w.r[0], w.r[1], w.r[2], w.r[3]);
-        uint2 sm = bdi_k4sm(hd, g);
-        float d = bd_h2f(hd.x) * (float)sm.x, m = bd_h2f(hd.x >> 16) * (float)sm.y;
-        __half2 off = __float2half2_rn(1024.f), s2 = __float2half2_rn(d), m2 = __float2half2_rn(-m);
+    } else if constexpr (T == 12 || T == 13) {   /* Q4_K, Q5_K: branchless bdi_k4sm scale decode */
+        const bd_u32 e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, sh = hi ? 4u : 0u;
+        const uint4 hd = make_uint4(w.r[0], w.r[1], w.r[2], w.r[3]);
+        const uint2 sm = bdi_k4sm(hd, g);
+        const float d = bd_h2f(hd.x) * (float)sm.x, m = bd_h2f(hd.x >> 16) * (float)sm.y;
+        const __half2 off = __float2half2_rn(1024.f), s2 = __float2half2_rn(d), m2 = __float2half2_rn(-m);
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             bd_u32 v = (w.r[4 + k] >> sh) & 0x0F0F0F0Fu;
-            if (T == 13) v |= ((w.r[8 + k] >> g) & 0x01010101u) << 4;
+            if constexpr (T == 13) v |= ((w.r[8 + k] >> g) & 0x01010101u) << 4;
             bd_codes_h(v, off, s2, m2, out + 2 * k);
         }
-    } else if (T == 14) {
-        bd_u32 b = e0 >> 8, e = e0 & 255u, n = e >> 7, r = e & 127u, base = b * 210u;
-        bd_u32 o1 = base + 64u * n + (r & 63u), o2 = base + 128u + 32u * n + (r & 31u), os = base + 192u + (e >> 4), od = base + 208u;
-        bd_u32 ns = 4u * (r >> 6), hs = 2u * (r >> 5);
-        float d = bd_h2f(w.r[11] >> ((od & 2u) * 8u)) * (float)(int)(signed char)((w.r[10] >> ((os & 3u) * 8u)) & 0xffu);
-        __half2 off = __float2half2_rn(1056.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
+    } else if constexpr (T == 14) {   /* Q6_K: branchless per-step decode */
+        const bd_u32 b = e0 >> 8, e = e0 & 255u, n = e >> 7, r = e & 127u, base = b * 210u;
+        const bd_u32 o1 = base + 64u * n + (r & 63u), o2 = base + 128u + 32u * n + (r & 31u), os = base + 192u + (e >> 4), od = base + 208u;
+        const bd_u32 ns = 4u * (r >> 6), hs = 2u * (r >> 5);
+        const float d = bd_h2f(w.r[11] >> ((od & 2u) * 8u)) * (float)(int)(signed char)((w.r[10] >> ((os & 3u) * 8u)) & 0xffu);
+        const __half2 off = __float2half2_rn(1056.f), s2 = __float2half2_rn(d), z2 = __float2half2_rn(0.f);
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            bd_u32 ql = __funnelshift_r(w.r[k], w.r[k + 1], (o1 & 2u) * 8u), qh = __funnelshift_r(w.r[5 + k], w.r[6 + k], (o2 & 2u) * 8u);
+            const bd_u32 ql = __funnelshift_r(w.r[k], w.r[k + 1], (o1 & 2u) * 8u), qh = __funnelshift_r(w.r[5 + k], w.r[6 + k], (o2 & 2u) * 8u);
             bd_codes_h(((ql >> ns) & 0x0F0F0F0Fu) | (((qh >> hs) & 0x03030303u) << 4), off, s2, z2, out + 2 * k);
         }
-    } else {
+    } else {   /* Q8_0 */
         bd_u32 b = e0 >> 5, base = b * 34u, o1 = base + 2u + 16u * ((e0 >> 4) & 1u);
         __half2 off = __float2half2_rn(1152.f), s2 = __float2half2_rn(bd_h2f(w.r[5] >> ((base & 2u) * 8u))), z2 = __float2half2_rn(0.f);
         #pragma unroll
@@ -4711,17 +4760,14 @@ __device__ __forceinline__ void hcm_dec(const HcmRaw &w, bd_u32 e0, bd_u32 *out,
     }
 }
 #endif
-/* The tiles, BM x BN a block of eight warps of 64 rows x WN outputs: 128 x 128 (WN 32, two blocks
- * a multiprocessor, 40 KB), 128 x 256 and 256 x 128 (WN 64, one, 64 and 80 KB): a taller tile
- * decodes each weight fewer times (S / BM), a wider one loads each input fewer times (O / BN),
- * and a 64-wide warp takes twice the products a fragment load. A step's fragments load one
- * group of products ahead of the products that take them. blockIdx.z: the inputs kc * z .. of
- * a split K, its partial sums into its own S x O of y. */
-template<int BM, int BN> struct HcmTile {   /* 40, 64 and 80 KB of shared memory */
-    static constexpr int WR = BM / 64, WC = 8 / WR, WN = BN / WC, NJ = WN / 8, NW = BN / 128, NX = BM / 64;
+/* The tiles, BM x BN a block of eight warps of WM rows x WN outputs: 16/32/64/128 x 128,
+ * 128 x 256 and 256 x 128. */
+template<int BM, int BN> struct HcmTile {
+    static constexpr int WR = BM >= 64 ? BM / 64 : 1, WC = 8 / WR, WN = BN / WC, NJ = WN / 8, NW = BN / 128;
+    static constexpr int NX = BM >= 64 ? BM / 64 : 1, WM = BM >= 64 ? 64 : BM, NM = WM / 16;
     static constexpr int XS = BM == 128 && BN == 128 ? 3 : 4;                    /* the inputs' stages */
     static constexpr int XB = BM * HCM_BK * 2, WB = BN * HCM_BK * 2, SMEM = XS * XB + 2 * WB;
-    static constexpr int MINB = (BM == 128 && BN == 128) || BM == 64 ? 2 : 1;
+    static constexpr int MINB = (BM == 128 && BN == 128) || BM <= 64 ? 2 : 1;
 };
 /* GLU: w the gate and wu the up projection, O their outputs; the block's weight rows alternate
  * eight of the gate's and the same eight of the up's, so a warp's n8 tiles j and j + 1 hold the
@@ -4734,8 +4780,9 @@ struct HcmArgs {
     const __half *xh; int ldx; const int *xrows;
     int m0, M, n0, kb0, nk;
     const bd_u32 *w, *wu; int rw, O;
-    const bd_u32 *tab;   /* the decoders' table (bd_table): IQ2_S's grid */
+    const bd_u32 *tab;   /* the decoders' table (bd_table): IQ grids */
     const float *hn; float fc;   /* MIX: the hyper-connection read's normalized streams (rows of 4 O) and its divisor */
+    __half *yh;   /* GLU: optional direct f16 write into HcmHalfCache for immediately following down_proj */
 };
 /* MIX (BN 128): Qwen3.8's hyper-connection read's up projection and its mix in one pass. The block's
  * weight rows are four streams' 32 outputs from n0 (row b O + n0 + i, output i of stream b, O the
@@ -4745,8 +4792,9 @@ template<int T, int BM, int BN, bool GLU, bool MIX = false>
 __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
 #if HCM_BODY
     using TL = HcmTile<BM, BN>;
-    static_assert(!MIX || (BN == 128 && !GLU), "the mix takes four streams of 32 outputs a block");
+    static_assert(!MIX || (BN == 128 && BM >= 64 && !GLU), "the mix takes four streams of 32 outputs a block");
     constexpr int XS = TL::XS, XB = TL::XB, WB = TL::WB, NJ = TL::NJ, NW = TL::NW, NX = TL::NX, WN = TL::WN, WR = TL::WR;
+    constexpr int WM = TL::WM, NM = TL::NM;
     extern __shared__ __align__(128) unsigned char hcm_sm[];
     unsigned char *Wsm = hcm_sm + XS * XB;
     const unsigned xs0 = (unsigned)__cvta_generic_to_shared(hcm_sm), ws0 = xs0 + XS * XB;
@@ -4772,25 +4820,25 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
     const __half *Xp[NX]; unsigned xd[NX]; bool xl[NX];
     #pragma unroll
     for (int q = 0; q < NX; q++) {
-        xl[q] = xr + 64 * q < M;
-        const int rr = xl[q] ? xr + 64 * q : 0;
+        const int rq = xr + 64 * q;
+        xl[q] = rq < M;
+        const int rr = xl[q] ? rq : 0;
         Xp[q] = A.xh + (size_t)(A.xrows ? A.xrows[rr] : m0 + rr) * A.ldx + kb0 + xc * 8;
-        xd[q] = hcm_swz(xr + 64 * q, xc);
+        xd[q] = hcm_swz(rq < BM ? rq : 0, xc);
     }
     #define HCM_LDX(st_, kb_) do { \
-        _Pragma("unroll") for (int q = 0; q < NX; q++) hcm_cp16(xs0 + (st_) * XB + xd[q], Xp[q] + (size_t)(kb_) * HCM_BK, xl[q]); \
+        _Pragma("unroll") for (int q = 0; q < NX; q++) \
+            if (BM >= 64 || xr + 64 * q < BM) hcm_cp16(xs0 + (st_) * XB + xd[q], Xp[q] + (size_t)(kb_) * HCM_BK, xl[q]); \
     } while (0)
-    float acc[4][NJ][4];
+    float acc[NM][NJ][4];
     #pragma unroll
-    for (int i = 0; i < 4; i++) for (int j = 0; j < NJ; j++) for (int e = 0; e < 4; e++) acc[i][j][e] = 0.f;
+    for (int i = 0; i < NM; i++) for (int j = 0; j < NJ; j++) for (int e = 0; e < 4; e++) acc[i][j][e] = 0.f;
     #pragma unroll
     for (int s = 0; s < XS - 1; s++) {
         if (s < nk) HCM_LDX(s, s);
         asm volatile("cp.async.commit_group;\n");
     }
     HcmRaw raw[NW];
-    #pragma unroll
-    for (int q = 0; q < NW; q++) for (int k = 0; k < 12; k++) raw[q].r[k] = 0u;
     #define HCM_FETCH(kb_) do { \
         _Pragma("unroll") for (int q = 0; q < NW; q++) \
             if (live_w[q]) hcm_fetch<T>(raw[q], Wr[q], (bd_u32)(kb0 + (kb_) * HCM_BK + lh * 16)); \
@@ -4808,57 +4856,93 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
     if (nk > 1) HCM_FETCH(1);
     /* the lanes' ldmatrix rows: A's 16 rows and two chunks, B's 8 outputs of two tiles and two chunks */
     const int ar = lane & 15, ac = lane >> 4, bn = (lane & 7) + ((lane >> 4) << 3), bc = (lane >> 3) & 1;
-    for (int kb = 0; kb < nk; kb++) {
-        asm volatile("cp.async.wait_group %0;\n" :: "n"(XS - 2));
-        __syncthreads();   /* step kb's inputs and weights are in; step kb - 1's stages are free */
-        {
-            int nx = kb + XS - 1;
-            if (nx < nk) HCM_LDX(nx % XS, nx);
-            asm volatile("cp.async.commit_group;\n");
-        }
-        const unsigned xb = xs0 + (kb % XS) * XB, wb = ws0 + (kb & 1) * WB;
-        bd_u32 a[2][4], b[2][NJ / 2][4];
-        #pragma unroll
-        for (int jp = 0; jp < NJ / 2; jp++) hcm_ldm4(b[0][jp], wb + hcm_swz(wc * WN + jp * 16 + bn, bc));
-        hcm_ldm4(a[0], xb + hcm_swz(wr * 64 + ar, ac));
-        #pragma unroll
-        for (int q = 0; q < 8; q++) {   /* group q: k16 kk = q >> 2, rows i = q & 3 */
-            const int kk = q >> 2, i = q & 3;
-            if (q < 7) hcm_ldm4(a[(q + 1) & 1], xb + hcm_swz(wr * 64 + ((q + 1) & 3) * 16 + ar, 2 * ((q + 1) >> 2) + ac));
-            if (q == 0) {
-                #pragma unroll
-                for (int jp = 0; jp < NJ / 2; jp++) hcm_ldm4(b[1][jp], wb + hcm_swz(wc * WN + jp * 16 + bn, 2 + bc));
-            }
-            #pragma unroll
-            for (int j = 0; j < NJ; j++) hcm_mma(acc[i][j], a[q & 1], b[kk][j >> 1][2 * (j & 1)], b[kk][j >> 1][2 * (j & 1) + 1]);
-            if (q == 2) {
-                /* step kb + 1's words (loaded during step kb - 1) into the other stage, among the
-                 * products; past the last step a stage nobody reads, the words still the last */
-                HCM_STW((kb + 1) & 1, kb + 1);
-                if (kb + 2 < nk) HCM_FETCH(kb + 2);
-            }
-        }
+    #define HCM_KLOOP(NM_ACT_) do { \
+        constexpr int NM_ACT = (NM_ACT_); \
+        for (int kb = 0; kb < nk; kb++) { \
+            asm volatile("cp.async.wait_group %0;\n" :: "n"(XS - 2)); \
+            __syncthreads(); \
+            { \
+                int nx = kb + XS - 1; \
+                if (nx < nk) HCM_LDX(nx % XS, nx); \
+                asm volatile("cp.async.commit_group;\n"); \
+            } \
+            const unsigned xb = xs0 + (kb % XS) * XB, wb = ws0 + (kb & 1) * WB; \
+            bd_u32 a[2][4], b[2][NJ / 2][4]; \
+            _Pragma("unroll") for (int jp = 0; jp < NJ / 2; jp++) hcm_ldm4(b[0][jp], wb + hcm_swz(wc * WN + jp * 16 + bn, bc)); \
+            hcm_ldm4(a[0], xb + hcm_swz(wr * WM + ar, ac)); \
+            _Pragma("unroll") for (int kk = 0; kk < 2; kk++) { \
+                _Pragma("unroll") for (int i = 0; i < NM_ACT; i++) { \
+                    const int step = kk * NM_ACT + i; \
+                    if (step + 1 < 2 * NM_ACT) { \
+                        const int nstep = step + 1, nkk = nstep / NM_ACT, ni = nstep - nkk * NM_ACT; \
+                        hcm_ldm4(a[nstep & 1], xb + hcm_swz(wr * WM + ni * 16 + ar, 2 * nkk + ac)); \
+                    } \
+                    if (kk == 0 && i == 0) { \
+                        _Pragma("unroll") for (int jp = 0; jp < NJ / 2; jp++) hcm_ldm4(b[1][jp], wb + hcm_swz(wc * WN + jp * 16 + bn, 2 + bc)); \
+                    } \
+                    _Pragma("unroll") for (int j = 0; j < NJ; j++) \
+                        hcm_mma(acc[i][j], a[step & 1], b[kk][j >> 1][2 * (j & 1)], b[kk][j >> 1][2 * (j & 1) + 1]); \
+                    if (kk == 0 && i == NM_ACT - 1) { \
+                        if (kb + 1 < nk) HCM_STW((kb + 1) & 1, kb + 1); \
+                        if (kb + 2 < nk) HCM_FETCH(kb + 2); \
+                    } \
+                } \
+            } \
+        } \
+    } while (0)
+    if constexpr (WR == 1 && NM == 4) {
+        const int nm = (M + 15) >> 4;
+        if (nm <= 1)      { HCM_KLOOP(1); }
+        else if (nm == 2) { HCM_KLOOP(2); }
+        else if (nm == 3) { HCM_KLOOP(3); }
+        else              { HCM_KLOOP(4); }
+    } else if constexpr (WR == 1 && NM == 2) {
+        if (M <= 16)      { HCM_KLOOP(1); }
+        else              { HCM_KLOOP(2); }
+    } else {
+        HCM_KLOOP(NM);
     }
+    #undef HCM_KLOOP
     #undef HCM_LDX
     #undef HCM_STW
     #undef HCM_FETCH
     /* if constexpr: each instantiation keeps only its own store (a GLU or MIX one had the plain
      * store after its return, which nvcc warned unreachable, #128-D, once a GLU instantiation) */
     if constexpr (GLU) {
-        #pragma unroll
-        for (int i = 0; i < 4; i++)
-            #pragma unroll
-            for (int j = 0; j < NJ; j += 2)
+        /* #pragma unroll 1 on outer i (and j) keeps exact IEEE expf while cutting SASS epilogue
+         * from ~43 KB to ~3 KB; compile-time constant acc selection prevents register spills */
+        #pragma unroll 1
+        for (int i = 0; i < NM; i++)
+            #pragma unroll 1
+            for (int j = 0; j < NJ; j += 2) {
+                float g_[4], u_[4];
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    float gv = 0.f, uv = 0.f;
+                    #pragma unroll
+                    for (int ii = 0; ii < NM; ii++)
+                        #pragma unroll
+                        for (int jj = 0; jj < NJ; jj += 2)
+                            if (ii == i && jj == j) { gv = acc[ii][jj][e]; uv = acc[ii][jj + 1][e]; }
+                    g_[e] = gv; u_[e] = uv;
+                }
                 #pragma unroll
                 for (int e = 0; e < 4; e += 2) {
-                    int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8), c = (n0 >> 1) + (((wc * WN + j * 8) >> 4) << 3) + tig * 2;
+                    int r = wr * WM + i * 16 + g + (e < 2 ? 0 : 8), c = (n0 >> 1) + (((wc * WN + j * 8) >> 4) << 3) + tig * 2;
                     if (r >= M) continue;
-                    float *yr = A.y + (size_t)(A.yrows ? A.yrows[r] : m0 + r) * A.ldy + c;
-                    float g0 = acc[i][j][e], g1 = acc[i][j][e + 1];
-                    float v0 = (g0 / (1.f + expf(-g0))) * acc[i][j + 1][e], v1 = (g1 / (1.f + expf(-g1))) * acc[i][j + 1][e + 1];
+                    const size_t yrow = (size_t)(A.yrows ? A.yrows[r] : m0 + r);
+                    float *yr = A.y + yrow * A.ldy + c;
+                    float g0 = g_[e], g1 = g_[e + 1];
+                    float v0 = (g0 / (1.f + expf(-g0))) * u_[e], v1 = (g1 / (1.f + expf(-g1))) * u_[e + 1];
                     if (c + 1 < O && !(O & 1)) *reinterpret_cast<float2 *>(yr) = make_float2(v0, v1);
                     else { if (c < O) yr[0] = v0; if (c + 1 < O) yr[1] = v1; }
+                    if (A.yh) {
+                        __half *yhr = A.yh + yrow * A.ldy + c;
+                        if (c + 1 < O && !(O & 1)) *reinterpret_cast<__half2 *>(yhr) = __halves2half2(hcg_h(v0), hcg_h(v1));
+                        else { if (c < O) yhr[0] = hcg_h(v0); if (c + 1 < O) yhr[1] = hcg_h(v1); }
+                    }
                 }
+            }
     } else if constexpr (MIX) {   /* the products' sigmoids through shared memory, 128 rows at a time, then each output's four streams in order */
         asm volatile("cp.async.wait_all;\n");
         float (*sg)[129] = reinterpret_cast<float (*)[129]>(hcm_sm);
@@ -4866,12 +4950,12 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
         for (int pass = 0; pass < (BM + 127) / 128; pass++) {
             __syncthreads();   /* the main loop's stages, or the pass before, read */
             #pragma unroll
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < NM; i++)
                 #pragma unroll
                 for (int j = 0; j < NJ; j++)
                     #pragma unroll
                     for (int e = 0; e < 4; e += 2) {
-                        const int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8) - 128 * pass, cl = wc * WN + j * 8 + tig * 2;
+                        const int r = wr * WM + i * 16 + g + (e < 2 ? 0 : 8) - 128 * pass, cl = wc * WN + j * 8 + tig * 2;
                         if (r < 0 || r >= 128) continue;
                         sg[r][cl] = 1.f / (1.f + expf(-acc[i][j][e]));
                         sg[r][cl + 1] = 1.f / (1.f + expf(-acc[i][j][e + 1]));
@@ -4891,12 +4975,12 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
         }
     } else {
         #pragma unroll
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < NM; i++)
             #pragma unroll
             for (int j = 0; j < NJ; j++)
                 #pragma unroll
                 for (int e = 0; e < 4; e += 2) {
-                    int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8), c = n0 + wc * WN + j * 8 + tig * 2;
+                    int r = wr * WM + i * 16 + g + (e < 2 ? 0 : 8), c = n0 + wc * WN + j * 8 + tig * 2;
                     if (r >= M) continue;
                     float *yr = A.y + (size_t)(A.yrows ? A.yrows[r] : m0 + r) * A.ldy + c;
                     if (c + 1 < O && !(O & 1)) *reinterpret_cast<float2 *>(yr) = make_float2(acc[i][j][e], acc[i][j][e + 1]);
@@ -4910,11 +4994,25 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
 template<int T, int BM, int BN, bool GLU>
 __global__ static void __launch_bounds__(256, (HcmTile<BM, BN>::MINB)) hcm_dense_k(float *__restrict__ y, const __half *__restrict__ xh,
                                                                              const bd_u32 *__restrict__ w, const bd_u32 *__restrict__ wu,
-                                                                             int rw, int S, int I, int O, int kc, const bd_u32 *__restrict__ tab) {
+                                                                             int rw, int S, int I, int O, int kc, const bd_u32 *__restrict__ tab,
+                                                                             __half *__restrict__ yh = nullptr) {
     COLI_PDL_WAIT();
-    const int m0 = blockIdx.y * BM, kb0 = blockIdx.z * kc;
-    HcmArgs A = {y + (size_t)blockIdx.z * S * O, O, nullptr, xh, I, nullptr, m0, S - m0 < BM ? S - m0 : BM, (int)blockIdx.x * BN, kb0,
-                 (I - kb0 < kc ? I - kb0 : kc) / HCM_BK, w, wu, rw, O, tab};
+    int bx = (int)blockIdx.x, by = (int)blockIdx.y;
+    if ((int)gridDim.x > 40 && (int)gridDim.y > 1) {   /* 2D L2 CTA swizzle (GROUP_N = 16): keep N-strip weights hot across all M-tiles */
+        constexpr int GROUP_N = 16;
+        const int gx = (int)gridDim.x, gy = (int)gridDim.y;
+        const int lin = by * gx + bx;
+        const int group_size = GROUP_N * gy;
+        const int group_id = lin / group_size;
+        const int first_n = group_id * GROUP_N;
+        const int group_w = gx - first_n < GROUP_N ? gx - first_n : GROUP_N;
+        const int in_group = lin - group_id * group_size;
+        by = in_group / group_w;
+        bx = first_n + (in_group - by * group_w);
+    }
+    const int m0 = by * BM, kb0 = (int)blockIdx.z * kc;
+    HcmArgs A = {y + (size_t)blockIdx.z * S * O, O, nullptr, xh, I, nullptr, m0, S - m0 < BM ? S - m0 : BM, bx * BN, kb0,
+                 (I - kb0 < kc ? I - kb0 : kc) / HCM_BK, w, wu, rw, O, tab, nullptr, 0.f, yh};
     hcm_body<T, BM, BN, GLU>(A);
 }
 /* hcm_body's MIX: a hyper-connection read's up projection of S rows and its mix (rows of O = H outputs); grid
@@ -4924,7 +5022,7 @@ __global__ static void __launch_bounds__(256, (HcmTile<BM, 128>::MINB)) hcm_mix_
         const bd_u32 *__restrict__ w, int rw, int S, int I, int H, const float *__restrict__ hn, float fc, const bd_u32 *__restrict__ tab) {
     COLI_PDL_WAIT();
     const int m0 = blockIdx.y * BM;
-    HcmArgs A = {y, H, nullptr, xh, I, nullptr, m0, S - m0 < BM ? S - m0 : BM, (int)blockIdx.x * 32, 0, I / HCM_BK, w, nullptr, rw, H, tab, hn, fc};
+    HcmArgs A = {y, H, nullptr, xh, I, nullptr, m0, S - m0 < BM ? S - m0 : BM, (int)blockIdx.x * 32, 0, I / HCM_BK, w, nullptr, rw, H, tab, hn, fc, nullptr};
     hcm_body<T, BM, 128, false, true>(A);
 }
 /* a split K's partial sums, in the order of the splits */
@@ -4981,26 +5079,233 @@ static void hcg_part_sum(const HcgPart &h, float *y, int S, int O, cudaStream_t 
 #endif
 }
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))   /* HIP has no carveout attribute; hcm_gemm is off there */
+/* Persistent per-stream f16 input cache + split-K partial buffer for hcm_gemm / hcm_mix_k:
+ * - Two ping-pong half buffers per (stream, device) so GLU can read xh from b[in] while writing yh
+ *   directly into b[1 - in] for the immediately following down_proj (eliminating hcm_half_k!).
+ * - Eliminates ~630 cudaMallocAsync/cudaFreeAsync calls per prefill; falls back cleanly to async
+ *   scratch if > HCM_HALF_MAX_BYTES or if stream is graph-capturing and buffer needs growth.
+ * - Invalidated via coli_cuda_qx_invalidate and bd_xq_forget / hcm_half_forget_stream. */
+static constexpr size_t HCM_HALF_MAX_BYTES = (size_t)128 << 20;
+static constexpr size_t HCM_PART_MAX_BYTES = (size_t)64 << 20;
+struct HcmHalfBuf {
+    void *p;
+    size_t cap;
+    const float *src;
+    int S, I;
+    bool valid, from_glu;
+};
+struct HcmHalfCache {
+    cudaStream_t st;
+    int dev;
+    HcmHalfBuf b[2];
+    int last;
+    void *part;
+    size_t part_cap;
+};
+static std::mutex g_hcm_hc_mu;
+static HcmHalfCache g_hcm_hc[16];
+static int g_hcm_hc_n = 0;
+
+static void hcm_half_shutdown(int device) {
+    std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
+    for (int i = 0; i < g_hcm_hc_n; i++) {
+        if (g_hcm_hc[i].dev != device) continue;
+        for (int k = 0; k < 2; k++) {
+            if (g_hcm_hc[i].b[k].p) cudaFree(g_hcm_hc[i].b[k].p);
+            g_hcm_hc[i].b[k] = {nullptr, 0, nullptr, 0, 0, false, false};
+        }
+        if (g_hcm_hc[i].part) cudaFree(g_hcm_hc[i].part);
+        g_hcm_hc[i].part = nullptr; g_hcm_hc[i].part_cap = 0;
+        g_hcm_hc[i].st = nullptr; g_hcm_hc[i].dev = -1;
+    }
+}
+static void hcm_half_invalidate_range(int device, const void *ptr, size_t nbytes) {
+    std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
+    for (int i = 0; i < g_hcm_hc_n; i++) {
+        if (device >= 0 && g_hcm_hc[i].dev != device) continue;
+        for (int k = 0; k < 2; k++) {
+            HcmHalfBuf &b = g_hcm_hc[i].b[k];
+            if (!b.valid) continue;
+            if (!ptr || !nbytes) {
+                b.valid = false; b.from_glu = false; b.src = nullptr;
+            } else {
+                const uintptr_t y0 = (uintptr_t)ptr, y1 = y0 + nbytes;
+                const uintptr_t x0 = (uintptr_t)b.src, x1 = x0 + (size_t)b.S * (size_t)b.I * sizeof(float);
+                if (y0 < x1 && x0 < y1) { b.valid = false; b.from_glu = false; b.src = nullptr; }
+            }
+        }
+    }
+}
+static void hcm_half_forget_stream(cudaStream_t st, const float *keep_glu_for) {
+    std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
+    for (int i = 0; i < g_hcm_hc_n; i++) {
+        if (g_hcm_hc[i].st != st) continue;
+        for (int k = 0; k < 2; k++) {
+            HcmHalfBuf &b = g_hcm_hc[i].b[k];
+            if (!b.valid) continue;
+            if (keep_glu_for && b.from_glu && b.src == keep_glu_for) continue;
+            b.valid = false; b.from_glu = false; b.src = nullptr;
+        }
+    }
+}
+static void hcm_half_clear_glu_and_invalidate_out(int device, cudaStream_t st, const void *y_dev, size_t ybytes) {
+    std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
+    const uintptr_t y0 = (uintptr_t)y_dev, y1 = y0 + ybytes;
+    for (int i = 0; i < g_hcm_hc_n; i++) {
+        if (device >= 0 && g_hcm_hc[i].dev != device) continue;
+        for (int k = 0; k < 2; k++) {
+            HcmHalfBuf &b = g_hcm_hc[i].b[k];
+            if (!b.valid) continue;
+            if (g_hcm_hc[i].st == st && b.from_glu) { b.valid = false; b.from_glu = false; b.src = nullptr; continue; }
+            if (y_dev && ybytes) {
+                const uintptr_t x0 = (uintptr_t)b.src, x1 = x0 + (size_t)b.S * (size_t)b.I * sizeof(float);
+                if (y0 < x1 && x0 < y1) { b.valid = false; b.from_glu = false; b.src = nullptr; }
+            }
+        }
+    }
+}
+static bool hcm_stream_capturing(cudaStream_t st) {
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone;
+}
+static int hcm_hc_find_or_add(cudaStream_t st, int dev) {
+    for (int i = 0; i < g_hcm_hc_n; i++) if (g_hcm_hc[i].st == st && g_hcm_hc[i].dev == dev) return i;
+    for (int i = 0; i < g_hcm_hc_n; i++) if (g_hcm_hc[i].dev == -1) {
+        g_hcm_hc[i] = {st, dev, {{nullptr, 0, nullptr, 0, 0, false, false}, {nullptr, 0, nullptr, 0, 0, false, false}}, 0, nullptr, 0};
+        return i;
+    }
+    if (g_hcm_hc_n >= 16) return -1;
+    g_hcm_hc[g_hcm_hc_n] = {st, dev, {{nullptr, 0, nullptr, 0, 0, false, false}, {nullptr, 0, nullptr, 0, 0, false, false}}, 0, nullptr, 0};
+    return g_hcm_hc_n++;
+}
+static bool hcm_hc_ensure(void *&p, size_t &cap, size_t bytes, size_t max_bytes, cudaStream_t st) {
+    if (cap >= bytes) return true;
+    if (bytes > max_bytes || hcm_stream_capturing(st)) { (void)cudaGetLastError(); return false; }
+    if (p) {
+        if (cudaStreamSynchronize(st) != cudaSuccess) { (void)cudaGetLastError(); return false; }
+        cudaFree(p); p = nullptr; cap = 0;
+    }
+    size_t want = bytes < ((size_t)4 << 20) ? ((size_t)4 << 20) : bytes;
+    if (want > max_bytes) want = bytes;
+    if (cudaMalloc(&p, want) != cudaSuccess) { (void)cudaGetLastError(); p = nullptr; return false; }
+    cap = want;
+    return true;
+}
+/* Obtain f16 representation of x[S, I] on stream st (skipping hcm_half_k on cache hit or GLU handoff).
+ * If *async_tmp is non-null on return, caller must cudaFreeAsync(*async_tmp, st). *slot_out is 0 or 1
+ * when using the persistent cache, else -1. */
+static const __half *hcm_half_get(int dev, const float *x, int S, int I, cudaStream_t st, bool allow_glu_hit,
+                                  void **async_tmp, int *slot_out) {
+    *async_tmp = nullptr;
+    if (slot_out) *slot_out = -1;
+    const size_t n = (size_t)S * I, bytes = n * sizeof(__half);
+    {
+        std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
+        const int idx = hcm_hc_find_or_add(st, dev);
+        if (idx >= 0) {
+            HcmHalfCache &hc = g_hcm_hc[idx];
+            /* check cache hit (g_bd_x_same, or direct GLU -> down_proj handoff) */
+            for (int k = 0; k < 2; k++) {
+                HcmHalfBuf &b = hc.b[k];
+                if (b.valid && b.p && b.src == x && b.S == S && b.I == I &&
+                    (g_bd_x_same || (allow_glu_hit && b.from_glu))) {
+                    b.from_glu = false;
+                    hc.last = k;
+                    if (slot_out) *slot_out = k;
+                    return (const __half *)b.p;
+                }
+            }
+            /* miss: pick the non-last slot if it has no valid data, else slot 0 */
+            int dst_k = 0;
+            if (hc.b[0].valid && !hc.b[1].valid) dst_k = 1;
+            else if (hc.b[0].cap >= bytes) dst_k = 0;
+            else if (hc.b[1].cap >= bytes) dst_k = 1;
+            HcmHalfBuf &dst = hc.b[dst_k];
+            dst.valid = false; dst.from_glu = false; dst.src = nullptr;
+            if (hcm_hc_ensure(dst.p, dst.cap, bytes, HCM_HALF_MAX_BYTES, st)) {
+                const long long n4 = (long long)(n / 4);
+                hcm_half_k<<<(unsigned)((n4 + 255) / 256), 256, 0, st>>>(reinterpret_cast<const float4 *>(x), reinterpret_cast<uint2 *>(dst.p), n4);
+                dst.src = x; dst.S = S; dst.I = I; dst.valid = true; dst.from_glu = false;
+                hc.last = dst_k;
+                if (slot_out) *slot_out = dst_k;
+                return (const __half *)dst.p;
+            }
+        }
+    }
+    void *scr = nullptr;
+    if (cudaMallocAsync(&scr, bytes + 256, st) != cudaSuccess) { (void)cudaGetLastError(); return nullptr; }
+    const long long n4 = (long long)(n / 4);
+    hcm_half_k<<<(unsigned)((n4 + 255) / 256), 256, 0, st>>>(reinterpret_cast<const float4 *>(x), reinterpret_cast<uint2 *>(scr), n4);
+    *async_tmp = scr;
+    return (const __half *)scr;
+}
+/* Reserve the alternate ping-pong half buffer for hcm_dense_k<..., GLU=true> to write yh directly,
+ * keyed on output y[S, O] (from_glu = true) so the immediately following down_proj skips hcm_half_k. */
+static __half *hcm_half_reserve_glu_out(int dev, const float *y, int S, int O, cudaStream_t st, int in_slot) {
+    if (O % 4 != 0) return nullptr;
+    const size_t bytes = (size_t)S * O * sizeof(__half);
+    if (bytes == 0 || bytes > HCM_HALF_MAX_BYTES) return nullptr;
+    std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
+    const int idx = hcm_hc_find_or_add(st, dev);
+    if (idx < 0) return nullptr;
+    HcmHalfCache &hc = g_hcm_hc[idx];
+    const int out_k = in_slot == 0 ? 1 : 0;
+    HcmHalfBuf &ob = hc.b[out_k];
+    ob.valid = false; ob.from_glu = false; ob.src = nullptr;
+    if (!hcm_hc_ensure(ob.p, ob.cap, bytes, HCM_HALF_MAX_BYTES, st)) return nullptr;
+    /* invalidate any other cached entry on this device overlapping y */
+    const uintptr_t y0 = (uintptr_t)y, y1 = y0 + (size_t)S * (size_t)O * sizeof(float);
+    for (int i = 0; i < g_hcm_hc_n; i++) {
+        if (g_hcm_hc[i].dev != dev) continue;
+        for (int k = 0; k < 2; k++) {
+            if (i == idx && k == out_k) continue;
+            HcmHalfBuf &b = g_hcm_hc[i].b[k];
+            if (!b.valid) continue;
+            const uintptr_t x0 = (uintptr_t)b.src, x1 = x0 + (size_t)b.S * (size_t)b.I * sizeof(float);
+            if (y0 < x1 && x0 < y1) { b.valid = false; b.from_glu = false; b.src = nullptr; }
+        }
+    }
+    ob.src = y; ob.S = S; ob.I = O; ob.valid = true; ob.from_glu = true;
+    return (__half *)ob.p;
+}
+static float *hcm_half_part_get(int dev, size_t bytes, cudaStream_t st, void **async_part) {
+    *async_part = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
+        const int idx = hcm_hc_find_or_add(st, dev);
+        if (idx >= 0 && hcm_hc_ensure(g_hcm_hc[idx].part, g_hcm_hc[idx].part_cap, bytes, HCM_PART_MAX_BYTES, st))
+            return (float *)g_hcm_hc[idx].part;
+    }
+    void *p = nullptr;
+    if (cudaMallocAsync(&p, bytes, st) != cudaSuccess) { (void)cudaGetLastError(); return nullptr; }
+    *async_part = p;
+    return (float *)p;
+}
 template<int T, int BM, int BN, bool GLU = false>
 static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, const bd_u32 *w, int rw, int S, int I, int O, int kc,
-                       const bd_u32 *wu = nullptr, const bd_u32 *tab = nullptr) {
+                       const bd_u32 *wu = nullptr, const bd_u32 *tab = nullptr, __half *yh = nullptr) {
     constexpr int smem = HcmTile<BM, BN>::SMEM;
     static unsigned set = 0;   /* the devices this kernel's attributes are on */
     int dev = 0;
     (void)cudaGetDevice(&dev);
     if (dev < 32 && !(set & (1u << dev))) {   /* past 48 KB; 128 x 128's two blocks a multiprocessor */
         cudaFuncSetAttribute(hcm_dense_k<T, BM, BN, GLU>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        cudaFuncSetAttribute(hcm_dense_k<T, BM, BN, GLU>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        if constexpr (HcmTile<BM, BN>::MINB > 1)
+            cudaFuncSetAttribute(hcm_dense_k<T, BM, BN, GLU>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
         (void)cudaGetLastError();
         set |= 1u << dev;
     }
-    hcm_dense_k<T, BM, BN, GLU><<<g, 256, smem, st>>>(y, xh, w, wu, rw, S, I, O, kc, tab);
+    hcm_dense_k<T, BM, BN, GLU><<<g, 256, smem, st>>>(y, xh, w, wu, rw, S, I, O, kc, tab, yh);
 }
+#else
+static void hcm_half_shutdown(int) {}
+static void hcm_half_invalidate_range(int, const void *, size_t) {}
+static void hcm_half_forget_stream(cudaStream_t, const float *) {}
+static void hcm_half_clear_glu_and_invalidate_out(int, cudaStream_t, const void *, size_t) {}
 #endif
-/* hcm_dense_k for a block tensor's S rows: the inputs in f16 (and a split K's partial sums) in
- * scratch the stream allocates and frees in its own order. COLI_CUDA_HCM_TILE and
- * COLI_CUDA_HCM_SPLIT (2 ..) force a tile and a split K. 0: not taken. COLI_CUDA_BD_HCM=0 keeps
- * the other tiles. */
+/* hcm_dense_k for a block tensor's S rows: the inputs in f16 (persistent per-stream HcmHalfCache) and
+ * split K's partial sums. COLI_CUDA_HCM_TILE and COLI_CUDA_HCM_SPLIT (2 ..) force a tile and a split K.
+ * 0: not taken. COLI_CUDA_BD_HCM=0 keeps the other tiles. */
 static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st,
                     ColiCudaTensor *tu = nullptr) {
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
@@ -5013,22 +5318,14 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
         e = getenv("COLI_CUDA_HCM_SPLIT"); fsplit = e ? atoi(e) : 0;    /* this split always */
     }
     int tt = hcm_type(t->fmt, t->I);
-    if (tt == 22 || tt == 42 || tt == 16 || tt == 17 || tt == 18 || tt == 6 || tt == 7) tt = 0;   /* the routed experts' types (hcm_moe): hcm_launch has no dense tiles of them */
-    if (tt == 21 && !bd_table(ctx)) tt = 0;   /* IQ3_S's grid: the decoders' table */
+    if (tt == 22 || tt == 42 || tt == 16 || tt == 17 || tt == 6 || tt == 7) tt = 0;   /* the routed experts' types (hcm_moe): hcm_launch has no dense tiles of them */
+    if ((tt == 21 || tt == 18 || tt == 29) && !bd_table(ctx)) tt = 0;   /* IQ3_S, IQ3_XXS, IQ1_M: the decoders' table */
     if (!on || !tt || ctx->compute_major < 8 || S <= BD_GEMV_MAX_S) return 0;
     const int I = t->I, O = t->O, glu = tu != nullptr, OB = glu ? 2 * O : O;   /* OB: the blocks' weight rows */
     if (glu && (tu->fmt != t->fmt || tu->I != I || tu->O != O || tu->row_words != t->row_words || tu->device != t->device)) return 0;
-    /* the tile: COLI_CUDA_HCM_TILE 1 (128 x 128), 2 (128 x 256), 3 (256 x 128), 4 (64 x 128, up to 64
-     * rows: hcg_dense_k's 64 x 64 without a split took 1.5-1.7 times as long). Past 128 rows 256 x
-     * 128: on an RTX PRO 4000 (70 W, its clock down to 1.4 GHz under these products) a 2048 x 7680
-     * Q4_K at 512 rows 71 TFLOP/s against 61 for 128 x 128 and 67 for 128 x 256, Q6_K 61 against 44:
-     * each weight decoded half as often. Its K split in two while that still makes one wave
-     * (7680 x 2048: 229 us against 250; three splits, past a wave, 283) */
     int tile = ftile >= 1 && ftile <= 4 ? ftile : S <= 64 ? 4 : S > 128 ? 3 : 1;
     if ((tile == 2 || tile == 3) && ctx->smem_optin < (size_t)(tile == 2 ? HcmTile<128, 256>::SMEM : HcmTile<256, 128>::SMEM)) tile = 1;
     const int BMt = tile == 3 ? 256 : tile == 4 ? 64 : 128, BNt = tile == 2 ? 256 : 128;
-    /* fewer blocks than the multiprocessors' slots: K split up to a wave, 512 inputs a split at
-     * least (a 2048 x 40 heads' gate was one block down 64 steps, 44 us whatever the rows) */
     const long long blocks = (long long)((OB + BNt - 1) / BNt) * ((S + BMt - 1) / BMt), slots = (long long)ctx->sms * (tile == 1 || tile == 4 ? 2 : 1);
     int ns = 1;
     if (glu) ns = 1;   /* the epilogue's silu needs the whole sums */
@@ -5042,25 +5339,34 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
     int kc = ((I + ns - 1) / ns + 255) / 256 * 256;   /* a split: whole blocks of 256 */
     if (kc > I) kc = I;
     ns = (I + kc - 1) / kc;
-    size_t n = (size_t)S * I, part = ns > 1 ? (size_t)ns * S * O * sizeof(float) : 0;
-    void *scr = NULL;
-    if (cudaMallocAsync(&scr, n * 2 + part + 256, st) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
-    long long n4 = (long long)(n / 4);
-    hcm_half_k<<<(unsigned)((n4 + 255) / 256), 256, 0, st>>>(reinterpret_cast<const float4 *>(x), reinterpret_cast<uint2 *>(scr), n4);
-    float *yp = ns > 1 ? reinterpret_cast<float *>((char *)scr + ((n * 2 + 255) / 256) * 256) : y;
+    void *async_xh = nullptr, *async_part = nullptr;
+    int in_slot = -1;
+    const __half *xh = hcm_half_get(ctx->device, x, S, I, st, !glu, &async_xh, &in_slot);
+    if (!xh) return 0;
+    float *yp = y;
+    if (ns > 1) {
+        yp = hcm_half_part_get(ctx->device, (size_t)ns * S * O * sizeof(float), st, &async_part);
+        if (!yp) {
+            if (async_xh) (void)cudaFreeAsync(async_xh, st);
+            return 0;
+        }
+    }
+    const bool xy_disjoint = ((uintptr_t)y >= (uintptr_t)(x + (size_t)S * I)) || ((uintptr_t)x >= (uintptr_t)(y + (size_t)S * O));
+    __half *yh = (glu && xy_disjoint) ? hcm_half_reserve_glu_out(ctx->device, y, S, O, st, in_slot) : nullptr;
     dim3 gq((unsigned)((OB + BNt - 1) / BNt), (unsigned)((S + BMt - 1) / BMt), (unsigned)ns);
-    const bd_u32 *wv = (const bd_u32 *)t->weights, *wuv = glu ? (const bd_u32 *)tu->weights : nullptr;
-    const __half *xh = (const __half *)scr;
+    const bd_u32 *wv = (const bd_u32 *)t->weights, *wuv = glu ? (const bd_u32 *)tu->weights : nullptr, *tab = bd_table(ctx);
     #define HCM_GO2(BM_, BN_, G_) do { switch (tt) { \
-        case 1: hcm_launch<1, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
-        case 30: hcm_launch<30, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
-        case 8: hcm_launch<8, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
-        case 12: hcm_launch<12, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
-        case 13: hcm_launch<13, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
-        case 23: hcm_launch<23, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
-        case 20: hcm_launch<20, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; \
-        case 21: hcm_launch<21, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, bd_table(ctx)); break; \
-        default: hcm_launch<14, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv); break; } } while (0)
+        case 1: hcm_launch<1, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, nullptr, yh); break; \
+        case 30: hcm_launch<30, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, nullptr, yh); break; \
+        case 8: hcm_launch<8, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, nullptr, yh); break; \
+        case 12: hcm_launch<12, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, nullptr, yh); break; \
+        case 13: hcm_launch<13, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, nullptr, yh); break; \
+        case 23: hcm_launch<23, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, nullptr, yh); break; \
+        case 20: hcm_launch<20, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, nullptr, yh); break; \
+        case 18: hcm_launch<18, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, tab, yh); break; \
+        case 21: hcm_launch<21, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, tab, yh); break; \
+        case 29: hcm_launch<29, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, tab, yh); break; \
+        default: hcm_launch<14, BM_, BN_, G_>(gq, st, yp, xh, wv, t->row_words, S, I, O, kc, wuv, nullptr, yh); break; } } while (0)
     #define HCM_GO(BM_, BN_) do { if (glu) HCM_GO2(BM_, BN_, true); else HCM_GO2(BM_, BN_, false); } while (0)
     if (tile == 3) HCM_GO(256, 128); else if (tile == 2) HCM_GO(128, 256); else if (tile == 4) HCM_GO(64, 128); else HCM_GO(128, 128);
     #undef HCM_GO
@@ -5070,7 +5376,9 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
         hcm_sum_k<<<(unsigned)((ny + 255) / 256), 256, 0, st>>>(y, yp, ny, ns);
     }
     cudaError_t le = cudaGetLastError();
-    (void)cudaFreeAsync(scr, st);
+    if (async_xh) (void)cudaFreeAsync(async_xh, st);
+    if (async_part) (void)cudaFreeAsync(async_part, st);
+    if (!yh) hcm_half_invalidate_range(ctx->device, y, (size_t)S * O * sizeof(float));
     return cuda_ok(le, "f16 block gemm launch");
 #endif
 }
@@ -5091,8 +5399,8 @@ extern "C" int coli_cuda_tensor_gemm_hcmix_async(ColiCudaTensor *t, float *mixed
     DeviceContext *ctx = find_ctx(t->device);
     if (!on || !select_ctx(ctx) || t->fmt < 100) return -1;
     int tt = hcm_type(t->fmt, t->I);
-    if (tt == 22 || tt == 42 || tt == 16 || tt == 17 || tt == 18 || tt == 6 || tt == 7) tt = 0;   /* hcm_gemm's dense types alone */
-    if (tt == 21 && !bd_table(ctx)) tt = 0;
+    if (tt == 22 || tt == 42 || tt == 16 || tt == 17 || tt == 6 || tt == 7) tt = 0;   /* hcm_gemm's dense types alone */
+    if ((tt == 21 || tt == 18 || tt == 29) && !bd_table(ctx)) tt = 0;
     if (!tt || ctx->compute_major < 8 || S <= BD_GEMV_MAX_S || t->I % HCM_BK) return -1;
     /* hcm_gemm's tile (256 rows past 128) and no K split: that is when it would split K, a block's
      * sums are the whole K */
@@ -5100,14 +5408,12 @@ extern "C" int coli_cuda_tensor_gemm_hcmix_async(ColiCudaTensor *t, float *mixed
     const long long blocks = (long long)(C * H / 128) * ((S + BMt - 1) / BMt), slots = (long long)ctx->sms * (big ? 1 : 2);
     if (blocks < slots && t->I / 512 >= 2) return -1;
     cudaStream_t st = (cudaStream_t)stream;
-    const size_t n = (size_t)S * t->I;
-    void *scr = NULL;
-    if (cudaMallocAsync(&scr, n * 2 + 256, st) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
-    long long n4 = (long long)(n / 4);
-    hcm_half_k<<<(unsigned)((n4 + 255) / 256), 256, 0, st>>>(reinterpret_cast<const float4 *>(x), reinterpret_cast<uint2 *>(scr), n4);
+    if (!g_bd_x_same) hcm_half_forget_stream(st, nullptr);
+    void *async_xh = nullptr;
+    const __half *xh = hcm_half_get(ctx->device, x, S, t->I, st, false, &async_xh, nullptr);
+    if (!xh) return 0;
     dim3 g((unsigned)(H / 32), (unsigned)((S + BMt - 1) / BMt));
     const bd_u32 *wv = (const bd_u32 *)t->weights, *tab = bd_table(ctx);
-    const __half *xh = (const __half *)scr;
     #define HCMIX_GO(T_, BM_) do { \
         constexpr size_t sm_ = HcmTile<BM_, 128>::SMEM > (size_t)128 * 129 * 4 ? HcmTile<BM_, 128>::SMEM : (size_t)128 * 129 * 4; \
         static unsigned set_ = 0; int dev_ = 0; (void)cudaGetDevice(&dev_); \
@@ -5119,12 +5425,14 @@ extern "C" int coli_cuda_tensor_gemm_hcmix_async(ColiCudaTensor *t, float *mixed
     #define HCMIX_T(BM_) do { switch (tt) { \
         case 1: HCMIX_GO(1, BM_); break;   case 30: HCMIX_GO(30, BM_); break; case 8: HCMIX_GO(8, BM_); break; \
         case 12: HCMIX_GO(12, BM_); break; case 13: HCMIX_GO(13, BM_); break; case 23: HCMIX_GO(23, BM_); break; \
-        case 20: HCMIX_GO(20, BM_); break; case 21: HCMIX_GO(21, BM_); break; default: HCMIX_GO(14, BM_); break; } } while (0)
+        case 20: HCMIX_GO(20, BM_); break; case 18: HCMIX_GO(18, BM_); break; case 21: HCMIX_GO(21, BM_); break; \
+        case 29: HCMIX_GO(29, BM_); break; default: HCMIX_GO(14, BM_); break; } } while (0)
     if (big) HCMIX_T(256); else HCMIX_T(128);
     #undef HCMIX_T
     #undef HCMIX_GO
     cudaError_t le = cudaGetLastError();
-    (void)cudaFreeAsync(scr, st);
+    if (async_xh) (void)cudaFreeAsync(async_xh, st);
+    hcm_half_invalidate_range(ctx->device, mixed, (size_t)S * H * sizeof(float));
     return cuda_ok(le, "f16 block gemm and mix launch") ? 1 : 0;
 #endif
 }
@@ -5172,7 +5480,10 @@ extern "C" int coli_cuda_bd_gemm_raw(int device, const void *w, int fmt, int I, 
     if (!t && !(t = (ColiCudaTensor *)calloc(1, sizeof *t))) return 0;
     t->weights = const_cast<void *>(w); t->scales = nullptr; t->fmt = fmt; t->I = I; t->O = O; t->device = device;
     t->row_words = row_words; t->weight_bytes = (size_t)row_words * 4 * (size_t)O;
-    return bd_tensor_gemm(ctx, t, y, x, S, (cudaStream_t)stream);
+    hcm_half_forget_stream((cudaStream_t)stream, nullptr);
+    int ok = bd_tensor_gemm(ctx, t, y, x, S, (cudaStream_t)stream);
+    hcm_half_invalidate_range(device, y, (size_t)S * O * sizeof(float));
+    return ok;
 }
 extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
     if (!p || !bytes) return 0;
@@ -5182,6 +5493,11 @@ extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
 extern "C" void coli_cuda_host_unregister(void *p) {
     if (!p) return;
     if (cudaHostUnregister(p) != cudaSuccess) (void)cudaGetLastError();
+}
+extern "C" int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!dst || !src || !select_ctx(ctx)) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, ctx->stream), "copy async");
 }
 /* the f16 GEMMs (sm_70 and later; not under HIP); COLI_CUDA_TC_F16=0 keeps TF32 where it runs */
 static int hcg_ok(const DeviceContext *ctx) {
@@ -5635,22 +5951,42 @@ extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu
         on = dec && !(b && *b == '0');
     }
     if (fault_injected() || !tg || !tu || !y_dev || !x_dev || S < 1 || tg->fmt < 100 || ((uintptr_t)x_dev & 15)) return 0;
+    cudaStream_t st = (cudaStream_t)stream;
+    if (g_bd_x_same == 0) {
+        bd_xq_forget(st);
+        hcm_half_forget_stream(st, nullptr);
+    } else if (g_bd_x_same == 2) {
+        hcm_half_forget_stream(st, nullptr);
+    }
 #if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
-    /* rows bd_mmg_k takes: the two matmuls apart on it (the caller's), the bits of the GEMVs and the product */
-    if (bd_mmq_takes(find_ctx(tg->device), tg, S) && bd_mmq_takes(find_ctx(tu->device), tu, S)) return 0;
+    {
+        DeviceContext *bc = find_ctx(tg->device);
+        if (bd_mmq_takes(bc, tg, S)) {
+            if (!dec || tg->fmt != tu->fmt || tg->I != tu->I || tg->O != tu->O || tg->row_words != tu->row_words ||
+                tg->device != tu->device) return 0;
+            const bd_u32 *tab = select_ctx(bc) ? bd_table(bc) : nullptr;
+            if (!tab) return 0;
+            if (!bd_mmg_glu_launch(y_dev, x_dev, (const bd_u32 *)tg->weights, (const bd_u32 *)tu->weights,
+                                   tg->fmt, tg->I, tg->O, tg->row_words, S, st, tab))
+                return 0;
+            hcm_half_invalidate_range(tg->device, y_dev, (size_t)S * tg->O * sizeof(float));
+            return cuda_ok(cudaGetLastError(), "block mmq glu launch");
+        }
+    }
 #endif
     if (S <= BD_GEMV_MAX_S) {
         if (!dec || tu->fmt != tg->fmt || tu->I != tg->I || tu->O != tg->O || tu->row_words != tg->row_words || tu->device != tg->device) return 0;
         DeviceContext *bc = find_ctx(tg->device);
         const bd_u32 *tab = select_ctx(bc) ? bd_table(bc) : nullptr;
         if (!tab || !bd_glu_launch(y_dev, x_dev, (const bd_u32 *)tg->weights, (const bd_u32 *)tu->weights, tab, tg->fmt, tg->I, tg->O,
-                                   tg->row_words, S, bc->smem_optin, (cudaStream_t)stream)) return 0;
+                                   tg->row_words, S, bc->smem_optin, st)) return 0;
+        hcm_half_invalidate_range(tg->device, y_dev, (size_t)S * tg->O * sizeof(float));
         return cuda_ok(cudaGetLastError(), "block glu launch");
     }
     if (!on) return 0;
     DeviceContext *ctx = find_ctx(tg->device);
     if (!select_ctx(ctx) || !bd_table(ctx)) return 0;
-    return hcm_gemm(ctx, tg, y_dev, x_dev, S, (cudaStream_t)stream, tu);
+    return hcm_gemm(ctx, tg, y_dev, x_dev, S, st, tu);
 }
 /* y[j] = row ids[j] of a block-format tensor against one row of x, each the bits the whole GEMV
  * gives that row (a draft's vocabulary, cuda_chain.cu's cc_matmul_rows); 0 where not taken (another
@@ -5756,8 +6092,18 @@ static int tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     cudaStream_t st = (cudaStream_t)stream;
-    if (!g_bd_x_same) bd_xq_forget(st);   /* x may have changed since the stream's quantization */
-    if (t->fmt >= 100) return bd_tensor_gemv(ctx, t, y_dev, x_dev, S, st);   /* a GGUF's blocks: cuda_bd.cuh */
+    if (g_bd_x_same == 0) {
+        bd_xq_forget(st);   /* x may have changed since the stream's quantization */
+        hcm_half_forget_stream(st, (t->fmt >= 100 && S > BD_GEMV_MAX_S) ? x_dev : nullptr);
+    } else if (g_bd_x_same == 2) {
+        hcm_half_forget_stream(st, (t->fmt >= 100 && S > BD_GEMV_MAX_S) ? x_dev : nullptr);
+    }
+    if (t->fmt >= 100) {
+        int ok = bd_tensor_gemv(ctx, t, y_dev, x_dev, S, st);   /* a GGUF's blocks: cuda_bd.cuh */
+        hcm_half_clear_glu_and_invalidate_out(t->device, st, y_dev, (size_t)S * t->O * sizeof(float));
+        return ok;
+    }
+    hcm_half_invalidate_range(t->device, y_dev, (size_t)S * t->O * sizeof(float));
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288 && ((uintptr_t)x_dev & 15) == 0) {   /* x in float4 loads */
         unsigned bx = (unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);
         const int8_t *w = (const int8_t *)t->weights;
@@ -6039,6 +6385,44 @@ __global__ static void moe_sum_k(const CcExpert *__restrict__ tab, const int *__
     }
     y[p.y_off + (size_t)s * p.y_row + d] = v;
 }
+/* vectorized rank-ordered sum (D % 4 == 0, 16-byte aligned hid/y/hy, K <= 32): promoted for parts == 2 */
+__global__ static void __launch_bounds__(64) moe_sum4_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids,
+        const float *__restrict__ w, const float *__restrict__ hid, const float *__restrict__ hy, float *__restrict__ y, CcMoe p) {
+    COLI_PDL_WAIT();
+    __shared__ int sv[32];
+    __shared__ float sw[32];
+    int s = blockIdx.y, t = threadIdx.x, d4 = blockIdx.x * 64 + t;
+    if (t < p.K) {
+        int e = ids[p.i_off + s * p.i_row + t];
+        sv[t] = e >= 0 && tab[p.t_off + e].g != nullptr;
+        float wk = w[p.w_off + s * p.w_row + t];
+        if (p.esc_off > 0 && sv[t]) wk *= moe_esc(tab, p, e).y;
+        sw[t] = wk;
+    }
+    __syncthreads();
+    if (d4 * 4 >= p.D) return;
+    const float4 *yd4 = reinterpret_cast<const float4 *>(hid + (size_t)(p.lay_S ? p.lay_S : p.S) * p.K * p.I);
+    int D4 = p.D >> 2;
+    float4 v = p.h_off >= 0 ? reinterpret_cast<const float4 *>(hy + p.h_off)[(size_t)s * D4 + d4] : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (p.K == 8) {
+        float4 u[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            u[k] = sv[k] ? yd4[(size_t)((p.lay_s0 + s) * 8 + k) * D4 + d4] : make_float4(0.f, 0.f, 0.f, 0.f);
+        #pragma unroll
+        for (int k = 0; k < 8; k++) if (sv[k]) {
+            float wk = sw[k];
+            v.x += wk * u[k].x; v.y += wk * u[k].y; v.z += wk * u[k].z; v.w += wk * u[k].w;
+        }
+    } else {
+        for (int k = 0; k < p.K; k++) if (sv[k]) {
+            float wk = sw[k];
+            float4 u = yd4[(size_t)((p.lay_s0 + s) * p.K + k) * D4 + d4];
+            v.x += wk * u.x; v.y += wk * u.y; v.z += wk * u.z; v.w += wk * u.w;
+        }
+    }
+    reinterpret_cast<float4 *>(y + p.y_off + (size_t)s * p.y_row)[d4] = v;
+}
 /* A prompt chunk's slots by expert (S > CC_MOE_FRAME_ROWS): counts, offsets and the
  * GEMMs' tiles (64 rows of one expert each), each slot's place. The integers sit in hid
  * after the floats: cnt[E] base[E + 1] cur[E] ntile[1] te[T] tr[T] order[A] posof[A]. */
@@ -6083,12 +6467,139 @@ __global__ static void moe_sort_place_k(const CcExpert *__restrict__ tab, const 
     int pos = m.base[e] + atomicAdd(&m.cur[e], 1);
     m.order[pos] = a; m.posof[a] = pos;
 }
-/* a tile's m.TR rows (xr and pr that many): x rows (the slots' tokens) and places, the expert's rows left */
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+/* Fused 1-block SMEM sort for E <= 512 (replaces cudaMemsetAsync + count + scan + place).
+ * TWO_BUCKET == true: splits tiles into Bucket 0 (1..32-row tails -> BM=32, stored at te[0..n32-1],
+ * n32 in m.cur[0]) and Bucket 1 (33..64-row tiles -> BM=64, stored at te[n32..ntile-1]). Total tile
+ * count equals sum_e ceil(cnt[e]/64) <= m.T: zero extra hid bytes, zero extra weight decodes! */
+template<bool TWO_BUCKET>
+__global__ static void __launch_bounds__(256) moe_sort_bd_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids, MoeSort m, CcMoe p) {
+    COLI_PDL_WAIT();
+    __shared__ int scnt[512], sbase[512], scur[512], wsum[17], wt0sum[17], wt1sum[17];
+    const int t = threadIdx.x, A = p.S * p.K, E = p.E;
+    const bool ok0 = t < E && tab[p.t_off + t].g != nullptr;
+    const bool ok1 = (t + 256) < E && tab[p.t_off + t + 256].g != nullptr;
+    scnt[t] = 0; scnt[t + 256] = 0;
+    sbase[t] = ok0 ? 0 : -1; sbase[t + 256] = ok1 ? 0 : -1;
+    __syncthreads();
+    const bool fast_ids = (p.i_row == p.K);
+    if (fast_ids && ((p.i_off & 3) == 0) && ((A & 3) == 0)) {
+        const int4 *ids4 = reinterpret_cast<const int4 *>(ids + p.i_off);
+        const int A4 = A >> 2;
+        for (int a4 = t; a4 < A4; a4 += 256) {
+            int4 v = ids4[a4];
+            if ((unsigned)v.x < (unsigned)E && sbase[v.x] >= 0) atomicAdd(&scnt[v.x], 1);
+            if ((unsigned)v.y < (unsigned)E && sbase[v.y] >= 0) atomicAdd(&scnt[v.y], 1);
+            if ((unsigned)v.z < (unsigned)E && sbase[v.z] >= 0) atomicAdd(&scnt[v.z], 1);
+            if ((unsigned)v.w < (unsigned)E && sbase[v.w] >= 0) atomicAdd(&scnt[v.w], 1);
+        }
+    } else {
+        for (int a = t; a < A; a += 256) {
+            int e = fast_ids ? ids[p.i_off + a] : ids[p.i_off + (a / p.K) * p.i_row + (a % p.K)];
+            if ((unsigned)e < (unsigned)E && sbase[e] >= 0) atomicAdd(&scnt[e], 1);
+        }
+    }
+    __syncthreads();
+    const int lane = t & 31, warp = t >> 5;
+    const int c0 = ok0 ? scnt[t] : 0, c1 = ok1 ? scnt[t + 256] : 0;
+    int nt0_a, nt1_a, nt0_b, nt1_b;
+    if constexpr (TWO_BUCKET) {
+        const int r0 = c0 & 63, r1 = c1 & 63;
+        nt0_a = (r0 >= 1 && r0 <= 32) ? 1 : 0; nt1_a = (c0 >> 6) + (r0 > 32 ? 1 : 0);
+        nt0_b = (r1 >= 1 && r1 <= 32) ? 1 : 0; nt1_b = (c1 >> 6) + (r1 > 32 ? 1 : 0);
+    } else {
+        nt0_a = c0 > 0 ? (c0 + m.TR - 1) / m.TR : 0; nt1_a = 0;
+        nt0_b = c1 > 0 ? (c1 + m.TR - 1) / m.TR : 0; nt1_b = 0;
+    }
+    int pc0 = c0, pt0a = nt0_a, pt1a = nt1_a, pc1 = c1, pt0b = nt0_b, pt1b = nt1_b;
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        int nc0 = __shfl_up_sync(0xffffffffu, pc0, d), n0a = __shfl_up_sync(0xffffffffu, pt0a, d), n1a = __shfl_up_sync(0xffffffffu, pt1a, d);
+        int nc1 = __shfl_up_sync(0xffffffffu, pc1, d), n0b = __shfl_up_sync(0xffffffffu, pt0b, d), n1b = __shfl_up_sync(0xffffffffu, pt1b, d);
+        if (lane >= d) { pc0 += nc0; pt0a += n0a; pt1a += n1a; pc1 += nc1; pt0b += n0b; pt1b += n1b; }
+    }
+    if (lane == 31) {
+        wsum[warp] = pc0; wt0sum[warp] = pt0a; wt1sum[warp] = pt1a;
+        wsum[warp + 8] = pc1; wt0sum[warp + 8] = pt0b; wt1sum[warp + 8] = pt1b;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int wc0 = lane < 16 ? wsum[lane] : 0, w0 = lane < 16 ? wt0sum[lane] : 0, w1 = lane < 16 ? wt1sum[lane] : 0;
+        int wc = wc0, s0 = w0, s1 = w1;
+        #pragma unroll
+        for (int d = 1; d < 16; d <<= 1) {
+            int nc = __shfl_up_sync(0xffffffffu, wc, d), n0 = __shfl_up_sync(0xffffffffu, s0, d), n1 = __shfl_up_sync(0xffffffffu, s1, d);
+            if (lane >= d) { wc += nc; s0 += n0; s1 += n1; }
+        }
+        if (lane < 16) { wsum[lane] = wc - wc0; wt0sum[lane] = s0 - w0; wt1sum[lane] = s1 - w1; }
+        if (lane == 15) { wsum[16] = wc; wt0sum[16] = s0; wt1sum[16] = s1; }
+    }
+    __syncthreads();
+    const int tot0 = wt0sum[16], tot1 = wt1sum[16];
+    const int b0 = wsum[warp] + pc0 - c0, o0a = wt0sum[warp] + pt0a - nt0_a, o1a = wt1sum[warp] + pt1a - nt1_a;
+    const int b1 = wsum[warp + 8] + pc1 - c1, o0b = wt0sum[warp + 8] + pt0b - nt0_b, o1b = wt1sum[warp + 8] + pt1b - nt1_b;
+    (void)o1a; (void)o1b;
+    sbase[t] = ok0 ? b0 : -1; sbase[t + 256] = ok1 ? b1 : -1;
+    scur[t] = 0; scur[t + 256] = 0;
+    if (t < E) {
+        m.cnt[t] = c0; m.base[t] = b0;
+        if constexpr (TWO_BUCKET) {
+            if (nt0_a && o0a < m.T) { m.te[o0a] = t; m.tr[o0a] = c0 & ~63; }
+            for (int k = 0; k < nt1_a && tot0 + o1a + k < m.T; k++) { m.te[tot0 + o1a + k] = t; m.tr[tot0 + o1a + k] = k * 64; }
+        } else {
+            for (int k = 0; k < nt0_a && o0a + k < m.T; k++) { m.te[o0a + k] = t; m.tr[o0a + k] = k * m.TR; }
+        }
+    }
+    if (t + 256 < E) {
+        const int e1 = t + 256;
+        m.cnt[e1] = c1; m.base[e1] = b1;
+        if constexpr (TWO_BUCKET) {
+            if (nt0_b && o0b < m.T) { m.te[o0b] = e1; m.tr[o0b] = c1 & ~63; }
+            for (int k = 0; k < nt1_b && tot0 + o1b + k < m.T; k++) { m.te[tot0 + o1b + k] = e1; m.tr[tot0 + o1b + k] = k * 64; }
+        } else {
+            for (int k = 0; k < nt0_b && o0b + k < m.T; k++) { m.te[o0b + k] = e1; m.tr[o0b + k] = k * m.TR; }
+        }
+    }
+    if (t == 0) {
+        m.base[E] = wsum[16];
+        const int ntot = tot0 + tot1;
+        *m.ntile = ntot < m.T ? ntot : m.T;
+        if constexpr (TWO_BUCKET) m.cur[0] = tot0 < m.T ? tot0 : m.T;
+    }
+    __syncthreads();
+    if (fast_ids && ((p.i_off & 3) == 0) && ((A & 3) == 0)) {
+        const int4 *ids4 = reinterpret_cast<const int4 *>(ids + p.i_off);
+        const int A4 = A >> 2;
+        for (int a4 = t; a4 < A4; a4 += 256) {
+            int4 v = ids4[a4];
+            int a = a4 << 2;
+            int e0 = v.x, sb0 = (unsigned)e0 < (unsigned)E ? sbase[e0] : -1;
+            if (sb0 < 0) m.posof[a] = -1; else { int p0 = sb0 + atomicAdd(&scur[e0], 1); m.order[p0] = a; m.posof[a] = p0; }
+            int e1 = v.y, sb1 = (unsigned)e1 < (unsigned)E ? sbase[e1] : -1;
+            if (sb1 < 0) m.posof[a + 1] = -1; else { int p1 = sb1 + atomicAdd(&scur[e1], 1); m.order[p1] = a + 1; m.posof[a + 1] = p1; }
+            int e2 = v.z, sb2 = (unsigned)e2 < (unsigned)E ? sbase[e2] : -1;
+            if (sb2 < 0) m.posof[a + 2] = -1; else { int p2 = sb2 + atomicAdd(&scur[e2], 1); m.order[p2] = a + 2; m.posof[a + 2] = p2; }
+            int e3 = v.w, sb3 = (unsigned)e3 < (unsigned)E ? sbase[e3] : -1;
+            if (sb3 < 0) m.posof[a + 3] = -1; else { int p3 = sb3 + atomicAdd(&scur[e3], 1); m.order[p3] = a + 3; m.posof[a + 3] = p3; }
+        }
+    } else {
+        for (int a = t; a < A; a += 256) {
+            int e = fast_ids ? ids[p.i_off + a] : ids[p.i_off + (a / p.K) * p.i_row + (a % p.K)];
+            int sb = (unsigned)e < (unsigned)E ? sbase[e] : -1;
+            if (sb < 0) { m.posof[a] = -1; continue; }
+            int pos = sb + atomicAdd(&scur[e], 1);
+            m.order[pos] = a; m.posof[a] = pos;
+        }
+    }
+}
+#endif
+/* a tile's BM rows (xr and pr that many): x rows (the slots' tokens) and places, clamped to BM */
+template<int BM = 64>
 __device__ __forceinline__ int moe_tile_rows(const MoeSort &m, const CcMoe &p, int t, int *xr, int *pr, int *e_out, int down) {
     int e = m.te[t], r0 = m.tr[t], M = m.cnt[e] - r0;
-    if (M > m.TR) M = m.TR;
-    if ((int)threadIdx.x < m.TR) {
-        int pos = m.base[e] + r0 + (threadIdx.x < M ? threadIdx.x : 0);
+    if (M > BM) M = BM;
+    if ((int)threadIdx.x < BM) {
+        int pos = m.base[e] + r0 + ((int)threadIdx.x < M ? (int)threadIdx.x : 0);
         pr[threadIdx.x] = pos;
         xr[threadIdx.x] = down ? pos : m.order[pos] / p.K;
     }
@@ -6182,38 +6693,88 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__
     size_t A = (size_t)p.S * p.K;
     hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.fmt_d ? p.fmt_d : p.fmt, p.D, p.I, blockIdx.x * TCG_BN);
 }
-/* A prompt chunk's GGUF experts of Q8_0, Q4_K, Q5_K or Q6_K through hcm_body (hcm_dense_k's
- * products: the weights' loads apart from their decoding) instead of hcg_tile's: a tile's up to 64
- * rows of one expert (moe_tile_rows), the gate and up in one pass (GLU) into hid's places, then the
- * down of the places' rows into hid's second part. The inputs in f16 (hcg_h's rounding): xh the
- * tokens' rows, hh hid's. */
-template<int T, int BM = 64>
+/* A prompt chunk's GGUF experts through hcm_body (hcm_dense_k's products: the weights' loads apart
+ * from their decoding) instead of hcg_tile's. BUCKET == -1: single-bucket (m.ntile); BUCKET == 0:
+ * 2-bucket BM=32 tails (m.cur[0] tiles at 0..n32-1); BUCKET == 1: 2-bucket BM=64 tiles (at n32..). */
+template<int T, int BM = 64, int BUCKET = -1>
 __global__ static void __launch_bounds__(256, (HcmTile<BM, 128>::MINB)) hcm_moe_gu_k(const CcExpert *__restrict__ tab,
         const __half *__restrict__ xh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw, const bd_u32 *__restrict__ btab) {
     COLI_PDL_WAIT();
     __shared__ int xr[BM], pr[BM];
-    if ((int)blockIdx.y >= *m.ntile) return;
-    int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 0);
+    int tidx;
+    if constexpr (BUCKET == 0) {
+        if ((int)blockIdx.y >= m.cur[0]) return;
+        tidx = (int)blockIdx.y;
+    } else if constexpr (BUCKET == 1) {
+        const int n32 = m.cur[0], n64 = *m.ntile - n32;
+        if ((int)blockIdx.y >= n64) return;
+        tidx = n32 + (int)blockIdx.y;
+    } else {
+        if ((int)blockIdx.y >= *m.ntile) return;
+        tidx = (int)blockIdx.y;
+    }
+    int e, M = moe_tile_rows<BM>(m, p, tidx, xr, pr, &e, 0);
     __syncthreads();
     const CcExpert ex = tab[p.t_off + e];
     HcmArgs A = {hid, p.I, pr, xh, p.D, xr, 0, M, (int)blockIdx.x * 128, 0, p.D / HCM_BK,
-                 (const bd_u32 *)ex.g, (const bd_u32 *)ex.u, rw, p.I, btab};
+                 (const bd_u32 *)ex.g, (const bd_u32 *)ex.u, rw, p.I, btab, nullptr, 0.f, nullptr};
     hcm_body<T, BM, 128, true>(A);
 }
-template<int T, int BM = 64>
+template<int T, int BM = 64, int BUCKET = -1>
 __global__ static void __launch_bounds__(256, (HcmTile<BM, 128>::MINB)) hcm_moe_dn_k(const CcExpert *__restrict__ tab,
         const __half *__restrict__ hh, float *__restrict__ hid, MoeSort m, CcMoe p, int rw, const bd_u32 *__restrict__ btab, int wrow0) {
     COLI_PDL_WAIT();
     __shared__ int xr[BM], pr[BM];
-    if ((int)blockIdx.y >= *m.ntile) return;
-    int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 1);
+    int tidx;
+    if constexpr (BUCKET == 0) {
+        if ((int)blockIdx.y >= m.cur[0]) return;
+        tidx = (int)blockIdx.y;
+    } else if constexpr (BUCKET == 1) {
+        const int n32 = m.cur[0], n64 = *m.ntile - n32;
+        if ((int)blockIdx.y >= n64) return;
+        tidx = n32 + (int)blockIdx.y;
+    } else {
+        if ((int)blockIdx.y >= *m.ntile) return;
+        tidx = (int)blockIdx.y;
+    }
+    int e, M = moe_tile_rows<BM>(m, p, tidx, xr, pr, &e, 1);
     __syncthreads();
     const CcExpert ex = tab[p.t_off + e];
     /* p.D outputs a slot, down's rows from wrow0 (a slice of columns, hcm_moe's cols) */
     HcmArgs A = {hid + (size_t)p.S * p.K * p.I, p.D, pr, hh, p.I, xr, 0, M, (int)blockIdx.x * 128, 0, p.I / HCM_BK,
-                 (const bd_u32 *)ex.d + (size_t)wrow0 * rw, nullptr, rw, p.D, btab};
+                 (const bd_u32 *)ex.d + (size_t)wrow0 * rw, nullptr, rw, p.D, btab, nullptr, 0.f, nullptr};
     hcm_body<T, BM, 128, false>(A);
 }
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+template<int T, int BM, int BUCKET>
+static void hcm_moe_gu_go(dim3 g, cudaStream_t st, const CcExpert *tab, const __half *xh, float *hid, MoeSort m, CcMoe p, int rw, const bd_u32 *btab) {
+    constexpr int smem = HcmTile<BM, 128>::SMEM;
+    static unsigned set = 0;
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 32 && !(set & (1u << dev))) {
+        cudaFuncSetAttribute(hcm_moe_gu_k<T, BM, BUCKET>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(hcm_moe_gu_k<T, BM, BUCKET>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        (void)cudaGetLastError();
+        set |= 1u << dev;
+    }
+    coli_launch(hcm_moe_gu_k<T, BM, BUCKET>, g, 256, smem, st, tab, xh, hid, m, p, rw, btab);
+}
+template<int T, int BM, int BUCKET>
+static void hcm_moe_dn_go(dim3 g, cudaStream_t st, const CcExpert *tab, const __half *hh, float *hid, MoeSort m, CcMoe p, int rw, const bd_u32 *btab, int wrow0) {
+    constexpr int smem = HcmTile<BM, 128>::SMEM;
+    static unsigned set = 0;
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 32 && !(set & (1u << dev))) {
+        cudaFuncSetAttribute(hcm_moe_dn_k<T, BM, BUCKET>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(hcm_moe_dn_k<T, BM, BUCKET>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        (void)cudaGetLastError();
+        set |= 1u << dev;
+    }
+    coli_launch(hcm_moe_dn_k<T, BM, BUCKET>, g, 256, smem, st, tab, hh, hid, m, p, rw, btab, wrow0);
+}
+#endif
 /* rows of x (x_row floats apart) into f16, hcm_half_k's rounding */
 __global__ static void hcm_half_rows_k(const float *__restrict__ x, int x_row, uint2 *__restrict__ xh, int S, int D) {
     COLI_PDL_WAIT();
@@ -6238,8 +6799,8 @@ static int hcm_moe_able(DeviceContext *ctx, const CcMoe *p, const bd_u32 *btab) 
     const int fd = p->fmt_d ? p->fmt_d : p->fmt, tg = hcm_type(p->fmt, p->D), td = hcm_type(fd, p->I);
     if (!on || !ctx || ctx->compute_major < 8 || !tg || !td || p->D % 4 || p->I % 4 || p->x_row % 4) return 0;
     if (tg == 1 || tg == 30 || td == 1 || td == 30) return 0;   /* 16-bit experts: hcg's tiles (HCM_MOE's types below) */
-    if ((tg == 22 || td == 22 || tg == 21 || td == 21 || tg == 16 || td == 16 || tg == 17 || td == 17 || tg == 18 || td == 18) && !btab)
-        return 0;   /* IQ2_S, IQ3_S, IQ2_XXS, IQ2_XS and IQ3_XXS read their grids (and ksigns) from the decoders' table */
+    if ((tg == 22 || td == 22 || tg == 21 || td == 21 || tg == 16 || td == 16 || tg == 17 || td == 17 || tg == 18 || td == 18 || tg == 29 || td == 29) && !btab)
+        return 0;   /* IQ2_S, IQ3_S, IQ2_XXS, IQ2_XS, IQ3_XXS and IQ1_M read their grids (and ksigns) from the decoders' table */
     const size_t rbg = bd_file_row_bytes(p->fmt, p->D), rbd = bd_file_row_bytes(fd, p->I);
     return rbg && rbd && rbg % 4 == 0 && rbd % 4 == 0;
 #endif
@@ -6247,9 +6808,9 @@ static int hcm_moe_able(DeviceContext *ctx, const CcMoe *p, const bd_u32 *btab) 
 /* cols > 0 (coli_cuda_moe_cols_async): down and the rows' sums a slice of cols outputs at a time, each
  * slice's down into hid after the gate's and up's (S*K rows of cols), then its sums into y's columns */
 static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st,
-                   const bd_u32 *btab, int cols = 0, const float *w = nullptr, float *y = nullptr) {
+                   const bd_u32 *btab, int cols = 0, const float *w = nullptr, float *y = nullptr, bool two_bucket = false) {
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
-    (void)ctx; (void)tab; (void)x; (void)hid; (void)m; (void)p; (void)st; (void)btab; (void)cols; (void)w; (void)y; return 0;
+    (void)ctx; (void)tab; (void)x; (void)hid; (void)m; (void)p; (void)st; (void)btab; (void)cols; (void)w; (void)y; (void)two_bucket; return 0;
 #else
     if (!hcm_moe_able(ctx, p, btab)) return 0;
     const int fd = p->fmt_d ? p->fmt_d : p->fmt, tg = hcm_type(p->fmt, p->D), td = hcm_type(fd, p->I);
@@ -6260,29 +6821,40 @@ static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, floa
     __half *xh = (__half *)scr, *hh = xh + (nx + 63) / 64 * 64;
     long long n4 = (long long)(nx / 4);
     coli_launch(hcm_half_rows_k, (unsigned)((n4 + 255) / 256), 256, 0, st, x + p->x_off, p->x_row, reinterpret_cast<uint2 *>(xh), p->S, p->D);
-    dim3 gg((unsigned)((2 * p->I + 127) / 128), (unsigned)m.T);
+    const unsigned gx_gu = (unsigned)((2 * p->I + 127) / 128);
+    const unsigned max_n32 = (unsigned)(p->E < (int)A ? p->E : (int)A), max_n64 = (unsigned)(A / 33);
     const int rwg = (int)(rbg / 4), rwd = (int)(rbd / 4);
-    #define HCM_MOE(K_, BM_, T_, ...) do { switch (T_) { \
-        case 8: coli_launch(K_<8, BM_>, __VA_ARGS__); break;   case 12: coli_launch(K_<12, BM_>, __VA_ARGS__); break; \
-        case 13: coli_launch(K_<13, BM_>, __VA_ARGS__); break; case 22: coli_launch(K_<22, BM_>, __VA_ARGS__); break; \
-        case 23: coli_launch(K_<23, BM_>, __VA_ARGS__); break; case 20: coli_launch(K_<20, BM_>, __VA_ARGS__); break; \
-        case 21: coli_launch(K_<21, BM_>, __VA_ARGS__); break; case 16: coli_launch(K_<16, BM_>, __VA_ARGS__); break; \
-        case 17: coli_launch(K_<17, BM_>, __VA_ARGS__); break; case 6: coli_launch(K_<6, BM_>, __VA_ARGS__); break; \
-        case 7: coli_launch(K_<7, BM_>, __VA_ARGS__); break; case 18: coli_launch(K_<18, BM_>, __VA_ARGS__); break; \
-        case 42: coli_launch(K_<42, BM_>, __VA_ARGS__); break; default: coli_launch(K_<14, BM_>, __VA_ARGS__); break; } } while (0)
+    #define HCM_MOE(GO_, BM_, BK_, T_, ...) do { switch (T_) { \
+        case 8: GO_<8, BM_, BK_>(__VA_ARGS__); break;   case 12: GO_<12, BM_, BK_>(__VA_ARGS__); break; \
+        case 13: GO_<13, BM_, BK_>(__VA_ARGS__); break; case 22: GO_<22, BM_, BK_>(__VA_ARGS__); break; \
+        case 23: GO_<23, BM_, BK_>(__VA_ARGS__); break; case 20: GO_<20, BM_, BK_>(__VA_ARGS__); break; \
+        case 21: GO_<21, BM_, BK_>(__VA_ARGS__); break; case 16: GO_<16, BM_, BK_>(__VA_ARGS__); break; \
+        case 17: GO_<17, BM_, BK_>(__VA_ARGS__); break; case 6: GO_<6, BM_, BK_>(__VA_ARGS__); break; \
+        case 7: GO_<7, BM_, BK_>(__VA_ARGS__); break;   case 18: GO_<18, BM_, BK_>(__VA_ARGS__); break; \
+        case 29: GO_<29, BM_, BK_>(__VA_ARGS__); break; case 42: GO_<42, BM_, BK_>(__VA_ARGS__); break; \
+        default: GO_<14, BM_, BK_>(__VA_ARGS__); break; } } while (0)
     long long h4 = (long long)(nh / 4);
-    if (m.TR == 128) {   /* tiles of 128 rows (moe_rows_bd_launch's choice): an expert's weights decoded once for twice the rows */
-        HCM_MOE(hcm_moe_gu_k, 128, tg, gg, 256, HcmTile<128, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
+    if (two_bucket) {
+        if (max_n32 > 0) HCM_MOE(hcm_moe_gu_go, 32, 0, tg, dim3(gx_gu, max_n32), st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
+        if (max_n64 > 0) HCM_MOE(hcm_moe_gu_go, 64, 1, tg, dim3(gx_gu, max_n64), st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
+    } else if (m.TR == 128) {
+        HCM_MOE(hcm_moe_gu_go, 128, -1, tg, dim3(gx_gu, (unsigned)m.T), st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
     } else {
-        HCM_MOE(hcm_moe_gu_k, 64, tg, gg, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
+        HCM_MOE(hcm_moe_gu_go, 64, -1, tg, dim3(gx_gu, (unsigned)m.T), st, tab, (const __half *)xh, hid, m, *p, rwg, btab);
     }
     coli_launch(hcm_half_k, (unsigned)((h4 + 255) / 256), 256, 0, st, reinterpret_cast<const float4 *>(hid), reinterpret_cast<uint2 *>(hh), h4);
     for (int c0 = 0; c0 < p->D; c0 += cols > 0 ? cols : p->D) {
         CcMoe q = *p;   /* the slice: its outputs, down's rows from c0, its sums into y from column c0 */
         if (cols > 0) { q.D = p->D - c0 < cols ? p->D - c0 : cols; q.y_off = p->y_off + c0; }
-        dim3 gs((unsigned)((q.D + 127) / 128), (unsigned)m.T);
-        if (m.TR == 128) HCM_MOE(hcm_moe_dn_k, 128, td, gs, 256, HcmTile<128, 128>::SMEM, st, tab, (const __half *)hh, hid, m, q, rwd, btab, c0);
-        else HCM_MOE(hcm_moe_dn_k, 64, td, gs, 256, HcmTile<64, 128>::SMEM, st, tab, (const __half *)hh, hid, m, q, rwd, btab, c0);
+        const unsigned gx_dn = (unsigned)((q.D + 127) / 128);
+        if (two_bucket) {
+            if (max_n32 > 0) HCM_MOE(hcm_moe_dn_go, 32, 0, td, dim3(gx_dn, max_n32), st, tab, (const __half *)hh, hid, m, q, rwd, btab, c0);
+            if (max_n64 > 0) HCM_MOE(hcm_moe_dn_go, 64, 1, td, dim3(gx_dn, max_n64), st, tab, (const __half *)hh, hid, m, q, rwd, btab, c0);
+        } else if (m.TR == 128) {
+            HCM_MOE(hcm_moe_dn_go, 128, -1, td, dim3(gx_dn, (unsigned)m.T), st, tab, (const __half *)hh, hid, m, q, rwd, btab, c0);
+        } else {
+            HCM_MOE(hcm_moe_dn_go, 64, -1, td, dim3(gx_dn, (unsigned)m.T), st, tab, (const __half *)hh, hid, m, q, rwd, btab, c0);
+        }
         if (cols > 0) coli_launch(moe_rows_sum_k, dim3((unsigned)((q.D + 255) / 256), (unsigned)p->S), 256, 0, st, w, (const float *)hid,
                                   (const float *)nullptr, y, m, q);
     }
@@ -6296,22 +6868,27 @@ static int moe_rows_bd_launch(DeviceContext *ctx, const CcExpert *tab, const flo
                               const bd_u32 *btab, cudaStream_t st, int cols = 0, const float *w = nullptr, float *y = nullptr) {
     size_t A = (size_t)p->S * p->K;
     unsigned ga = (unsigned)((A + 255) / 256);
-    /* tiles of 128 rows where the f16 tiles take the call and an expert has 32 rows or more on average
-     * (COLI_CUDA_MOE_TILE128: 1 always there, 0 never). A tile decodes its expert's weights once for
-     * its rows, which is most of its time: 64-row tiles left an expert of more rows decoding them
-     * again (Qwen3.8's 512 experts, 10 a row: 4096 rows 26.5 -> 16.2 ms a call on an RTX PRO 4000,
-     * and a 2048-row chunk's hot experts past 64 of its routes); at fewer rows the larger tile's
-     * products go to empty rows (a 545-token prompt 5% slower with them) */
     static int t128 = -2;
     if (t128 == -2) { const char *e = getenv("COLI_CUDA_MOE_TILE128"); t128 = e && *e ? atoi(e) : -1; }
-    m.TR = t128 != 0 && (t128 == 1 || A >= (size_t)32 * (size_t)p->E) && hcm_moe_able(ctx, p, btab) ? 128 : 64;
-    if (!cuda_ok(cudaMemsetAsync(m.cnt, 0, (size_t)p->E * sizeof(int), st), "chain moe sort")) return 0;
-    coli_launch(moe_sort_count_k, ga, 256, 0, st, tab, ids, m, *p);
-    coli_launch(moe_sort_scan_k, 1, 32, 0, st, m, *p);
-    coli_launch(moe_sort_place_k, ga, 256, 0, st, tab, ids, m, *p);
-    if (hcm_moe(ctx, tab, x, hid, m, p, st, btab, cols, w, y)) return 1;
+    const bool hcm_ok = hcm_moe_able(ctx, p, btab) != 0;
+    m.TR = t128 != 0 && (t128 == 1 || A >= (size_t)32 * (size_t)p->E) && hcm_ok ? 128 : 64;
+    bool two_bucket = false;
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+    if (p->E <= 512) {
+        two_bucket = hcm_ok && m.TR == 64;
+        if (two_bucket) coli_launch(moe_sort_bd_k<true>, dim3(1u), 256, 0, st, tab, ids, m, *p);
+        else coli_launch(moe_sort_bd_k<false>, dim3(1u), 256, 0, st, tab, ids, m, *p);
+    } else
+#endif
+    {
+        if (!cuda_ok(cudaMemsetAsync(m.cnt, 0, (size_t)p->E * sizeof(int), st), "chain moe sort")) return 0;
+        coli_launch(moe_sort_count_k, ga, 256, 0, st, tab, ids, m, *p);
+        coli_launch(moe_sort_scan_k, 1, 32, 0, st, m, *p);
+        coli_launch(moe_sort_place_k, ga, 256, 0, st, tab, ids, m, *p);
+    }
+    if (hcm_moe(ctx, tab, x, hid, m, p, st, btab, cols, w, y, two_bucket)) return 1;
     if (cols > 0) return 0;   /* the slices are hcm_moe's alone (coli_cuda_moe_cols_async asked hcm_moe_able first) */
-    if (m.TR != 64) { m.TR = 64; coli_launch(moe_sort_scan_k, 1, 32, 0, st, m, *p); }   /* hcg's tiles are of 64 rows */
+    if (m.TR != 64 || two_bucket) { m.TR = 64; coli_launch(moe_sort_scan_k, 1, 32, 0, st, m, *p); }   /* hcg's tiles are of 64 rows */
     dim3 gg((unsigned)((p->I + TCG_BN - 1) / TCG_BN), (unsigned)m.T), gd((unsigned)((p->D + TCG_BN - 1) / TCG_BN), (unsigned)m.T);
     HCG_BT_LAUNCH(hcg_moe_gu_bd_k, p->fmt, gg, st, tab, x, hid, m, *p, btab);
     HCG_BT_LAUNCH(hcg_moe_dn_bd_k, p->fmt_d ? p->fmt_d : p->fmt, gd, st, tab, hid, m, *p, btab);
@@ -6558,10 +7135,10 @@ __global__ static void __launch_bounds__(256) bd_stage_k(const CcExpert *__restr
         if (v + 3 * step < nv) b[v + 3 * step] = r3;
     }
 }
-template<int TG>
+template<int TG, bool GQ = false>
 __global__ static void __launch_bounds__(256) moe_bd_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__ x,
         const int *__restrict__ ids, float *__restrict__ hid, CcMoe p, int lpr, int rw, const bd_u32 *__restrict__ btab,
-        const char *__restrict__ stg, size_t sslot) {
+        const char *__restrict__ stg, size_t sslot, const uint4 *__restrict__ gq) {
     COLI_PDL_WAIT();
     extern __shared__ uint4 bd_sm4[];
     __shared__ CcExpert ke[CC_ROUTE_KMAX];
@@ -6573,7 +7150,17 @@ __global__ static void __launch_bounds__(256) moe_bd_gu_k(const CcExpert *__rest
     uint4 *xq = bd_sm4 + TW / 4;
     float *dx = reinterpret_cast<float *>(xq + qr);
     int *xs = reinterpret_cast<int *>(dx + nb);
-    bdx_quant(x + p.x_off + (size_t)s * p.x_row, 1, p.D, xq, dx, xs);
+    if constexpr (GQ) {
+        (void)x;
+        const float *gdx = reinterpret_cast<const float *>(gq + (size_t)p.S * qr);
+        const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)p.S * nb);
+        for (int i = tid; i < qr; i += 256) xq[i] = gq[(size_t)s * qr + i];
+        for (int i = tid; i < nb; i += 256) dx[i] = gdx[(size_t)s * nb + i];
+        for (int i = tid; i < 2 * nb; i += 256) xs[i] = gxs[(size_t)s * 2 * nb + i];
+    } else {
+        (void)gq;
+        bdx_quant(x + p.x_off + (size_t)s * p.x_row, 1, p.D, xq, dx, xs);
+    }
     if (tid < p.K) {
         int e = ids[p.i_off + s * p.i_row + tid];
         int on = e >= 0 && tab[p.t_off + e].g != nullptr;
@@ -6602,10 +7189,10 @@ __global__ static void __launch_bounds__(256) moe_bd_gu_k(const CcExpert *__rest
         if (ql == 0 && live) hid[((size_t)s * p.K + k) * p.I + o] = moe_glu(p, g * kg[k], uu * kg[k]);
     }
 }
-template<int TD>
+template<int TD, bool GQ = false>
 __global__ static void __launch_bounds__(256) moe_bd_dn_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids,
         float *__restrict__ hid, CcMoe p, int lpr, int tiles, int rw, const bd_u32 *__restrict__ btab,
-        const char *__restrict__ stg, size_t sslot) {
+        const char *__restrict__ stg, size_t sslot, const uint4 *__restrict__ gq) {
     COLI_PDL_WAIT();
     extern __shared__ uint4 bd_sm4[];
     int wgi = (int)(blockIdx.x + blockIdx.y * gridDim.x), j = wgi / tiles, tile = wgi - j * tiles;
@@ -6618,14 +7205,24 @@ __global__ static void __launch_bounds__(256) moe_bd_dn_k(const CcExpert *__rest
     if (pc >= 0) bd_stage_at(&ex, stg, sslot, pc);
     constexpr int TW = bd_tab_words(TD);
     BdTabs tb = bd_tables_fill<TD>(reinterpret_cast<bd_u32 *>(bd_sm4), btab);
-    int nb = p.I / 32, qr = bd_xq_row(p.I);
+    int nb = p.I / 32, qr = bd_xq_row(p.I), tid = threadIdx.x;
     uint4 *xq = bd_sm4 + TW / 4;
     float *dx = reinterpret_cast<float *>(xq + qr);
     int *xs = reinterpret_cast<int *>(dx + nb);
-    bdx_quant(hid + (size_t)j * p.I, 1, p.I, xq, dx, xs);
+    if constexpr (GQ) {
+        int tot = p.S * p.K;
+        const float *gdx = reinterpret_cast<const float *>(gq + (size_t)tot * qr);
+        const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)tot * nb);
+        for (int i = tid; i < qr; i += 256) xq[i] = gq[(size_t)j * qr + i];
+        for (int i = tid; i < nb; i += 256) dx[i] = gdx[(size_t)j * nb + i];
+        for (int i = tid; i < 2 * nb; i += 256) xs[i] = gxs[(size_t)j * 2 * nb + i];
+    } else {
+        (void)gq;
+        bdx_quant(hid + (size_t)j * p.I, 1, p.I, xq, dx, xs);
+    }
     __syncthreads();
     BdX X = {xq, dx, xs, qr, nb};
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr, nq = p.I / 32;
+    int lane = tid & 31, warp = tid >> 5, rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr, nq = p.I / 32;
     int per_tile = (p.D + tiles - 1) / tiles, lo = tile * per_tile, hi = min(lo + per_tile, p.D);
     size_t dn = (size_t)p.S * p.K * p.I;
     for (int o0 = lo + warp * rps; o0 < hi; o0 += 8 * rps) {   /* uniform in the warp */
@@ -6642,15 +7239,21 @@ __global__ static void __launch_bounds__(256) moe_bd_dn_k(const CcExpert *__rest
 }
 template<int TG>
 static int moe_bd_gu_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, const bd_u32 *btab,
-                            size_t smem_max, const char *stg, size_t sslot, cudaStream_t st) {
+                            size_t smem_max, const char *stg, size_t sslot, const uint4 *gq, cudaStream_t st) {
     size_t sm = (size_t)bd_tab_words(TG) * 4 + bd_x_bytes(p->D, 1);
     if (sm > smem_max) return 0;
-    static unsigned raised;
-    bd_smem_raise((const void *)moe_bd_gu_k<TG>, sm, smem_max, &raised);
     int lpr = bd_lpr(p->D), upw = 8 * (32 / lpr), nwg = (p->K * p->I + upw - 1) / upw;   /* units a block */
     if (nwg > 1024) nwg = 1024;
     int rw = (int)((size_t)p->D / BD_BLK[TG] * BD_BYTES[TG] + 3) / 4;
-    coli_launch(moe_bd_gu_k<TG>, dim3((unsigned)nwg, (unsigned)p->S), 256, sm, st, tab, x, ids, hid, *p, lpr, rw, btab, stg, sslot);
+    if (gq) {
+        static unsigned raised_q;
+        bd_smem_raise((const void *)moe_bd_gu_k<TG, true>, sm, smem_max, &raised_q);
+        coli_launch(moe_bd_gu_k<TG, true>, dim3((unsigned)nwg, (unsigned)p->S), 256, sm, st, tab, x, ids, hid, *p, lpr, rw, btab, stg, sslot, gq);
+    } else {
+        static unsigned raised;
+        bd_smem_raise((const void *)moe_bd_gu_k<TG, false>, sm, smem_max, &raised);
+        coli_launch(moe_bd_gu_k<TG, false>, dim3((unsigned)nwg, (unsigned)p->S), 256, sm, st, tab, x, ids, hid, *p, lpr, rw, btab, stg, sslot, (const uint4 *)nullptr);
+    }
     return 1;
 }
 template<int TD>
@@ -6658,13 +7261,488 @@ static int moe_bd_dn_launch(const CcExpert *tab, const int *ids, float *hid, con
                             size_t smem_max, const char *stg, size_t sslot, cudaStream_t st) {
     size_t sm = (size_t)bd_tab_words(TD) * 4 + bd_x_bytes(p->I, 1);
     if (sm > smem_max) return 0;
-    static unsigned raised;
-    bd_smem_raise((const void *)moe_bd_dn_k<TD>, sm, smem_max, &raised);
     int lpr = bd_lpr(p->I), rpp = 8 * (32 / lpr), tiles = (p->D + rpp - 1) / rpp;   /* a down tile: one pass of the block */
     uint64_t nb = (uint64_t)p->S * p->K * tiles;
     unsigned gx = nb < 65535 ? (unsigned)nb : 65535u, gy = (unsigned)((nb + gx - 1) / gx);
     int rw = (int)((size_t)p->I / BD_BLK[TD] * BD_BYTES[TD] + 3) / 4;
-    coli_launch(moe_bd_dn_k<TD>, dim3(gx, gy), 256, sm, st, tab, ids, hid, *p, lpr, tiles, rw, btab, stg, sslot);
+    const uint4 *gq_h = nullptr;
+    const int tot = p->S * p->K;
+    if (tiles >= 8 && p->I >= 2048 && tot >= 1 && tot <= 128 && bd_x_bytes(p->I, tot) <= ((size_t)1 << 20)) {
+        BdXqHeld *held = nullptr;
+        uint4 *qbuf = (uint4 *)bd_xq_scratch(st, bd_x_bytes(p->I, tot), &held);
+        if (qbuf) {
+            if (held) *held = {nullptr, 0, 0};
+            bdx_quant_launch(hid, tot, p->I, p->I, qbuf, st);
+            gq_h = qbuf;
+        }
+    }
+    if (gq_h) {
+        static unsigned raised_q;
+        bd_smem_raise((const void *)moe_bd_dn_k<TD, true>, sm, smem_max, &raised_q);
+        coli_launch(moe_bd_dn_k<TD, true>, dim3(gx, gy), 256, sm, st, tab, ids, hid, *p, lpr, tiles, rw, btab, stg, sslot, gq_h);
+    } else {
+        static unsigned raised;
+        bd_smem_raise((const void *)moe_bd_dn_k<TD, false>, sm, smem_max, &raised);
+        coli_launch(moe_bd_dn_k<TD, false>, dim3(gx, gy), 256, sm, st, tab, ids, hid, *p, lpr, tiles, rw, btab, stg, sslot, (const uint4 *)nullptr);
+    }
+    return 1;
+}
+/* ---- Decode / Verify S=2..8 expert dedup + bit-exact fused down+sum (parts == 3) ---- */
+struct MoeDedup {
+    int ndist;
+    int de[128];
+    int dcnt[128];
+    int dslots[128][8];
+};
+static std::mutex g_moe_dd_mu;
+static struct { cudaStream_t st; int dev; MoeDedup *p; } g_moe_dd[16];
+static int g_moe_dd_n = 0;
+static void moe_dedup_shutdown(int device) {
+    std::lock_guard<std::mutex> lk(g_moe_dd_mu);
+    for (int i = 0; i < g_moe_dd_n; i++) {
+        if (g_moe_dd[i].dev != device) continue;
+        if (g_moe_dd[i].p) cudaFree(g_moe_dd[i].p);
+        g_moe_dd[i] = {nullptr, -1, nullptr};
+    }
+}
+static MoeDedup *moe_dedup_scratch(int dev, cudaStream_t st) {
+    std::lock_guard<std::mutex> lk(g_moe_dd_mu);
+    int free_i = -1;
+    for (int i = 0; i < g_moe_dd_n; i++) {
+        if (g_moe_dd[i].st == st && g_moe_dd[i].dev == dev && g_moe_dd[i].p) return g_moe_dd[i].p;
+        if (free_i < 0 && g_moe_dd[i].dev == -1) free_i = i;
+    }
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+    if (hcm_stream_capturing(st)) { (void)cudaGetLastError(); return nullptr; }
+#endif
+    if (free_i < 0) { if (g_moe_dd_n >= 16) return nullptr; free_i = g_moe_dd_n++; }
+    MoeDedup *p = nullptr;
+    if (cudaMalloc(&p, sizeof(MoeDedup)) != cudaSuccess) { (void)cudaGetLastError(); return nullptr; }
+    g_moe_dd[free_i] = {st, dev, p};
+    return p;
+}
+/* 1-block dedup for 2 <= S <= 8 && S * K <= 128: partitions active slots by distinct expert (<= 8 hits/group) */
+__global__ static void __launch_bounds__(128) moe_bd_dedup_k(
+        const CcExpert *__restrict__ tab, const int *__restrict__ ids, CcMoe p, MoeDedup *__restrict__ dd) {
+    COLI_PDL_WAIT();
+    __shared__ int se[128], sde[128], sdcnt[128], sdslots[128][8], s_nd;
+    const int tid = threadIdx.x, n = p.S * p.K;
+    if (tid < n) {
+        const int s = tid / p.K, k = tid - s * p.K;
+        const int e = ids[p.i_off + s * p.i_row + k];
+        se[tid] = (e >= 0 && tab[p.t_off + e].g != nullptr) ? e : -1;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int nd = 0;
+        for (int j = 0; j < n; j++) {
+            const int e = se[j];
+            if (e < 0) continue;
+            int u = -1;
+            for (int i = 0; i < nd; i++) if (sde[i] == e && sdcnt[i] < 8) { u = i; break; }
+            if (u < 0) { u = nd++; sde[u] = e; sdcnt[u] = 0; }
+            sdslots[u][sdcnt[u]++] = j;
+        }
+        s_nd = nd;
+        dd->ndist = nd;
+    }
+    __syncthreads();
+    const int nd = s_nd;
+    if (tid < nd) { dd->de[tid] = sde[tid]; dd->dcnt[tid] = sdcnt[tid]; }
+    for (int i = tid; i < nd * 8; i += 128) {
+        const int u = i >> 3, c = i & 7;
+        dd->dslots[u][c] = sdslots[u][c];
+    }
+}
+/* Gate+Up dedup for S=2..8: loads each distinct expert ONCE per <= NR hitting tokens (100% bit-exact) */
+template<int TG, int NR>
+__global__ static void __launch_bounds__(256) moe_bd_gu_dedup_k(
+        const CcExpert *__restrict__ tab, float *__restrict__ hid, CcMoe p, int lpr, int rw,
+        const bd_u32 *__restrict__ btab, const char *__restrict__ stg, size_t sslot,
+        const uint4 *__restrict__ gq, const MoeDedup *__restrict__ dd, int nr_g) {
+    COLI_PDL_WAIT();
+    const int u = (int)blockIdx.y;
+    if (u >= dd->ndist) return;
+    extern __shared__ uint4 bd_sm4[];
+    __shared__ int sslot_sh[NR];
+    constexpr int TW = bd_tab_words(TG);
+    BdTabs tb = bd_tables_fill<TG>(reinterpret_cast<bd_u32 *>(bd_sm4), btab);
+    const int e = dd->de[u], cnt = dd->dcnt[u], tid = threadIdx.x;
+    CcExpert ex = tab[p.t_off + e];
+    if (!ex.g) return;
+    const int pc = stg ? ((const int *)stg)[dd->dslots[u][0]] : -1;
+    if (pc >= 0) bd_stage_at(&ex, stg, sslot, pc);
+    const int nb = p.D / 32, qr = bd_xq_row(p.D);
+    uint4 *xq = bd_sm4 + TW / 4;
+    float *dx = reinterpret_cast<float *>(xq + nr_g * qr);
+    int *xs = reinterpret_cast<int *>(dx + nr_g * nb);
+    const float *gdx = reinterpret_cast<const float *>(gq + (size_t)p.S * qr);
+    const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)p.S * nb);
+    const int lane = tid & 31, warp = tid >> 5, rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr, nq = p.D / 32;
+    const int stride = (int)gridDim.x * 8 * rps;
+    for (int c0 = 0; c0 < cnt; c0 += nr_g) {
+        const int nrow = cnt - c0 < nr_g ? cnt - c0 : nr_g;
+        if (tid < nrow) sslot_sh[tid] = dd->dslots[u][c0 + tid];
+        __syncthreads();
+        for (int r = 0; r < nrow; r++) {
+            const int s = sslot_sh[r] / p.K;
+            for (int i = tid; i < qr; i += 256) xq[r * qr + i] = gq[(size_t)s * qr + i];
+            for (int i = tid; i < nb; i += 256) dx[r * nb + i] = gdx[(size_t)s * nb + i];
+            for (int i = tid; i < 2 * nb; i += 256) xs[r * 2 * nb + i] = gxs[(size_t)s * 2 * nb + i];
+        }
+        __syncthreads();
+        BdX X = {xq, dx, xs, qr, nb};
+        for (int o0 = ((int)blockIdx.x * 8 + warp) * rps; o0 < p.I; o0 += stride) {
+            const int o = o0 + sub;
+            const bool live = o < p.I;
+            float g[NR], uu[NR];
+            #pragma unroll
+            for (int r = 0; r < NR; r++) { g[r] = 0.f; uu[r] = 0.f; }
+            if (live) {
+                const bd_u32 *wg = (const bd_u32 *)ex.g + (size_t)o * rw, *wu = (const bd_u32 *)ex.u + (size_t)o * rw;
+                for (int q = ql; q < nq; q += lpr) {
+                    bdi_step<TG, NR>(wg, (bd_u32)q, X, nrow, tb, g);
+                    bdi_step<TG, NR>(wu, (bd_u32)q, X, nrow, tb, uu);
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < NR; r++) if (r < nrow) {
+                float gv = mg_lanes_sum(g[r], lpr), uv = mg_lanes_sum(uu[r], lpr);
+                if (ql == 0 && live) hid[(size_t)sslot_sh[r] * p.I + o] = (gv / (1.f + expf(-gv))) * uv;
+            }
+        }
+        if (c0 + nr_g < cnt) __syncthreads();
+    }
+}
+static inline size_t moe_bd_smem_lim(size_t smem_max, size_t static_b) {
+    const size_t pad = (static_b + 255u) & ~(size_t)255u;
+    return smem_max > pad ? smem_max - pad : 0;
+}
+static inline void moe_bd_smem_raise(const void *k, size_t sm, size_t static_b, size_t smem_lim, unsigned *raised) {
+    int dev = 0;
+    if (sm + static_b <= 48 * 1024 || cudaGetDevice(&dev) != cudaSuccess || dev > 31 || ((*raised >> dev) & 1u)) return;
+    (void)cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_lim);
+    (void)cudaGetLastError();
+    *raised |= 1u << dev;
+}
+template<int TG>
+static int moe_bd_gu_dedup_launch(const CcExpert *tab, float *hid, const CcMoe *p, const bd_u32 *btab,
+                                  size_t smem_max, const char *stg, size_t sslot, const uint4 *gq, const MoeDedup *dd, cudaStream_t st) {
+    constexpr size_t STAT_B = sizeof(int) * 4;
+    const size_t sm_lim = moe_bd_smem_lim(smem_max, STAT_B);
+    const int nr_g = p->S < 4 ? p->S : 4;
+    const size_t sm = (size_t)bd_tab_words(TG) * 4 + bd_x_bytes(p->D, nr_g);
+    if (sm > sm_lim) return 0;
+    const int lpr = bd_lpr(p->D), upw = 8 * (32 / lpr);
+    int nwg = (p->I + upw - 1) / upw;
+    if (nwg > 1024) nwg = 1024;
+    const int rw = (int)((size_t)p->D / BD_BLK[TG] * BD_BYTES[TG] + 3) / 4;
+    static unsigned raised;
+    moe_bd_smem_raise((const void *)moe_bd_gu_dedup_k<TG, 4>, sm, STAT_B, sm_lim, &raised);
+    coli_launch(moe_bd_gu_dedup_k<TG, 4>, dim3((unsigned)nwg, (unsigned)(p->S * p->K)), 256, sm, st,
+                tab, hid, *p, lpr, rw, btab, stg, sslot, gq, dd, nr_g);
+    return 1;
+}
+/* Bit-exact fused down + rank-ordered sum for S == 1 (parts == 3, no atomicAdd, no hid[dn] traffic).
+ * Inline hid quant when gq_h == nullptr (I <= 1024); nw_exp == 8 runs 8 experts in parallel per block. */
+template<int TD>
+__global__ static void __launch_bounds__(256) moe_bd_dn_sum_s1_k(
+        const CcExpert *__restrict__ tab, const int *__restrict__ ids, const float *__restrict__ w,
+        const float *__restrict__ hid, const float *__restrict__ hy, float *__restrict__ y,
+        CcMoe p, int lpr, int rw, const bd_u32 *__restrict__ btab, const char *__restrict__ stg, size_t sslot,
+        const uint4 *__restrict__ gq_h, int nw_exp, int all_in_smem, size_t x_bytes) {
+    COLI_PDL_WAIT();
+    extern __shared__ uint4 bd_sm4[];
+    __shared__ CcExpert ke[CC_ROUTE_KMAX];
+    __shared__ int kl[CC_ROUTE_KMAX];
+    __shared__ float kw[CC_ROUTE_KMAX];
+    constexpr int TW = bd_tab_words(TD);
+    BdTabs tb = bd_tables_fill<TD>(reinterpret_cast<bd_u32 *>(bd_sm4), btab);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr, nq = p.I / 32;
+    const int nb = p.I / 32, qr = bd_xq_row(p.I);
+    const int B_O = nw_exp == 8 ? rps : 8 * rps, o0 = (int)blockIdx.x * B_O;
+    if (tid < p.K) {
+        const int e = ids[p.i_off + tid];
+        const int on = e >= 0 && tab[p.t_off + e].g != nullptr;
+        kl[tid] = on;
+        kw[tid] = w[p.w_off + tid];
+        if (on) {
+            CcExpert ex = tab[p.t_off + e];
+            const int pc = stg ? ((const int *)stg)[tid] : -1;
+            if (pc >= 0) bd_stage_at(&ex, stg, sslot, pc);
+            ke[tid] = ex;
+        }
+    }
+    __syncthreads();
+    uint4 *xq = bd_sm4 + TW / 4;
+    const int xrows = all_in_smem ? p.K : 1;
+    float *dx = reinterpret_cast<float *>(xq + xrows * qr);
+    int *xs = reinterpret_cast<int *>(dx + xrows * nb);
+    float *partial = reinterpret_cast<float *>(reinterpret_cast<char *>(bd_sm4 + TW / 4) + x_bytes);
+    if (all_in_smem) {
+        if (gq_h) {
+            const float *gdx = reinterpret_cast<const float *>(gq_h + (size_t)p.K * qr);
+            const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)p.K * nb);
+            for (int k = 0; k < p.K; k++) if (kl[k]) {
+                for (int i = tid; i < qr; i += 256) xq[k * qr + i] = gq_h[(size_t)k * qr + i];
+                for (int i = tid; i < nb; i += 256) dx[k * nb + i] = gdx[(size_t)k * nb + i];
+                for (int i = tid; i < 2 * nb; i += 256) xs[k * 2 * nb + i] = gxs[(size_t)k * 2 * nb + i];
+            }
+        } else {
+            for (int kk = tid; kk < p.K * nb; kk += 256) {
+                const int k = kk / nb, b = kk - k * nb;
+                if (kl[k]) bdx_quant_block(hid + (size_t)k * p.I, p.I, k, b, xq, dx, xs);
+            }
+        }
+        __syncthreads();
+        const int eg = nw_exp == 8 ? warp : 0;
+        const int bo = nw_exp == 8 ? sub : (warp * rps + sub);
+        const int o = o0 + bo;
+        const bool live = o < p.D;
+        for (int k = eg; k < p.K; k += nw_exp) {
+            if (!kl[k]) continue;
+            BdX Xk = {xq + k * qr, dx + k * nb, xs + k * 2 * nb, qr, nb};
+            float v = 0.f;
+            if (live) {
+                const bd_u32 *wd = (const bd_u32 *)ke[k].d + (size_t)o * rw;
+                for (int q = ql; q < nq; q += lpr) bdi_step<TD, 1>(wd, (bd_u32)q, Xk, 1, tb, &v);
+            }
+            v = mg_lanes_sum(v, lpr);
+            if (ql == 0 && live) partial[k * B_O + bo] = v;
+        }
+    } else {
+        const float *gdx = reinterpret_cast<const float *>(gq_h + (size_t)p.K * qr);
+        const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)p.K * nb);
+        const int bo = warp * rps + sub, o = o0 + bo;
+        const bool live = o < p.D;
+        for (int k = 0; k < p.K; k++) {
+            if (!kl[k]) continue;
+            for (int i = tid; i < qr; i += 256) xq[i] = gq_h[(size_t)k * qr + i];
+            for (int i = tid; i < nb; i += 256) dx[i] = gdx[(size_t)k * nb + i];
+            for (int i = tid; i < 2 * nb; i += 256) xs[i] = gxs[(size_t)k * 2 * nb + i];
+            __syncthreads();
+            BdX Xk = {xq, dx, xs, qr, nb};
+            float v = 0.f;
+            if (live) {
+                const bd_u32 *wd = (const bd_u32 *)ke[k].d + (size_t)o * rw;
+                for (int q = ql; q < nq; q += lpr) bdi_step<TD, 1>(wd, (bd_u32)q, Xk, 1, tb, &v);
+            }
+            v = mg_lanes_sum(v, lpr);
+            if (ql == 0 && live) partial[k * B_O + bo] = v;
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+    const int bo_lim = p.D - o0 < B_O ? p.D - o0 : B_O;
+    for (int bo = tid; bo < bo_lim; bo += 256) {
+        const int d = o0 + bo;
+        float v = p.h_off >= 0 ? hy[p.h_off + d] : 0.f;
+        for (int k = 0; k < p.K; k++) if (kl[k]) v += kw[k] * partial[k * B_O + bo];
+        y[p.y_off + d] = v;
+    }
+}
+/* Bit-exact fused dedup down + rank-ordered sum for S=2..8 (parts == 3, S * K <= 128).
+ * NW_EXP == 8: 1 warp per distinct expert (syncwarp only); NW_EXP == 1: all 8 warps cooperate per expert. */
+template<int TD, int NW_EXP>
+__global__ static void __launch_bounds__(256) moe_bd_dn_sum_dedup_k(
+        const CcExpert *__restrict__ tab, const int *__restrict__ ids, const float *__restrict__ w,
+        const float *__restrict__ hy, float *__restrict__ y, CcMoe p, int lpr, int rw,
+        const bd_u32 *__restrict__ btab, const char *__restrict__ stg, size_t sslot,
+        const uint4 *__restrict__ gq_h, const MoeDedup *__restrict__ dd, int nr_g, size_t grp_b) {
+    COLI_PDL_WAIT();
+    extern __shared__ uint4 bd_sm4[];
+    __shared__ uint8_t s_on[128];
+    __shared__ float s_w[128];
+    constexpr int TW = bd_tab_words(TD);
+    BdTabs tb = bd_tables_fill<TD>(reinterpret_cast<bd_u32 *>(bd_sm4), btab);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int tot = p.S * p.K;
+    if (tid < tot) {
+        const int s = tid / p.K, k = tid - s * p.K;
+        const int e = ids[p.i_off + s * p.i_row + k];
+        s_on[tid] = (e >= 0 && tab[p.t_off + e].g != nullptr) ? 1 : 0;
+        s_w[tid] = w[p.w_off + s * p.w_row + k];
+    }
+    __syncthreads();
+    const int rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr, nq = p.I / 32;
+    const int nb = p.I / 32, qr = bd_xq_row(p.I);
+    const int B_O = NW_EXP == 8 ? rps : 8 * rps, o0 = (int)blockIdx.x * B_O;
+    const float *gdx = reinterpret_cast<const float *>(gq_h + (size_t)tot * qr);
+    const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)tot * nb);
+    float *partial = reinterpret_cast<float *>(reinterpret_cast<char *>(bd_sm4 + TW / 4) + (size_t)NW_EXP * grp_b);
+    const int ndist = dd->ndist;
+    if constexpr (NW_EXP == 8) {
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+        uint4 *xq = reinterpret_cast<uint4 *>(reinterpret_cast<char *>(bd_sm4 + TW / 4) + (size_t)warp * grp_b);
+        float *dx = reinterpret_cast<float *>(xq + nr_g * qr);
+        int *xs = reinterpret_cast<int *>(dx + nr_g * nb);
+        const int bo = sub, o = o0 + bo;
+        const bool live = o < p.D;
+        for (int u = warp; u < ndist; u += 8) {
+            const int e = dd->de[u], cnt = dd->dcnt[u];
+            CcExpert ex = tab[p.t_off + e];
+            if (!ex.g) continue;
+            const int pc = stg ? ((const int *)stg)[dd->dslots[u][0]] : -1;
+            if (pc >= 0) bd_stage_at(&ex, stg, sslot, pc);
+            for (int c0 = 0; c0 < cnt; c0 += nr_g) {
+                const int nrow = cnt - c0 < nr_g ? cnt - c0 : nr_g;
+                int slots[4];
+                #pragma unroll
+                for (int r = 0; r < 4; r++) if (r < nrow) slots[r] = dd->dslots[u][c0 + r];
+                for (int r = 0; r < nrow; r++) {
+                    const int j = slots[r];
+                    for (int i = lane; i < qr; i += 32) xq[r * qr + i] = gq_h[(size_t)j * qr + i];
+                    for (int i = lane; i < nb; i += 32) dx[r * nb + i] = gdx[(size_t)j * nb + i];
+                    for (int i = lane; i < 2 * nb; i += 32) xs[r * 2 * nb + i] = gxs[(size_t)j * 2 * nb + i];
+                }
+                __syncwarp();
+                BdX X = {xq, dx, xs, qr, nb};
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                if (live) {
+                    const bd_u32 *wd = (const bd_u32 *)ex.d + (size_t)o * rw;
+                    for (int q = ql; q < nq; q += lpr) bdi_step<TD, 4>(wd, (bd_u32)q, X, nrow, tb, acc);
+                }
+                #pragma unroll
+                for (int r = 0; r < 4; r++) if (r < nrow) {
+                    float v = mg_lanes_sum(acc[r], lpr);
+                    if (ql == 0 && live) partial[slots[r] * B_O + bo] = v;
+                }
+                __syncwarp();
+            }
+        }
+#endif
+    } else {
+        __shared__ int sslot_sh[4];
+        uint4 *xq = bd_sm4 + TW / 4;
+        float *dx = reinterpret_cast<float *>(xq + nr_g * qr);
+        int *xs = reinterpret_cast<int *>(dx + nr_g * nb);
+        const int bo = warp * rps + sub, o = o0 + bo;
+        const bool live = o < p.D;
+        for (int u = 0; u < ndist; u++) {
+            const int e = dd->de[u], cnt = dd->dcnt[u];
+            CcExpert ex = tab[p.t_off + e];
+            if (!ex.g) continue;
+            const int pc = stg ? ((const int *)stg)[dd->dslots[u][0]] : -1;
+            if (pc >= 0) bd_stage_at(&ex, stg, sslot, pc);
+            for (int c0 = 0; c0 < cnt; c0 += nr_g) {
+                const int nrow = cnt - c0 < nr_g ? cnt - c0 : nr_g;
+                if (tid < nrow) sslot_sh[tid] = dd->dslots[u][c0 + tid];
+                __syncthreads();
+                for (int r = 0; r < nrow; r++) {
+                    const int j = sslot_sh[r];
+                    for (int i = tid; i < qr; i += 256) xq[r * qr + i] = gq_h[(size_t)j * qr + i];
+                    for (int i = tid; i < nb; i += 256) dx[r * nb + i] = gdx[(size_t)j * nb + i];
+                    for (int i = tid; i < 2 * nb; i += 256) xs[r * 2 * nb + i] = gxs[(size_t)j * 2 * nb + i];
+                }
+                __syncthreads();
+                BdX X = {xq, dx, xs, qr, nb};
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                if (live) {
+                    const bd_u32 *wd = (const bd_u32 *)ex.d + (size_t)o * rw;
+                    for (int q = ql; q < nq; q += lpr) bdi_step<TD, 4>(wd, (bd_u32)q, X, nrow, tb, acc);
+                }
+                #pragma unroll
+                for (int r = 0; r < 4; r++) if (r < nrow) {
+                    float v = mg_lanes_sum(acc[r], lpr);
+                    if (ql == 0 && live) partial[sslot_sh[r] * B_O + bo] = v;
+                }
+                __syncthreads();
+            }
+        }
+    }
+    __syncthreads();
+    const int bo_lim = p.D - o0 < B_O ? p.D - o0 : B_O;
+    const int nout = p.S * bo_lim;
+    for (int idx = tid; idx < nout; idx += 256) {
+        const int s = idx / bo_lim, bo = idx - s * bo_lim, d = o0 + bo;
+        float v = p.h_off >= 0 ? hy[p.h_off + (size_t)s * p.D + d] : 0.f;
+        const int base_j = s * p.K;
+        for (int k = 0; k < p.K; k++) if (s_on[base_j + k]) v += s_w[base_j + k] * partial[(base_j + k) * B_O + bo];
+        y[p.y_off + (size_t)s * p.y_row + d] = v;
+    }
+}
+template<int TD>
+static int moe_bd_dn_sum_launch(const DeviceContext *ctx, const CcExpert *tab, const int *ids, const float *w,
+                                float *hid, float *y, const float *hy, const CcMoe *p, const bd_u32 *btab,
+                                size_t smem_max, const char *stg, size_t sslot, const MoeDedup *dd, cudaStream_t st) {
+    const int lpr = bd_lpr(p->I), rps = 32 / lpr, tot = p->S * p->K;
+    const int rw = (int)((size_t)p->I / BD_BLK[TD] * BD_BYTES[TD] + 3) / 4;
+    const size_t tab_b = (size_t)bd_tab_words(TD) * 4;
+    const int bo1 = 8 * rps, blocks1 = (p->D + bo1 - 1) / bo1;
+    const int bo8 = rps, blocks8 = (p->D + bo8 - 1) / bo8;
+    if (p->S == 1) {
+        constexpr size_t STAT_S1 = (sizeof(CcExpert) + sizeof(int) + sizeof(float)) * CC_ROUTE_KMAX;
+        const size_t sm_lim = moe_bd_smem_lim(smem_max, STAT_S1);
+        const size_t x_all_b = (bd_x_bytes(p->I, p->K) + 15) & ~(size_t)15;
+        const size_t x_one_b = (bd_x_bytes(p->I, 1) + 15) & ~(size_t)15;
+        const bool inline_q = (p->I <= 1024);
+        int nw_exp = 1, all_in_smem = 0;
+        size_t x_b = x_one_b, sm = 0;
+        const uint4 *gq_h = nullptr;
+        const size_t sm8 = tab_b + x_all_b + (size_t)p->K * bo8 * sizeof(float);
+        const size_t sm1_all = tab_b + x_all_b + (size_t)p->K * bo1 * sizeof(float);
+        const size_t sm1_one = tab_b + x_one_b + (size_t)p->K * bo1 * sizeof(float);
+        if (blocks1 < ctx->sms && sm8 <= sm_lim) {
+            nw_exp = 8; all_in_smem = 1; x_b = x_all_b; sm = sm8;
+        } else if (inline_q && sm1_all <= sm_lim) {
+            nw_exp = 1; all_in_smem = 1; x_b = x_all_b; sm = sm1_all;
+        } else if (sm1_one <= sm_lim) {
+            nw_exp = 1; all_in_smem = 0; x_b = x_one_b; sm = sm1_one;
+        } else {
+            return 0;
+        }
+        if (!(inline_q && all_in_smem)) {
+            if (bd_x_bytes(p->I, p->K) > ((size_t)1 << 20)) return 0;
+            BdXqHeld *held = nullptr;
+            uint4 *qbuf = (uint4 *)bd_xq_scratch(st, bd_x_bytes(p->I, p->K), &held);
+            if (!qbuf) return 0;
+            if (held) *held = {nullptr, 0, 0};
+            bdx_quant_launch(hid, p->K, p->I, p->I, qbuf, st);
+            gq_h = qbuf;
+        }
+        static unsigned raised;
+        moe_bd_smem_raise((const void *)moe_bd_dn_sum_s1_k<TD>, sm, STAT_S1, sm_lim, &raised);
+        const unsigned gx = (unsigned)(nw_exp == 8 ? blocks8 : blocks1);
+        coli_launch(moe_bd_dn_sum_s1_k<TD>, dim3(gx), 256, sm, st,
+                    tab, ids, w, hid, hy, y, *p, lpr, rw, btab, stg, sslot, gq_h, nw_exp, all_in_smem, x_b);
+        return 1;
+    }
+    if (!dd || bd_x_bytes(p->I, tot) > ((size_t)1 << 20)) return 0;
+    constexpr size_t STAT_DD = 128 + 128 * sizeof(float) + 4 * sizeof(int);
+    const size_t sm_lim = moe_bd_smem_lim(smem_max, STAT_DD);
+    const int nr_g = p->S < 4 ? p->S : 4;
+    const size_t grp_b = (bd_x_bytes(p->I, nr_g) + 15) & ~(size_t)15;
+    const size_t sm1 = tab_b + grp_b + (size_t)tot * bo1 * sizeof(float);
+    int nw_exp = 0;
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+    const size_t cap2 = moe_bd_smem_lim((size_t)48 * 1024, STAT_DD);
+    const size_t sm8 = tab_b + 8 * grp_b + (size_t)tot * bo8 * sizeof(float);
+    {
+        const size_t lim8 = blocks1 < ctx->sms / 2 ? sm_lim : (cap2 < sm_lim ? cap2 : sm_lim);
+        if (blocks1 < ctx->sms && sm8 <= lim8) nw_exp = 8;
+    }
+#endif
+    if (!nw_exp && sm1 <= sm_lim) nw_exp = 1;
+    if (!nw_exp) return 0;
+    BdXqHeld *held = nullptr;
+    uint4 *qbuf = (uint4 *)bd_xq_scratch(st, bd_x_bytes(p->I, tot), &held);
+    if (!qbuf) return 0;
+    if (held) *held = {nullptr, 0, 0};
+    bdx_quant_launch(hid, tot, p->I, p->I, qbuf, st);
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+    if (nw_exp == 8) {
+        static unsigned raised8;
+        moe_bd_smem_raise((const void *)moe_bd_dn_sum_dedup_k<TD, 8>, sm8, STAT_DD, sm_lim, &raised8);
+        coli_launch(moe_bd_dn_sum_dedup_k<TD, 8>, dim3((unsigned)blocks8), 256, sm8, st,
+                    tab, ids, w, hy, y, *p, lpr, rw, btab, stg, sslot, (const uint4 *)qbuf, dd, nr_g, grp_b);
+        return 1;
+    }
+#endif
+    static unsigned raised1;
+    moe_bd_smem_raise((const void *)moe_bd_dn_sum_dedup_k<TD, 1>, sm1, STAT_DD, sm_lim, &raised1);
+    coli_launch(moe_bd_dn_sum_dedup_k<TD, 1>, dim3((unsigned)blocks1), 256, sm1, st,
+                tab, ids, w, hy, y, *p, lpr, rw, btab, stg, sslot, (const uint4 *)qbuf, dd, nr_g, grp_b);
     return 1;
 }
 #define BD_MOE_TYPES(X) X(6) X(7) X(8) X(10) X(11) X(12) X(13) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(40) X(42)
@@ -6674,9 +7752,17 @@ static int moe_bd_ok(const CcMoe *p) {
     return tg >= 0 && tg < 43 && td >= 0 && td < 43 && bd_fmt_ok(p->fmt) && bd_fmt_ok(td + 100) && bdi_moe_has(tg) && bdi_moe_has(td) &&
            p->D % BD_BLK[tg] == 0 && p->I % BD_BLK[td] == 0 && p->K <= CC_ROUTE_KMAX && !p->planar;
 }
-static int moe_bd_launch(DeviceContext *ctx, const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, cudaStream_t st) {
+static int moe_bd_launch(DeviceContext *ctx, const CcExpert *tab, const float *x, const int *ids, const float *w, float *hid,
+                         float *y, const float *hy, const CcMoe *p, cudaStream_t st, int *sum_done) {
+    if (sum_done) *sum_done = 0;
     const bd_u32 *btab = bd_table(ctx);
     if (!btab || ((uintptr_t)(x + p->x_off) & 15) || p->x_row % 4) return 0;
+    if (g_bd_x_same == 0) {
+        bd_xq_forget(st);
+        hcm_half_forget_stream(st, nullptr);
+    } else if (g_bd_x_same == 2) {
+        hcm_half_forget_stream(st, nullptr);
+    }
     int ok = 0, tg = p->fmt - 100, td = (p->fmt_d ? p->fmt_d : p->fmt) - 100;
     const char *stg = nullptr;
     size_t sslot = 0;
@@ -6686,13 +7772,52 @@ static int moe_bd_launch(DeviceContext *ctx, const CcExpert *tab, const float *x
         stg = ctx->moe_stage; sslot = ctx->moe_stage_slot;
         coli_launch(bd_stage_k, dim3(48u, (unsigned)ctx->moe_stage_n), 256, 0, st, tab, ids, *p, ctx->moe_stage, sslot, ctx->moe_stage_n, gub, dnb);
     }
-    switch (tg) {
-#define BD_GU_CASE(t) case t: ok = moe_bd_gu_launch<t>(tab, x, ids, hid, p, btab, ctx->smem_optin, stg, sslot, st); break;
-        BD_MOE_TYPES(BD_GU_CASE)
+    const uint4 *gq = nullptr;
+    if (p->S <= BD_GEMV_MAX_S && p->x_row == p->D && bd_x_bytes(p->D, p->S) <= ((size_t)1 << 20)) {
+        gq = bd_xq_quant(x + p->x_off, p->S, p->D, st);
+    }
+    static int moe_dedup_on = -1;
+    if (moe_dedup_on < 0) { const char *e = getenv("COLI_CUDA_MOE_DEDUP"); moe_dedup_on = (e && *e == '1') ? 1 : 0; }
+    MoeDedup *dd = nullptr;
+    if (moe_dedup_on && p->act == 0 && p->esc_off == 0 && p->S >= 2 && p->S <= 8 && p->S * p->K <= 128) {
+        dd = moe_dedup_scratch(ctx->device, st);
+        if (dd) coli_launch(moe_bd_dedup_k, dim3(1u), 128, 0, st, tab, ids, *p, dd);
+    }
+    int gu_done = 0;
+    if (dd && gq) {
+        switch (tg) {
+#define BD_GUD_CASE(t) case t: gu_done = moe_bd_gu_dedup_launch<t>(tab, hid, p, btab, ctx->smem_optin, stg, sslot, gq, dd, st); break;
+            BD_MOE_TYPES(BD_GUD_CASE)
+#undef BD_GUD_CASE
+            default: break;
+        }
+    }
+    if (gu_done) {
+        ok = 1;
+    } else {
+        switch (tg) {
+#define BD_GU_CASE(t) case t: ok = moe_bd_gu_launch<t>(tab, x, ids, hid, p, btab, ctx->smem_optin, stg, sslot, gq, st); break;
+            BD_MOE_TYPES(BD_GU_CASE)
 #undef BD_GU_CASE
-        default: return 0;
+            default: return 0;
+        }
     }
     if (!ok) return 0;
+    const bool can_fuse_sum = p->parts == 3 && p->act == 0 && p->esc_off == 0 && p->S * p->K <= 128 &&
+                              w && y && (p->h_off < 0 || hy) && (p->S == 1 || dd != nullptr);
+    if (can_fuse_sum) {
+        int fused = 0;
+        switch (td) {
+#define BD_DNS_CASE(t) case t: fused = moe_bd_dn_sum_launch<t>(ctx, tab, ids, w, hid, y, hy, p, btab, ctx->smem_optin, stg, sslot, dd, st); break;
+            BD_MOE_TYPES(BD_DNS_CASE)
+#undef BD_DNS_CASE
+            default: break;
+        }
+        if (fused) {
+            if (sum_done) *sum_done = 1;
+            return cuda_ok(cudaGetLastError(), "chain moe block fused launch");
+        }
+    }
     switch (td) {
 #define BD_DN_CASE(t) case t: ok = moe_bd_dn_launch<t>(tab, ids, hid, p, btab, ctx->smem_optin, stg, sslot, st); break;
         BD_MOE_TYPES(BD_DN_CASE)
@@ -6744,15 +7869,26 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         int brows = tiles && btab && LS > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && hcg_ok(bc) && p->D % HCG_BK == 0 && p->I % HCG_BK == 0 &&
                     (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0;
         MoeSort bm = moe_sort_of(hid, p);
-        if ((p->parts & 1) && (!x || !(brows ? moe_rows_bd_launch(bc, tab, x, ids, hid, bm, p, btab, bst) : moe_bd_launch(bc, tab, x, ids, hid, p, bst))))
+        int sum_done = 0;
+        if ((p->parts & 1) && (!x || !(brows ? moe_rows_bd_launch(bc, tab, x, ids, hid, bm, p, btab, bst)
+                                             : moe_bd_launch(bc, tab, x, ids, w, hid, y, hy, p, bst, &sum_done))))
             return 0;
-        if (p->parts & 2) {
+        if ((p->parts & 2) && !sum_done) {
             if (!w || !y || (p->h_off >= 0 && !hy)) return 0;
-            dim3 g((unsigned)((p->D + 255) / 256), (unsigned)p->S);
-            if (brows) coli_launch(moe_rows_sum_k, g, 256, 0, bst, w, hid, hy, y, bm, *p);
-            else coli_launch(moe_sum_k, g, 256, 0, bst, tab, ids, w, hid, hy, y, *p);
+            const bool sum4_ok = !brows && (p->D % 4 == 0) && p->K <= 32 && ((uintptr_t)hid & 15) == 0 &&
+                                 ((uintptr_t)(y + p->y_off) & 15) == 0 && (p->y_row % 4 == 0) &&
+                                 (p->h_off < 0 || ((uintptr_t)(hy + p->h_off) & 15) == 0);
+            if (sum4_ok) {
+                dim3 g4((unsigned)((p->D / 4 + 63) / 64), (unsigned)p->S);
+                coli_launch(moe_sum4_k, g4, 64, 0, bst, tab, ids, w, hid, hy, y, *p);
+            } else {
+                dim3 g((unsigned)((p->D + 255) / 256), (unsigned)p->S);
+                if (brows) coli_launch(moe_rows_sum_k, g, 256, 0, bst, w, hid, hy, y, bm, *p);
+                else coli_launch(moe_sum_k, g, 256, 0, bst, tab, ids, w, hid, hy, y, *p);
+            }
             if (!cuda_ok(cudaGetLastError(), "chain moe sum launch")) return 0;
         }
+        if ((p->parts & 2) && y) hcm_half_invalidate_range(device, y + p->y_off, (size_t)p->S * (size_t)p->y_row * sizeof(float));
         return 1;
     }
     if (p->fmt == 4 && (p->gs < 16 || p->gs % 16)) return 0;
@@ -6784,10 +7920,19 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
     }
     if (p->parts & 2) {
         if (!w || !y || (p->h_off >= 0 && !hy)) return 0;
-        dim3 g((unsigned)((p->D + 255) / 256), (unsigned)p->S);
-        if (rows) coli_launch(moe_rows_sum_k, g, 256, 0, st, w, hid, hy, y, m, *p);
-        else coli_launch(moe_sum_k, g, 256, 0, st, tab, ids, w, hid, hy, y, *p);
+        const bool sum4_ok = !rows && (p->D % 4 == 0) && p->K <= 32 && ((uintptr_t)hid & 15) == 0 &&
+                             ((uintptr_t)(y + p->y_off) & 15) == 0 && (p->y_row % 4 == 0) &&
+                             (p->h_off < 0 || ((uintptr_t)(hy + p->h_off) & 15) == 0);
+        if (sum4_ok) {
+            dim3 g4((unsigned)((p->D / 4 + 63) / 64), (unsigned)p->S);
+            coli_launch(moe_sum4_k, g4, 64, 0, st, tab, ids, w, hid, hy, y, *p);
+        } else {
+            dim3 g((unsigned)((p->D + 255) / 256), (unsigned)p->S);
+            if (rows) coli_launch(moe_rows_sum_k, g, 256, 0, st, w, hid, hy, y, m, *p);
+            else coli_launch(moe_sum_k, g, 256, 0, st, tab, ids, w, hid, hy, y, *p);
+        }
         if (!cuda_ok(cudaGetLastError(), "chain moe sum launch")) return 0;
+        hcm_half_invalidate_range(device, y + p->y_off, (size_t)p->S * (size_t)p->y_row * sizeof(float));
     }
     return 1;
 }
@@ -6812,7 +7957,9 @@ extern "C" int coli_cuda_moe_cols_async(int device, const CcExpert *tab, const f
         !hcm_moe_able(bc, p, btab)) return -1;
     CcMoe q = *p; q.D = cols < p->D ? cols : p->D;   /* the sort's integers after the slots' I and a slice's outputs */
     MoeSort m = moe_sort_of(hid, &q);
-    return moe_rows_bd_launch(bc, tab, x, ids, hid, m, p, btab, (cudaStream_t)stream, cols, w, y) ? 1 : 0;
+    int ok = moe_rows_bd_launch(bc, tab, x, ids, hid, m, p, btab, (cudaStream_t)stream, cols, w, y) ? 1 : 0;
+    if (ok) hcm_half_invalidate_range(device, y + p->y_off, (size_t)p->S * (size_t)p->y_row * sizeof(float));
+    return ok;
 }
 
 /* sm_89 Qwen3.6 native INT4-g64 experts and their INT8 and float projections.
@@ -8149,6 +9296,8 @@ static void qx_invalidate(DeviceContext *ctx, const float *y_dev, size_t n_float
 }
 extern "C" void coli_cuda_qx_invalidate(int device, const float *y_dev, size_t n_floats) {
     qx_invalidate(find_ctx(device), y_dev, n_floats);
+    bd_xq_invalidate_range(y_dev, n_floats * sizeof(float));
+    hcm_half_invalidate_range(device, y_dev, n_floats * sizeof(float));
 }
 static int hcg_alloc_qx_i8(DeviceContext *ctx, int S, int I, int slot) {
     size_t qb = (size_t)S * I, sb = ((size_t)S * (I >> 6)) * sizeof(float);
@@ -9115,40 +10264,7 @@ extern "C" int coli_cuda_tensor_swiglu_async(ColiCudaTensor *tg, ColiCudaTensor 
         float *y_dev, const float *x_dev, int S, void *stream) {
     return coli_cuda_tensor_swiglu_weights_async(tg, tu, y_dev, x_dev, S, stream, 0);
 }
-__global__ static void __launch_bounds__(64) moe_sum4_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids,
-        const float *__restrict__ w, const float *__restrict__ hid, const float *__restrict__ hy, float *__restrict__ y, CcMoe p) {
-    __shared__ int sv[32];
-    __shared__ float sw[32];
-    int s = blockIdx.y, t = threadIdx.x, d4 = blockIdx.x * 64 + t;
-    if (t < p.K) {
-        int e = ids[p.i_off + s * p.i_row + t];
-        sv[t] = e >= 0 && tab[p.t_off + e].g != nullptr;
-        sw[t] = w[p.w_off + s * p.w_row + t];
-    }
-    __syncthreads();
-    if (d4 * 4 >= p.D) return;
-    const float4 *yd4 = reinterpret_cast<const float4 *>(hid + (size_t)(p.lay_S ? p.lay_S : p.S) * p.K * p.I);
-    int D4 = p.D >> 2;
-    float4 v = p.h_off >= 0 ? reinterpret_cast<const float4 *>(hy + p.h_off)[(size_t)s * D4 + d4] : make_float4(0.f, 0.f, 0.f, 0.f);
-    if (p.K == 8) {
-        float4 u[8];
-        #pragma unroll
-        for (int k = 0; k < 8; k++)
-            u[k] = sv[k] ? yd4[(size_t)((p.lay_s0 + s) * 8 + k) * D4 + d4] : make_float4(0.f, 0.f, 0.f, 0.f);
-        #pragma unroll
-        for (int k = 0; k < 8; k++) if (sv[k]) {
-            float wk = sw[k];
-            v.x += wk * u[k].x; v.y += wk * u[k].y; v.z += wk * u[k].z; v.w += wk * u[k].w;
-        }
-    } else {
-        for (int k = 0; k < p.K; k++) if (sv[k]) {
-            float wk = sw[k];
-            float4 u = yd4[(size_t)((p.lay_s0 + s) * p.K + k) * D4 + d4];
-            v.x += wk * u.x; v.y += wk * u.y; v.z += wk * u.z; v.w += wk * u.w;
-        }
-    }
-    reinterpret_cast<float4 *>(y + p.y_off + (size_t)s * p.y_row)[d4] = v;
-}
+/* ::moe_sum4_k promoted above qwen36_cuda for shared use across parts == 2 */
 /* A prompt chunk's slots by expert (S > CC_MOE_FRAME_ROWS): counts, offsets and the
  * GEMMs' tiles (16, 32 or 64 rows of one expert each), each slot's place. The integers sit in hid
  * before the floats: cnt[E] base[E + 1] cur[E] ntile[1] te[T] tr[T] order[A] posof[A]. */
@@ -9802,7 +10918,10 @@ extern "C" int coli_cuda_qwen36_moe_async(int device, const CcExpert *tab, const
 #undef Q36_MMA
 }  // namespace qwen36_cuda
 #else
-extern "C" void coli_cuda_qx_invalidate(int, const float *, size_t) {}
+extern "C" void coli_cuda_qx_invalidate(int device, const float *y_dev, size_t n_floats) {
+    bd_xq_invalidate_range(y_dev, n_floats * sizeof(float));
+    hcm_half_invalidate_range(device, y_dev, n_floats * sizeof(float));
+}
 extern "C" int coli_cuda_qx_prepare(int, const float *, int, int, int8_t **, float **, int, int) { return 0; }
 extern "C" int coli_cuda_tensor_swiglu_async(ColiCudaTensor *, ColiCudaTensor *, float *, const float *, int, void *) { return 0; }
 extern "C" int coli_cuda_tensor_swiglu_weights_async(ColiCudaTensor *, ColiCudaTensor *, float *, const float *, int, void *, int) { return 0; }

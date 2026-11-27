@@ -1,5 +1,6 @@
 #include "qwen36_tier.h"   /* CUDA VRAM expert tier, shared with qwen36; CPU-only builds get the inline no-op stubs */
 #ifdef COLI_CUDA
+#include "backend_cuda.h"   /* coli_cuda_copy_async, coli_cuda_pipe_upload/sync, coli_cuda_host_register */
 #include "cuda_chain.h"     /* cc_moe_block_type: the GGUF types the tier's groups compute; the backend's block formats */
 #endif
 #include "vk_tier.h"       /* Vulkan routed-expert tier (COLI_VULKAN=1); builds without VK=1 get inline no-op stubs */
@@ -2997,7 +2998,7 @@ static void q38_ple_rows(Model *m,int p,int64_t local,int count,float *out) {
         Q38_NEED(count>=1&&local>=0&&local<=t->ne[1]-count&&rb>0&&count<=INT64_MAX/rb,
                  "PLE row run out of range");
         int64_t nb=(int64_t)count*rb;
-        uint8_t stack[1024],*raw=nb<=(int64_t)sizeof stack?stack:(uint8_t*)malloc((size_t)nb);
+        uint8_t stack[4096],*raw=nb<=(int64_t)sizeof stack?stack:(uint8_t*)malloc((size_t)nb);
         if(!raw){fprintf(stderr,"OOM PLE rows\n");exit(1);}
         q38_gg_read(t,raw,local*rb,nb);
         for(int i=0;i<count;i++)
@@ -3047,14 +3048,25 @@ static int q38_ple_ref_cmp(const void *a,const void *b) {
     if(x->row!=y->row)return x->row<y->row?-1:1;
     return (x->at>y->at)-(x->at<y->at);
 }
+#define Q38_PLE_STACK 128
+static inline void q38_ple_pref_clear(Model *m) {
+    free(m->ple_pref);
+    m->ple_pref=NULL; m->ple_pref_rows=0;
+}
 static int q38_ple_coalesced(Model *m,const int64_t *rows,int64_t total,float *buffer) {
     Cfg *c=&m->c; int64_t dim=c->ngram_head_dim;
     int64_t run_max=((int64_t)4<<20)/(dim*(int64_t)sizeof(float)); if(run_max<1)run_max=1;
-    Q38PleRef *refs=(Q38PleRef*)malloc((size_t)total*sizeof *refs);
-    int64_t *uniq=(int64_t*)malloc((size_t)total*sizeof *uniq);       /* ref -> its unique row */
-    int64_t *run_first=(int64_t*)malloc((size_t)total*sizeof *run_first);   /* run -> its first unique row */
-    int *run_part=(int*)malloc((size_t)total*sizeof *run_part), *run_n=(int*)malloc((size_t)total*sizeof *run_n);
-    int64_t *run_local=(int64_t*)malloc((size_t)total*sizeof *run_local);
+    Q38PleRef refs_s[Q38_PLE_STACK];
+    int64_t uniq_s[Q38_PLE_STACK],run_first_s[Q38_PLE_STACK],run_local_s[Q38_PLE_STACK];
+    int run_part_s[Q38_PLE_STACK],run_n_s[Q38_PLE_STACK];
+    float rowbuf_s[8192];
+    const int use_stk=total<=Q38_PLE_STACK;
+    Q38PleRef *refs=use_stk?refs_s:(Q38PleRef*)malloc((size_t)total*sizeof *refs);
+    int64_t *uniq=use_stk?uniq_s:(int64_t*)malloc((size_t)total*sizeof *uniq);       /* ref -> its unique row */
+    int64_t *run_first=use_stk?run_first_s:(int64_t*)malloc((size_t)total*sizeof *run_first);   /* run -> its first unique row */
+    int *run_part=use_stk?run_part_s:(int*)malloc((size_t)total*sizeof *run_part);
+    int *run_n=use_stk?run_n_s:(int*)malloc((size_t)total*sizeof *run_n);
+    int64_t *run_local=use_stk?run_local_s:(int64_t*)malloc((size_t)total*sizeof *run_local);
     float *rowbuf=NULL;
     if(!refs||!uniq||!run_first||!run_part||!run_n||!run_local)goto fail;
     for(int64_t i=0;i<total;i++){refs[i].row=rows[i];refs[i].at=i;}
@@ -3067,17 +3079,20 @@ static int q38_ple_coalesced(Model *m,const int64_t *rows,int64_t total,float *b
         else{run_first[runs]=nu;run_part[runs]=p;run_local[runs]=local;run_n[runs]=1;runs++;}
         prev_part=p;prev_local=local;uniq[k]=nu++;
     }
-    rowbuf=(float*)malloc((size_t)nu*(size_t)dim*sizeof(float));
+    const int use_rb_stk=(nu*dim)<=(int64_t)(sizeof rowbuf_s/sizeof rowbuf_s[0]);
+    rowbuf=use_rb_stk?rowbuf_s:(float*)malloc((size_t)nu*(size_t)dim*sizeof(float));
     if(!rowbuf)goto fail;
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(dynamic) if(runs>1)
     for(int64_t r=0;r<runs;r++)q38_ple_rows(m,run_part[r],run_local[r],run_n[r],rowbuf+run_first[r]*dim);
     for(int64_t k=0;k<total;k++)
         memcpy(buffer+refs[k].at*dim,rowbuf+uniq[k]*dim,(size_t)dim*sizeof(float));
     __atomic_fetch_add(&m->ple_rows_wanted,(uint64_t)total,__ATOMIC_RELAXED);
-    free(refs);free(uniq);free(run_first);free(run_part);free(run_n);free(run_local);free(rowbuf);
+    if(!use_stk){free(refs);free(uniq);free(run_first);free(run_part);free(run_n);free(run_local);}
+    if(!use_rb_stk)free(rowbuf);
     return 1;
 fail:
-    free(refs);free(uniq);free(run_first);free(run_part);free(run_n);free(run_local);free(rowbuf);
+    if(!use_stk){free(refs);free(uniq);free(run_first);free(run_part);free(run_n);free(run_local);}
+    if(rowbuf&&rowbuf!=rowbuf_s)free(rowbuf);
     return 0;
 }
 
@@ -3146,7 +3161,7 @@ static void q38_ple_advise(Model *m,const int *ids,int S,int from) {
 }
 static void q38_ple_prefetch(Model *m,const int *ids,int S) {
     Cfg *c=&m->c;
-    free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+    q38_ple_pref_clear(m);
     if(c->ple_layer<0||S<1||c->ngram_heads<1||c->ngram_head_dim<1) return;
     if(!q38_env_bool("Q38_PLE_PREFETCH",1)) return;
 
@@ -4259,14 +4274,136 @@ static void q38_tier_warm(Model *m,int hist) {
         free(in);
     }
     double t0=now_s();
+    const gguf_tensor *(*lt)[3]=(const gguf_tensor *(*)[3])calloc((size_t)L,sizeof(*lt));
+    int64_t (*leb)[3]=(int64_t (*)[3])calloc((size_t)L,sizeof(*leb));
+    if(lt&&leb){
+        for(int l=0;l<L;l++){
+            q38_gg_expert_tensors(m,l,lt[l]);
+            for(int k=0;k<3;k++) leb[l][k]=lt[l][k]->nbytes/E;
+        }
+    }
+    int start_i=0;
+#ifdef COLI_CUDA
+    {
+        const char *wd_env=getenv("Q38_WARM_DIRECT");
+        int want_wd=!(wd_env&&wd_env[0]=='0');
+        if(want_wd&&n>0&&lt&&leb&&qt_warm_gguf_ready()){
+            enum { Q38_GWAVE = 64 };
+            size_t max_sl=qt_warm_gguf_max_slot();
+            size_t stg_stride=(max_sl*(size_t)Q38_GWAVE+4095u)&~(size_t)4095u;
+            uint8_t *stg_base=NULL;
+            if(max_sl>0){
+#ifdef _WIN32
+                stg_base=(uint8_t*)_aligned_malloc(2*stg_stride,4096);
+#else
+                if(posix_memalign((void**)&stg_base,4096,2*stg_stride)) stg_base=NULL;
+#endif
+            }
+            if(stg_base){
+                memset(stg_base,0,2*stg_stride);
+                uint8_t *stg[2]={stg_base,stg_base+stg_stride};
+                int pinned=coli_cuda_host_register(stg_base,2*stg_stride);
+                int ok_all=1,done_n=0,cur=0;
+                int prev_valid=0,prev_dev=0,prev_cnt=0,prev_l[Q38_GWAVE],prev_e[Q38_GWAVE],prev_aslot[Q38_GWAVE];
+                for(int w0=0;w0<n&&ok_all;){
+                    int l=pl[w0],w1=w0+1;
+                    while(w1<n&&w1-w0<Q38_GWAVE&&pl[w1]==l)w1++;
+                    int cnt=w1-w0,dev=0,aslot[Q38_GWAVE],got=0;
+                    void *dptr[Q38_GWAVE];
+                    size_t ou=0,od=0,sl=0;
+                    for(int k=0;k<cnt;k++){
+                        if(!qt_warm_gguf_begin(l,pe[w0+k],&dev,&dptr[k],&ou,&od,&sl,&aslot[k]))break;
+                        got++;
+                    }
+                    if(got!=cnt){
+                        for(int k=0;k<got;k++)qt_warm_gguf_commit(l,pe[w0+k],aslot[k],0);
+                        ok_all=0; start_i=w0; break;
+                    }
+                    const gguf_tensor *tg=lt[l][0],*tu=lt[l][1],*td=lt[l][2];
+                    int64_t ebg=leb[l][0],ebu=leb[l][1],ebd=leb[l][2];
+                    uint8_t *sb=stg[cur];
+                    #pragma omp parallel for schedule(static)
+                    for(int k=0;k<cnt;k++){
+                        int e=pe[w0+k];
+                        uint8_t *dst=sb+(size_t)k*sl;
+                        q38_gg_read(tg,dst,(int64_t)e*ebg,ebg);
+                        q38_gg_read(tu,dst+ou,(int64_t)e*ebu,ebu);
+                        q38_gg_read(td,dst+od,(int64_t)e*ebd,ebd);
+                    }
+                    if(prev_valid){
+                        int sy=coli_cuda_pipe_sync(prev_dev);
+                        for(int k=0;k<prev_cnt;k++){
+                            if(!qt_warm_gguf_commit(prev_l[k],prev_e[k],prev_aslot[k],sy))ok_all=0;
+                            else if(sy)done_n++;
+                        }
+                        prev_valid=0;
+                        if(!sy){
+                            for(int k=0;k<cnt;k++)qt_warm_gguf_commit(l,pe[w0+k],aslot[k],0);
+                            ok_all=0; start_i=w0; break;
+                        }
+                    }
+                    int contig=1;
+                    for(int k=1;k<cnt&&contig;k++)
+                        if((const char*)dptr[k]!=(const char*)dptr[0]+(size_t)k*sl)contig=0;
+                    int async_ok=0;
+                    if(pinned&&contig&&coli_cuda_copy_async(dev,dptr[0],sb,(size_t)cnt*sl)){
+                        async_ok=1;
+                        prev_valid=1; prev_dev=dev; prev_cnt=cnt;
+                        for(int k=0;k<cnt;k++){prev_l[k]=l;prev_e[k]=pe[w0+k];prev_aslot[k]=aslot[k];}
+                        cur^=1;
+                    } else {
+                        int up_ok=1;
+                        if(contig) up_ok=coli_cuda_pipe_upload(dev,dptr[0],sb,(size_t)cnt*sl);
+                        else {
+                            for(int k=0;k<cnt&&up_ok;k++)
+                                up_ok=coli_cuda_pipe_upload(dev,dptr[k],sb+(size_t)k*sl,sl);
+                        }
+                        for(int k=0;k<cnt;k++){
+                            if(!qt_warm_gguf_commit(l,pe[w0+k],aslot[k],up_ok))ok_all=0;
+                            else if(up_ok)done_n++;
+                        }
+                        if(!up_ok){ ok_all=0; start_i=w0; break; }
+                    }
+                    (void)async_ok;
+                    w0=w1;
+                    start_i=w0;
+                }
+                if(prev_valid){
+                    int sy=coli_cuda_pipe_sync(prev_dev);
+                    for(int k=0;k<prev_cnt;k++){
+                        if(!qt_warm_gguf_commit(prev_l[k],prev_e[k],prev_aslot[k],sy))ok_all=0;
+                        else if(sy)done_n++;
+                    }
+                }
+                if(pinned)coli_cuda_host_unregister(stg_base);
+#ifdef _WIN32
+                _aligned_free(stg_base);
+#else
+                free(stg_base);
+#endif
+                if(ok_all&&done_n==n){
+                    fprintf(stderr,"[qtier] qwen38: warm start (direct-to-VRAM async double-buffered GGUF waves of %d, %s): %d/%d experts in VRAM (%s) -- %.2f s\n",
+                            Q38_GWAVE,pinned?"pinned":"pageable",done_n,n,hist?".coli_usage":"no history: in order",now_s()-t0);
+                    free(lt);free(leb);free(pl);free(pe);
+                    return;
+                }
+            }
+        }
+    }
+#endif
     #pragma omp parallel
     {
         uint8_t *buf=NULL; size_t cap=0;
         #pragma omp for schedule(dynamic,4)
-        for(int i=0;i<n;i++){
-            const gguf_tensor *t[3]; q38_gg_expert_tensors(m,pl[i],t);
+        for(int i=start_i;i<n;i++){
+            const gguf_tensor *t[3];
             int64_t eb[3]; size_t tot=0;
-            for(int k=0;k<3;k++){eb[k]=t[k]->nbytes/E;tot+=(size_t)eb[k];}
+            if(lt&&leb){
+                for(int k=0;k<3;k++){t[k]=lt[pl[i]][k];eb[k]=leb[pl[i]][k];tot+=(size_t)eb[k];}
+            } else {
+                q38_gg_expert_tensors(m,pl[i],t);
+                for(int k=0;k<3;k++){eb[k]=t[k]->nbytes/E;tot+=(size_t)eb[k];}
+            }
             if(tot>cap){uint8_t *nb=(uint8_t*)realloc(buf,tot);if(!nb){qt_note_planned(pl[i],pe[i],NULL,NULL,NULL,NULL,NULL,NULL);continue;}buf=nb;cap=tot;}
             for(int k=0,o=0;k<3;o+=(int)eb[k],k++)q38_gg_read(t[k],buf+o,(int64_t)pe[i]*eb[k],eb[k]);
             qt_note_planned(pl[i],pe[i],buf,buf+eb[0],buf+eb[0]+eb[1],NULL,NULL,NULL);
@@ -4276,7 +4413,7 @@ static void q38_tier_warm(Model *m,int hist) {
     qt_fill_wait();
     fprintf(stderr,"[qtier] qwen38: warm start, %d of the GGUF's experts in VRAM, the history's most used first (%s) -- %.1f s\n",
             n,hist?".coli_usage":"no history: expert by expert across the layers",now_s()-t0);
-    free(pl);free(pe);
+    free(lt);free(leb);free(pl);free(pe);
 }
 #ifdef COLI_CUDA
 static size_t q38cc_reserve_bytes(Model *m);   /* qwen38_cuda_chain.h */
@@ -5533,7 +5670,7 @@ static void q38_layer_forward(Model *m,int i,float *hyper,const int *ids,int S,i
         /* consumate: il chunk successivo ha altri token, e riusare queste
          * righe darebbe gli embedding del chunk precedente combaciando in
          * silenzio invece di dare errore. */
-        free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+        q38_ple_pref_clear(m);
     }
     q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
     if(i>=c->layers||c->is_attn[i]) q38_attention(m,l,i,mixed,S,pos_base,block);
@@ -5587,6 +5724,66 @@ static void q38_embed_row(Model *m,int id,int abs_pos,float *out) {
     else q38_weight_row(&m->embed,id,out);
 }
 
+/* Batch embedding gather + C-stream replication with token deduplication & OpenMP for prefill (S > 8). */
+static void q38_embed_batch(Model *m,const int *ids,int S,int pos_base,float *hyper,int check_vocab) {
+    Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
+    if(check_vocab){
+        for(int s=0;s<S;s++)
+            if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
+    }
+    if(S<=8){
+        for(int s=0;s<S;s++){
+            float *e=hyper+(int64_t)s*W;
+            q38_embed_row(m,ids[s],pos_base+s,e);
+            for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
+        }
+        return;
+    }
+    int first_stk[2048];
+    int *first_s=S<=2048?first_stk:(int*)malloc((size_t)S*sizeof(int));
+    int ht_cap=16; while(ht_cap<S*2)ht_cap<<=1;
+    int ht_k_stk[4096],ht_v_stk[4096];
+    int *ht_k=ht_cap<=4096?ht_k_stk:(int*)malloc((size_t)ht_cap*sizeof(int));
+    int *ht_v=ht_cap<=4096?ht_v_stk:(int*)malloc((size_t)ht_cap*sizeof(int));
+    if(first_s&&ht_k&&ht_v){
+        int mask=ht_cap-1;
+        for(int i=0;i<ht_cap;i++)ht_k[i]=-1;
+        for(int s=0;s<S;s++){
+            int abs_pos=pos_base+s;
+            int vis=(m->vis_map&&abs_pos>=0&&abs_pos<m->vis_map_len&&m->vis_map[abs_pos]>=0&&m->vis_map[abs_pos]<m->vis_rows_n);
+            if(vis){ first_s[s]=-1; continue; }
+            int id=ids[s];
+            uint32_t h=((uint32_t)id*2654435761u)&(uint32_t)mask;
+            while(ht_k[h]>=0&&ht_k[h]!=id)h=(h+1u)&(uint32_t)mask;
+            if(ht_k[h]<0){ ht_k[h]=id; ht_v[h]=s; first_s[s]=-1; }
+            else first_s[s]=ht_v[h];
+        }
+        #pragma omp parallel for schedule(dynamic,16)
+        for(int s=0;s<S;s++){
+            if(first_s[s]<0)q38_embed_row(m,ids[s],pos_base+s,hyper+(int64_t)s*W);
+        }
+        #pragma omp parallel for schedule(static)
+        for(int s=0;s<S;s++){
+            float *e=hyper+(int64_t)s*W;
+            if(first_s[s]>=0)memcpy(e,hyper+(int64_t)first_s[s]*W,(size_t)H*sizeof(float));
+            for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
+        }
+        if(first_s!=first_stk)free(first_s);
+        if(ht_k!=ht_k_stk)free(ht_k);
+        if(ht_v!=ht_v_stk)free(ht_v);
+        return;
+    }
+    if(first_s&&first_s!=first_stk)free(first_s);
+    if(ht_k&&ht_k!=ht_k_stk)free(ht_k);
+    if(ht_v&&ht_v!=ht_v_stk)free(ht_v);
+    #pragma omp parallel for schedule(static)
+    for(int s=0;s<S;s++){
+        float *e=hyper+(int64_t)s*W;
+        q38_embed_row(m,ids[s],pos_base+s,e);
+        for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
+    }
+}
+
 /* The forward behind step(): ids[0..S) at pos_base through every layer, the
  * final mixer and lm_head. The logits of the last `nlogits` rows come back
  * (step() asks for one, an MTP verify for two), and with `streams` every
@@ -5600,16 +5797,7 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
      * id dei token soltanto, e i due layer che le precedono danno il tempo di
      * farle arrivare dal disco. */
     q38_ple_prefetch(m,ids,S);
-    for(int s=0;s<S;s++)
-        if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
-    /* a prompt's rows on the team: a 4180-token prompt's embedding rows and their copies into the
-     * streams' fresh pages (171 MB of Qwen3.8-Flash-Next) took 40 ms on one core */
-    #pragma omp parallel for schedule(static) if(S>=64)
-    for(int s=0;s<S;s++){
-        float *e=hyper+(int64_t)s*W;
-        q38_embed_row(m,ids[s],pos_base+s,e);
-        for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
-    }
+    q38_embed_batch(m,ids,S,pos_base,hyper,1);
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
     int first=0;   /* the layers a partial dense chain ran on the device (COLI_VULKAN) */
     float *chain_logit=NULL;   /* the Vulkan or the CUDA chain ran the final mixer and lm_head */
@@ -5626,20 +5814,16 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         if(took==2){   /* the first N layers: the PLE rows were the chain's when its layer is one of them */
             free(chain_logit); chain_logit=NULL;
             first=q38c_layers(m);
-            if(c->ple_layer<first){free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;}
+            if(c->ple_layer<first)q38_ple_pref_clear(m);
         } else if(took){
-            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
+            q38_ple_pref_clear(m);   /* consumed, as q38_layer_forward does */
         } else {
             free(chain_logit); chain_logit=NULL;
             q38c_cpu_step(m,pos_base);
             /* A completed chunk may already have returned its final streams in
              * hyper. Replay the whole forward from embeddings after a later
              * chunk fails, including rows the device had finished. */
-            for(int s=0;s<S;s++){
-                float *e=hyper+(int64_t)s*W;
-                q38_embed_row(m,ids[s],pos_base+s,e);
-                for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
-            }
+            q38_embed_batch(m,ids,S,pos_base,hyper,0);
         }
     }
 #endif
@@ -5652,15 +5836,11 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         chain_logit=falloc(!echo&&q38cc_greedy_ok(m,S,nlogits)?1:(int64_t)nlogits*c->vocab);
         int took=q38cc_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
         if(took){
-            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
+            q38_ple_pref_clear(m);   /* consumed, as q38_layer_forward does */
         } else {
             free(chain_logit); chain_logit=NULL;
             q38cc_cpu_step(m,pos_base);
-            for(int s=0;s<S;s++){
-                float *e=hyper+(int64_t)s*W;
-                q38_embed_row(m,ids[s],pos_base+s,e);
-                for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
-            }
+            q38_embed_batch(m,ids,S,pos_base,hyper,0);
         }
     }
 #endif
@@ -5671,7 +5851,7 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
          * state back */
         if(coli_prompt_break()){   /* prompt_break.h: set by q38_serve_prefill only */
             free(hyper);free(mixed);free(inject);free(block);
-            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+            q38_ple_pref_clear(m);
             if(streams)*streams=NULL;
             return NULL;
         }
@@ -6745,6 +6925,7 @@ static void q38_model_free(Model *m) {
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
     free(m->draft_codes);free(m->draft_sc);m->draft_codes=NULL;m->draft_sc=NULL;
     free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);
+    q38_ple_pref_clear(m);
     free(m->ple_history); free(m->PLE_conv_state); free(m->c.is_attn); st_destroy(&m->S);
     memset(m,0,sizeof(*m));
 }

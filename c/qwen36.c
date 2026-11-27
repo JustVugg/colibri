@@ -8319,6 +8319,7 @@ static void q36_seq_swap(Model *m, Q36Seq *q);   /* below: a chain swaps a conve
 #include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 static void q36_embed_row(Model *m, int id, int pos, float *row);
+static void q36_embed_batch(Model *m, const int *ids, int S, int pos_base, float *dst);
 static int q36_cuda_tier_drafts(Model *m);   /* the CUDA tier whole, run by the CUDA chain */
 #include "qwen36_mtp.h"    /* Q36_MTP: the MTP head drafts for the speculative step */
 static void q36_mtp_lm_head(Model *m, const float *row, float *logits) {
@@ -8379,6 +8380,67 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
     } else
         memcpy(row, m->embed + (int64_t)id*D, D*sizeof(float));
     if (m->c.muse && !(vrow >= 0 && vrow < m->vis_rows_n)) rmsnorm_plain(row, row, D, m->c.eps);   /* Muse Spark: the token's row normalised */
+}
+static void q36_embed_batch(Model *m, const int *ids, int S, int pos_base, float *dst) {
+    if (S <= 0) return;
+    const int D = m->c.hidden;
+    if (S < 64) {
+        #pragma omp parallel for schedule(static) if (S >= 16)
+        for (int s = 0; s < S; s++) q36_embed_row(m, ids[s], pos_base + s, dst + (int64_t)s * D);
+        return;
+    }
+    size_t ht_cap = 128;
+    while (ht_cap < (size_t)S * 2u) ht_cap <<= 1;
+    int ht_stk[8192], first_stk[4096];
+    int *ht = S <= 4096 ? ht_stk : (int *)malloc(ht_cap * sizeof(int));
+    int *first_s = S <= 4096 ? first_stk : (int *)malloc((size_t)S * sizeof(int));
+    if (!ht || !first_s) {
+        if (S > 4096) { free(ht); free(first_s); }
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) q36_embed_row(m, ids[s], pos_base + s, dst + (int64_t)s * D);
+        return;
+    }
+    for (size_t i = 0; i < ht_cap; i++) ht[i] = -1;
+    const size_t mask = ht_cap - 1u;
+    const int *vmap = m->vis_map;
+    const int vlen = m->vis_map_len;
+    int has_dup = 0;
+    for (int s = 0; s < S; s++) {
+        int pos = pos_base + s;
+        if (vmap && pos >= 0 && pos < vlen && vmap[pos] >= 0) {
+            first_s[s] = -1;
+            continue;
+        }
+        int tok = ids[s];
+        uint32_t h = (uint32_t)tok * 2654435761u;
+        size_t slot = (size_t)(h ^ (h >> 16)) & mask;
+        for (;;) {
+            int prev = ht[slot];
+            if (prev < 0) {
+                ht[slot] = s;
+                first_s[s] = -1;
+                break;
+            }
+            if (ids[prev] == tok) {
+                first_s[s] = prev;
+                has_dup = 1;
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (int s = 0; s < S; s++) {
+        if (first_s[s] < 0) q36_embed_row(m, ids[s], pos_base + s, dst + (int64_t)s * D);
+    }
+    if (has_dup) {
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) {
+            int src = first_s[s];
+            if (src >= 0) memcpy(dst + (int64_t)s * D, dst + (int64_t)src * D, (size_t)D * sizeof(float));
+        }
+    }
+    if (S > 4096) { free(ht); free(first_s); }
 }
 #ifdef QWEN36_METAL_GRAPH
 /* A token's embedding row, without the image rows (the Metal graph takes no images). */
@@ -8511,10 +8573,8 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
             exit(1);
         }
     }
-    /* a prompt's rows over the team: each decoded from the file's blocks on its own (LFM3's
-     * Q6_K table, 2048 a row: on one thread the prompt waited for them before the device) */
-    #pragma omp parallel for schedule(static) if (S >= 16)
-    for (int s = 0; s < S; s++) q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
+    /* a prompt's rows over the team: deduplicated by token id, each unique row decoded once */
+    q36_embed_batch(m, ids, S, pos_base, x);
     tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
     float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
@@ -11927,6 +11987,138 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     int *wpl = malloc((size_t)cap_total*sizeof(int));
     int *wpe = malloc((size_t)cap_total*sizeof(int));
     int wn = qt_plan_fill(wpl, wpe, cap_total);
+#ifdef COLI_CUDA
+    /* Direct-to-VRAM GGUF exact-arena wave warmstart when ALL active experts fit in VRAM:
+     * skips 20+ GB RAM cache allocation, skips CPU Q36_ILV16 interleaving, reads 64-expert waves
+     * in parallel via OpenMP straight into double-buffered page-locked staging buffers, and DMAs
+     * each wave directly into the contiguous VRAM arena asynchronously (3-4x faster load, ~13x less RAM). */
+    if (g_gguf && wn > 0 && qt_warm_gguf_ready()) {
+        int active_tot = 0;
+        for (int l = 0; l < m->c.n_layers; l++) if (!q36_dense_l(&m->c, l)) active_tot += m->c.n_experts;
+        const char *wd_env = getenv("Q36_WARM_DIRECT");
+        int want_wd = !(wd_env && *wd_env == '0');
+        if (want_wd && wn == active_tot) {
+            enum { Q36_GWAVE = 64 };
+            size_t max_sl = qt_warm_gguf_max_slot();
+            size_t stg_bytes = (size_t)Q36_GWAVE * max_sl;
+            size_t stg_stride = (stg_bytes + 4095u) & ~(size_t)4095u;
+            uint8_t *stg_base = NULL;
+            if (max_sl > 0) {
+#ifdef _WIN32
+                stg_base = (uint8_t *)_aligned_malloc(2 * stg_stride, 4096);
+#else
+                if (posix_memalign((void **)&stg_base, 4096, 2 * stg_stride)) stg_base = NULL;
+#endif
+            }
+            if (stg_base) {
+                memset(stg_base, 0, 2 * stg_stride);
+                uint8_t *stg[2] = { stg_base, stg_base + stg_stride };
+                int pinned = coli_cuda_host_register(stg_base, 2 * stg_stride);
+                int ok_all = 1, done_n = 0, used_async = 0;
+                int cur = 0, prev_valid = 0, prev_dev = 0, prev_l = 0, prev_e0 = 0, prev_cnt = 0;
+                int prev_aslot[Q36_GWAVE];
+                for (int l = 0; l < m->c.n_layers && ok_all; l++) {
+                    if (q36_dense_l(&m->c, l)) continue;
+                    const GqExp *x = &m->gqx[l];
+                    const int E = m->c.n_experts;
+                    for (int e0 = 0; e0 < E && ok_all; e0 += Q36_GWAVE) {
+                        int cnt = E - e0 < Q36_GWAVE ? E - e0 : Q36_GWAVE;
+                        int dev = 0, aslot[Q36_GWAVE];
+                        void *dptr[Q36_GWAVE];
+                        size_t ou = 0, od = 0, sl = 0;
+                        int got = 0;
+                        for (int k = 0; k < cnt; k++) {
+                            if (!qt_warm_gguf_begin(l, e0 + k, &dev, &dptr[k], &ou, &od, &sl, &aslot[k])) break;
+                            got++;
+                        }
+                        if (got != cnt) {
+                            for (int k = 0; k < got; k++) qt_warm_gguf_commit(l, e0 + k, aslot[k], 0);
+                            ok_all = 0;
+                            break;
+                        }
+                        int io_err = 0;
+                        #pragma omp parallel for schedule(static) reduction(|:io_err)
+                        for (int k = 0; k < cnt; k++) {
+                            int e = e0 + k;
+                            uint8_t *dst = stg[cur] + (size_t)k * sl;
+                            if (x->packed) {
+                                int64_t raw = x->eb_g + x->eb_u + x->eb_d;
+                                if (gguf_read(&g_gg, x->packed, dst, (int64_t)e * x->stride, raw)) { io_err = 1; continue; }
+                                if (od != (size_t)(x->eb_g + x->eb_u)) memmove(dst + od, dst + x->eb_g + x->eb_u, (size_t)x->eb_d);
+                                if (ou != (size_t)x->eb_g)             memmove(dst + ou, dst + x->eb_g, (size_t)x->eb_u);
+                            } else {
+                                if (gguf_read(&g_gg, x->g, dst,      (int64_t)e * x->eb_g, x->eb_g) ||
+                                    gguf_read(&g_gg, x->u, dst + ou, (int64_t)e * x->eb_u, x->eb_u) ||
+                                    gguf_read(&g_gg, x->d, dst + od, (int64_t)e * x->eb_d, x->eb_d)) io_err = 1;
+                            }
+                        }
+                        if (prev_valid) {
+                            int sync_ok = coli_cuda_pipe_sync(prev_dev);
+                            for (int k = 0; k < prev_cnt; k++) {
+                                if (!qt_warm_gguf_commit(prev_l, prev_e0 + k, prev_aslot[k], sync_ok)) ok_all = 0;
+                                else if (sync_ok) done_n++;
+                            }
+                            if (!sync_ok) ok_all = 0;
+                            prev_valid = 0;
+                        }
+                        int contig = ok_all && !io_err;
+                        for (int k = 1; k < cnt && contig; k++) {
+                            if ((const char *)dptr[k] != (const char *)dptr[0] + (size_t)k * sl) contig = 0;
+                        }
+                        int up_ok = ok_all && !io_err;
+                        int issued_async = 0;
+                        if (up_ok && pinned && contig && coli_cuda_copy_async(dev, dptr[0], stg[cur], (size_t)cnt * sl)) {
+                            prev_valid = 1;
+                            prev_dev = dev;
+                            prev_l = l;
+                            prev_e0 = e0;
+                            prev_cnt = cnt;
+                            memcpy(prev_aslot, aslot, (size_t)cnt * sizeof(int));
+                            cur ^= 1;
+                            issued_async = 1;
+                            used_async = 1;
+                        }
+                        if (!issued_async) {
+                            if (up_ok) {
+                                if (contig) up_ok = coli_cuda_pipe_upload(dev, dptr[0], stg[cur], (size_t)cnt * sl);
+                                else {
+                                    for (int k = 0; k < cnt && up_ok; k++)
+                                        up_ok = coli_cuda_pipe_upload(dev, dptr[k], stg[cur] + (size_t)k * sl, sl);
+                                }
+                            }
+                            for (int k = 0; k < cnt; k++) {
+                                if (!qt_warm_gguf_commit(l, e0 + k, aslot[k], up_ok)) ok_all = 0;
+                                else if (up_ok) done_n++;
+                            }
+                            if (!up_ok) ok_all = 0;
+                        }
+                    }
+                }
+                if (prev_valid) {
+                    int sync_ok = coli_cuda_pipe_sync(prev_dev);
+                    for (int k = 0; k < prev_cnt; k++) {
+                        if (!qt_warm_gguf_commit(prev_l, prev_e0 + k, prev_aslot[k], sync_ok)) ok_all = 0;
+                        else if (sync_ok) done_n++;
+                    }
+                    if (!sync_ok) ok_all = 0;
+                    prev_valid = 0;
+                }
+                if (pinned) coli_cuda_host_unregister(stg_base);
+#ifdef _WIN32
+                _aligned_free(stg_base);
+#else
+                free(stg_base);
+#endif
+                if (ok_all && done_n == wn) {
+                    free(wpl); free(wpe);
+                    fprintf(stderr, "[qtier] warmstart (direct-to-VRAM GGUF waves of %d, %s%s): %d/%d experts in VRAM, 0 RAM copy -- %.2f s\n",
+                            Q36_GWAVE, pinned ? "pinned" : "pageable", used_async ? ", async double-buffered" : "", done_n, wn, now_s() - t0);
+                    return;
+                }
+            }
+        }
+    }
+#endif
     if (qt_streaming()) {
         /* Copy mode (the RAM holds fewer than every expert of a layer): each
          * planned expert is read into a slot of the thread's own, handed over

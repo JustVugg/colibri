@@ -235,6 +235,13 @@ void qt_note_block(int layer, int eid,
              const float *gs, const float *us, const float *ds);
 void qt_fill_wait(void);   /* blocks until every enqueued upload is resident (not merely dequeued) */
 
+/* Direct-to-VRAM GGUF exact-arena wave warmstart (bypass RAM expert cache, single DMA per wave). */
+int    qt_warm_gguf_ready(void);
+size_t qt_warm_gguf_max_slot(void);
+int    qt_warm_gguf_begin(int layer, int eid, int *dev_out, void **dev_ptr, size_t *ou_out, size_t *od_out,
+                          size_t *slot_out, int *aslot_out);
+int    qt_warm_gguf_commit(int layer, int eid, int aslot, int ok);
+
 /* Re-plan the resident set from the prompt's own routing. counts[] are this
  * prompt's routing counts per expert: for layer >= 0 one layer's ne counts
  * (the engine calls this after each prefill layer's routing, so the swaps of
@@ -434,6 +441,10 @@ static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,c
 static inline int  qt_fill_next(int*a,int*b){(void)a;(void)b;return 0;}
 static inline void qt_note_block(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline void qt_fill_wait(void){}
+static inline int    qt_warm_gguf_ready(void){return 0;}
+static inline size_t qt_warm_gguf_max_slot(void){return 0;}
+static inline int    qt_warm_gguf_begin(int a,int b,int*c,void**d,size_t*e,size_t*f,size_t*g,int*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
+static inline int    qt_warm_gguf_commit(int a,int b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_replan(int l,const uint32_t*a,int b){(void)l;(void)a;(void)b;return 0;}
 static inline int  qt_evicted_take(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_stats_mark(void){}

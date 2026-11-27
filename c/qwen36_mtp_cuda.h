@@ -15,11 +15,12 @@
  * form, device memory) stays off under the CUDA chain: beside the card the CPU's head costs
  * about half a decode step a draft. */
 typedef struct {
-    int on, failed, cap, fmt, gs, pick_dev, vids_n;
+    int on, failed, cap, fmt, fmt_d, gs, pick_dev, vids_n;
     uint64_t vids_gen;
     CcBuf *prm, *emb, *hin, *cat, *x, *nrm, *q, *k, *v, *ctx, *tmp, *cs, *kc, *vc;
     CcBuf *lg, *gsb, *us, *hs, *sd, *sg, *ids, *wt, *rt, *fin, *hid, *outd, *pick, *vids, *tab, *mh;
     ColiCudaTensor *eh, *lq, *lk, *lv, *lo, *shg, *shu, *shd, *rq, *sq, *lm, **ex;
+    void *ex_arena; int ex_arena_dev;
     CcBuf *pk, *pv; int pn;   /* a parked conversation's first pn rows of kc and vc (q36_mc_park) */
     size_t o_en, o_hn, o_in, o_post, o_qn, o_kn, o_head;
 } Q36MtpCuda;
@@ -32,6 +33,15 @@ static int q36_mc_res(CcBuf **b, size_t floats, int kind) { return cc_reserve(b,
  * planar_to_pairs: byte j = element 2j low, 2j + 1 high). */
 static ColiCudaTensor *q36_mc_expert(int dev, const QW *w, int *fmt) {
     ColiCudaTensor *t = NULL;
+    if (w->gq) {
+        int bf = qdw_gq_fmt(w);
+        if (bf >= 100 && cc_moe_block_type(bf - 100) && (w->gs == 1.0f || w->gs == 0.0f) &&
+            coli_cuda_tensor_upload(&t, w->gq, NULL, bf, w->I, w->O, dev)) {
+            *fmt = bf;
+            return t;
+        }
+        return NULL;
+    }
     if (w->q4 && w->sg && w->ng * 64 == w->I) {
         size_t nb = (size_t)w->I * w->O / 2;
         uint8_t *pairs = malloc(nb);
@@ -61,6 +71,193 @@ static ColiCudaTensor *q36_mc_qw(int dev, const QW *w) {
         return t && d == dev ? t : NULL;
     }
     return q36cc_qw_tensor(dev, w);
+}
+
+static void q36_mc_pack_gq(uint8_t *dst, const uint8_t *src, size_t rb, size_t pitch, int O) {
+    if (pitch == rb) {
+        memcpy(dst, src, rb * (size_t)O);
+    } else {
+        size_t pad = pitch - rb;
+        for (int o = 0; o < O; o++) {
+            memcpy(dst + (size_t)o * pitch, src + (size_t)o * rb, rb);
+            memset(dst + (size_t)o * pitch + rb, 0, pad);
+        }
+    }
+}
+static void q36_mc_planar_to_pairs_signed(uint8_t *dst, const uint8_t *src, size_t nb) {
+    for (size_t b = 0; b < nb; b += 32) {
+        const uint8_t *p = src + b;
+        uint8_t *q = dst + b;
+        for (int j = 0; j < 16; j++) {
+            q[j]      = (uint8_t)(((p[2 * j] & 0x0F) | (p[2 * j + 1] << 4)) ^ 0x88);
+            q[16 + j] = (uint8_t)(((p[2 * j] >> 4)   | (p[2 * j + 1] & 0xF0)) ^ 0x88);
+        }
+    }
+}
+/* Pack all E routed MTP experts into a single host staging buffer and upload into one VRAM arena
+ * (replaces 3*E individual cudaMalloc/cudaMemcpy/sync round trips). Returns 1 on success, 0 to fall
+ * back to per-tensor q36_mc_expert upload. */
+static int q36_mc_upload_arena(Q36MtpCuda *g, const Q36Mtp *p, int dev, int D, int I, int E, CcExpert *tab) {
+    if (E <= 0 || D <= 0 || I <= 0) return 0;
+    const QW *e0 = &p->eg[0];
+    if (e0->gq) {
+        int bf_g = qdw_gq_fmt(&p->eg[0]), bf_d = qdw_gq_fmt(&p->ed[0]);
+        if (bf_g < 100 || bf_d < 100 || !cc_moe_block_type(bf_g - 100) || !cc_moe_block_type(bf_d - 100)) return 0;
+        int64_t rb_g = gq_row_bytes(bf_g - 100, D), rb_d = gq_row_bytes(bf_d - 100, I);
+        if (rb_g <= 0 || rb_d <= 0) return 0;
+        for (int x = 0; x < E; x++) {
+            const QW *qw[3] = {&p->eg[x], &p->eu[x], &p->ed[x]};
+            for (int j = 0; j < 3; j++) {
+                int bf = qw[j]->gq ? qdw_gq_fmt(qw[j]) : 0;
+                int want_bf = j < 2 ? bf_g : bf_d;
+                int want_I  = j < 2 ? D : I;
+                int want_O  = j < 2 ? I : D;
+                if (!qw[j]->gq || bf != want_bf || qw[j]->gq_type != want_bf - 100 ||
+                    (qw[j]->gs != 1.0f && qw[j]->gs != 0.0f) || qw[j]->I != want_I || qw[j]->O != want_O)
+                    return 0;
+            }
+        }
+        size_t pitch_g = ((size_t)rb_g + 3u) & ~(size_t)3u;
+        size_t pitch_d = ((size_t)rb_d + 3u) & ~(size_t)3u;
+        size_t sz_g = (pitch_g * (size_t)I + 255u) & ~(size_t)255u;
+        size_t sz_d = (pitch_d * (size_t)D + 255u) & ~(size_t)255u;
+        size_t off_u = sz_g, off_d = 2 * sz_g, slot_bytes = off_d + sz_d;
+        size_t total_bytes = (size_t)E * slot_bytes;
+        uint8_t *stg = (uint8_t *)malloc(total_bytes);
+        if (!stg) return 0;
+        void *arena = coli_cuda_pipe_alloc(dev, total_bytes);
+        if (!arena) { free(stg); return 0; }
+        #pragma omp parallel for schedule(static)
+        for (int x = 0; x < E; x++) {
+            uint8_t *slot = stg + (size_t)x * slot_bytes;
+            q36_mc_pack_gq(slot,         p->eg[x].gq, (size_t)rb_g, pitch_g, I);
+            q36_mc_pack_gq(slot + off_u, p->eu[x].gq, (size_t)rb_g, pitch_g, I);
+            q36_mc_pack_gq(slot + off_d, p->ed[x].gq, (size_t)rb_d, pitch_d, D);
+        }
+        int up_ok = coli_cuda_pipe_upload(dev, arena, stg, total_bytes) && coli_cuda_pipe_sync(dev);
+        free(stg);
+        if (!up_ok) { coli_cuda_pipe_free(dev, arena); return 0; }
+        const uint8_t *base = (const uint8_t *)arena;
+        for (int x = 0; x < E; x++) {
+            const uint8_t *slot = base + (size_t)x * slot_bytes;
+            tab[x].g = slot; tab[x].u = slot + off_u; tab[x].d = slot + off_d;
+            tab[x].gs = tab[x].us = tab[x].ds = NULL;
+            tab[x].planar = 0; tab[x].host = 0;
+        }
+        g->fmt = bf_g; g->fmt_d = bf_d;
+        g->ex_arena = arena; g->ex_arena_dev = dev;
+        return 1;
+    }
+    if (e0->q4 && e0->sg && e0->ng * 64 == e0->I) {
+        if ((D % 64) != 0 || (I % 64) != 0) return 0;
+        for (int x = 0; x < E; x++) {
+            const QW *qw[3] = {&p->eg[x], &p->eu[x], &p->ed[x]};
+            for (int j = 0; j < 3; j++) {
+                int want_I = j < 2 ? D : I;
+                int want_O = j < 2 ? I : D;
+                if (qw[j]->gq || !qw[j]->q4 || !qw[j]->sg || qw[j]->q4r16 ||
+                    qw[j]->I != want_I || qw[j]->O != want_O || qw[j]->ng * 64 != want_I)
+                    return 0;
+            }
+        }
+        size_t nb_gu = (size_t)D * (size_t)I / 2u;
+        size_t nb_d  = (size_t)I * (size_t)D / 2u;
+        size_t sb_gu = (size_t)I * (size_t)(D / 64) * sizeof(float);
+        size_t sb_d  = (size_t)D * (size_t)(I / 64) * sizeof(float);
+        size_t sz_gu  = (nb_gu + 255u) & ~(size_t)255u;
+        size_t sz_d   = (nb_d  + 255u) & ~(size_t)255u;
+        size_t sz_sgu = (sb_gu + 255u) & ~(size_t)255u;
+        size_t sz_sd  = (sb_d  + 255u) & ~(size_t)255u;
+        size_t off_u = sz_gu, off_d = 2 * sz_gu, off_gs = off_d + sz_d;
+        size_t off_us = off_gs + sz_sgu, off_ds = off_us + sz_sgu, slot_bytes = off_ds + sz_sd;
+        size_t total_bytes = (size_t)E * slot_bytes;
+        uint8_t *stg = (uint8_t *)malloc(total_bytes);
+        if (!stg) return 0;
+        void *arena = coli_cuda_pipe_alloc(dev, total_bytes);
+        if (!arena) { free(stg); return 0; }
+        #pragma omp parallel for schedule(static)
+        for (int x = 0; x < E; x++) {
+            uint8_t *slot = stg + (size_t)x * slot_bytes;
+            q36_mc_planar_to_pairs_signed(slot,         p->eg[x].q4, nb_gu);
+            q36_mc_planar_to_pairs_signed(slot + off_u, p->eu[x].q4, nb_gu);
+            q36_mc_planar_to_pairs_signed(slot + off_d, p->ed[x].q4, nb_d);
+            memcpy(slot + off_gs, p->eg[x].sg, sb_gu);
+            memcpy(slot + off_us, p->eu[x].sg, sb_gu);
+            memcpy(slot + off_ds, p->ed[x].sg, sb_d);
+        }
+        int up_ok = coli_cuda_pipe_upload(dev, arena, stg, total_bytes) && coli_cuda_pipe_sync(dev);
+        free(stg);
+        if (!up_ok) { coli_cuda_pipe_free(dev, arena); return 0; }
+        const uint8_t *base = (const uint8_t *)arena;
+        for (int x = 0; x < E; x++) {
+            const uint8_t *slot = base + (size_t)x * slot_bytes;
+            tab[x].g  = slot;
+            tab[x].u  = slot + off_u;
+            tab[x].d  = slot + off_d;
+            tab[x].gs = (const float *)(slot + off_gs);
+            tab[x].us = (const float *)(slot + off_us);
+            tab[x].ds = (const float *)(slot + off_ds);
+            tab[x].planar = 0; tab[x].host = 0;
+        }
+        g->fmt = 4; g->fmt_d = 4;
+        g->ex_arena = arena; g->ex_arena_dev = dev;
+        return 1;
+    }
+    if (e0->q && e0->sc && !e0->q8r16) {
+        for (int x = 0; x < E; x++) {
+            const QW *qw[3] = {&p->eg[x], &p->eu[x], &p->ed[x]};
+            for (int j = 0; j < 3; j++) {
+                int want_I = j < 2 ? D : I;
+                int want_O = j < 2 ? I : D;
+                if (qw[j]->gq || (qw[j]->q4 && qw[j]->sg && qw[j]->ng * 64 == qw[j]->I) ||
+                    !qw[j]->q || !qw[j]->sc || qw[j]->q8r16 || qw[j]->I != want_I || qw[j]->O != want_O)
+                    return 0;
+            }
+        }
+        size_t nb_gu = (size_t)D * (size_t)I;
+        size_t nb_d  = (size_t)I * (size_t)D;
+        size_t sb_gu = (size_t)I * sizeof(float);
+        size_t sb_d  = (size_t)D * sizeof(float);
+        size_t sz_gu  = (nb_gu + 255u) & ~(size_t)255u;
+        size_t sz_d   = (nb_d  + 255u) & ~(size_t)255u;
+        size_t sz_sgu = (sb_gu + 255u) & ~(size_t)255u;
+        size_t sz_sd  = (sb_d  + 255u) & ~(size_t)255u;
+        size_t off_u = sz_gu, off_d = 2 * sz_gu, off_gs = off_d + sz_d;
+        size_t off_us = off_gs + sz_sgu, off_ds = off_us + sz_sgu, slot_bytes = off_ds + sz_sd;
+        size_t total_bytes = (size_t)E * slot_bytes;
+        uint8_t *stg = (uint8_t *)malloc(total_bytes);
+        if (!stg) return 0;
+        void *arena = coli_cuda_pipe_alloc(dev, total_bytes);
+        if (!arena) { free(stg); return 0; }
+        #pragma omp parallel for schedule(static)
+        for (int x = 0; x < E; x++) {
+            uint8_t *slot = stg + (size_t)x * slot_bytes;
+            memcpy(slot,          p->eg[x].q,  nb_gu);
+            memcpy(slot + off_u,  p->eu[x].q,  nb_gu);
+            memcpy(slot + off_d,  p->ed[x].q,  nb_d);
+            memcpy(slot + off_gs, p->eg[x].sc, sb_gu);
+            memcpy(slot + off_us, p->eu[x].sc, sb_gu);
+            memcpy(slot + off_ds, p->ed[x].sc, sb_d);
+        }
+        int up_ok = coli_cuda_pipe_upload(dev, arena, stg, total_bytes) && coli_cuda_pipe_sync(dev);
+        free(stg);
+        if (!up_ok) { coli_cuda_pipe_free(dev, arena); return 0; }
+        const uint8_t *base = (const uint8_t *)arena;
+        for (int x = 0; x < E; x++) {
+            const uint8_t *slot = base + (size_t)x * slot_bytes;
+            tab[x].g  = slot;
+            tab[x].u  = slot + off_u;
+            tab[x].d  = slot + off_d;
+            tab[x].gs = (const float *)(slot + off_gs);
+            tab[x].us = (const float *)(slot + off_us);
+            tab[x].ds = (const float *)(slot + off_ds);
+            tab[x].planar = 0; tab[x].host = 0;
+        }
+        g->fmt = 1; g->fmt_d = 1;
+        g->ex_arena = arena; g->ex_arena_dev = dev;
+        return 1;
+    }
+    return 0;
 }
 
 static int q36_mc_init(Model *m) {
@@ -95,21 +292,26 @@ static int q36_mc_init(Model *m) {
     g->lm = !(E ? g->sq : g->shd) ? NULL : p->nvoc ? q36_mc_qw(dev, &p->dvoc) : ch->t_lm;
     ok = g->lm != NULL;
     /* the routed experts, one format, and their table of device addresses */
-    g->ex = ok && E ? calloc((size_t)3 * E, sizeof *g->ex) : NULL;
     CcExpert *tab = ok && E ? calloc((size_t)E, sizeof *tab) : NULL;
-    ok = ok && (!E || (g->ex && tab));
-    g->fmt = 0;
-    for (int x = 0; ok && x < E; x++) {
-        const QW *qw[3] = {&p->eg[x], &p->eu[x], &p->ed[x]};
-        for (int j = 0; ok && j < 3; j++) {
-            int f = 0;
-            ColiCudaTensor *t = q36_mc_expert(dev, qw[j], &f);
-            ok = t && (!g->fmt || f == g->fmt);
-            g->fmt = f; g->ex[(size_t)3 * x + j] = t;
+    ok = ok && (!E || tab);
+    g->fmt = 0; g->fmt_d = 0;
+    if (ok && E && !q36_mc_upload_arena(g, p, dev, D, I, E, tab)) {
+        g->ex = calloc((size_t)3 * E, sizeof *g->ex);
+        ok = g->ex != NULL;
+        for (int x = 0; ok && x < E; x++) {
+            const QW *qw[3] = {&p->eg[x], &p->eu[x], &p->ed[x]};
+            for (int j = 0; ok && j < 3; j++) {
+                int f = 0;
+                ColiCudaTensor *t = q36_mc_expert(dev, qw[j], &f);
+                if (j < 2) { ok = t && (!g->fmt || f == g->fmt); g->fmt = f; }
+                else       { ok = t && (!g->fmt_d || f == g->fmt_d); g->fmt_d = f; }
+                g->ex[(size_t)3 * x + j] = t;
+            }
+            ok = ok && cc_tensor_dev(g->ex[3 * x], &tab[x].g, &tab[x].gs, NULL) && cc_tensor_dev(g->ex[3 * x + 1], &tab[x].u, &tab[x].us, NULL) &&
+                 cc_tensor_dev(g->ex[3 * x + 2], &tab[x].d, &tab[x].ds, NULL);
         }
-        ok = ok && cc_tensor_dev(g->ex[3 * x], &tab[x].g, &tab[x].gs, NULL) && cc_tensor_dev(g->ex[3 * x + 1], &tab[x].u, &tab[x].us, NULL) &&
-             cc_tensor_dev(g->ex[3 * x + 2], &tab[x].d, &tab[x].ds, NULL);
     }
+    if (!g->fmt_d) g->fmt_d = g->fmt;
     g->gs = g->fmt == 4 ? 64 : 0;
     ok = ok && (!E || (cc_reserve(&g->tab, (size_t)E * sizeof(CcExpert), CC_DEV) && cc_begin() &&
                        cc_write(g->tab, 0, tab, (size_t)E * sizeof(CcExpert)) && cc_submit(1)));
@@ -131,6 +333,7 @@ static int q36_mc_init(Model *m) {
          q36_mc_res(&g->outd, p->nvoc ? p->nvoc : c->vocab, g->pick_dev ? CC_DEV : CC_DOWN) &&
          (!g->pick_dev || q36_mc_res(&g->pick, 2, CC_DOWN));
     if (!ok) {
+        if (g->ex_arena) { coli_cuda_pipe_free(g->ex_arena_dev, g->ex_arena); g->ex_arena = NULL; }
         fprintf(stderr, "[mtp] the head does not fit the CUDA chain's device (an expert format, the f16 dense form or "
                         "device memory): it stays off\n");
         return 0;
@@ -203,18 +406,23 @@ static int q36_mc_norm(CcBuf *x, size_t xo, int xrow, size_t wo, CcBuf *y, size_
 /* rows R at pos0: tokens tok[r], the model's rows hid[r] (host) or, hid NULL, the device
  * state of the row before (R = 1); the head's input up to its K/V rows, stored. The host's
  * rows go in through the open frame (cc_write), ordered after the frames before. */
-static int q36_mc_input(Model *m, const int *tok, const float *hid, int R, int pos0) {
+static int q36_mc_input(Model *m, const int *tok, const float *hid, int R, int pos0, int want_q) {
     Q36MtpCuda *g = &g_q36_mc; Cfg *c = &m->c; Q36Mtp *p = &g_q36_mtp;
     int D = c->hidden, KV = c->kv_heads, kvd = c->k_head_dim, kvo = KV * kvd, half = c->rotary_dim / 2;
     float *em = falloc((int64_t)R * D), *cs = falloc((int64_t)R * (half > 0 ? 2 * half : 2));
     CcRegion *rg = malloc(sizeof *rg * (size_t)R * KV);
     if (!rg) { free(em); free(cs); return 0; }
-    for (int r = 0; r < R; r++) q36_embed_row(m, tok[r], pos0 + r, em + (size_t)r * D);
-    for (int s = 0; s < R; s++)
-        for (int j = 0; j < half; j++) {
-            float ang = (pos0 + s) * powf(c->theta, -2.0f * j / c->rotary_dim);
-            cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
-        }
+    q36_embed_batch(m, tok, R, pos0, em);
+    if (half > 0) {
+        float inv[256];
+        for (int j = 0; j < half && j < 256; j++) inv[j] = powf(c->theta, -2.0f * j / c->rotary_dim);
+        #pragma omp parallel for schedule(static) if (R >= 16)
+        for (int s = 0; s < R; s++)
+            for (int j = 0; j < half; j++) {
+                float ang = (pos0 + s) * (j < 256 ? inv[j] : powf(c->theta, -2.0f * j / c->rotary_dim));
+                cs[((size_t)s * half + j) * 2] = cosf(ang); cs[((size_t)s * half + j) * 2 + 1] = sinf(ang);
+            }
+    }
     for (int s = 0; s < R; s++) for (int h = 0; h < KV; h++)
         rg[s * KV + h] = (CcRegion){((size_t)h * g->cap + pos0 + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
     CcNorm kn = {R * KV, kvd, KV, 0, kvo, kvd, 0, kvo, kvd, (int)g->o_kn, 0, CC_NORM_ADD1, c->eps, 1.f};
@@ -227,6 +435,7 @@ static int q36_mc_input(Model *m, const int *tok, const float *hid, int R, int p
              cc_matmul(g->eh, g->cat, 0, g->x, 0, R) &&
              q36_mc_norm(g->x, 0, D, g->o_in, g->nrm, 0, D, R, D, c->eps) &&
              cc_matmul(g->lk, g->nrm, 0, g->k, 0, R) && cc_matmul(g->lv, g->nrm, 0, g->v, 0, R) &&
+             (!want_q || cc_matmul(g->lq, g->nrm, 0, g->q, 0, R)) &&
              cc_norm(g->k, g->prm, g->k, &kn) && (!half || cc_rope(g->k, g->cs, &kr)) &&
              (!q36_kv16() || !cc_kv16_ready() || (cc_ew(g->k, g->k, NULL, NULL, NULL, &r16) && cc_ew(g->v, g->v, NULL, NULL, NULL, &r16))) &&
              cc_copy_regions(g->kc, g->k, rg, R * KV) && cc_copy_regions(g->vc, g->v, rg, R * KV);
@@ -237,9 +446,19 @@ static int q36_mc_input(Model *m, const int *tok, const float *hid, int R, int p
 /* fed rows: their K/V rows only, one frame not waited for */
 static int q36_mc_kv_rows(Model *m, const int *tok, const float *hid, int R, int pos0) {
     double t0 = now_s();
-    int ok = q36_mc_bufs(m, R) && cc_begin() && q36_mc_input(m, tok, hid, R, pos0) && cc_submit(0);
+    int ok = q36_mc_bufs(m, R) && cc_begin() && q36_mc_input(m, tok, hid, R, pos0, 0) && cc_submit(0);
     g_q36_mtp.kv_rows += (unsigned long long)R; g_q36_mtp.kv_ms += (now_s() - t0) * 1e3;
     return ok;
+}
+static int q36_mc_mlp(Q36MtpCuda *g, int Ish) {
+    CcEw sw = {CC_EW_SWIGLU, Ish, Ish, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+    int glu = cc_matmul_glu(g->shg, g->shu, g->nrm, g->hs, 1);
+    if (glu < 0 && !g_gguf && !g_q36_mtp.sh_g.gq && !g_q36_mtp.sh_g.gq_gone &&
+        !g_q36_mtp.sh_u.gq && !g_q36_mtp.sh_u.gq_gone && cc_matmul_swiglu_ready())
+        glu = cc_matmul_swiglu(g->shg, g->shu, g->nrm, 0, g->hs, 0, 1);
+    return (glu > 0 || (glu < 0 && cc_matmul(g->shg, g->nrm, 0, g->gsb, 0, 1) &&
+                        cc_matmul(g->shu, g->nrm, 0, g->us, 0, 1) && cc_ew(g->hs, g->gsb, g->us, NULL, NULL, &sw))) &&
+           cc_matmul(g->shd, g->hs, 0, g->sd, 0, 1);
 }
 /* a draft row at pos. Its draft id and probability picked on the device (pick_dev: the whole
  * vocabulary or the adaptive list, no Q36_MTP_VOCAB_IDS, no Q36_MTP_DUMP), or its logits brought
@@ -265,30 +484,60 @@ static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logit
     CcRope qr = {H, H, 0, qo, qdim, half, 0, 2 * half};
     CcAttn a = {1, H, KV, hd, pos, g->cap, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
     CcEw add = {CC_EW_ADD, D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-    CcEw sw = {CC_EW_SWIGLU, Ish, Ish, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
     CcRoute rp = {.S = 1, .E = E, .K = K, .kind = 0, .l_row = E, .i_row = K, .w_row = K,
                   .n_group = 1, .topk_group = 1, .norm = 1, .temp = 1.f, .scale = 1.f};
     CcMoe mp = {.S = 1, .K = K, .D = D, .I = I, .fmt = g->fmt, .gs = g->gs, .act = 0, .parts = 3,
-                .x_row = D, .i_row = K, .w_row = K, .y_row = D, .h_off = -1, .E = E};
+                .x_row = D, .i_row = K, .w_row = K, .y_row = D, .h_off = -1, .E = E, .fmt_d = g->fmt_d};
     CcEw cb1 = {CC_EW_COMBINE, D, D, 1, 1 | 2 | 4, 1, 0, 0, 0, 0, 0, 1.f};
-    int ok = vok && q36_mc_input(m, &tok, hid, 1, pos) &&
-             cc_matmul(g->lq, g->nrm, 0, g->q, 0, 1) &&
+    CcAddNorm an_post = {1, D, 0, 0, 0, 0, (int)g->o_post, 0, c->eps};
+    CcAddNorm an_head = {1, D, 0, 0, 0, 0, (int)g->o_head, 0, c->eps};
+    int ok = vok && q36_mc_input(m, &tok, hid, 1, pos, 1) &&
              cc_norm(g->q, g->prm, g->q, &qn) && (!half || cc_rope(g->q, g->cs, &qr)) &&
              cc_attn(g->q, g->kc, g->vc, g->ctx, g->q, NULL, &a) &&
-             cc_matmul(g->lo, g->ctx, 0, g->tmp, 0, 1) &&
-             cc_ew(g->x, g->x, g->tmp, NULL, NULL, &add) &&
-             q36_mc_norm(g->x, 0, D, g->o_post, g->nrm, 0, D, 1, D, c->eps) &&
-             (!E || cc_matmul(g->rq, g->nrm, 0, g->lg, 0, 1)) &&
-             cc_matmul(g->shg, g->nrm, 0, g->gsb, 0, 1) && cc_matmul(g->shu, g->nrm, 0, g->us, 0, 1) &&
-             cc_ew(g->hs, g->gsb, g->us, NULL, NULL, &sw) &&
-             cc_matmul(g->shd, g->hs, 0, g->sd, 0, 1) &&
-             (E ? cc_matmul(g->sq, g->nrm, 0, g->sg, 0, 1) && cc_route(g->lg, NULL, g->ids, g->wt, &rp) &&
-                  cc_moe(g->tab, g->nrm, g->ids, g->wt, g->mh, g->rt, NULL, &mp) &&
-                  cc_ew(g->x, g->x, g->rt, g->sd, g->sg, &cb1)
-                : cc_ew(g->x, g->x, g->sd, NULL, NULL, &add)) &&
-             q36_mc_norm(g->x, 0, D, g->o_head, g->fin, 0, D, 1, D, c->eps) && cc_copy(g->hid, 0, g->fin, 0, D) &&
-             (use_voc ? cc_matmul_rows(g->lm, g->vids, g->fin, g->outd, V) : cc_matmul(g->lm, g->fin, 0, g->outd, 0, 1)) &&
-             (!g->pick_dev || cc_pick(g->outd, g->pick, V)) && cc_submit(1);
+             cc_matmul(g->lo, g->ctx, 0, g->tmp, 0, 1);
+    if (ok) {
+        int f1 = cc_addnorm(g->x, g->tmp, g->prm, g->nrm, &an_post);
+        ok = f1 >= 0 ? f1 : (cc_ew(g->x, g->x, g->tmp, NULL, NULL, &add) &&
+                             q36_mc_norm(g->x, 0, D, g->o_post, g->nrm, 0, D, 1, D, c->eps));
+    }
+    if (ok) {
+        if (E) {
+            CcEw sw = {CC_EW_SWIGLU, Ish, Ish, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+            ok = cc_matmul(g->rq, g->nrm, 0, g->lg, 0, 1) &&
+                 cc_matmul(g->sq, g->nrm, 0, g->sg, 0, 1) &&
+                 cc_route(g->lg, NULL, g->ids, g->wt, &rp);
+            if (ok) {
+                int glu = cc_matmul_glu(g->shg, g->shu, g->nrm, g->hs, 1);
+                if (glu < 0 && !g_gguf && !g_q36_mtp.sh_g.gq && !g_q36_mtp.sh_g.gq_gone &&
+                    !g_q36_mtp.sh_u.gq && !g_q36_mtp.sh_u.gq_gone && cc_matmul_swiglu_ready())
+                    glu = cc_matmul_swiglu(g->shg, g->shu, g->nrm, 0, g->hs, 0, 1);
+                if (glu > 0) {
+                    ok = cc_moe(g->tab, g->nrm, g->ids, g->wt, g->mh, g->rt, NULL, &mp) &&
+                         cc_matmul(g->shd, g->hs, 0, g->sd, 0, 1);
+                } else if (glu < 0) {
+                    ok = cc_matmul(g->shg, g->nrm, 0, g->gsb, 0, 1) &&
+                         cc_matmul(g->shu, g->nrm, 0, g->us, 0, 1) &&
+                         cc_moe(g->tab, g->nrm, g->ids, g->wt, g->mh, g->rt, NULL, &mp) &&
+                         cc_ew(g->hs, g->gsb, g->us, NULL, NULL, &sw) &&
+                         cc_matmul(g->shd, g->hs, 0, g->sd, 0, 1);
+                } else {
+                    ok = 0;
+                }
+            }
+            ok = ok && cc_ew(g->x, g->x, g->rt, g->sd, g->sg, &cb1) &&
+                 q36_mc_norm(g->x, 0, D, g->o_head, g->fin, 0, D, 1, D, c->eps);
+        } else {
+            ok = q36_mc_mlp(g, Ish);
+            if (ok) {
+                int f2 = cc_addnorm(g->x, g->sd, g->prm, g->fin, &an_head);
+                ok = f2 >= 0 ? f2 : (cc_ew(g->x, g->x, g->sd, NULL, NULL, &add) &&
+                                     q36_mc_norm(g->x, 0, D, g->o_head, g->fin, 0, D, 1, D, c->eps));
+            }
+        }
+    }
+    ok = ok && cc_copy(g->hid, 0, g->fin, 0, D) &&
+         (use_voc ? cc_matmul_rows(g->lm, g->vids, g->fin, g->outd, V) : cc_matmul(g->lm, g->fin, 0, g->outd, 0, 1)) &&
+         (!g->pick_dev || cc_pick(g->outd, g->pick, V)) && cc_submit(1);
     if (!ok) return 0;
     if (g->pick_dev) {   /* the vocabulary stays in VRAM; only the draft id and its probability cross */
         const void *pk = cc_ptr(g->pick);

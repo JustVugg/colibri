@@ -793,7 +793,7 @@ static void q38cc_recover(Model *m, int upto) {
     float *pref = m->ple_pref; int pref_rows = m->ple_pref_rows, snap = m->snap_rows, rowwise = g_q38_rowwise;
     m->ple_pref = NULL; m->ple_pref_rows = 0; m->snap_rows = 0; g_q38_rowwise = 0;
     for (int i = 0; i < nl; i++) q38_layer_forward(m, i, hyper, ids, upto, 0, mixed, inject, block);
-    free(m->ple_pref);
+    q38_ple_pref_clear(m);
     m->ple_pref = pref; m->ple_pref_rows = pref_rows; m->snap_rows = snap; g_q38_rowwise = rowwise;
     free(ids); free(hyper); free(mixed); free(inject); free(block);
 }
@@ -975,16 +975,17 @@ static int q38cc_gr_read(Q38CChain *ch, Model *m, GatedResidual *g, size_t norm_
     CcEw lo = {CC_EW_HC_LOW, n * R, R, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
     CcEw mx = {CC_EW_HC_MIX, n * H, H, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
     int ok = cc_norm(q38cc_hb(ch), ch->prm, ch->hn, &np) &&
-             cc_matmul(q38cc_t(ch, &g->down), ch->hn, 0, ch->low, 0, n) && cc_ew(ch->low, ch->low, NULL, NULL, NULL, &lo);
+             cc_matmul(q38cc_t(ch, &g->down), ch->hn, 0, ch->low, 0, n);
+    if (ok && inj) {
+        CcEw ij = {CC_EW_HC_INJ, n * C, C, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
+        ok = cc_matmul(q38cc_t(ch, &g->inject), ch->hn, 0, inj, 0, n) && cc_ew(inj, inj, NULL, NULL, NULL, &ij);
+    }
+    ok = ok && cc_ew(ch->low, ch->low, NULL, NULL, NULL, &lo);
     /* the up projection and the mix in one pass where the backend takes them (cc_matmul_hcmix: the same
      * bits, the product's n rows of W never written), else the two ops */
     const int fused = ok ? cc_matmul_hcmix(q38cc_t(ch, &g->up), ch->low, 0, ch->hn, ch->mixed, n, H, C, (float)C) : 0;
     if (fused == 0) ok = 0;
     else if (fused < 0) ok = cc_matmul(q38cc_t(ch, &g->up), ch->low, 0, ch->mix, 0, n) && cc_ew(ch->mixed, ch->mix, ch->hn, NULL, NULL, &mx);
-    if (ok && inj) {
-        CcEw ij = {CC_EW_HC_INJ, n * C, C, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
-        ok = cc_matmul(q38cc_t(ch, &g->inject), ch->hn, 0, inj, 0, n) && cc_ew(inj, inj, NULL, NULL, NULL, &ij);
-    }
     return ok;
 }
 static int q38cc_gr_apply(Q38CChain *ch, Model *m, CcBuf *inj, int n) {
@@ -1171,13 +1172,25 @@ static int q38cc_ple(Q38CChain *ch, Model *m, int n, int c0, int ns) {
     }
     return ok;
 }
-static int q38cc_shared(Q38CChain *ch, Model *m, Layer *l, int i, int n) {
+static int q38cc_shared_gu(Q38CChain *ch, Model *m, Layer *l, int i, int n) {
     Cfg *c = &m->c; int SI = c->shared_inter;
     CcEw sw = {CC_EW_SWIGLU, n * SI, SI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-    const int glu = cc_matmul_glu(q38cc_t(ch, &l->sh_g), q38cc_t(ch, &l->sh_u), ch->mixed, ch->hs, n);   /* the gate's and up's sums in one pass */
-    return (glu > 0 || (glu < 0 && cc_matmul(q38cc_t(ch, &l->sh_g), ch->mixed, 0, ch->gs, 0, n) &&
-                        cc_matmul(q38cc_t(ch, &l->sh_u), ch->mixed, 0, ch->us, 0, n) && cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &sw))) &&
-           cc_matmul(q38cc_t(ch, &l->sh_d), ch->hs, 0, ch->ds, 0, n) && cc_matmul(ch->t_sg[i], ch->mixed, 0, ch->sgd, 0, n);
+    ColiCudaTensor *tg = q38cc_t(ch, &l->sh_g), *tu = q38cc_t(ch, &l->sh_u);
+    /* Run shared gate before sh_g/sh_u so all ch->mixed consumers stay adjacent for bd_x_same reuse. */
+    int ok = cc_matmul(ch->t_sg[i], ch->mixed, 0, ch->sgd, 0, n);
+    if (!ok) return 0;
+    /* Fused gate+up+SwiGLU: GGUF block formats via cc_matmul_glu, INT8 trunk via cc_matmul_swiglu. */
+    int glu = cc_matmul_glu(tg, tu, ch->mixed, ch->hs, n);
+    if (glu < 0 && l->sh_g.kind != Q38_WEIGHT_GGML && l->sh_u.kind != Q38_WEIGHT_GGML && cc_matmul_swiglu_ready())
+        glu = cc_matmul_swiglu(tg, tu, ch->mixed, 0, ch->hs, 0, n);
+    return (glu > 0 || (glu < 0 && cc_matmul(tg, ch->mixed, 0, ch->gs, 0, n) &&
+                        cc_matmul(tu, ch->mixed, 0, ch->us, 0, n) && cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &sw)));
+}
+static int q38cc_shared_dn(Q38CChain *ch, Layer *l, int n) {
+    return cc_matmul(q38cc_t(ch, &l->sh_d), ch->hs, 0, ch->ds, 0, n);
+}
+static int q38cc_shared(Q38CChain *ch, Model *m, Layer *l, int i, int n) {
+    return q38cc_shared_gu(ch, m, l, i, n) && q38cc_shared_dn(ch, l, n);
 }
 /* block = routed + sigmoid(gate) * shared (q38_moe's out), then hyper += inject x block */
 static int q38cc_moe_apply(Q38CChain *ch, Model *m, int n, CcBuf *routed) {
@@ -2137,14 +2150,17 @@ static CcBuf *q38cc_dm_tab(Q38CChain *ch, int n) {
 static int q38cc_dm_hosted(Q38CChain *ch, int i, int n) { return q38cc_pc_step(ch, n) ? ch->dm_partd[i] : ch->dm_part[i]; }
 /* a step's layer i up to its routes: the router, the routes (and their copy down), the host's
  * word where the host has slots (*v), the shared expert */
-static int q38cc_dm_route(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
+static int q38cc_dm_route_gu(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
     Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
     CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
     int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
     *v = 0;
     if (ok && q38cc_dm_hosted(ch, i, n)) { *v = ++ch->dm_seq; ok = cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) && cc_signal(ch->dm_dfl, 0, *v); }
-    return ok && q38cc_shared(ch, m, l, i, n);
+    return ok && q38cc_shared_gu(ch, m, l, i, n);
+}
+static int q38cc_dm_route(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
+    return q38cc_dm_route_gu(ch, m, l, i, n, v) && q38cc_shared_dn(ch, l, n);
 }
 /* the device's slots of layer i's n rows (their routes in) into dm_hid */
 static int q38cc_dm_card(Q38CChain *ch, Model *m, int i, int n) {
@@ -2157,9 +2173,9 @@ static int q38cc_dm_card(Q38CChain *ch, Model *m, int i, int n) {
     if (ok && stg) ok = cc_fetch_done() && q38cc_stage_from(ch, m, i + 1);   /* the sum below reads no weights */
     return ok;
 }
-/* layer i up to the device's own experts: q38cc_dm_route, then q38cc_dm_card */
+/* layer i up to the device's own experts: q38cc_dm_route_gu, then q38cc_dm_card, then shared down */
 static int q38cc_dm_layer_a(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
-    return q38cc_dm_route(ch, m, l, i, n, v) && q38cc_dm_card(ch, m, i, n);
+    return q38cc_dm_route_gu(ch, m, l, i, n, v) && q38cc_dm_card(ch, m, i, n) && q38cc_shared_dn(ch, l, n);
 }
 /* the rest: the host's word where it has slots, the sum of the slots into dm_y; hid as a
  * q38cc_dm_card of lay_S rows left it, these n rows its rows lay_s0.. (0, 0: this step's) */
@@ -3030,8 +3046,9 @@ static int q38cc_dm_layer_lm(Q38CChain *ch, Model *m, Layer *l, int i, int n, in
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
     int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
-    ok = ok && q38cc_shared(ch, m, l, i, n) && (!stg || !first || cc_fetch_wait()) &&
-         cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
+    ok = ok && q38cc_shared_gu(ch, m, l, i, n) && (!stg || !first || cc_fetch_wait()) &&
+         cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp) &&
+         q38cc_shared_dn(ch, l, n);
     if (ok && stg && last) ok = cc_fetch_done() && q38cc_stage_from(ch, m, i + 1);
     CcMoe ms = mp; ms.parts = 2; ms.h_off = -1;
     ok = ok && cc_moe(tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &ms);
@@ -3839,8 +3856,8 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
             CcRoute rp = {n, E, c->topk, 0, 0, E, 0, 0, 0, c->topk, 0, c->topk, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
             CcMoe mp = {n, c->topk, H, c->inter, 100 + GQ_Q2_0, 0, 0, 3, 0, 0, H, 0, c->topk, 0, c->topk, 0, H, -1, E, 0, 100 + GQ_Q2_0, 0, 0, 0, 0.f, 0.f};
             ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->hd_ids, ch->hd_w, &rp) &&
-                 q38cc_shared(ch, m, l, L, n) && cc_moe(ch->hd_tab, ch->mixed, ch->hd_ids, ch->hd_w, ch->dm_hid, ch->dm_y, NULL, &mp) &&
-                 q38cc_moe_apply(ch, m, n, ch->dm_y);
+                 q38cc_shared_gu(ch, m, l, L, n) && cc_moe(ch->hd_tab, ch->mixed, ch->hd_ids, ch->hd_w, ch->dm_hid, ch->dm_y, NULL, &mp) &&
+                 q38cc_shared_dn(ch, l, n) && q38cc_moe_apply(ch, m, n, ch->dm_y);
             ch->hd_card_rows += (unsigned long long)n;
         } else if (hyb) {   /* routed on the device, the server computes them while the card runs the shared expert, one frame */
             CcRoute rp = {n, E, c->topk, 0, 0, E, 0, 0, 0, c->topk, 0, c->topk, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
