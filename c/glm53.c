@@ -5282,6 +5282,9 @@ static int glm53_ps_marks(const Tok *T, const int *ids, int np, int from, int *m
  * che dopo non c'e' piu' un gateway a cui rispondere e puo' uscire. */
 static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     if (!q->plen) { serve_line("ERROR %llu EMPTY_PROMPT\n", q->id); return 0; }
+#ifdef COLI_VULKAN
+    g53c_retry();   /* a chain that stopped with the device alive comes back (vkc_chain_retry) */
+#endif
     g_temp = q->temp; g_topp = q->top_p > 0.0f ? q->top_p : 1.0f;
 
     if (q->slot < 0 || q->slot >= g_n_slots) {

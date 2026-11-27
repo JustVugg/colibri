@@ -723,8 +723,20 @@ static int g53c_mla(G53Chain *ch, const GModel *m, const GSession *s, const GLay
  * the CPU from the recorded input rows of [rec_base, start), from the host's copy at
  * rec_base. The second device's is read back first (g53c_sync_host): dev2 without dev0
  * does not happen. */
+static int g_g53c_mode;   /* the chain's mode before a stop (g53c_retry brings it back) */
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. g53c_recover gave the state to the host and the device no owner: the next forward takes the session as
+ * any new owner, its rows and state up from the host. One device. */
+static void g53c_retry(void) {
+    G53Chain *ch = g_g53c;
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || g_g53c2 || !vkc_chain_retry("glm53")) return;
+    ch->owner = NULL; ch->where = G53C_HOST;
+    for (int i = 0; i < ch->lo + ch->n; i++) ch->kv_valid[i] = ch->pool_valid[i] = 0;
+    ch->failed = 0; g_vk_chain = g_g53c_mode ? g_g53c_mode : 1;
+}
 static void g53c_recover(GModel *m, GSession *s, int start, int dev0, int dev2, const G53Chain *who) {
     G53Chain *ch = g_g53c, *ch2 = g_g53c2;
+    if (g_vk_chain) g_g53c_mode = g_vk_chain;
     g_vk_chain = 0;
     if (!ch) return;
     int had = ch->owner == s && (dev0 || dev2);
