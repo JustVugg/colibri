@@ -6320,6 +6320,9 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
 
     for (;;) {
         ColiServeCommand command;
+#ifdef COLI_VULKAN
+        vkc_restart_if_lost("deepseek_v41");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         ColiServeReadResult result = coli_serve_read_command(stdin, &v41_wire, &command);
         if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) break;
         if (result == COLI_SERVE_READ_NOMEM) {

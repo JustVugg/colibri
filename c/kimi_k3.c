@@ -4708,6 +4708,9 @@ static void serve_loop(Model *m, Tok *T){
     if(g_k3_mux_slots>1){ serve_mux(m,T); coli_ps_report(&g_k3_ps); return; }
     for(;;){
         ServeReq q={0}; int r;
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("kimi_k3");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r==0);
         if(r<0){ coli_ps_report(&g_k3_ps); return; }
         if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0){ coli_ps_report(&g_k3_ps); return; } serve_emap(m); }

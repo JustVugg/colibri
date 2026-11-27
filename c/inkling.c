@@ -5191,6 +5191,9 @@ static void serve_loop(Model *m, Tok *T) {
     serve_tiers_emap(m);
     if (g_ink_mux_slots > 1) { serve_mux(m, T); coli_ps_report(&g_ink_ps); return; }
     for (;;) {
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("inkling");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) { coli_ps_report(&g_ink_ps); return; }   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));

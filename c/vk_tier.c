@@ -220,6 +220,7 @@ static struct {
      * place by the GEMMs; bpool[e] marks them in the step */
     int pool_copy; uint8_t *bpool;
     unsigned long long pc_experts; double pc_bytes;
+    int lost;                     /* the device stopped answering (issue): vkt_lost */
 } T;
 
 /* "2.31 GiB", "35.0 MiB", "9.5 KiB": the budget lines read on a 24 GB card and a tiny fixture alike */
@@ -2528,7 +2529,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
     if (!coli_vk_xb_ready()) {
-        if (T.on) { coli_event(VKT_TAG " tier %s: the device stopped answering, the experts stay on the CPU", T.engine); T.on = 0; }
+        if (T.on) { coli_event(VKT_TAG " tier %s: the device stopped answering, the experts stay on the CPU", T.engine); T.on = 0; T.lost = 1; }
         return 0;
     }
     if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
@@ -2779,6 +2780,7 @@ int vkt_resident(int layer, int eid) {
            slot(layer, eid)->state == VS_RESIDENT;
 }
 int vkt_ready(void) { return T.on; }
+int vkt_lost(void) { return T.lost; }
 
 /* ---- budget ---------------------------------------------------------------------- */
 static size_t mem_available(void) { return (size_t)(compat_mem_available_gb() * 1e9); }

@@ -954,6 +954,37 @@ int vkc_finish(void) {
  * to the backend's per-matrix path and the expert tier, where every such frame had marked it lost and the CPU had
  * taken everything until the process ended (#2793: "the device stopped answering", 300 s for a 12.7k prompt and
  * 7 tok/s after). The line says which of the two, what the chain's memory refused last, at which position. */
+/* Between two requests: a device lost for real (the chain's or the expert tier's: a driver reset, Windows' 2 s
+ * watchdog) leaves this process on the CPU, and a Vulkan device does not come back in it. The engine exits instead,
+ * after saying why, and the gateway starts it again (keep_engine) on a fresh device: the next request waits for it
+ * there and runs at the device's speed again. Once in ten minutes: a second loss within them keeps the CPU
+ * (colibri-logs/lost-restart holds the time). COLI_VK_LOST_RESTART=0 keeps the CPU always. */
+void vkc_restart_if_lost(const char *engine) {
+    if (!(g_kctx[0].lost || g_kctx[1].lost || vkt_lost())) return;
+    static int said;
+    const char *e = getenv("COLI_VK_LOST_RESTART");
+    if (e && *e == '0') return;
+    char mark[1024] = "";
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = getenv("USERPROFILE");
+    if (home && *home) snprintf(mark, sizeof mark, "%s/colibri-logs/lost-restart", home);
+    time_t now = time(NULL);
+    if (*mark) {
+        FILE *f = fopen(mark, "r");
+        long long last = 0;
+        if (f) { if (fscanf(f, "%lld", &last) != 1) last = 0; fclose(f); }
+        if (last > 0 && now - (time_t)last < 600) {
+            if (!said++) coli_event("[VK] %s: the device was lost again within ten minutes of a restart for that; the CPU runs "
+                                    "from here on (COLI_VK_LOST_RESTART=0 always keeps it)", engine);
+            return;
+        }
+        f = fopen(mark, "w");
+        if (f) { fprintf(f, "%lld\n", (long long)now); fclose(f); }
+    }
+    coli_event("[VK] %s: the device was lost; the engine exits so that the gateway starts it again on a fresh device", engine);
+    fflush(stdout); fflush(stderr);
+    _Exit(75);   /* C99: no atexit handlers (the device is gone), the same on Windows */
+}
 /* every submitted frame waited for, their temporaries and staging buffers given back (stage_relieve's, between two
  * requests: no frame open after vkc_finish) */
 static void stage_relieve_idle(void) {

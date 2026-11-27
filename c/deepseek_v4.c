@@ -21322,6 +21322,9 @@ static int v4_serve_main(void) {
     for (; n == 1;) {
         V4ServeRequest request = {0};
         int result;
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("deepseek_v4");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         do result = v4_serve_read_request(stdin, stdout, &request, NULL);
         while (result == 0);
         if (result < 0) break;

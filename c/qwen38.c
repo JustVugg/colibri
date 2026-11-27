@@ -3533,6 +3533,9 @@ static void serve_loop(Model *m){
     if(g_q38_mux_slots>1){serve_mux(m);q38_mux_free(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
     for(;;){
         ServeReq q={0}; int r;
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("qwen38");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r!=2&&r>=0);
         if(r<0){q38_prefix_cache_release(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
         if(r==2){

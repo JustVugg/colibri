@@ -11898,6 +11898,9 @@ static void serve_loop(Model *m){
     if(g_q36_mux_slots>1){ serve_mux(m); q36_ps_report(); return; }
     for(;;){
         ServeReq q={0}; int r;
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("qwen36");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         do r=serve_read_req(stdin,stdout,&q); while(r==0||r==4||r==5);
         if(r<0){ q36_mtp_vocab_save(); q36_ps_report(); return; }
         /* Resend the grid after EVERY turn, not only after READY: at boot the

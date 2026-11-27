@@ -944,6 +944,9 @@ void vkc_frame_failed(const char *engine, int pos, int rows);
  * this request: the first after the stop, then the 2nd, 4th ... 64th after each further one, so a cause that persists
  * costs one failed frame ever more rarely. The frames' staging is given back first. 0 after a lost device. */
 int  vkc_chain_retry(const char *engine);
+/* Between two requests (a serve loop, before it reads the next): after a device lost for real, the engine exits for
+ * the gateway to start it again on a fresh device (once in ten minutes; COLI_VK_LOST_RESTART=0 keeps the CPU). */
+void vkc_restart_if_lost(const char *engine);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
 void vkc_prof_print(void);
 

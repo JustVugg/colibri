@@ -6031,6 +6031,9 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     emap_emit(m);
     for (;;) {
         ServeReq q; char verb[16];
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("glm53");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         if (!serve_read_req(stdin, &q, verb, sizeof(verb))) break;   /* EOF: si esce */
         if (!strcmp(verb, "SUBMIT")) {
             /* < 0: stdin e' finito mentre il turno girava. Il turno e' stato
