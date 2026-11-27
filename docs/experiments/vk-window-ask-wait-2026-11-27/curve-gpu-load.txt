@@ -1,0 +1,21 @@
+AMD Radeon RX 9060 XT (RADV GFX1200), memory type 3 (heap 1, 15.92 GiB), 3 rounds of 13 x 1 GiB, polled every 1000 us for 3000 ms
+tier budget = free - 1.00 reserve - 0.89 dense - 2.44 chain (GiB)
+
+round 1: free 15.56 GiB before, 13 GiB allocated in 0.2 ms (free then 2.56), freed
+  just after the free: 2.56 GiB (13.00 of 13 GiB still counted)
+  back within 64 MiB of before: 153.9 ms
+  GiB still counted over time: 13.0@0ms 12.0@20ms 11.0@34ms 10.0@45ms 9.0@56ms 8.0@67ms 7.0@77ms 6.0@88ms 5.0@100ms 4.0@111ms 3.0@124ms 2.0@132ms 1.0@143ms 0.0@154ms
+  if the tier sized itself at: 50 ms -> 1.23 GiB 100 ms -> 6.23 GiB 150 ms -> 10.23 GiB 200 ms -> 11.23 GiB 300 ms -> 11.23 GiB
+
+round 2: free 15.56 GiB before, 13 GiB allocated in 0.2 ms (free then 2.56), freed
+  just after the free: 2.56 GiB (13.00 of 13 GiB still counted)
+  back within 64 MiB of before: 163.8 ms
+  GiB still counted over time: 13.0@0ms 12.0@29ms 11.0@39ms 10.0@51ms 9.0@62ms 8.0@73ms 7.0@85ms 6.0@96ms 5.0@108ms 4.0@118ms 3.0@130ms 2.0@142ms 1.0@152ms 0.0@164ms
+  if the tier sized itself at: 50 ms -> 0.23 GiB 100 ms -> 5.23 GiB 150 ms -> 9.23 GiB 200 ms -> 11.23 GiB 300 ms -> 11.23 GiB
+
+round 3: free 15.55 GiB before, 13 GiB allocated in 0.1 ms (free then 2.55), freed
+  just after the free: 2.55 GiB (13.00 of 13 GiB still counted)
+  back within 64 MiB of before: 154.4 ms
+  GiB still counted over time: 13.0@0ms 12.0@20ms 11.0@34ms 10.0@44ms 9.0@56ms 8.0@67ms 7.0@77ms 6.0@89ms 5.0@99ms 4.0@110ms 3.0@122ms 2.0@132ms 1.0@143ms 0.0@154ms 0.7@2610ms 0.0@2629ms 1.7@2666ms 0.7@2686ms 0.0@2699ms 6.7@2784ms 12.7@2785ms 11.7@2804ms 10.7@2819ms 9.7@2829ms 8.7@2841ms 7.7@2852ms 6.7@2863ms 5.7@2875ms 4.7@2885ms 3.7@2897ms 2.7@2908ms 1.7@2919ms 0.7@2931ms 0.0@2942ms
+  if the tier sized itself at: 50 ms -> 1.22 GiB 100 ms -> 6.22 GiB 150 ms -> 10.22 GiB 200 ms -> 11.22 GiB 300 ms -> 11.22 GiB
+
