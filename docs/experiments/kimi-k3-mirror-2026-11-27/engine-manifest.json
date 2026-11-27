@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "model": "Kimi K3.1 Pro, int8 container written by c/tools/k3_repack.py --bits 8 (94 shards, 1505.7 GB)",
+  "command": "MODEL=<container on nvme0> RUNS=3 NGEN=64 DRIVES='<block devices of nvme0, nvme1, nvme2, nvme3>' ./bench.sh OUT base-off@<v2.2.0>/c/kimi_k3 pr-off@<this commit>/c/kimi_k3 'pr-mirror@<this commit>/c/kimi_k3@COLI_MODEL_MIRROR=<copy on nvme2>;<copy on nvme3>' (bench.sh in this directory). Each run is a fresh process: env <common.env> kimi_k3 <container> <prompt.txt> --chat --ngen 64, 91 prompt tokens, greedy. Page cache dropped before each run, arms rotated per round, 3 rounds, no warm-up.",
+  "prompt_hash": "78481f6b35640980c31ed90e84f4af56bf2b50a6a76c2cd629b421797f6f05dd",
+  "hardware": {
+    "cpu": "Intel Core Ultra 7 270K Plus, 24 cores (8 P + 16 E), no SMT",
+    "ram": "125 GiB DDR5-5200 (4 x 32 GB)",
+    "storage": "4x Samsung 990 PRO 4 TB, each PCIe 4.0 x4. nvme0 (primary) and nvme1 on CPU root ports, nvme2 and nvme3 (the two copies) on Z890 chipset root ports, which share one uplink to the CPU. nvme1 was idle in this run. No drive throttled: the thermal management counters of nvme smart-log did not change, the hottest drive peaked at 66 C.",
+    "os": "Ubuntu 24.04.5, kernel 6.8.0-149-generic, gcc 13.3.0, make kimi_k3 ARCH=native"
+  },
+  "warmup_runs": 0,
+  "hypothesis": "Without COLI_MODEL_MIRROR, the engine of this branch decodes at the rate of its base commit: every read takes drive 0, whose descriptors are the primary's own.",
+  "commit": "523d0e3bc336b10d5eec05dfc842e90c4ff7cc58",
+  "changed_variables": [
+    "engine"
+  ],
+  "baseline": {
+    "config": {
+      "engine": "kimi_k3 at e479104ae01bdc40ce81e675299b1d230891b321",
+      "COLI_DISK_WEIGHTS": "1,1,1"
+    },
+    "samples": {
+      "tok_s": [
+        0.2564,
+        0.2564,
+        0.2565
+      ]
+    },
+    "median_tok_s": 0.2564,
+    "quality": {
+      "method": "byte-identical output: all 9 runs of the three arms wrote the same text (greedy, COLI_TEMP=0, 64 tokens), output sha256 a1f8d5c503cecf8cf4bc1c91fd938dc3cef3b0a66a7f62be5d4cce01af546bc7",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/kimi-k3-mirror-2026-11-27/base-off-raw.txt",
+      "sha256": "aef1f8980c655d6298ddbef15e16d12b7f773a576142816d9aecb012f5c831b4"
+    }
+  },
+  "trial": {
+    "config": {
+      "engine": "kimi_k3 at 523d0e3bc336b10d5eec05dfc842e90c4ff7cc58",
+      "COLI_DISK_WEIGHTS": "1,1,1"
+    },
+    "samples": {
+      "tok_s": [
+        0.2564,
+        0.2564,
+        0.2564
+      ]
+    },
+    "median_tok_s": 0.2564,
+    "quality": {
+      "method": "byte-identical output: all 9 runs of the three arms wrote the same text (greedy, COLI_TEMP=0, 64 tokens), output sha256 a1f8d5c503cecf8cf4bc1c91fd938dc3cef3b0a66a7f62be5d4cce01af546bc7",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/kimi-k3-mirror-2026-11-27/pr-off-raw.txt",
+      "sha256": "d563d1adee5f8d4ab0c7ad70189aeeed1e42f0d8a072967ed530daf92f4a3983"
+    }
+  },
+  "outcome": "no-change"
+}
