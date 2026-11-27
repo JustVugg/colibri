@@ -8326,6 +8326,11 @@ static void q36_seq_swap(Model *m, Q36Seq *q);   /* below: a chain swaps a conve
  * recently used place, its state through the host, as when the device has no room for one more.
  * es: the mirrors' element size; avail: the device's free memory then. */
 static int g_q36_places_plan = -1;
+/* KV_SLOTS: the slots whose requests run now (serve_mux keeps it). A place a running conversation holds is never
+ * handed to another conversation (q36c_conv_get, q36cc_conv_get), and a request that finds no place waits for one
+ * (q36_mux_room) instead of starting without: a step with one conversation short of a place ran every row on the
+ * host's path (the 27B at 8 conversations on a 24 GB card, 5 places: 1.8 tok/s each against 15 at 4). */
+static unsigned char *g_q36_mux_busy;
 static size_t q36_place_bytes(Model *m, int ctx, size_t es) {
     Cfg *c = &m->c; int R = q36_ring_for(c, ctx);
     size_t b = 0, nr = q36_rec_cells(c) * sizeof(float), nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float);
@@ -11588,6 +11593,7 @@ static int g_q36_mux_cur;       /* the slot the Model holds, -1 when every one i
 typedef struct {
     ServeReq q;
     int active, cancel, stop, limited, forwards;
+    int waiting; unsigned long long wseq;   /* read, waiting for a place on the device (q36_mux_room), in arrival order */
     int *ids, np, gen;
     float *lo;                  /* the logits the next pick reads */
     Q36ReqClock clk;
@@ -11637,6 +11643,7 @@ static int q36_mux_alloc(Model *m){
 /* A request's end, as serve_one ends one. */
 static void q36_mux_finish(Model *m, Q36MuxReq *r){
     free(r->lo); r->lo = NULL; free(r->ids); r->ids = NULL; r->active = 0;
+    if (g_q36_mux_busy && r->q.slot >= 0 && r->q.slot < g_q36_mux_slots) g_q36_mux_busy[r->q.slot] = 0;   /* its place may go to a waiting one */
     free(r->ahead); r->ahead = NULL; r->dn = r->acc = 0;
     if (g_q36_mux_cur != r->q.slot) q36_mux_bind(m, r->q.slot);
     /* an image turn's rope positions go with the turn, as q36_vision_detach drops them */
@@ -11737,14 +11744,60 @@ static int q36_mux_budget(void) {
 }
 #endif
 
+/* can slot's conversation start now with its state on the device (the chain's places)? 1 without places */
+static int q36_mux_room(Model *m, int slot) {
+#ifdef COLI_VULKAN
+    if (g_vk_chain) return q36c_mux_room(m, slot);
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_chain) return q36cc_mux_room(m, slot);
+#endif
+    (void)m; (void)slot;
+    return 1;
+}
+/* a read request's prompt and first token (serve_mux's, when it has a place) */
+static void q36_mux_admit(Model *m, Q36MuxReq *t, int mux_drafts) {
+    t->waiting = 0;
+    q36_mux_bind(m, t->q.slot);
+    int ok = q36_serve_start(m, &t->q, &t->ids, &t->np, &t->lo, &t->clk);
+    /* the image's rows are the prompt's: no decode row reads them; its rope
+     * positions stay with the conversation until the turn ends */
+    free(m->vis_rows); free(m->vis_map); m->vis_rows = NULL; m->vis_map = NULL;
+    m->vis_rows_n = m->vis_map_len = 0;
+    if (ok) { t->active = 1; t->limited = 1; t->forwards = 1; if (g_q36_mux_busy) g_q36_mux_busy[t->q.slot] = 1; }
+    else { free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0; }
+#ifdef COLI_CUDA
+    if (ok && mux_drafts) q36_mtp_vocab_begin(t->ids, t->np);   /* the draft vocabulary, as a lone request's */
+#else
+    (void)mux_drafts;
+#endif
+    free(t->q.payload); t->q.payload = NULL;
+    if (ok) emap_emit(m);
+}
+/* the waiting requests that find a place start, the oldest first (a later one does not pass it) */
+static int q36_mux_admit_waiting(Model *m, Q36MuxReq *rq, int n, int mux_drafts) {
+    int started = 0;
+    for (;;) {
+        int k = -1;
+        for (int i = 0; i < n; i++) if (rq[i].waiting && (k < 0 || rq[i].wseq < rq[k].wseq)) k = i;
+        if (k < 0 || !q36_mux_room(m, rq[k].q.slot)) break;
+        q36_mux_admit(m, &rq[k], mux_drafts);
+        started++;
+    }
+    return started;
+}
+
 static void serve_mux(Model *m){
     int n = g_q36_mux_slots, V = m->c.vocab, input_eof = 0;
     Q36MuxReq *rq = calloc((size_t)n, sizeof *rq);
+    unsigned char *busy = calloc((size_t)n, 1);
+    unsigned long long wclock = 0, waits = 0;
+    g_q36_mux_busy = busy;
     const int R = n * Q36_SPEC_ROWS;   /* a step's rows, drafts too */
     Q36Row *rows = malloc((size_t)R * sizeof *rows);
     int *tok = malloc((size_t)R * sizeof(int)), *who = malloc((size_t)R * sizeof(int)), *snap = malloc((size_t)R * sizeof(int));
     float *hid = NULL;
-    if (!rq || !rows || !tok || !who || !snap) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
+    if (!rq || !busy || !rows || !tok || !who || !snap) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
     int mux_drafts = 0;
 #ifdef COLI_CUDA
     /* the conversations draft with the MTP head on the CUDA chain's card (its state a conversation each) */
@@ -11769,6 +11822,7 @@ static void serve_mux(Model *m){
     if (g_cuda_chain) q36cc_mux_init(m);
 #endif
     for (;;) {
+        q36_mux_admit_waiting(m, rq, n, mux_drafts);
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
         if (g_q36_held_eof) input_eof = 1;   /* a prompt's checks read the end of input */
         /* idle: wait for a command; decoding: take one only when one is there. The frames a
@@ -11782,28 +11836,26 @@ static void serve_mux(Model *m){
                     if (r == 4) rq[i].cancel = 1;
                     else rq[i].stop = 1;
                 }
+                for (int i = 0; i < n; i++) if (rq[i].waiting && !strcmp(rq[i].q.id, q.id)) {
+                    if (r == 4) {   /* cancelled before it started: it ends as a cancelled prompt does */
+                        printf("ERROR %s CANCELLED\n", rq[i].q.id); fflush(stdout);
+                        free(rq[i].q.payload); rq[i].q.payload = NULL; rq[i].waiting = 0;
+                    } else rq[i].stop = 1;   /* stopped: it starts and its first pick ends it, as for a running one */
+                }
             } else if (r == 2 || r == 3) {
                 int bad = q.slot < 0 || q.slot >= n;
-                if (bad || rq[q.slot].active) {
+                if (bad || rq[q.slot].active || rq[q.slot].waiting) {
                     printf("ERROR %s %s\n", q.id, bad ? "invalid cache slot" : "SLOT_BUSY"); fflush(stdout);
                 } else if (r == 3) {
                     q36_mux_bind(m, q.slot); clef_serve_one(m, &q);
                 } else {
                     Q36MuxReq *t = &rq[q.slot];
                     memset(t, 0, sizeof *t); t->q = q; q.payload = NULL;
-                    q36_mux_bind(m, t->q.slot);
-                    int ok = q36_serve_start(m, &t->q, &t->ids, &t->np, &t->lo, &t->clk);
-                    /* the image's rows are the prompt's: no decode row reads them; its rope
-                     * positions stay with the conversation until the turn ends */
-                    free(m->vis_rows); free(m->vis_map); m->vis_rows = NULL; m->vis_map = NULL;
-                    m->vis_rows_n = m->vis_map_len = 0;
-                    if (ok) { t->active = 1; t->limited = 1; t->forwards = 1; }
-                    else { free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0; }
-#ifdef COLI_CUDA
-                    if (ok && mux_drafts) q36_mtp_vocab_begin(t->ids, t->np);   /* the draft vocabulary, as a lone request's */
-#endif
-                    free(t->q.payload); t->q.payload = NULL;
-                    if (ok) emap_emit(m);
+                    t->waiting = 1; t->wseq = ++wclock;
+                    q36_mux_admit_waiting(m, rq, n, mux_drafts);
+                    if (t->waiting && !waits++)
+                        fprintf(stderr, "[qwen36] KV_SLOTS=%d: a conversation waits for a place on the device (the others' "
+                                        "keep it and their speed; it starts when one of them ends)\n", n);
                 }
                 free(q.payload);
             }
@@ -11910,7 +11962,9 @@ static void serve_mux(Model *m){
         for (int i = 0; i < n; i++) { dr += rq[i].drafts; ac += rq[i].accepted; }
         if (dr) fprintf(stderr, "[qwen36] KV_SLOTS=%d: %llu drafts, %llu accepted (%.1f%%)\n", n, dr, ac, 100.0 * (double)ac / (double)dr);
     }
-    free(rq); free(rows); free(tok); free(who); free(snap); free(hid);
+    if (waits) fprintf(stderr, "[qwen36] KV_SLOTS=%d: %llu request%s waited for a place on the device\n", n, waits, waits == 1 ? "" : "s");
+    g_q36_mux_busy = NULL;
+    free(rq); free(busy); free(rows); free(tok); free(who); free(snap); free(hid);
 }
 
 static void serve_loop(Model *m){

@@ -1146,8 +1146,11 @@ static int q36c_conv_get(Q36Chain *ch, Model *m, int slot, int evict) {
     for (int j = 0; j < ch->nconv && k < 0; j++) if (ch->conv[j].slot < 0) k = j;
     if (k < 0) k = q36c_conv_new(ch, m);
     if (k < 0 && evict) {
-        for (int j = 0; j < ch->nconv; j++)
+        for (int j = 0; j < ch->nconv; j++) {
+            const int s = ch->conv[j].slot;
+            if (g_q36_mux_busy && s >= 0 && s < g_q36_mux_slots && g_q36_mux_busy[s]) continue;   /* a running conversation's */
             if (ch->conv[j].used != ch->conv_clock && (k < 0 || ch->conv[j].used < ch->conv[k].used)) k = j;
+        }
         if (k < 0) return -1;
         if (k == ch->conv_cur) q36c_conv_save(ch);
         if (!q36c_conv_down(ch, m, &ch->conv[k])) return -1;
@@ -1258,6 +1261,19 @@ static void q36c_mux_leave(Model *m) {
 }
 /* slot is held now (-1: none, a decode step's turn): its place, or nothing on the device
  * counts as its own */
+/* KV_SLOTS: can slot's conversation start now with its state on the device? Its own place, a free one, one more
+ * (opened now), or the place of a conversation whose request is not running (g_q36_mux_busy; its state goes to the
+ * host when the place is taken). Without places (a second device, a partial chain, the split) every conversation
+ * goes through the host anyway: 1. */
+static int q36c_mux_room(Model *m, int slot) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (!ch || !ch->conv || !q36c_pool_ok(ch, m)) return 1;
+    for (int k = 0; k < ch->nconv; k++) {
+        const int s = ch->conv[k].slot;
+        if (s == slot || s < 0 || s >= g_q36_mux_slots || !g_q36_mux_busy || !g_q36_mux_busy[s]) return 1;
+    }
+    return q36c_conv_new(ch, m) >= 0;
+}
 static void q36c_mux_enter(Model *m, int slot) {
     Q36Chain *ch = q36c_of(m, 0);
     if (ch && !ch->conv && ch->pool_closed) q36c_pool_reopen(m, slot);
