@@ -98,9 +98,10 @@ void qt_experts_withdraw(const char *why);
 /* Bytes the engine will put on the device after the tier sizes itself (the CUDA chain's own
  * router, b|a and gate rows), kept out of the automatic allowance. Call before qt_init. */
 void qt_reserve(size_t bytes);
-/* more to keep out, sized from the first device's free memory when the tier reads it (fn(free) bytes): the
- * planned places of several conversations (qwen36's q36_places_plan), whose count depends on that memory */
-void qt_reserve_fn(size_t (*fn)(size_t free_bytes));
+/* more to keep out of the first device's expert budget, sized from the room the trunk leaves there (fn(room,
+ * experts): bytes; experts 0 when no expert goes to the card): the planned places of several conversations
+ * (qwen36's q36_places_plan), whose count depends on that room. Never out of the trunk's room. */
+void qt_reserve_fn(size_t (*fn)(size_t room, int experts));
 void qt_reserve_short(size_t bytes, size_t experts);   /* out of the expert budget only when fewer than `experts` fit */
 /* a chain's prompt staging past the `base` bytes of its reserve, toward `full` (qwen36_tier.c's
  * rule); qt_stage_extra: the bytes the budget gave it. Call before qt_init_gguf. */
@@ -359,7 +360,7 @@ static inline int  qt_place_is_auto(void){return 0;}
 static inline void qt_trunk_withdraw(const char*a){(void)a;}
 static inline void qt_experts_withdraw(const char*a){(void)a;}
 static inline void qt_reserve(size_t b){(void)b;}
-static inline void qt_reserve_fn(size_t (*f)(size_t)){(void)f;}
+static inline void qt_reserve_fn(size_t (*f)(size_t,int)){(void)f;}
 static inline void qt_reserve_short(size_t b,size_t e){(void)b;(void)e;}
 static inline void qt_reserve_stage(size_t a,size_t b){(void)a;(void)b;}
 static inline size_t qt_stage_extra(void){return 0;}

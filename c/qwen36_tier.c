@@ -703,8 +703,8 @@ void qt_trunk_withdraw(const char *why){
 /* qt_reserve: device bytes the engine places after the tier sized itself (qwen36_tier.h) */
 static size_t G_reserve;
 void qt_reserve(size_t bytes){ G_reserve = bytes; }
-static size_t (*G_reserve_fn)(size_t);
-void qt_reserve_fn(size_t (*fn)(size_t)){ G_reserve_fn = fn; }
+static size_t (*G_reserve_fn)(size_t, int);
+void qt_reserve_fn(size_t (*fn)(size_t, int)){ G_reserve_fn = fn; }
 /* qt_reserve_short: bytes kept out of a device's expert budget only when it holds fewer than
  * `experts` of them (a chain's staging of the experts the RAM keeps, which with every expert on
  * the card would hold memory for nothing) */
@@ -1028,10 +1028,9 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     for(int i=0;i<G.ndev;i++){
         size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
         capdev[i] = G.dev[i];
-        const size_t keep = G_reserve + (i == 0 && G_reserve_fn ? G_reserve_fn(freeb) : 0);
         capacity[i] = (bg && strcmp(bg,"auto") && atof(bg)>0)
                    ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
-                   : (freeb>(1ull<<30)+keep ? freeb-(1ull<<30)-keep : 0);
+                   : (freeb>(1ull<<30)+G_reserve ? freeb-(1ull<<30)-G_reserve : 0);
         fprintf(stderr,"[qtier] dev %d: %.1f GB free, allowance %.1f GB\n",
                 G.dev[i], freeb/1073741824.0, capacity[i]/1073741824.0);
     }
@@ -1201,6 +1200,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         for(int j=0;j<ncap;j++) if(capdev[j]==G.dev[i]) cap_i = capacity[j];
         G_trunk_bytes[i] = trunk;                 /* by expert-device index, for qt_stats */
         G.budget[i] = G_trunk_only ? 0 : cap_i > trunk ? cap_i - trunk : 0;
+        if(i == 0 && G_reserve_fn){   /* the planned places: out of the room the trunk leaves, the experts' */
+            const size_t pl = G_reserve_fn(cap_i > trunk ? cap_i - trunk : 0, !G_trunk_only);
+            if(!G_trunk_only) G.budget[i] = G.budget[i] > pl ? G.budget[i] - pl : 0;
+        }
         /* with exact slots the experts' count at their layers' average slot */
         size_t per = G.exp_bytes;
         if(G_exact){ size_t all=0; for(int l=0;l<G.nl;l++) all+=G_lsl[l]; per = all/(size_t)G.nl; }

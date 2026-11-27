@@ -889,13 +889,17 @@ static void q36cc_room_from_tier(Q36CChain *ch, size_t need) {
         if (fr >= need || !qt_chain_give_back(need - fr, q36cc_tensor_addr)) return;
     }
 }
-/* the room the planned places past the chain's own take (q36_places_plan), for the tier: sized from the device's
- * free memory when the tier reads it (qt_reserve_fn; before the tier starts the backend has no device to ask) */
+/* the room the planned places past the chain's own take (q36_places_plan), out of the expert budget: sized from
+ * the room the trunk leaves on the card when the tier places it (qt_reserve_fn; before the tier starts the backend
+ * has no device to ask, and the trunk's room is never theirs: the 27B's 8 places of 1.15 GiB, taken from the whole
+ * free memory, left a shared expert's gate off the card and the chain off, 1.1 tok/s). With experts on the card the
+ * places take half of that room; without (a dense model), all of it but 1 GiB for the prompts' buffers. */
 static Model *g_q36cc_plan_model;
-static size_t q36cc_places_reserve(size_t free_bytes) {
+static size_t q36cc_places_reserve(size_t room, int experts) {
     size_t b = 0;
+    const size_t gib = (size_t)1 << 30;
     if (g_q36cc_plan_model && g_q36_mux_slots > 1 && coli_kv_plan())
-        q36_places_plan(g_q36cc_plan_model, q36cc_kves(), free_bytes, &b);
+        q36_places_plan(g_q36cc_plan_model, q36cc_kves(), experts ? room : (room > gib ? 2 * (room - gib) : 0), &b);
     return b;
 }
 static void q36cc_places_plan_at_tier(Model *m) {
