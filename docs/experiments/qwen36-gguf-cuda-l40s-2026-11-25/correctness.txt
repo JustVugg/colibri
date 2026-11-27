@@ -1,0 +1,213 @@
+Qwen3.6 GGUF CUDA profiles vs dev
+
+Checkpoint: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+SHA-256: 707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450
+FP32 reference: dev 1403453f42ccc843fd73182ca7dd911dc31c5782
+Baseline c/ source tree: e38e7411e3fb6617c60cc597f0e1bba7dc4488c5
+
+Method
+
+On each GPU, the benchmark saved the dev output and compared the bits of
+all 248,320 FP32 logits after prefill and at each measured decode step.
+All 17 workloads matched on all eight GPUs at the measured revisions.
+The tables count the three retained trial runs. Each GPU has 6,360 matching
+vectors (1,579,315,200 FP32 values). The timed dev and trial runs also have
+identical logged logit and token fingerprints, NLL and top-1 for every row.
+The fingerprints below come from the timing log. NLL and top-1 are the
+benchmark's per-workload values at its logged precision.
+
+Workload numbering: 1 cold 64, 2 sequential 512, 3 final 64, 4 cold 512,
+5–9 long prompts 2,048 through 32,768, and 10–17 Chat 1 through Chat 8.
+
+Measured revisions
+
+L4, A100 and RTX PRO 6000 used the earlier GGUF implementation. RTX 3090,
+RTX PRO 4000 and RTX 5090 were measured before the RTX 4090 cache change.
+RTX 4090 and L40S include the change. See base.md for the timing protocol.
+
+NVIDIA L4
+
+workload_id | vectors per run | logits fingerprint | token fingerprint | NLL | top-1
+1 | 129 | 0b1284066af31f06 | a7164b3cd0654951 | 2.78083 | 0.500
+2 | 129 | 718cf7f00f2c05cf | bc09903f9a4069bc | 2.86017 | 0.477
+3 | 129 | 0b1284066af31f06 | a7164b3cd0654951 | 2.78083 | 0.500
+4 | 129 | 718cf7f00f2c05cf | bc09903f9a4069bc | 2.86017 | 0.477
+5 | 129 | 619af167897e650d | d6661a686430b1fa | 2.43676 | 0.461
+6 | 129 | e9840f15df74a122 | 45601e6c456735d4 | 1.49690 | 0.609
+7 | 129 | fc6c67ea043b7ccf | e54687bacc388530 | 2.43431 | 0.477
+8 | 129 | 5007fadfee19a53a | e3656e007bca1e82 | 2.22535 | 0.484
+9 | 129 | 5ea5d52328b40b6f | 572e8fcebb462016 | 2.36495 | 0.484
+10 | 58 | 60319e33c2554f91 | a9232a16bd227f2d | 1.61763 | 0.702
+11 | 33 | 20dd888eaa086411 | 7d6e0f6d44b5cecc | 0.02169 | 1.000
+12 | 88 | 9f9d504e576e3acd | 159540b062b93762 | 1.06943 | 0.747
+13 | 45 | 8e6bb8ccff5147ca | 23d625e741190180 | 0.22901 | 0.932
+14 | 55 | 9da52258536027d0 | 24b73c35bded487b | 1.09601 | 0.796
+15 | 25 | c295f477f46ff371 | 331c8c8593842500 | 0.32172 | 0.875
+16 | 468 | 04405ac55670a04b | c005de8ea3c4e76e | 0.85995 | 0.760
+17 | 187 | 74538e74b5bb0ff8 | 1ac06551ca8a243e | 0.85772 | 0.720
+
+NVIDIA A100 SXM4 40 GB
+
+workload_id | vectors per run | logits fingerprint | token fingerprint | NLL | top-1
+1 | 129 | a247480adba1000e | a7164b3cd0654951 | 2.77645 | 0.508
+2 | 129 | 3c90814b867254ed | bc09903f9a4069bc | 2.86549 | 0.469
+3 | 129 | a247480adba1000e | a7164b3cd0654951 | 2.77645 | 0.508
+4 | 129 | 3c90814b867254ed | bc09903f9a4069bc | 2.86549 | 0.469
+5 | 129 | 619af167897e650d | d6661a686430b1fa | 2.43676 | 0.461
+6 | 129 | c59f6b741b34d242 | 45601e6c456735d4 | 1.48777 | 0.602
+7 | 129 | 5b3407c8a08f4f6f | e54687bacc388530 | 2.44132 | 0.469
+8 | 129 | 4aeca1f5c2580e41 | e3656e007bca1e82 | 2.21207 | 0.508
+9 | 129 | 43cff667b1f7403e | 572e8fcebb462016 | 2.37294 | 0.477
+10 | 58 | e6cdf28e4aa3f642 | a9232a16bd227f2d | 1.64473 | 0.702
+11 | 33 | 39fa3c56b204fa58 | 7d6e0f6d44b5cecc | 0.02536 | 1.000
+12 | 88 | 786c74f77c3a5439 | 159540b062b93762 | 1.06546 | 0.747
+13 | 45 | f553cd77c2968399 | 23d625e741190180 | 0.22368 | 0.932
+14 | 55 | d6ac43810576f5e3 | 24b73c35bded487b | 1.11225 | 0.796
+15 | 25 | 0338047d9e63767f | 331c8c8593842500 | 0.31188 | 0.875
+16 | 468 | a7a9a4e4aa904df2 | c005de8ea3c4e76e | 0.84690 | 0.764
+17 | 187 | 8f41dc73f34b3d66 | 1ac06551ca8a243e | 0.84916 | 0.726
+
+GeForce RTX 3090
+
+workload_id | vectors per run | logits fingerprint | token fingerprint | NLL | top-1
+1 | 129 | 3484f108184b8a23 | a7164b3cd0654951 | 2.79768 | 0.492
+2 | 129 | 5adbfd3ded8628a8 | bc09903f9a4069bc | 2.85947 | 0.484
+3 | 129 | 3484f108184b8a23 | a7164b3cd0654951 | 2.79768 | 0.492
+4 | 129 | 5adbfd3ded8628a8 | bc09903f9a4069bc | 2.85947 | 0.484
+5 | 129 | 077bb557ed112bbc | d6661a686430b1fa | 2.42078 | 0.461
+6 | 129 | 1ab9f82fb7a914d0 | 45601e6c456735d4 | 1.49690 | 0.609
+7 | 129 | ddba703052fd297b | e54687bacc388530 | 2.43290 | 0.469
+8 | 129 | abf683eda135453b | e3656e007bca1e82 | 2.21605 | 0.492
+9 | 129 | c1bf8fa8f899697c | 572e8fcebb462016 | 2.36373 | 0.477
+10 | 58 | 0c84dcfaf8ab9011 | a9232a16bd227f2d | 1.63601 | 0.702
+11 | 33 | cb8085b1e2b5cc67 | 7d6e0f6d44b5cecc | 0.01872 | 1.000
+12 | 88 | 28a003cd90e7b58c | 159540b062b93762 | 1.06720 | 0.747
+13 | 45 | b91f018ab2999ed5 | 23d625e741190180 | 0.23539 | 0.932
+14 | 55 | 3469ae7dab90c85a | 24b73c35bded487b | 1.11340 | 0.796
+15 | 25 | 2e3d950820ce46ff | 331c8c8593842500 | 0.33032 | 0.875
+16 | 468 | a66dbab11d42c52b | c005de8ea3c4e76e | 0.85600 | 0.762
+17 | 187 | 035f2c1d0437cf5a | 1ac06551ca8a243e | 0.86647 | 0.720
+
+RTX PRO 4000 Blackwell
+
+workload_id | vectors per run | logits fingerprint | token fingerprint | NLL | top-1
+1 | 129 | 3e98fe7680d0e83e | a7164b3cd0654951 | 2.79535 | 0.500
+2 | 129 | 0b3aaaf9f53a9752 | bc09903f9a4069bc | 2.84830 | 0.492
+3 | 129 | 3e98fe7680d0e83e | a7164b3cd0654951 | 2.79535 | 0.500
+4 | 129 | 0b3aaaf9f53a9752 | bc09903f9a4069bc | 2.84830 | 0.492
+5 | 129 | 22f6ef78a460f8cb | d6661a686430b1fa | 2.41831 | 0.469
+6 | 129 | a07ffccec156cb8b | 45601e6c456735d4 | 1.47785 | 0.602
+7 | 129 | 02ad5d6540fe00b6 | e54687bacc388530 | 2.44141 | 0.469
+8 | 129 | ab32fb195702b0f5 | e3656e007bca1e82 | 2.21409 | 0.492
+9 | 129 | 350c97b8365f976c | 572e8fcebb462016 | 2.35810 | 0.484
+10 | 58 | 9e8c862929398f00 | a9232a16bd227f2d | 1.61450 | 0.702
+11 | 33 | d9438a8a80f2759f | 7d6e0f6d44b5cecc | 0.01955 | 1.000
+12 | 88 | aae655e50dbf6f48 | 159540b062b93762 | 1.07869 | 0.724
+13 | 45 | 48cb97cbad22990e | 23d625e741190180 | 0.22490 | 0.932
+14 | 55 | e1d9331984d68a58 | 24b73c35bded487b | 1.10636 | 0.796
+15 | 25 | fae14b6517337ecd | 331c8c8593842500 | 0.30849 | 0.875
+16 | 468 | cb34ce14d987e7fa | c005de8ea3c4e76e | 0.84763 | 0.767
+17 | 187 | 5dd526ce57316038 | 1ac06551ca8a243e | 0.84784 | 0.715
+
+GeForce RTX 4090
+
+workload_id | vectors per run | logits fingerprint | token fingerprint | NLL | top-1
+1 | 129 | 078a6a97a3ff516e | a7164b3cd0654951 | 2.77812 | 0.492
+2 | 129 | e1786aada4d79d11 | bc09903f9a4069bc | 2.86221 | 0.477
+3 | 129 | a12df545214895fb | a7164b3cd0654951 | 2.79127 | 0.492
+4 | 129 | e2883e034fbfb811 | bc09903f9a4069bc | 2.85754 | 0.484
+5 | 129 | 172fb267801a8c69 | d6661a686430b1fa | 2.42191 | 0.469
+6 | 129 | 7e87ec74c3cdf6ca | 45601e6c456735d4 | 1.48324 | 0.609
+7 | 129 | 071f0e098f834e7a | e54687bacc388530 | 2.44450 | 0.469
+8 | 129 | 47daa4bbbdbab1dd | e3656e007bca1e82 | 2.21619 | 0.492
+9 | 129 | db20a25bb8609be0 | 572e8fcebb462016 | 2.37395 | 0.469
+10 | 58 | 03e298a60987e4f8 | a9232a16bd227f2d | 1.64786 | 0.702
+11 | 33 | 5dadc196ef07322d | 7d6e0f6d44b5cecc | 0.02056 | 1.000
+12 | 88 | c7b8b028793b460c | 159540b062b93762 | 1.05706 | 0.736
+13 | 45 | 7c1a6b75761b3b93 | 23d625e741190180 | 0.22211 | 0.932
+14 | 55 | ebf27d86b263dab8 | 24b73c35bded487b | 1.09735 | 0.796
+15 | 25 | df6a043e305d08e1 | 331c8c8593842500 | 0.31537 | 0.875
+16 | 468 | 939be2bde8e6ac3b | c005de8ea3c4e76e | 0.83487 | 0.762
+17 | 187 | 5ba282f15bd72412 | 1ac06551ca8a243e | 0.85012 | 0.715
+
+GeForce RTX 5090
+
+workload_id | vectors per run | logits fingerprint | token fingerprint | NLL | top-1
+1 | 129 | e859492ada401fea | a7164b3cd0654951 | 2.78497 | 0.492
+2 | 129 | 52bed504001cc8d3 | bc09903f9a4069bc | 2.85911 | 0.469
+3 | 129 | e859492ada401fea | a7164b3cd0654951 | 2.78497 | 0.492
+4 | 129 | 52bed504001cc8d3 | bc09903f9a4069bc | 2.85911 | 0.469
+5 | 129 | af36d44fddcc3a0f | d6661a686430b1fa | 2.42838 | 0.453
+6 | 129 | 444aa896c19b7670 | 45601e6c456735d4 | 1.49104 | 0.609
+7 | 129 | d117c5a936c2850c | e54687bacc388530 | 2.44600 | 0.469
+8 | 129 | be63e3291b076770 | e3656e007bca1e82 | 2.21266 | 0.500
+9 | 129 | bff13751fc03b84a | 572e8fcebb462016 | 2.35106 | 0.477
+10 | 58 | 0b9990a0d5e11fcc | a9232a16bd227f2d | 1.62175 | 0.702
+11 | 33 | 394efc5596cd5f6b | 7d6e0f6d44b5cecc | 0.01847 | 1.000
+12 | 88 | e760840d39313934 | 159540b062b93762 | 1.06355 | 0.747
+13 | 45 | 8f061272bcadf1bf | 23d625e741190180 | 0.23666 | 0.932
+14 | 55 | 48c95ca79624882a | 24b73c35bded487b | 1.12706 | 0.796
+15 | 25 | d97b4fbb8eeba41b | 331c8c8593842500 | 0.31775 | 0.875
+16 | 468 | d7004f505c639e01 | c005de8ea3c4e76e | 0.86239 | 0.762
+17 | 187 | 0180d4ea6f35688b | 1ac06551ca8a243e | 0.85727 | 0.720
+
+RTX PRO 6000 Blackwell Server Edition
+
+workload_id | vectors per run | logits fingerprint | token fingerprint | NLL | top-1
+1 | 129 | e859492ada401fea | a7164b3cd0654951 | 2.78497 | 0.492
+2 | 129 | 52bed504001cc8d3 | bc09903f9a4069bc | 2.85911 | 0.469
+3 | 129 | e859492ada401fea | a7164b3cd0654951 | 2.78497 | 0.492
+4 | 129 | 52bed504001cc8d3 | bc09903f9a4069bc | 2.85911 | 0.469
+5 | 129 | af36d44fddcc3a0f | d6661a686430b1fa | 2.42838 | 0.453
+6 | 129 | 444aa896c19b7670 | 45601e6c456735d4 | 1.49104 | 0.609
+7 | 129 | d117c5a936c2850c | e54687bacc388530 | 2.44600 | 0.469
+8 | 129 | be63e3291b076770 | e3656e007bca1e82 | 2.21266 | 0.500
+9 | 129 | bff13751fc03b84a | 572e8fcebb462016 | 2.35106 | 0.477
+10 | 58 | 0b9990a0d5e11fcc | a9232a16bd227f2d | 1.62175 | 0.702
+11 | 33 | cb32c88b8540e0e8 | 7d6e0f6d44b5cecc | 0.01768 | 1.000
+12 | 88 | c2ae3be48e4562a3 | 159540b062b93762 | 1.06325 | 0.759
+13 | 45 | 53dc78127a02f914 | 23d625e741190180 | 0.23022 | 0.932
+14 | 55 | d616fc79656c6751 | 24b73c35bded487b | 1.11458 | 0.796
+15 | 25 | cfa8b8be807c5e78 | 331c8c8593842500 | 0.30237 | 0.875
+16 | 468 | c7db3982ee782f7f | c005de8ea3c4e76e | 0.85763 | 0.758
+17 | 187 | 31d68fd648ff4e9b | 1ac06551ca8a243e | 0.86213 | 0.720
+
+NVIDIA L40S
+
+workload_id | vectors per run | logits fingerprint | token fingerprint | NLL | top-1
+1 | 129 | 7b378a37573ae8c2 | a7164b3cd0654951 | 2.78082 | 0.500
+2 | 129 | 9324757e396b9d5a | bc09903f9a4069bc | 2.85633 | 0.492
+3 | 129 | 7b378a37573ae8c2 | a7164b3cd0654951 | 2.78082 | 0.500
+4 | 129 | 9324757e396b9d5a | bc09903f9a4069bc | 2.85633 | 0.492
+5 | 129 | dbd0250208f8d710 | d6661a686430b1fa | 2.42712 | 0.461
+6 | 129 | 93153d1c5890a16e | 45601e6c456735d4 | 1.47875 | 0.602
+7 | 129 | f481c1fba83ad1f5 | e54687bacc388530 | 2.44456 | 0.469
+8 | 129 | fb626911f4549119 | e3656e007bca1e82 | 2.22567 | 0.492
+9 | 129 | 764db8f1ef7706e2 | 572e8fcebb462016 | 2.36930 | 0.469
+10 | 58 | 75bcbb3a6d4cf407 | a9232a16bd227f2d | 1.63840 | 0.702
+11 | 33 | 97621da14333b662 | 7d6e0f6d44b5cecc | 0.02664 | 1.000
+12 | 88 | 58dac19b7bc0f6cd | 159540b062b93762 | 1.06008 | 0.747
+13 | 45 | 1cd7f420aba05a62 | 23d625e741190180 | 0.22581 | 0.932
+14 | 55 | 94a9dcdff25f941e | 24b73c35bded487b | 1.09306 | 0.796
+15 | 25 | 6d2cf862fb747709 | 331c8c8593842500 | 0.30813 | 0.875
+16 | 468 | 645b78abcb50f011 | c005de8ea3c4e76e | 0.84745 | 0.767
+17 | 187 | 963f03ef23d4bf9d | 1ac06551ca8a243e | 0.85234 | 0.720
+
+Separate L40S confirmation
+
+Cold 512 + 128 decode: 3/3 measured trial runs matched 129 vectors each
+(32,033,280 FP32 values per run). Saved dev reference SHA-256:
+d2e392829763b7f7ed1defdd26b0e5296688f209974976168fdc9e10407f7149.
+See manifest.json and raw.json for the timings and per-run comparisons.
+
+Project checks on the submitted code
+
+Dev revision: e8b1c9b3f28c4724603e64a3a692f2e9d1141344
+Qualified repository tree with the patch: dce451b587551ef2164fdcac3d404de73122ec58
+Qualified c/ subtree, identical to the submitted c/ subtree: 824631008787ce9c997953aef84d0abf0635d9fe
+make check (macOS): passed. Python reported 3,592 tests, 671 skipped.
+glm_tiny: 32/32 teacher-forced positions and 20/20 greedy tokens.
+All 17 oracle regression tests passed.
+make -C c cuda-test CUDA_ARCH=native (Linux, L4): all 15 executables passed.
+CUDA 13.0.88, NVIDIA driver 580.82.07. The 30 compiler warning lines match
+those previously recorded on the L4.

@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "hypothesis": "The profiled Qwen3.6 CUDA paths increase cold 512-token prefill throughput for the selected GGUF on NVIDIA L40S while preserving every tested float32 logit.",
+  "commit": "1403453f42ccc843fd73182ca7dd911dc31c5782",
+  "commit_role": "Upstream dev commit whose c/ tree exactly matches the measured baseline. The trial was built from the Git tree in trial.config.c_tree.",
+  "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "prompt_hash_input": "SHA-256 of the full promessi_sposi.txt source. The benchmark tokenizes the first 512 prompt tokens for this row.",
+  "hardware": {
+    "gpu": "NVIDIA L40S (sm_89)",
+    "cpu": "28 contracted vCPUs, 56 physical cores in the affinity set, cgroup quota of 23.8 CPUs; 23 OpenMP threads. CPU model unrecorded.",
+    "ram": "124999999488 bytes available to the container",
+    "storage": "100 GB requested on RunPod Community. Device model, filesystem and mount options unrecorded.",
+    "os": "Linux, CUDA 12.4 (nvcc 12.4.131), NVIDIA driver 550.144.03"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "c_tree"
+  ],
+  "primary_metric": "prefill_tps",
+  "outcome": "improvement",
+  "baseline": {
+    "config": {
+      "GPU": "NVIDIA L40S",
+      "model_sha256": "707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450",
+      "OMP_NUM_THREADS": 23,
+      "context": "cold 512 + 128",
+      "CUDA_EXPERT_GB": "auto",
+      "c_tree": "e38e7411e3fb6617c60cc597f0e1bba7dc4488c5"
+    },
+    "samples": {
+      "tok_s": [
+        2276.62,
+        2235.06,
+        2214.56
+      ],
+      "decode_tok_s": [
+        111.083,
+        111.472,
+        111.698
+      ]
+    },
+    "median_tok_s": 2235.06,
+    "median_decode_tok_s": 111.472,
+    "quality": {
+      "method": "129 FP32 vectors per round, byte comparison against the fixed dev reference, including each of the 128 decode steps. Three measured pairs.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-gguf-cuda-l40s-2026-11-25/raw.json",
+      "sha256": "bbab9a6554dfa1fce1d50dddb660fd1d59f66a69cca3281dd319e91035aec300"
+    }
+  },
+  "trial": {
+    "config": {
+      "GPU": "NVIDIA L40S",
+      "model_sha256": "707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450",
+      "OMP_NUM_THREADS": 23,
+      "context": "cold 512 + 128",
+      "CUDA_EXPERT_GB": "auto",
+      "c_tree": "d5751371ea8b6adb12d29df51b827146c8507857"
+    },
+    "samples": {
+      "tok_s": [
+        5616.94,
+        5783.07,
+        5855.48
+      ],
+      "decode_tok_s": [
+        136.005,
+        133.564,
+        137.387
+      ]
+    },
+    "median_tok_s": 5783.07,
+    "median_decode_tok_s": 136.005,
+    "quality": {
+      "method": "129 FP32 vectors per round, byte comparison against the fixed dev reference, including each of the 128 decode steps. Three measured pairs.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-gguf-cuda-l40s-2026-11-25/raw.json",
+      "sha256": "bbab9a6554dfa1fce1d50dddb660fd1d59f66a69cca3281dd319e91035aec300"
+    }
+  },
+  "command": "qwen36-bench --model \"$IMPORTED_MODEL\" --steps \"$STEPS\" --text \"$PROMPT\" --lengths 512 --gen 128 --teacher",
+  "build": "CUDA=1 CUDA_ARCH=sm_89 CUDA_HOME=/usr/local/cuda HIP=0 COLI_ANS=0; same qwen36_bench.c harness (SHA-256 0789069f5315cad26dda67afeffde87e8b5476c8ddb2bb7a38140f55999d2d66) for both source trees.",
+  "run_environment": {
+    "dev": {
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_NUM_THREADS": "23",
+      "OMP_PROC_BIND": "close",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "BENCH_FLOAT32_MODE": "compare"
+    },
+    "pila": {
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_NUM_THREADS": "23",
+      "OMP_PROC_BIND": "close",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "BENCH_FLOAT32_MODE": "compare"
+    }
+  },
+  "paired_median_change_pct": {
+    "prefill_tps": 158.74338943920966,
+    "gen_steady_tps": 22.43547617547239
+  }
+}
