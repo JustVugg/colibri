@@ -323,6 +323,16 @@ static void v41c_lower_one(Model *m, V41Chain *ch, int pos) {
     }
 }
 static void v41c_lower(Model *m, int pos) { for (int d = 0; d < 2; d++) v41c_lower_one(m, v41c_of(d), pos); }   /* both chains */
+static int g_v41c_mode;   /* the chain's mode before a stop (v41c_retry brings it back) */
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. The host's state is canonical: every watermark down to 0, so the next forward takes every row up. */
+static void v41c_retry(Model *m) {
+    V41Chain *ch = v41c_of(0);
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || !vkc_chain_retry("deepseek_v41")) return;
+    v41c_lower(m, 0);
+    for (int d = 0; d < 2; d++) if (v41c_of(d)) v41c_of(d)->failed = 0;
+    g_vk_chain = g_v41c_mode ? g_v41c_mode : 1;
+}
 static void v41c_cpu_step(Model *m, int start_pos) { v41c_lower(m, start_pos); }      /* a CPU forward from start_pos */
 static void v41c_rollback(Model *m, int committed_end) { v41c_lower(m, committed_end); }  /* rows past it rejected */
 static void v41c_reset(Model *m) { v41c_lower(m, 0); }
@@ -1575,6 +1585,7 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     if (ch2) { vkc_device(1); lost2 = vkc_lost(); vkc_device(0); }
     if (vkc_lost() || lost2) {
         for (int d = 0; d < 2; d++) if (v41c_of(d)) v41c_of(d)->failed = 1;
+        if (g_vk_chain) g_v41c_mode = g_vk_chain;
         g_vk_chain = 0;
         return 0;
     }
@@ -1599,6 +1610,7 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     v41c_lower_one(m, ch2, start);
     if (lost) {
         for (int d = 0; d < 2; d++) if (v41c_of(d)) v41c_of(d)->failed = 1;
+        if (g_vk_chain) g_v41c_mode = g_vk_chain;
         g_vk_chain = 0;
         fprintf(stderr, "[VK] deepseek_v41 dev2 chain: the device was lost; the CPU runs its layers, and every layer from the next "
                         "forward on (the host's state is current: there is nothing to rebuild)\n");

@@ -5959,6 +5959,9 @@ static int v41_ps_marks(const Tok *T, const int *ids, int np, int from, int *mar
 
 static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
                            float **pending_image, int *pending_h, int *pending_w, V41Req *rq, int lone) {
+#ifdef COLI_VULKAN
+    v41c_retry(m);   /* a chain that stopped with the device alive comes back (vkc_chain_retry) */
+#endif
     Cfg *c = &m->c;
     double turn_started = now_s();
     double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn, engram0 = m->t_engram;
