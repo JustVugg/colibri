@@ -14,9 +14,15 @@
 // (tid / 128), the V row read once for the G heads.
 // Specialization constants: G (1 to 4) and ND (1: hd <= 128, 2: hd <= 256). The host sets rb <= 24 / G
 // and jc, the V rows a pass, with (jc + rb - 1) * hd <= 4096 floats.
+// SPLIT 1 (a decode step's rows, up to 8): chain_relattn.comp's mode 1 the same way, a workgroup a KV head,
+// a block of rows and the tile WorkGroupID.z of nc: each (row, head)'s tile from m = -inf and l = 0, its
+// [m, l, acc[hd]] at ((s0 + s) * H + h) * nc + c) * (hd + 2) of binding 3, as mode 1 writes it (mode 2 joins
+// them). The layout: a lane a thread (tid % 128) and the pairs of one parity (tid / 128), the tile's
+// maximum and sum in mode 1's tree over the 128 lanes.
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const int G = 3;
 layout(constant_id = 1) const int ND = 1;
+layout(constant_id = 2) const int SPLIT = 0;
 
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
 layout(std430, binding = 1) readonly buffer KB { float kc[]; };
@@ -34,7 +40,7 @@ layout(push_constant) uniform P {
     int r_off, r_row, relp_off, tau_off;
     float scale;
     int has_sink, sink_off;
-    int s0, rb, jc;
+    int s0, rb, jc, nc;
 } p;
 
 const int PM = 24;              // pairs a workgroup at most
@@ -59,7 +65,130 @@ float v_at(int t, int kvh, int d) {
                           : kvs[p.vs_off + (t - p.pos_base) * p.kv_row + kvh * p.hd + d];
 }
 
+const int NU = PM / 2;   // SPLIT: the pairs a thread
+
+void split_main() {
+    int kvh = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x), c = int(gl_WorkGroupID.z);
+    int rb = p.rb, sb = int(gl_WorkGroupID.y) * rb, nrows = min(rb, p.S - sb), P = nrows * G;
+    int qb0 = p.pos_base + p.s0 + sb, qlast = qb0 + nrows - 1;
+    int tb0 = row_t0(qb0);
+    int span = 128 + row_t0(qlast) - tb0;
+    int tb = tb0 + 128 * c, tend = min(tb + span, qlast + 1);
+    int i = tid & 127, hp = tid >> 7;
+    float sa[NU];
+    for (int u = 0; u < NU; u++) sa[u] = 0.0;
+    for (int dc = 0; dc < p.hd; dc += DC) {
+        barrier();
+        for (int idx = tid; idx < span * DC; idx += 256) {
+            int uu = idx / DC, dd = idx - uu * DC, t = tb + uu, d = dc + dd;
+            kv[uu * (DC + 1) + dd] = t < tend && d < p.hd ? k_at(t, kvh, d) : 0.0;
+        }
+        for (int idx = tid; idx < P * DC; idx += 256) {
+            int pp = idx / DC, dd = idx - pp * DC, d = dc + dd;
+            qsh[pp * DC + dd] = d < p.hd ? q[p.q_off + (sb + pp / G) * p.q_row + (kvh * G + pp % G) * p.hd + d] : 0.0;
+        }
+        barrier();
+        int dn = min(DC, p.hd - dc);
+        for (int u = 0; u < NU; u++) {
+            int pp = hp + 2 * u;
+            if (pp >= P) continue;
+            int ko = (row_t0(qb0 + pp / G) - tb0 + i) * (DC + 1);
+            for (int dd = 0; dd < dn; dd++) sa[u] += qsh[pp * DC + dd] * kv[ko + dd];
+        }
+    }
+    barrier();
+    float sv[NU];
+    for (int u = 0; u < NU; u++) {
+        int pp = hp + 2 * u;
+        sv[u] = -3.0e38;
+        if (pp >= P) continue;
+        int rr = pp / G, s = sb + rr, h = kvh * G + pp % G, qpos = qb0 + rr, t0 = row_t0(qpos);
+        int ii = 128 * c + i;
+        if (ii < qpos - t0 + 1) {
+            int dist = qpos - (t0 + ii);
+            float bias = 0.0;
+            if (dist < p.ext)
+                for (int jj = 0; jj < p.d_rel; jj++)
+                    bias += r[p.r_off + s * p.r_row + h * p.d_rel + jj] * relp[p.relp_off + jj * p.ext + dist];
+            sv[u] = tau[p.tau_off + s] * (sa[u] * p.scale + bias);
+        }
+        kv[pp * 128 + i] = sv[u];
+    }
+    for (int off = 64; off > 0; off >>= 1) {   // the tile's maximum, mode 1's tree
+        barrier();
+        for (int u = 0; u < NU; u++) {
+            int pp = hp + 2 * u;
+            if (pp < P && i < off) kv[pp * 128 + i] = max(kv[pp * 128 + i], kv[pp * 128 + i + off]);
+        }
+    }
+    barrier();
+    float mn[NU];
+    for (int u = 0; u < NU; u++) {
+        int pp = hp + 2 * u;
+        mn[u] = pp < P ? max(-3.0e38, kv[pp * 128]) : 0.0;
+    }
+    barrier();
+    for (int u = 0; u < NU; u++) {
+        int pp = hp + 2 * u;
+        if (pp >= P) continue;
+        int qpos = qb0 + pp / G;
+        float e = 128 * c + i < qpos - row_t0(qpos) + 1 ? exp(sv[u] - mn[u]) : 0.0;
+        sc[pp * 128 + i] = e;
+        kv[pp * 128 + i] = e;
+    }
+    for (int off = 64; off > 0; off >>= 1) {   // its sum, mode 1's tree
+        barrier();
+        for (int u = 0; u < NU; u++) {
+            int pp = hp + 2 * u;
+            if (pp < P && i < off) kv[pp * 128 + i] += kv[pp * 128 + i + off];
+        }
+    }
+    barrier();
+    if (i == 0)
+        for (int u = 0; u < NU; u++) {
+            int pp = hp + 2 * u;
+            if (pp >= P) continue;
+            int b = (((p.s0 + sb + pp / G) * p.H + kvh * G + pp % G) * p.nc + c) * (p.hd + 2);
+            o[b] = mn[u];
+            o[b + 1] = kv[pp * 128];
+        }
+    float oacc[NU * ND];
+    for (int u = 0; u < NU * ND; u++) oacc[u] = 0.0;
+    int w = p.jc + rb - 1, dg = tid & 127;
+    for (int j0 = 0; j0 < 128; j0 += p.jc) {
+        barrier();
+        for (int idx = tid; idx < w * p.hd; idx += 256) {
+            int uu = idx / p.hd, d = idx - uu * p.hd, t = tb + j0 + uu;
+            kv[idx] = t < tend ? v_at(t, kvh, d) : 0.0;
+        }
+        barrier();
+        for (int u = 0; u < NU; u++) {
+            int pp = hp + 2 * u;
+            if (pp >= P) continue;
+            int qpos = qb0 + pp / G, vo = row_t0(qpos) - tb0;
+            int cnt = min(128, qpos - row_t0(qpos) + 1 - 128 * c) - j0;
+            for (int uu = 0; uu < min(p.jc, cnt); uu++) {
+                float wt = sc[pp * 128 + j0 + uu];
+                for (int e = 0; e < ND; e++) {
+                    int d = dg + 128 * e;
+                    if (d < p.hd) oacc[u * ND + e] += wt * kv[(vo + uu) * p.hd + d];
+                }
+            }
+        }
+    }
+    for (int u = 0; u < NU; u++) {
+        int pp = hp + 2 * u;
+        if (pp >= P) continue;
+        int b = (((p.s0 + sb + pp / G) * p.H + kvh * G + pp % G) * p.nc + c) * (p.hd + 2);
+        for (int e = 0; e < ND; e++) {
+            int d = dg + 128 * e;
+            if (d < p.hd) o[b + 2 + d] = oacc[u * ND + e];
+        }
+    }
+}
+
 void main() {
+    if (SPLIT != 0) { split_main(); return; }
     int kvh = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
     int rb = p.rb, sb = int(gl_WorkGroupID.y) * rb, nrows = min(rb, p.S - sb);
     int qb0 = p.pos_base + p.s0 + sb, qlast = qb0 + nrows - 1;   // the block's first and last rows' positions

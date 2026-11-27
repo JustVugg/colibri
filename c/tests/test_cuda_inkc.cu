@@ -128,6 +128,22 @@ static void test_relattn_h(int S, int pos_base, int window, int cap, int hd, int
         printf("  %s %s: tiles and a block a (head, row): %zu of %zu floats differ\n", diff ? "FAIL" : "ok  ", what, diff, y.size());
         if (diff) fails++;
     }
+    if (H / KVH <= 4 && S <= 8 && nc >= 2) {   /* the split decode: on the KV heads and a block a (head, row, tile) */
+        setenv("COLI_CUDA_RELATTN_TILE", "0", 1);
+        setenv("COLI_CUDA_RELATTN_TILE_DEC", "1", 1);
+        int okd = T->begin() && T->relattn(bq, bk, bv, bo, bs, brr, bp, bt, &p) && T->submit(1);
+        std::vector<float> yd = down(bo, 0, ref.size());
+        setenv("COLI_CUDA_RELATTN_TILE_DEC", "0", 1);
+        okd = okd && T->begin() && T->relattn(bq, bk, bv, bo, bs, brr, bp, bt, &p) && T->submit(1);
+        std::vector<float> ys = down(bo, 0, ref.size());
+        unsetenv("COLI_CUDA_RELATTN_TILE"); unsetenv("COLI_CUDA_RELATTN_TILE_DEC");
+        char wd[200]; snprintf(wd, sizeof wd, "%s, split on the KV heads", what);
+        check(okd ? rel_to_max(yd.data(), ref.data(), ref.size()) : 1e30, 2e-5, wd);
+        size_t diff = 0;
+        for (size_t i = 0; i < ys.size(); i++) diff += memcmp(&ys[i], &yd[i], 4) != 0;
+        printf("  %s %s: split on the KV heads and a block a (head, row, tile): %zu of %zu floats differ\n", diff ? "FAIL" : "ok  ", what, diff, ys.size());
+        if (diff) fails++;
+    }
     CcBuf *all[] = {bq, bk, bv, bs, brr, bp, bt, bo};
     for (CcBuf *b : all) T->free(b);
 }
@@ -251,6 +267,10 @@ int main(void) {
     test_relattn_h(19, 140, 100, 100, 64, 16, 100, 1, 8, 2);
     test_relattn_h(17, 40, 0, 64, 256, 64, 32, 1, 3, 1);
     test_relattn_h(9, 600, 0, 700, 128, 16, 512, 1, 24, 8);
+    test_relattn_h(1, 1500, 0, 1501, 128, 16, 1024, 1, 24, 8);   /* the split decode on the KV heads */
+    test_relattn_h(4, 2000, 1024, 1024, 128, 16, 1024, 1, 24, 8);
+    test_relattn_h(8, 700, 0, 708, 64, 8, 64, 0, 8, 2);
+    test_relattn_h(3, 300, 0, 303, 256, 64, 32, 1, 3, 1);
     printf("loop gate\n");
     {
         const int caps = T->size >= offsetof(ColiCudaChainOps, ink2_caps) + sizeof T->ink2_caps && T->ink2_caps ? T->ink2_caps() : 0;

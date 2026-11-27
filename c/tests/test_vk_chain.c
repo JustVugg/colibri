@@ -897,6 +897,32 @@ static void test_relattn_h(int S, int pos_base, int window, int cap, int hd, int
           "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d heads %d/%d: err %.2e, tiles %.2e (%s), %zu of %zu differ",
           S, pos_base, window, cap, hd, dr, ext, sink, H, KVH, e, et, tiled ? "ran" : "did not run", diff, no);
     free(tile);
+    /* a decode-sized step over more than a tile: the split (mode 1's partials, mode 2's join) on
+     * chain_relattn_tile.comp's SPLIT and on mode 1, the same bits */
+    int nmax = pos_base + S;
+    if (window > 0 && nmax > window) nmax = window;
+    const int nc = (nmax + 127) / 128;
+    if (S <= 8 && nc >= 2 && H / KVH <= 4) {
+        VkcBuf *part = vkc_buf((size_t)S * H * nc * (hd + 2) * 4, VKC_DEV);
+        float *dec = malloc(no * sizeof *dec);
+        vkc_relattn_part(part);
+        const int wd = vkc_relattn_tile_dec(1);
+        VkcStats d0; vkc_stats(&d0);
+        vkc_begin(); int okd = vkc_relattn(qb, kb, vb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+        VkcStats d1; vkc_stats(&d1);
+        memcpy(dec, vkc_ptr(ob), no * sizeof *dec);
+        vkc_relattn_tile_dec(0);
+        vkc_begin(); okd = okd && vkc_relattn(qb, kb, vb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+        vkc_relattn_tile_dec(wd);
+        vkc_relattn_part(NULL);
+        double es = relerr((float *)vkc_ptr(ob), ref, no, 1e-3), ed = relerr(dec, ref, no, 1e-3);
+        size_t dd = 0;
+        for (size_t i = 0; i < no; i++) dd += memcmp(dec + i, (float *)vkc_ptr(ob) + i, 4) != 0;
+        CHECK(okd && es < 2e-5 && ed < 2e-5 && d1.relattn_tile > d0.relattn_tile && !dd,
+              "relattn split S %d pos %d window %d hd %d heads %d/%d, %d tiles: err %.2e, on the KV heads %.2e (%s), %zu of %zu differ",
+              S, pos_base, window, hd, H, KVH, nc, es, ed, d1.relattn_tile > d0.relattn_tile ? "ran" : "did not run", dd, no);
+        free(dec); vkc_free(part);
+    }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(rb); vkc_free(pb); vkc_free(tb); vkc_free(ob);
     free(q); free(kt); free(vt); free(r); free(relp); free(tau); free(snk); free(ref); free(kr); free(vr); free(scr); free(rbuf); free(pbuf); free(tbuf);
 }
@@ -918,6 +944,12 @@ static void test_relattn_tiles(void) {
     test_relattn_h(19, 140, 100, 100, 64, 16, 100, 1, 8, 2);       /* four */
     test_relattn_h(17, 40, 0, 64, 256, 64, 32, 1, 3, 1);           /* the largest head and bank */
     test_relattn_h(9, 600, 0, 700, 128, 16, 512, 1, 24, 8);        /* a decode-sized step over five tiles */
+    /* the split decode on the KV heads: one row and a verify's rows, a window over a wrapped ring, four heads a KV
+     * head (two blocks of rows), the largest head */
+    test_relattn_h(1, 1500, 0, 1501, 128, 16, 1024, 1, 24, 8);
+    test_relattn_h(4, 2000, 1024, 1024, 128, 16, 1024, 1, 24, 8);
+    test_relattn_h(8, 700, 0, 708, 64, 8, 64, 0, 8, 2);
+    test_relattn_h(3, 300, 0, 303, 256, 64, 32, 1, 3, 1);
     rng = saved;
 }
 /* Inkling-2's residual mix (inkling2.h's ink2_attn_res): nb block states and the stream, each

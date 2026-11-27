@@ -444,11 +444,170 @@ __global__ static void __launch_bounds__(256) ccg_relattn_tile_k(const float *__
         }
     }
 }
-/* COLI_CUDA_RELATTN_TILE: the rows from which a step's attention runs ccg_relattn_tile_k (9, past the split
- * decode's 8; 0 never), read at each call */
-static int cc_relattn_tile_rows(void) {
-    const char *e = getenv("COLI_CUDA_RELATTN_TILE");
-    return e && *e ? atoi(e) : 9;
+/* chain_relattn_tile.comp's SPLIT on CUDA: a decode step's partials (ccg_relattn_k's with part, the same bits), a block a
+ * KV head, a block of rows and the tile blockIdx.z of nc, the KV head's query heads at once: each K and V row read once
+ * for them; pb_ptr: pos_base from the device (the graphs) */
+template <int G, int ND>
+__global__ static void __launch_bounds__(256) ccg_relattn_split_k(const float *__restrict__ q, const float *__restrict__ kc,
+        const float *__restrict__ vc, const float *__restrict__ kvs, const float *__restrict__ r, const float *__restrict__ relp,
+        const float *__restrict__ tau, CcRelAttn p, int rb, int jc, float *__restrict__ part, const int *pb_ptr) {
+    constexpr int PM = 24, NU = PM / 2, DC = 16, KVN = 4096;
+    __shared__ float kv[KVN], qsh[PM * DC], sc[PM * 128];
+    if (pb_ptr) p.pos_base = *pb_ptr;
+    const int kvh = (int)blockIdx.x, tid = (int)threadIdx.x, c = (int)blockIdx.z, nc = (int)gridDim.z;
+    const int sb = (int)blockIdx.y * rb, nrows = min(rb, p.S - sb), P = nrows * G;
+    const int qb0 = p.pos_base + sb, qlast = qb0 + nrows - 1;
+    auto row_t0 = [&](int qpos) { return p.window > 0 ? max(0, qpos - p.window + 1) : 0; };
+    const int tb0 = row_t0(qb0), span = 128 + row_t0(qlast) - tb0;
+    const int tb = tb0 + 128 * c, tend = min(tb + span, qlast + 1);
+    auto k_at = [&](int t, int d) {
+        return t < p.pos_base ? kc[p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d]
+                              : kvs[p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd + d];
+    };
+    auto v_at = [&](int t, int d) {
+        return t < p.pos_base ? vc[p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d]
+                              : kvs[p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd + d];
+    };
+    const int i = tid & 127, hp = tid >> 7;
+    float sa[NU];
+#pragma unroll
+    for (int u = 0; u < NU; u++) sa[u] = 0.f;
+    for (int dc = 0; dc < p.hd; dc += DC) {
+        __syncthreads();
+        for (int idx = tid; idx < span * DC; idx += 256) {
+            const int uu = idx / DC, dd = idx - uu * DC, t = tb + uu, d = dc + dd;
+            kv[uu * (DC + 1) + dd] = t < tend && d < p.hd ? k_at(t, d) : 0.f;
+        }
+        for (int idx = tid; idx < P * DC; idx += 256) {
+            const int pp = idx / DC, dd = idx - pp * DC, d = dc + dd;
+            qsh[pp * DC + dd] = d < p.hd ? q[p.q_off + (long)(sb + pp / G) * p.q_row + (kvh * G + pp % G) * p.hd + d] : 0.f;
+        }
+        __syncthreads();
+        const int dn = min(DC, p.hd - dc);
+#pragma unroll
+        for (int u = 0; u < NU; u++) {
+            const int pp = hp + 2 * u;
+            if (pp >= P) continue;
+            const int ko = (row_t0(qb0 + pp / G) - tb0 + i) * (DC + 1);
+            for (int dd = 0; dd < dn; dd++) sa[u] += qsh[pp * DC + dd] * kv[ko + dd];
+        }
+    }
+    __syncthreads();
+    float sv[NU];
+#pragma unroll
+    for (int u = 0; u < NU; u++) {
+        const int pp = hp + 2 * u;
+        sv[u] = -3.0e38f;
+        if (pp >= P) continue;
+        const int rr = pp / G, s = sb + rr, h = kvh * G + pp % G, qpos = qb0 + rr, t0 = row_t0(qpos), ii = 128 * c + i;
+        if (ii < qpos - t0 + 1) {
+            const int dist = qpos - (t0 + ii);
+            float bias = 0.f;
+            if (dist < p.ext)
+                for (int jj = 0; jj < p.d_rel; jj++) bias += r[p.r_off + (long)s * p.r_row + h * p.d_rel + jj] * relp[p.relp_off + jj * p.ext + dist];
+            sv[u] = tau[p.tau_off + s] * (sa[u] * p.scale + bias);
+        }
+        kv[pp * 128 + i] = sv[u];
+    }
+    for (int off = 64; off > 0; off >>= 1) {
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < NU; u++) {
+            const int pp = hp + 2 * u;
+            if (pp < P && i < off) kv[pp * 128 + i] = fmaxf(kv[pp * 128 + i], kv[pp * 128 + i + off]);
+        }
+    }
+    __syncthreads();
+    float mn[NU];
+#pragma unroll
+    for (int u = 0; u < NU; u++) { const int pp = hp + 2 * u; mn[u] = pp < P ? fmaxf(-3.0e38f, kv[pp * 128]) : 0.f; }
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < NU; u++) {
+        const int pp = hp + 2 * u;
+        if (pp >= P) continue;
+        const int qpos = qb0 + pp / G;
+        const float e = 128 * c + i < qpos - row_t0(qpos) + 1 ? expf(sv[u] - mn[u]) : 0.f;
+        sc[pp * 128 + i] = e; kv[pp * 128 + i] = e;
+    }
+    for (int off = 64; off > 0; off >>= 1) {
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < NU; u++) {
+            const int pp = hp + 2 * u;
+            if (pp < P && i < off) kv[pp * 128 + i] += kv[pp * 128 + i + off];
+        }
+    }
+    __syncthreads();
+    if (i == 0) {
+#pragma unroll
+        for (int u = 0; u < NU; u++) {
+            const int pp = hp + 2 * u;
+            if (pp >= P) continue;
+            float *pz = part + (((long)(sb + pp / G) * p.H + kvh * G + pp % G) * nc + c) * (p.hd + 2);
+            pz[0] = mn[u]; pz[1] = kv[pp * 128];
+        }
+    }
+    float oacc[NU * ND];
+#pragma unroll
+    for (int u = 0; u < NU * ND; u++) oacc[u] = 0.f;
+    const int w = jc + rb - 1, dg = tid & 127;
+    for (int j0 = 0; j0 < 128; j0 += jc) {
+        __syncthreads();
+        for (int idx = tid; idx < w * p.hd; idx += 256) {
+            const int uu = idx / p.hd, d = idx - uu * p.hd, t = tb + j0 + uu;
+            kv[idx] = t < tend ? v_at(t, d) : 0.f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < NU; u++) {
+            const int pp = hp + 2 * u;
+            if (pp >= P) continue;
+            const int qpos = qb0 + pp / G, vo = row_t0(qpos) - tb0;
+            const int cnt = min(min(128, qpos - row_t0(qpos) + 1 - 128 * c) - j0, jc);
+            for (int uu = 0; uu < cnt; uu++) {
+                const float wt = sc[pp * 128 + j0 + uu];
+#pragma unroll
+                for (int e = 0; e < ND; e++) {
+                    const int d = dg + 128 * e;
+                    if (d < p.hd) oacc[u * ND + e] += wt * kv[(vo + uu) * p.hd + d];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < NU; u++) {
+        const int pp = hp + 2 * u;
+        if (pp >= P) continue;
+        float *pz = part + (((long)(sb + pp / G) * p.H + kvh * G + pp % G) * nc + c) * (p.hd + 2);
+#pragma unroll
+        for (int e = 0; e < ND; e++) { const int d = dg + 128 * e; if (d < p.hd) pz[2 + d] = oacc[u * ND + e]; }
+    }
+}
+template <int G>
+static void cc_relattn_split_launch(int nd, dim3 g, cudaStream_t st, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *r,
+                                    CcBuf *relp, CcBuf *tau, const CcRelAttn *p, int rb, int jc, float *part, const int *pb) {
+    if (nd == 1) coli_launch(ccg_relattn_split_k<G, 1>, g, 256, 0, st, fp(q), fp(kc), fp(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc, part, pb);
+    else coli_launch(ccg_relattn_split_k<G, 2>, g, 256, 0, st, fp(q), fp(kc), fp(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc, part, pb);
+}
+/* a decode step's partials on the KV heads (0 when they do not apply: more than 4 heads a KV head, or switched off) */
+static int cc_relattn_split_tiles(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
+                                  const CcRelAttn *p, int nc, float *part, const int *pb) {
+    const int G = p->H / p->KVH;
+    if (G < 1 || G > 4 || !cc_relattn_tile_dec()) return 0;
+    int rb = 24 / G;
+    while (rb > 1 && 4096 / p->hd - rb + 1 < 4) rb--;
+    int jc = 4096 / p->hd - rb + 1;
+    if (jc > 32) jc = 32;
+    const int nd = p->hd > 128 ? 2 : 1;
+    dim3 g((unsigned)p->KVH, (unsigned)((p->S + rb - 1) / rb), (unsigned)nc);
+    switch (G) {
+    case 1: cc_relattn_split_launch<1>(nd, g, c->stream, q, kc, vc, kvs, r, relp, tau, p, rb, jc, part, pb); break;
+    case 2: cc_relattn_split_launch<2>(nd, g, c->stream, q, kc, vc, kvs, r, relp, tau, p, rb, jc, part, pb); break;
+    case 3: cc_relattn_split_launch<3>(nd, g, c->stream, q, kc, vc, kvs, r, relp, tau, p, rb, jc, part, pb); break;
+    default: cc_relattn_split_launch<4>(nd, g, c->stream, q, kc, vc, kvs, r, relp, tau, p, rb, jc, part, pb); break;
+    }
+    return 1;
 }
 template <int G>
 static void cc_relattn_tile_launch(int nd, dim3 g, cudaStream_t st, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs,
@@ -489,8 +648,9 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
         float *part = NULL;
         const size_t pb = (size_t)p->S * p->H * nc * (p->hd + 2) * sizeof(float);
         if (cudaMallocAsync((void **)&part, pb, c->stream) == cudaSuccess) {
-            coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o),
-                        fp(kvs), fp(r), fp(relp), fp(tau), *p, part, (const int *)nullptr);
+            if (!cc_relattn_split_tiles(c, q, kc, vc, kvs, r, relp, tau, p, nc, part, nullptr))
+                coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o),
+                            fp(kvs), fp(r), fp(relp), fp(tau), *p, part, (const int *)nullptr);
             coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, (const float *)part, fp(tau), fpw(o), *p, nc);
             (void)cudaFreeAsync(part, c->stream);
             return launched(c, "relattn split");
@@ -524,8 +684,9 @@ static int cc_relattn_pb(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, C
     if (!c || !p || !pb_buf || p->hd > 256 || p->hd < 1 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
     if (p->S <= 0) return 1;
     if (part_buf && nc >= 2) {
-        coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o),
-                    fp(kvs), fp(r), fp(relp), fp(tau), *p, fpw(part_buf), (const int *)fp(pb_buf));
+        if (!cc_relattn_split_tiles(c, q, kc, vc, kvs, r, relp, tau, p, nc, fpw(part_buf), (const int *)fp(pb_buf)))
+            coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o),
+                        fp(kvs), fp(r), fp(relp), fp(tau), *p, fpw(part_buf), (const int *)fp(pb_buf));
         coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, fp(part_buf), fp(tau), fpw(o), *p, nc);
         return launched(c, "relattn pb split");
     }
