@@ -828,6 +828,14 @@ Each value must be finite and not negative.
 
 On expiry, admission pauses and the old process is killed and reaped before a
 replacement is loaded. All requests on that process fail; they are not replayed.
+
+An engine that ends between two requests is a different case: a request it had not
+started yet (no output sent to the client) waits for the engine `keep_engine` starts
+in its place and runs there once, instead of failing. That is how an engine that lost
+its GPU for real (a driver's reset; `COLI_VK_LOST_RESTART` in docs/ENVIRONMENT.md)
+comes back on a fresh device without a failed turn. `COLI_ENGINE_RETRY_WAIT` (900 s)
+bounds the wait for the new engine's load; a request that fails again, or one that
+had produced output, fails as before.
 The old pinned-prefix state is discarded. While recovery is pending, health is
 unavailable and queued clients retain their ordinary queue timeout. If the OS
 cannot reap the process, admission stays paused and the watchdog retries; it does

@@ -8388,6 +8388,13 @@ def is_image_engine(engine):
     return getattr(engine, "modality", "text") == "image"
 
 
+def engine_gone_error(error):
+    """The error a request gets when its engine's process ended under it (the dispatcher saw it go,
+    or the request was written to an engine already gone): the engine's, not the request's."""
+    text = str(error)
+    return text.startswith("colibri engine exited unexpectedly") or text.startswith("colibri engine dispatcher stopped")
+
+
 def engine_alive(engine):
     """False once the served engine has died: Engine and ImageEngine say so through
     `alive`; an object without it (a test double, an embedder's engine) is taken as running."""
@@ -8603,13 +8610,42 @@ class APIServer(ThreadingHTTPServer):
 
         if kwargs.get("on_tool") is not None:
             kwargs["on_tool"] = measured(kwargs["on_tool"])
+        engine = self.engine
         try:
-            stats = self.engine.generate(prompt, max_tokens, temperature, top_p,
-                                         measured(on_text), *args, **kwargs)
+            try:
+                stats = engine.generate(prompt, max_tokens, temperature, top_p,
+                                        measured(on_text), *args, **kwargs)
+            except RuntimeError as error:
+                # The engine went before this request produced anything (it exits for a fresh device after
+                # losing one, a crash between two requests): keep_engine starts it again, and the request
+                # runs there once instead of failing. A second failure, or one after output, is the request's.
+                if first_output or not engine_gone_error(error):
+                    raise
+                fresh = self.await_fresh_engine(engine)
+                if fresh is None:
+                    raise
+                print(f"[gateway] the request runs on the engine started again ({error})", file=sys.stderr)
+                stats = fresh.generate(prompt, max_tokens, temperature, top_p,
+                                       measured(on_text), *args, **kwargs)
         finally:
             self.scheduler.observe_timing("engine_call_seconds", time.monotonic() - started)
         self.note_prompt_size(prompt, stats, kwargs.get("image") is not None)
         return stats
+
+    # How long a request whose engine went before it started waits for keep_engine's next one:
+    # an engine's load (a model in RAM, its expert tier's warm start) takes seconds to minutes.
+    ENGINE_RETRY_WAIT_S = _positive_env("COLI_ENGINE_RETRY_WAIT", 900)
+
+    def await_fresh_engine(self, old, timeout=None):
+        """The engine keep_engine put in place of `old` once it runs; None past the timeout
+        (no watchdog, a start that keeps failing) or while the server stops."""
+        deadline = time.monotonic() + (self.ENGINE_RETRY_WAIT_S if timeout is None else timeout)
+        while time.monotonic() < deadline:
+            now = self.engine
+            if now is not old and engine_alive(now):
+                return now
+            time.sleep(0.25)
+        return None
 
     def note_prompt_size(self, prompt, stats, image=False):
         """Tokens per prompt character, measured on the prompts served (a picture's
