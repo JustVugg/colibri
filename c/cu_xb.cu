@@ -129,6 +129,9 @@ static void cu_stage_put(uint8_t *p, size_t cap, int pinned) {
 
 static struct {
     std::mutex mx;                     /* the pools, the pending frees */
+    std::mutex e8_mx;                  /* direct-to-device E8M0 scale expansion scratch */
+    uint8_t *e8_tmp;
+    size_t e8_cap;
     int tried, ready, dev, integrated, mapped;
     char name[256];
     size_t total, smem_max;
@@ -188,7 +191,17 @@ static int cu_open(void) {
     bdtab_fill(t.data(), NULL);
     if (cudaMalloc(&C.tab, (size_t)BDT_WORDS * 4) != cudaSuccess ||
         cudaMemcpy(C.tab, t.data(), (size_t)BDT_WORDS * 4, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-    for (int k = 0; k < CU_POOLS; k++) { vka_pool_init(&C.pool[k].p, CU_BLOCK, 0); C.pool[k].host = k == 5; }
+    for (int k = 0; k < CU_POOLS; k++) {
+#ifdef _WIN32
+        /* WDDM 1 GiB contiguous cudaMalloc triggers multi-second physical page defrag stalls;
+         * 256 MiB blocks keep warm-start pool allocation fast on Windows. */
+        const size_t blk = CU_BLOCK;
+#else
+        const size_t blk = (k != 5 && !C.integrated && C.total >= ((size_t)4 << 30)) ? ((size_t)1024 << 20) : CU_BLOCK;
+#endif
+        vka_pool_init(&C.pool[k].p, blk, 0);
+        C.pool[k].host = k == 5;
+    }
     C.pool[1].on = C.pool[4].on = 1;
     C.pool[5].on = C.mapped;
     C.ready = 1;
@@ -249,14 +262,39 @@ static int cu_dev2_open_env(void) {
     if (!ok) { cudaGetLastError(); return 0; }
     const char *f = getenv("COLI_VK_DEV2_FAULT");
     C2.fault = f && atoi(f) > 0 ? atoi(f) : 0;
-    { std::lock_guard<std::mutex> lk(C.mx); C.pool[3].on = 1; }
+    {
+        std::lock_guard<std::mutex> lk(C.mx);
+#ifdef _WIN32
+        C.pool[3].p.block_bytes = CU_BLOCK;
+#else
+        C.pool[3].p.block_bytes = (!C2.integrated && C2.total >= ((size_t)4 << 30)) ? ((size_t)1024 << 20) : CU_BLOCK;
+#endif
+        C.pool[3].on = 1;
+    }
     C2.on = 1;
     return 1;
 }
 
 /* ---------------------------------------------------------------- the pools */
-static size_t cu_block_bytes(size_t def) { return def; }
-static size_t cu_block_bytes_dev(int dev, size_t def) { (void)dev; return def; }
+static size_t cu_dev_block(void) {
+#ifdef _WIN32
+    return CU_BLOCK;
+#else
+    return (C.ready && !C.integrated && C.total >= ((size_t)4 << 30)) ? ((size_t)1024 << 20) : CU_BLOCK;
+#endif
+}
+static size_t cu_block_bytes(size_t def) { return def == CU_BLOCK ? cu_dev_block() : def; }
+static size_t cu_block_bytes_dev(int dev, size_t def) {
+    if (dev == 0) return cu_block_bytes(def);
+    if (dev == 1 && C2.on && def == CU_BLOCK) {
+#ifdef _WIN32
+        return CU_BLOCK;
+#else
+        return (!C2.integrated && C2.total >= ((size_t)4 << 30)) ? ((size_t)1024 << 20) : CU_BLOCK;
+#endif
+    }
+    return def;
+}
 static size_t cu_buffer_alignment(void) { return CU_ALIGN; }
 static int pool_of(int dev) { return dev == 0 ? 1 : dev == 1 ? (C2.on ? 3 : -1) : dev == 2 ? 5 : -1; }
 
@@ -274,7 +312,12 @@ static int pool_take(int k, size_t bytes, VkaRange *r) {
     int prev = 0;
     cudaGetDevice(&prev);
     if (!P->host && pool_dev(k) != prev) cudaSetDevice(pool_dev(k));   /* the second device's pool: its memory */
-    const cudaError_t er = P->host ? cudaHostAlloc(&m, cap, cudaHostAllocMapped | cudaHostAllocPortable) : cudaMalloc(&m, cap);
+    cudaError_t er = P->host ? cudaHostAlloc(&m, cap, cudaHostAllocMapped | cudaHostAllocPortable) : cudaMalloc(&m, cap);
+    if (!P->host && er != cudaSuccess && cap > CU_BLOCK && bytes <= CU_BLOCK) {
+        cudaGetLastError();
+        cap = CU_BLOCK;
+        er = cudaMalloc(&m, cap);
+    }
     if (!P->host && pool_dev(k) != prev) cudaSetDevice(prev);
     if (er != cudaSuccess) {
         cudaGetLastError();
@@ -416,6 +459,25 @@ static int cu_tier_tensor_like(int dev, ColiVkTensor **t, const ColiVkTensor *sr
     *t = n;
     return 1;
 }
+/* Small event pool for cu_tensor_commit on C.dev so concurrent warm-start threads wait only
+ * for their own queued H2D copies instead of convoying on cudaStreamSynchronize(C.cs). */
+static std::mutex g_cu_ev_mx;
+static std::vector<cudaEvent_t> g_cu_ev;
+static cudaEvent_t cu_ev_get(void) {
+    {
+        std::lock_guard<std::mutex> lk(g_cu_ev_mx);
+        if (!g_cu_ev.empty()) { cudaEvent_t e = g_cu_ev.back(); g_cu_ev.pop_back(); return e; }
+    }
+    cudaEvent_t e = NULL;
+    if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) { cudaGetLastError(); return NULL; }
+    return e;
+}
+static void cu_ev_put(cudaEvent_t e) {
+    if (!e) return;
+    std::lock_guard<std::mutex> lk(g_cu_ev_mx);
+    if (g_cu_ev.size() < 64) { g_cu_ev.push_back(e); return; }
+    cudaEventDestroy(e);
+}
 /* the host images up, all n before it returns (each on its device's copy stream) */
 static int cu_tensor_commit(ColiVkTensor *const *t, int n) {
     if (!cu_set()) return 0;
@@ -424,14 +486,24 @@ static int cu_tensor_commit(ColiVkTensor *const *t, int n) {
         if (d && !two) break;
         if (d) cudaSetDevice(C2.dev);
         cudaStream_t cs = d ? C2.cs : C.cs;
+        int queued = 0;
         for (int i = 0; i < n; i++) {
             ColiVkTensor *x = t[i];
             if (!x || !x->img) continue;
             if ((x->pool == 3) != d) { two |= x->pool == 3; continue; }
             ok &= cudaMemcpyAsync(x->w, x->img, x->wbytes, cudaMemcpyHostToDevice, cs) == cudaSuccess &&
                   cudaMemcpyAsync(x->s, x->img + x->wbytes, x->sbytes, cudaMemcpyHostToDevice, cs) == cudaSuccess;
+            queued++;
         }
-        ok &= cudaStreamSynchronize(cs) == cudaSuccess;
+        if (queued) {
+            cudaEvent_t ev = (d == 0 && ok) ? cu_ev_get() : NULL;
+            if (ev) {
+                ok &= cudaEventRecord(ev, cs) == cudaSuccess && cudaEventSynchronize(ev) == cudaSuccess;
+                cu_ev_put(ev);
+            } else {
+                ok &= cudaStreamSynchronize(cs) == cudaSuccess;
+            }
+        }
     }
     cu_set();
     for (int i = 0; i < n; i++) if (t[i] && t[i]->img) {
@@ -1127,4 +1199,67 @@ static const CuTierOps g_ops = {
     cu_xb_step_begin, cu_xb_step_sum, cu_xb_step_end, cu_xb_sub_fit, cu_xb_sub_reserve, cu_xb_sub_issue, cu_xb_sub_issue_step,
     cu_xb_sub_join, cu_xb_sub_busy, cu_xb_sub_copy, cu_xb_sub_copy_drop,
 };
+/* Direct-to-device MXFP4 (fmt 7, E8M0) warm-start hooks: decode WNR4/WNR3 records straight
+ * into VRAM pool 1 (t->w for packed MXFP4 nibbles, t->s for raw uint8_t E8M0 scale bytes),
+ * then expand E8M0 -> IEEE float scales on GPU in a single batched pass. Zero D2H/H2D bounce. */
+__global__ void cu_e8m0_to_f32_k(float *__restrict__ dst, const uint8_t *__restrict__ src, size_t n) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        dst[i] = __uint_as_float((uint32_t)src[i] << 23);
+}
+
+extern "C" COLI_CUDA_DLLEXPORT int coli_cuda_tier_alloc_mxfp4(
+    int dev, ColiVkTensor **t, int I, int O, int gs, size_t pad_w, size_t pad_s,
+    int *cuda_dev_out, unsigned char **w_dev_out, unsigned char **s_dev_out) {
+    if (dev != 0 || !t || !w_dev_out || !s_dev_out || !cu_set()) return 0;
+    if (gs != 32 || I < 32 || (I % 32) != 0 || O < 1) return 0;
+    ColiVkTensor *n = tensor_new(pool_of(0), 7, I, O, gs, pad_w, pad_s);
+    if (!n) return 0;
+    if ((size_t)n->rowWords * 4 != cu_row_bytes(7, I) || (((uintptr_t)n->w) & 15u) != 0) {
+        std::lock_guard<std::mutex> lk(C.mx);
+        tensor_release(n);
+        return 0;
+    }
+    *t = n;
+    if (cuda_dev_out) *cuda_dev_out = C.dev;
+    *w_dev_out = n->w;
+    *s_dev_out = (unsigned char *)n->s;
+    return 1;
+}
+
+extern "C" COLI_CUDA_DLLEXPORT int coli_cuda_tier_expand_e8m0(ColiVkTensor *const *t, int n) {
+    if (n <= 0) return 1;
+    if (!t || !cu_set()) return 0;
+    size_t max_ns = 0;
+    for (int i = 0; i < n; i++) {
+        const ColiVkTensor *x = t[i];
+        if (!x || x->pool != 1 || x->fmt != 7 || !x->s) return 0;
+        const size_t ns = cu_scale_floats(x->fmt, x->I, x->O, x->gs);
+        if (x->sbytes < ns * sizeof(float)) return 0;
+        if (ns > max_ns) max_ns = ns;
+    }
+    if (!max_ns) return 1;
+    std::lock_guard<std::mutex> lk(C.e8_mx);
+    if (max_ns > C.e8_cap) {
+        uint8_t *nb = NULL;
+        if (cudaMalloc(&nb, max_ns) != cudaSuccess) { cudaGetLastError(); return 0; }
+        if (C.e8_tmp) cudaFree(C.e8_tmp);
+        C.e8_tmp = nb; C.e8_cap = max_ns;
+    }
+    int ok = 1;
+    for (int i = 0; i < n && ok; i++) {
+        ColiVkTensor *x = t[i];
+        const size_t ns = cu_scale_floats(x->fmt, x->I, x->O, x->gs);
+        if (!ns) continue;
+        ok = cudaMemcpyAsync(C.e8_tmp, x->s, ns, cudaMemcpyDeviceToDevice, C.cs) == cudaSuccess;
+        if (!ok) break;
+        unsigned blocks = (unsigned)((ns + 255) / 256);
+        if (blocks > 65535u) blocks = 65535u;
+        cu_e8m0_to_f32_k<<<blocks, 256, 0, C.cs>>>(x->s, C.e8_tmp, ns);
+        ok = cudaPeekAtLastError() == cudaSuccess;
+    }
+    ok &= cudaStreamSynchronize(C.cs) == cudaSuccess;
+    if (!ok) cudaGetLastError();
+    return ok;
+}
+
 extern "C" COLI_CUDA_DLLEXPORT const CuTierOps *coli_cuda_tier_ops(void) { return &g_ops; }

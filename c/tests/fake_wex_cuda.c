@@ -125,5 +125,25 @@ FAKE_EXPORT int wex_cuda_decode_batch_to_host(int n, const WexEntry *const *entr
     return failed;
 }
 
+FAKE_EXPORT int wex_cuda_decode_batch_to_host_scratch(int n, const WexEntry *const *entries,
+                                                      const unsigned char *const *records, int device,
+                                                      unsigned char *const *dst, int *status) {
+    const int fail = knob("FAKE_WEX_BATCH_FAIL", -1);
+    int failed = 0;
+    (void)device;
+    for (int i = 0; i < n; i++) {
+        uint64_t raw = 0;
+        unsigned char *out = fake_decode(entries[i], records[i], &raw, &status[i]);
+        if (out) { memcpy(dst[i], out, (size_t)raw); free(out); }
+        else if (dst[i] && !wex_entry_raw_sizes(entries[i], &raw, &(uint64_t){0})) memset(dst[i], 0x5a, (size_t)raw);
+        if (i == fail) {
+            if (!wex_entry_raw_sizes(entries[i], &raw, &(uint64_t){0})) memset(dst[i], 0x5a, (size_t)raw);
+            status[i] = 1;
+        }
+        failed += status[i] != 0;
+    }
+    return failed;
+}
+
 FAKE_EXPORT int wex_cuda_host_register(void *pointer, size_t bytes) { return pointer && bytes ? 0 : -1; }
 FAKE_EXPORT int wex_cuda_host_unregister(void *pointer) { return pointer ? 0 : -1; }

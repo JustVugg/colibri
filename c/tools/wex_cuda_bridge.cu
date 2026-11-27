@@ -21,8 +21,12 @@
  *                             model registry); a record failing its integrity check
  *                             (hash, ceil, canonical zero) returns -1
  *   WEX_CUDA_FEATURE_BATCH_HOST wex_cuda_decode_batch_to_host: the batch pipeline,
- *                             each WNR2/WNR3 record decoded into a caller host buffer
+ *                             each WNR2/WNR3/WNR4 record decoded into a caller host buffer
  *                             (canonical raw slab), for stores that fill RAM slots
+ *   WEX_CUDA_FEATURE_WNR4     wex_cuda_register_wnr4_model; WNR4-MX (codec 8) records
+ *   WEX_CUDA_FEATURE_BATCH_HOST_SCRATCH wex_cuda_decode_batch_to_host_scratch: batch
+ *                             to host into caller scratch buffers (on error dst[i] may be
+ *                             overwritten; dst[i] must not overlap any record), single sync
  */
 #include "../wex_cuda.cuh"
 #include "../third_party/wnr4/wnr4_cuda.cuh"
@@ -288,28 +292,37 @@ static int wex_cuda_wnr4_geo(const WexEntry *entry,Wnr4Geo *g) {
     return wnr4_geo(g,WNR4_KIND_MX,scount,scols,entry->scale_offsets,entry->weight_offsets);
 }
 
-struct WexCudaWnr4Buf {
-    unsigned char *drec=nullptr,*draw=nullptr;
-    size_t drec_cap=0,draw_cap=0;
+struct WexCudaWnr4Lane {
     Wnr4CudaJob *djob=nullptr,*hjob=nullptr; size_t djob_cap=0,hjob_cap=0;
     Wnr4CudaRec *dinfo=nullptr,*hinfo=nullptr; size_t dinfo_cap=0,hinfo_cap=0;
     uint32_t *derr=nullptr,*herr=nullptr; size_t derr_cap=0,herr_cap=0;
     cudaStream_t stream=nullptr;
+    std::vector<Wnr4CudaJob> by_m[3];
+    void clear() {
+        if(stream) cudaStreamSynchronize(stream);
+        if(djob) cudaFree(djob); if(dinfo) cudaFree(dinfo); if(derr) cudaFree(derr);
+        if(hjob) cudaFreeHost(hjob); if(hinfo) cudaFreeHost(hinfo); if(herr) cudaFreeHost(herr);
+        if(stream) cudaStreamDestroy(stream);
+        djob=hjob=nullptr; dinfo=hinfo=nullptr; derr=herr=nullptr; stream=nullptr;
+        djob_cap=hjob_cap=dinfo_cap=hinfo_cap=derr_cap=herr_cap=0;
+    }
+};
+
+struct WexCudaWnr4Buf {
+    unsigned char *drec=nullptr,*draw=nullptr;
+    size_t drec_cap=0,draw_cap=0;
+    WexCudaWnr4Lane lanes[2];
     int dev_id=-1;
     std::vector<size_t> rec_at,raw_at;
     std::vector<uint64_t> raws;
     std::vector<int> valid;
-    std::vector<Wnr4CudaJob> by_m[3];
+    std::vector<int> lane_recs[2];
     int device() const { return dev_id; }
     ~WexCudaWnr4Buf() { clear(); }
     void clear() {
-        if(stream) cudaStreamSynchronize(stream);
+        lanes[0].clear(); lanes[1].clear();
         if(drec) cudaFree(drec); if(draw) cudaFree(draw);
-        if(djob) cudaFree(djob); if(dinfo) cudaFree(dinfo); if(derr) cudaFree(derr);
-        if(hjob) cudaFreeHost(hjob); if(hinfo) cudaFreeHost(hinfo); if(herr) cudaFreeHost(herr);
-        if(stream) cudaStreamDestroy(stream);
-        drec=draw=nullptr; djob=hjob=nullptr; dinfo=hinfo=nullptr; derr=herr=nullptr; stream=nullptr;
-        drec_cap=draw_cap=djob_cap=hjob_cap=dinfo_cap=hinfo_cap=derr_cap=herr_cap=0; dev_id=-1;
+        drec=draw=nullptr; drec_cap=draw_cap=0; dev_id=-1;
     }
     template<typename T> static bool grow_dev(T *&p,size_t &cap,size_t n,size_t grow_to=0) {
         if(n<=cap) return true;
@@ -333,28 +346,42 @@ struct WexCudaWnr4Buf {
         }
         cap=alloc_n; return true;
     }
-    bool ensure_recs(int dev,size_t rec_bytes,size_t raw_bytes,size_t nrecs) {
+    bool ensure_recs(int dev,size_t rec_bytes,size_t raw_bytes,size_t nrecs,int nlanes,const size_t lane_n[2]) {
         if(dev_id>=0 && dev_id!=dev) { int keep=-1; cudaGetDevice(&keep); cudaSetDevice(dev_id); clear(); if(keep>=0) cudaSetDevice(keep); }
-        if(!stream && cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking)!=cudaSuccess) { (void)cudaGetLastError(); stream=nullptr; return false; }
         dev_id=dev;
+        for(int l=0;l<nlanes;l++) {
+            if(!lanes[l].stream && cudaStreamCreateWithFlags(&lanes[l].stream,cudaStreamNonBlocking)!=cudaSuccess) {
+                (void)cudaGetLastError(); lanes[l].stream=nullptr; return false;
+            }
+        }
         /* When batching (nrecs > 1), pre-size to an 8-record wave to avoid repeated
          * cudaFree/cudaMalloc stalls as batch sizes climb from 2 -> 4 -> 8. */
         size_t rec_grow=(nrecs>1 && nrecs<8) ? (rec_bytes/nrecs+4096u)*8u : rec_bytes;
         size_t raw_grow=(raw_bytes && nrecs>1 && nrecs<8) ? (raw_bytes/nrecs+4096u)*8u : raw_bytes;
-        size_t nr_grow=nrecs>1 && nrecs<8 ? 8u : nrecs;
-        return grow_dev(drec,drec_cap,rec_bytes,rec_grow) && (!raw_bytes || grow_dev(draw,draw_cap,raw_bytes,raw_grow)) &&
-               grow_dev(dinfo,dinfo_cap,nrecs,nr_grow) && grow_host(hinfo,hinfo_cap,nrecs,nr_grow) &&
-               grow_dev(derr,derr_cap,nrecs,nr_grow) && grow_host(herr,herr_cap,nrecs,nr_grow);
+        if(!grow_dev(drec,drec_cap,rec_bytes,rec_grow) || (raw_bytes && !grow_dev(draw,draw_cap,raw_bytes,raw_grow)))
+            return false;
+        for(int l=0;l<nlanes;l++) {
+            size_t ln=lane_n[l] ? lane_n[l] : 1u;
+            size_t ln_grow=(nrecs>1 && ln<8u) ? 8u : ln;
+            WexCudaWnr4Lane &L=lanes[l];
+            if(!grow_dev(L.dinfo,L.dinfo_cap,ln,ln_grow) || !grow_host(L.hinfo,L.hinfo_cap,ln,ln_grow) ||
+               !grow_dev(L.derr,L.derr_cap,ln,ln_grow) || !grow_host(L.herr,L.herr_cap,ln,ln_grow))
+                return false;
+        }
+        return true;
     }
-    bool ensure_jobs(size_t njobs) {
-        size_t jgrow=djob_cap ? (njobs>djob_cap*2u ? njobs : djob_cap*2u) : njobs;
-        return grow_dev(djob,djob_cap,njobs,jgrow) && grow_host(hjob,hjob_cap,njobs,jgrow);
+    bool ensure_jobs(int l,size_t njobs,bool batched) {
+        WexCudaWnr4Lane &L=lanes[l];
+        size_t base_grow=(batched && njobs<4096u) ? 4096u : njobs;
+        size_t jgrow=L.djob_cap ? (njobs>L.djob_cap*2u ? njobs : L.djob_cap*2u) : base_grow;
+        return grow_dev(L.djob,L.djob_cap,njobs,jgrow) && grow_host(L.hjob,L.hjob_cap,njobs,jgrow);
     }
 };
 static WexCudaPool<WexCudaWnr4Buf> &wex_cuda_wnr4_pool() { static auto *pool=new WexCudaPool<WexCudaWnr4Buf>(); return *pool; }
 
 static int wex_cuda_wnr4_batch(int n,const WexEntry *const *entries,const unsigned char *const *records,int device,
-    unsigned char *const *dst_scale,unsigned char *const *dst_weight,unsigned char *const *dst_host,int *status) {
+    unsigned char *const *dst_scale,unsigned char *const *dst_weight,unsigned char *const *dst_host,int *status,
+    bool scratch_dst=false) {
     if(n<=0) return 0;
     if(!entries || !records || !(dst_host || (dst_scale && dst_weight)) || !status) return n;
     if(cudaSetDevice(device)!=cudaSuccess) { (void)cudaGetLastError(); for(int i=0;i<n;i++) status[i]=1; return n; }
@@ -365,6 +392,7 @@ static int wex_cuda_wnr4_batch(int n,const WexEntry *const *entries,const unsign
     b.rec_at.assign((size_t)n,0); b.raw_at.assign((size_t)n,0);
     b.raws.assign((size_t)n,0); b.valid.assign((size_t)n,0);
     uint32_t model_id=0;
+    int valid_count=0;
     for(int i=0;i<n;i++) {
         status[i]=-1;
         const WexEntry *e=entries[i];
@@ -383,6 +411,7 @@ static int wex_cuda_wnr4_batch(int n,const WexEntry *const *entries,const unsign
         b.raw_at[(size_t)i]=raw_bytes; if(dst_host) raw_bytes+=(size_t)aligned;
         b.raws[(size_t)i]=raw;
         b.valid[(size_t)i]=1;
+        valid_count++;
     }
     auto failures=[&] { int bad=0; for(int i=0;i<n;i++) bad+=status[i]!=0; return bad; };
     if(!model_id) return failures();
@@ -391,70 +420,141 @@ static int wex_cuda_wnr4_batch(int n,const WexEntry *const *entries,const unsign
         for(int i=0;i<n;i++) if(b.valid[(size_t)i]) status[i]=1;
         return failures();
     }
-    if(!b.ensure_recs(device,rec_bytes?rec_bytes:256u,raw_bytes,(size_t)n)) {
+    /* 2-stream ping-pong overlap when >= 4 valid records (warm-start / prefill waves, >= 2 recs/lane):
+     * for 1..3 records (typical decode misses), one W=4/8/16 kernel + one sync beats splitting into
+     * two smaller kernels + two syncs. */
+    const int nlanes=valid_count>=4 ? 2 : 1;
+    const int half=nlanes==2 ? valid_count/2 : valid_count;
+    b.lane_recs[0].clear(); b.lane_recs[1].clear();
+    for(int i=0,seen=0;i<n;i++) {
+        if(!b.valid[(size_t)i]) continue;
+        b.lane_recs[seen<half ? 0 : 1].push_back(i);
+        seen++;
+    }
+    const size_t lane_n[2]={b.lane_recs[0].size(),b.lane_recs[1].size()};
+    if(!b.ensure_recs(device,rec_bytes?rec_bytes:256u,raw_bytes,(size_t)n,nlanes,lane_n)) {
         for(int i=0;i<n;i++) if(b.valid[(size_t)i]) status[i]=1;
         return failures();
     }
-    for(int k=0;k<3;k++) {
-        b.by_m[k].clear();
-        if(b.by_m[k].capacity()<(size_t)n*512u) b.by_m[k].reserve((size_t)n*512u);
-    }
-    int queued=0;
-    cudaError_t err=cudaSuccess;
-    for(int i=0;i<n;i++) {
-        if(!b.valid[(size_t)i]) continue;
-        const WexEntry *e=entries[i];
-        Wnr4Geo geo;
-        if(wex_cuda_wnr4_geo(e,&geo)) { status[i]=-1; continue; }
-        unsigned char *ds[3],*dw[3];
-        for(int m=0;m<3;m++) {
-            ds[m]=dst_host ? b.draw+b.raw_at[(size_t)i]+e->scale_offsets[m] : dst_scale[3*i+m];
-            dw[m]=dst_host ? b.draw+b.raw_at[(size_t)i]+e->weight_offsets[m] : dst_weight[3*i+m];
+    cudaError_t lane_err[2]={cudaSuccess,cudaSuccess};
+    bool lane_active[2]={false,false};
+    int lane_queued[2]={0,0};
+    /* Phase 1: plan & enqueue H2D + kernel for all lanes before ANY D2H so lane 1's H2D
+     * is never head-of-line blocked behind lane 0's kernel-dependent D2H on WDDM/GeForce. */
+    for(int l=0;l<nlanes;l++) {
+        WexCudaWnr4Lane &L=b.lanes[l];
+        const std::vector<int> &idxs=b.lane_recs[l];
+        if(idxs.empty()) continue;
+        for(int k=0;k<3;k++) {
+            L.by_m[k].clear();
+            if(L.by_m[k].capacity()<idxs.size()*512u) L.by_m[k].reserve(idxs.size()*512u);
         }
-        if(wnr4_cuda_plan(&geo,hmodel,records[i],e->total_bytes,wex_read_u32_le(records[i]+8u),
-                          b.drec+b.rec_at[(size_t)i],(uint32_t)i,ds,dw,&b.hinfo[i],b.by_m)) {
-            status[i]=-1; continue;
+        std::memset(L.hinfo,0,sizeof(Wnr4CudaRec)*idxs.size());
+        cudaError_t err=cudaSuccess;
+        for(size_t j=0;j<idxs.size();j++) {
+            const int i=idxs[j];
+            const WexEntry *e=entries[i];
+            Wnr4Geo geo;
+            if(wex_cuda_wnr4_geo(e,&geo)) { status[i]=-1; continue; }
+            unsigned char *ds[3],*dw[3];
+            for(int m=0;m<3;m++) {
+                ds[m]=dst_host ? b.draw+b.raw_at[(size_t)i]+e->scale_offsets[m] : dst_scale[3*i+m];
+                dw[m]=dst_host ? b.draw+b.raw_at[(size_t)i]+e->weight_offsets[m] : dst_weight[3*i+m];
+            }
+            if(wnr4_cuda_plan(&geo,hmodel,records[i],e->total_bytes,wex_read_u32_le(records[i]+8u),
+                              b.drec+b.rec_at[(size_t)i],(uint32_t)j,ds,dw,&L.hinfo[j],L.by_m)) {
+                status[i]=-1; continue;
+            }
+            /* Start H2D immediately so PCIe DMA overlaps CPU planning of the remaining records. */
+            if(err==cudaSuccess) {
+                err=cudaMemcpyAsync(b.drec+b.rec_at[(size_t)i],records[i],e->total_bytes,cudaMemcpyHostToDevice,L.stream);
+                if(err==cudaSuccess) lane_active[l]=true;
+            }
+            status[i]=2; lane_queued[l]++;
         }
-        /* Start H2D immediately so PCIe DMA overlaps CPU planning of the remaining records. */
-        if(err==cudaSuccess)
-            err=cudaMemcpyAsync(b.drec+b.rec_at[(size_t)i],records[i],e->total_bytes,cudaMemcpyHostToDevice,b.stream);
-        status[i]=2; queued++;
+        if(!lane_queued[l]) continue;
+        const size_t njobs_cap=wnr4_cuda_jobs_cap(L.by_m,nullptr);
+        if(!b.ensure_jobs(l,njobs_cap+1u,n>1)) {
+            lane_err[l]=cudaErrorMemoryAllocation;
+            continue;
+        }
+        size_t njobs=0;
+        const uint32_t W=wnr4_cuda_jobs_into(L.by_m,L.hjob,&njobs);
+        if(err==cudaSuccess) err=cudaMemcpyAsync(L.dinfo,L.hinfo,sizeof(Wnr4CudaRec)*idxs.size(),cudaMemcpyHostToDevice,L.stream);
+        if(err==cudaSuccess && njobs) err=cudaMemcpyAsync(L.djob,L.hjob,sizeof(Wnr4CudaJob)*njobs,cudaMemcpyHostToDevice,L.stream);
+        if(err==cudaSuccess) err=cudaMemsetAsync(L.derr,0,4u*idxs.size(),L.stream);
+        if(err==cudaSuccess && njobs) err=wnr4_cuda_launch_w(*tables,L.djob,(uint32_t)njobs,L.dinfo,L.derr,W,L.stream);
+        if(err==cudaSuccess) lane_active[l]=true;
+        /* Flush lane 0's H2D+kernel command batch immediately while CPU plans lane 1. */
+        if(l==0 && nlanes==2 && err==cudaSuccess) (void)cudaStreamQuery(L.stream);
+        lane_err[l]=err;
     }
-    if(!queued) return failures();
-    size_t njobs_cap=wnr4_cuda_jobs_cap(b.by_m,nullptr);
-    if(!b.ensure_jobs(njobs_cap+1u)) {
-        cudaStreamSynchronize(b.stream);
-        for(int i=0;i<n;i++) if(status[i]==2) status[i]=1;
+    /* Phase 2: enqueue D2H(herr) (and D2H(draw -> dst_host) when scratch_dst) for all lanes. */
+    for(int l=0;l<nlanes;l++) {
+        if(!lane_queued[l] || lane_err[l]!=cudaSuccess) continue;
+        WexCudaWnr4Lane &L=b.lanes[l];
+        const std::vector<int> &idxs=b.lane_recs[l];
+        cudaError_t err=cudaMemcpyAsync(L.herr,L.derr,4u*idxs.size(),cudaMemcpyDeviceToHost,L.stream);
+        if(dst_host && scratch_dst && err==cudaSuccess) {
+            for(size_t j=0;j<idxs.size() && err==cudaSuccess;j++) {
+                const int i=idxs[j];
+                if(status[i]!=2) continue;
+                err=cudaMemcpyAsync(dst_host[i],b.draw+b.raw_at[(size_t)i],(size_t)b.raws[(size_t)i],
+                                    cudaMemcpyDeviceToHost,L.stream);
+            }
+        }
+        lane_err[l]=err;
+    }
+    if(!dst_host || scratch_dst) {
+        for(int l=0;l<nlanes;l++) {
+            const std::vector<int> &idxs=b.lane_recs[l];
+            if(lane_active[l]) {
+                cudaError_t se=cudaStreamSynchronize(b.lanes[l].stream);
+                if(lane_err[l]==cudaSuccess) lane_err[l]=se;
+            }
+            if(lane_err[l]!=cudaSuccess) {
+                (void)cudaGetLastError();
+                for(int i : idxs) if(status[i]==2) status[i]=1;
+            } else {
+                for(size_t j=0;j<idxs.size();j++) {
+                    const int i=idxs[j];
+                    if(status[i]==2) status[i]=b.lanes[l].herr[j] ? -1 : 0;
+                }
+            }
+        }
         return failures();
     }
-    size_t njobs=0;
-    wnr4_cuda_jobs_into(b.by_m,b.hjob,&njobs);
-    if(err==cudaSuccess) err=cudaMemcpyAsync(b.dinfo,b.hinfo,sizeof(Wnr4CudaRec)*(size_t)n,cudaMemcpyHostToDevice,b.stream);
-    if(err==cudaSuccess && njobs) err=cudaMemcpyAsync(b.djob,b.hjob,sizeof(Wnr4CudaJob)*njobs,cudaMemcpyHostToDevice,b.stream);
-    if(err==cudaSuccess) err=cudaMemsetAsync(b.derr,0,4u*(size_t)n,b.stream);
-    if(err==cudaSuccess && njobs) err=wnr4_cuda_launch(*tables,b.djob,(uint32_t)njobs,b.dinfo,b.derr,b.stream);
-    if(err==cudaSuccess) err=cudaMemcpyAsync(b.herr,b.derr,4u*(size_t)n,cudaMemcpyDeviceToHost,b.stream);
-    if(err==cudaSuccess) err=cudaStreamSynchronize(b.stream);
-    if(err!=cudaSuccess) {
-        (void)cudaGetLastError();
-        for(int i=0;i<n;i++) if(status[i]==2) status[i]=1;
-        return failures();
-    }
-    if(!dst_host) {
-        for(int i=0;i<n;i++) if(status[i]==2) status[i]=b.herr[i] ? -1 : 0;
-        return failures();
-    }
-    for(int i=0;i<n;i++) {
-        if(status[i]!=2) continue;
-        if(b.herr[i]) { status[i]=-1; continue; }
-        if(cudaMemcpyAsync(dst_host[i],b.draw+b.raw_at[(size_t)i],(size_t)b.raws[(size_t)i],cudaMemcpyDeviceToHost,b.stream)!=cudaSuccess) {
-            (void)cudaGetLastError(); status[i]=1; continue;
+    /* Strict non-scratch host batch: sync lane l to inspect herr before D2H so failed records leave dst_host untouched. */
+    bool d2h_queued[2]={false,false};
+    for(int l=0;l<nlanes;l++) {
+        const std::vector<int> &idxs=b.lane_recs[l];
+        if(lane_active[l]) {
+            cudaError_t se=cudaStreamSynchronize(b.lanes[l].stream);
+            if(lane_err[l]==cudaSuccess) lane_err[l]=se;
         }
-        status[i]=-2;
+        if(lane_err[l]!=cudaSuccess) {
+            (void)cudaGetLastError();
+            for(int i : idxs) if(status[i]==2) status[i]=1;
+            continue;
+        }
+        for(size_t j=0;j<idxs.size();j++) {
+            const int i=idxs[j];
+            if(status[i]!=2) continue;
+            if(b.lanes[l].herr[j]) { status[i]=-1; continue; }
+            if(cudaMemcpyAsync(dst_host[i],b.draw+b.raw_at[(size_t)i],(size_t)b.raws[(size_t)i],
+                               cudaMemcpyDeviceToHost,b.lanes[l].stream)!=cudaSuccess) {
+                (void)cudaGetLastError(); status[i]=1; continue;
+            }
+            status[i]=-2;
+            d2h_queued[l]=true;
+        }
     }
-    bool copied=cudaStreamSynchronize(b.stream)==cudaSuccess;
-    if(!copied) (void)cudaGetLastError();
-    for(int i=0;i<n;i++) if(status[i]==-2) status[i]=copied ? 0 : 1;
+    for(int l=0;l<nlanes;l++) {
+        if(!d2h_queued[l]) continue;
+        bool copied=cudaStreamSynchronize(b.lanes[l].stream)==cudaSuccess;
+        if(!copied) (void)cudaGetLastError();
+        for(int i : b.lane_recs[l]) if(status[i]==-2) status[i]=copied ? 0 : 1;
+    }
     return failures();
 }
 
@@ -614,9 +714,11 @@ WEX_CUDA_EXPORT int wex_cuda_decode_to_host(const WexEntry *entry,
 #define WEX_CUDA_FEATURE_NR3      16u
 #define WEX_CUDA_FEATURE_BATCH_HOST 32u
 #define WEX_CUDA_FEATURE_WNR4     64u
+#define WEX_CUDA_FEATURE_BATCH_HOST_SCRATCH 128u
 WEX_CUDA_EXPORT unsigned int wex_cuda_helper_features(void) {
     return WEX_CUDA_FEATURE_DEVICE | WEX_CUDA_FEATURE_REGISTER | WEX_CUDA_FEATURE_NR2 | WEX_CUDA_FEATURE_BATCH |
-           WEX_CUDA_FEATURE_NR3 | WEX_CUDA_FEATURE_BATCH_HOST | WEX_CUDA_FEATURE_WNR4;
+           WEX_CUDA_FEATURE_NR3 | WEX_CUDA_FEATURE_BATCH_HOST | WEX_CUDA_FEATURE_WNR4 |
+           WEX_CUDA_FEATURE_BATCH_HOST_SCRATCH;
 }
 
 static int wex_cuda_nr2_to_device(const WexEntry *entry,const unsigned char *record,int device,
@@ -757,11 +859,12 @@ static WexCudaPool<WexCudaBatchSet> &wex_cuda_batch_pool() { static auto *pool=n
  * With dst_host (and no dst_scale/dst_weight): record i's raw slab goes to the
  * host buffer dst_host[i] instead, copied back only once its error word is 0. */
 static int wex_cuda_batch(int n,const WexEntry *const *entries,const unsigned char *const *records,int device,
-    unsigned char *const *dst_scale,unsigned char *const *dst_weight,unsigned char *const *dst_host,int *status) {
+    unsigned char *const *dst_scale,unsigned char *const *dst_weight,unsigned char *const *dst_host,int *status,
+    bool scratch_dst=false) {
     if(n<=0) return 0;
     if(!entries || !records || !(dst_host || (dst_scale && dst_weight)) || !status) return n;
     for(int i=0;i<n;i++) if(entries[i] && wex_entry_is_wnr4(entries[i]))
-        return wex_cuda_wnr4_batch(n,entries,records,device,dst_scale,dst_weight,dst_host,status);
+        return wex_cuda_wnr4_batch(n,entries,records,device,dst_scale,dst_weight,dst_host,status,scratch_dst);
     const int PENDING=2;
     std::vector<WexNr2Record> views((size_t)n);
     std::vector<WexCudaNr2Plan> plans((size_t)n);
@@ -836,6 +939,7 @@ static int wex_cuda_batch(int n,const WexEntry *const *entries,const unsigned ch
                                                             w.device_raw,w.device_error,work)!=cudaSuccess ||
            cudaEventRecord(w.consumed,work)!=cudaSuccess ||
            (!dst_host && wex_cuda_launch_commit(w.device_raw,&commit,w.device_error,work)!=cudaSuccess) ||
+           (dst_host && scratch_dst && wex_cuda_copy_back(entry,plan,w.device_raw,dst_host[i],work)!=cudaSuccess) ||
            cudaMemcpyAsync(host.errors+i,w.device_error,4u,cudaMemcpyDeviceToHost,work)!=cudaSuccess) {
             (void)cudaGetLastError();
             return -1;
@@ -855,9 +959,9 @@ static int wex_cuda_batch(int n,const WexEntry *const *entries,const unsigned ch
      * wait for what is queued, and report it and the rest as unavailable */
     int broken_at=n;
     bool synced=true;
-    if(!dst_host) {
-        /* device destinations: the commit kernel writes them only after a clean
-         * decode, so every record is queued at once and the host waits once */
+    if(!dst_host || scratch_dst) {
+        /* device destinations (device-side gated commit) or caller-owned host scratch
+         * destinations (overwrite allowed on error): queue everything and wait once */
         for(int i=0,k=0;i<n && broken_at==n;i++)
             if(status[i]==PENDING && queue(i,lane[k++%lanes])) broken_at=i;
         synced=drain(lanes);
@@ -926,7 +1030,17 @@ WEX_CUDA_EXPORT int wex_cuda_decode_batch_to_device(int n,const WexEntry *const 
 WEX_CUDA_EXPORT int wex_cuda_decode_batch_to_host(int n,const WexEntry *const *entries,
     const unsigned char *const *records,int device,unsigned char *const *dst,int *status) {
     if(!dst) return n>0 ? n : 0;
-    return wex_cuda_batch(n,entries,records,device,nullptr,nullptr,dst,status);
+    return wex_cuda_batch(n,entries,records,device,nullptr,nullptr,dst,status,false);
+}
+
+/* WEX_CUDA_FEATURE_BATCH_HOST_SCRATCH: like wex_cuda_decode_batch_to_host, but for
+ * caller-owned temporary/scratch buffers where dst[i] may be overwritten when record i
+ * fails (status[i] != 0) and dst[i] must not overlap any records[j]. Enqueues D2H right
+ * after the decode kernel on the same stream to eliminate the intermediate host sync. */
+WEX_CUDA_EXPORT int wex_cuda_decode_batch_to_host_scratch(int n,const WexEntry *const *entries,
+    const unsigned char *const *records,int device,unsigned char *const *dst,int *status) {
+    if(!dst) return n>0 ? n : 0;
+    return wex_cuda_batch(n,entries,records,device,nullptr,nullptr,dst,status,true);
 }
 
 /* Page-lock a caller staging buffer for this helper's uploads (portable). */

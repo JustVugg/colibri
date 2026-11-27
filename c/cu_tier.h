@@ -52,7 +52,16 @@ int  cut_host_pool_on(void);
 size_t cut_stage_room(void);
 int  cut_dev_host(int layer, uint8_t *host);
 int  cut_score(int layer, uint64_t *score);
+typedef struct { int layer, eid; void *t[3]; } CutWarmDirect;
+int  cut_warm_direct_ready(int *cuda_dev_out);
+int  cut_warm_direct_alloc(int layer, int eid, CutWarmDirect *out,
+                           unsigned char *dev_w[3], unsigned char *dev_s[3]);
+int  cut_warm_direct_commit(CutWarmDirect *items, const int *ok, int n);
 #else
+typedef struct { int layer, eid; void *t[3]; } CutWarmDirect;
+static inline int cut_warm_direct_ready(int *d){(void)d;return 0;}
+static inline int cut_warm_direct_alloc(int l,int e,CutWarmDirect *o,unsigned char *w[3],unsigned char *s[3]){(void)l;(void)e;(void)o;(void)w;(void)s;return 0;}
+static inline int cut_warm_direct_commit(CutWarmDirect *i,const int *ok,int n){(void)i;(void)ok;(void)n;return 0;}
 static inline int cut_host_pool_on(void){return 0;}
 static inline size_t cut_stage_room(void){return 0;}
 static inline int cut_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}

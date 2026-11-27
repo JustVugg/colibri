@@ -387,9 +387,10 @@ static inline uint32_t wnr4_cuda_jobs(std::vector<Wnr4CudaJob> by_m[3], std::vec
     jobs.resize(nj);
     return W;
 }
-static inline cudaError_t wnr4_cuda_launch(const Wnr4CudaTables &tab, const Wnr4CudaJob *jobs_dev, uint32_t njobs,
-                                           const Wnr4CudaRec *recs_dev, uint32_t *errors_dev, cudaStream_t stream) {
-    const uint32_t W = wnr4_cuda_planned_warps, blocks = (njobs + W - 1u) / W;
+static inline cudaError_t wnr4_cuda_launch_w(const Wnr4CudaTables &tab, const Wnr4CudaJob *jobs_dev, uint32_t njobs,
+                                             const Wnr4CudaRec *recs_dev, uint32_t *errors_dev, uint32_t W,
+                                             cudaStream_t stream) {
+    const uint32_t blocks = (njobs + W - 1u) / W;
     const bool rg = wnr4_cuda_rows_global < 0 ? (tab.kind == 1u && W == 16u) : wnr4_cuda_rows_global != 0;
     const int smem = rg ? 0 : (int)(tab.rows * 32u);
     if (!blocks) return cudaSuccess;
@@ -422,6 +423,10 @@ static inline cudaError_t wnr4_cuda_launch(const Wnr4CudaTables &tab, const Wnr4
 #undef WNR4_LAUNCH2
 #undef WNR4_LAUNCH3
     return cudaGetLastError();
+}
+static inline cudaError_t wnr4_cuda_launch(const Wnr4CudaTables &tab, const Wnr4CudaJob *jobs_dev, uint32_t njobs,
+                                           const Wnr4CudaRec *recs_dev, uint32_t *errors_dev, cudaStream_t stream) {
+    return wnr4_cuda_launch_w(tab, jobs_dev, njobs, recs_dev, errors_dev, wnr4_cuda_planned_warps, stream);
 }
 
 #endif

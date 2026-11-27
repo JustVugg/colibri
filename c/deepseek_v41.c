@@ -1912,7 +1912,7 @@ static void v41_gx_geometry(Model *m) {
 #include "wex_decode.c"
 
 #define V41_WEX_BUF_POOL 64
-#define V41_WEX_PIN_SLOTS 40
+#define V41_WEX_PIN_SLOTS 52
 typedef struct V41Wex {
     shards S;                  /* the container: its one file */
     st_tensor *t;              /* [cell * 6 + part]: the part's bytes in the file (RAW) or in the decoded
@@ -2211,7 +2211,8 @@ static int v41_wex_has(const Model *m, const char *kind, int layer, int eid) {
 
 /* A record that failed: refused for the run, the shards serve its expert from now on. */
 static void v41_wex_refuse(V41Wex *w, int layer, int eid, const char *why) {
-    __atomic_store_n(&w->state[(size_t)layer * (size_t)w->experts + (size_t)eid], (unsigned char)2, __ATOMIC_RELEASE);
+    if (__atomic_exchange_n(&w->state[(size_t)layer * (size_t)w->experts + (size_t)eid],
+                            (unsigned char)2, __ATOMIC_ACQ_REL) == 2) return;
     __atomic_fetch_add(&w->refused, UINT64_C(1), __ATOMIC_RELAXED);
     fprintf(stderr, "[v41_wex] layer %d expert %d: the record %s; this expert comes from the safetensors from now on\n",
             layer, eid, why);
@@ -2466,14 +2467,19 @@ static void v41_wex_slot_ptrs(const V41Wex *w, size_t cell, const WexEntry *e, S
 /* Verify first-read SHA-256 of a coded record (when COLI_WEX_VERIFY is on). 1 = ok, 0 = refused. */
 static int v41_wex_verify_coded(V41Wex *w, int layer, int eid, const WexEntry *e, const uint8_t *record) {
     const size_t cell = (size_t)layer * (size_t)w->experts + (size_t)eid;
-    if (!w->sha || __atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE)) return 1;
+    if (!w->sha) return 1;
+    unsigned char st = __atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE);
+    if (st == 1) return 1;
+    if (st == 2) return 0;
     unsigned char digest[32];
     wex4_sha256(record, e->total_bytes, digest);
     if (memcmp(digest, w->sha + cell * 32, 32)) {
         v41_wex_refuse(w, layer, eid, "does not match its SHA-256 in the index");
         return 0;
     }
-    __atomic_store_n(&w->state[cell], (unsigned char)1, __ATOMIC_RELEASE);
+    unsigned char expected = 0;
+    __atomic_compare_exchange_n(&w->state[cell], &expected, (unsigned char)1,
+                                0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -2522,7 +2528,8 @@ static uint64_t v41_wex_fetch_nr3(Model *m, int layer, int eid, const WexEntry *
  * when GPU decoded straight into `slot->wex_slab`), handle CPU fallback/refusal, and return
  * pooled buffers. */
 static void v41_wex_post_one(Model *m, int layer, int eid, Slot *s, const WexEntry *e,
-                             uint8_t *rec, int rpin, uint8_t *slab, int spin, int st, int check_sha) {
+                             uint8_t *rec, int rpin, uint8_t *slab, int spin, int st, int check_sha,
+                             int *rec_refs) {
     V41Wex *w = m->wex;
     const size_t cell = (size_t)layer * m->c.n_routed + eid;
     if (!check_sha || v41_wex_verify_coded(w, layer, eid, e, rec)) {
@@ -2551,7 +2558,8 @@ static void v41_wex_post_one(Model *m, int layer, int eid, Slot *s, const WexEnt
         }
     }
     if (slab) v41_wex_buf_put(w, slab, spin);
-    v41_wex_buf_put(w, rec, rpin);
+    if (!rec_refs || __atomic_fetch_sub(rec_refs, 1, __ATOMIC_ACQ_REL) == 1)
+        v41_wex_buf_put(w, rec, rpin);
 }
 
 /* Always decode GPU batches into CUDA-pinned slabs (never pageable slot memory, which
@@ -2568,12 +2576,12 @@ static void v41_wex_gpu_decode_wave(Model *m, int layer, Slot *const *slot, cons
         st_w[j] = 1;
     }
     const double tg0 = now_s();
-    coli_wex_cuda_decode_batch_to_host(cnt, ew, (const unsigned char *const *)rw, 0, slabs, st_w);
+    coli_wex_cuda_decode_batch_to_host_scratch(cnt, ew, (const unsigned char *const *)rw, 0, slabs, st_w);
     const double tg1 = now_s();
     if (!g_v41_in_prefetch) w->t_gpu += tg1 - tg0;
     for (int j = 0; j < cnt; j++) {
         const int idx = idxs[j];
-        v41_wex_post_one(m, layer, eid[idx], slot[idx], ew[j], rw[j], rpin[j], slabs[j], spin[j], st_w[j], 1);
+        v41_wex_post_one(m, layer, eid[idx], slot[idx], ew[j], rw[j], rpin[j], slabs[j], spin[j], st_w[j], 1, NULL);
     }
     if (!g_v41_in_prefetch) w->t_post += now_s() - tg1;
 }
@@ -2616,10 +2624,15 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     }
     double started = now_s();
     const unsigned int cu_bits = m->wex && m->wex->nr3 ? coli_wex_cuda_features() : 0u;
-    int coded_total = 0;
+    int coded_total = 0, coded_unverified = 0;
     if (m->wex && m->wex->nr3 && first)
         for (int q = 0; q < n; q++)
-            if (v41_wex_nr3(m, &list[first[q]], layer)) coded_total++;
+            if (v41_wex_nr3(m, &list[first[q]], layer)) {
+                coded_total++;
+                if (m->wex->sha &&
+                    !__atomic_load_n(&m->wex->state[(size_t)layer * m->c.n_routed + eid[q]], __ATOMIC_ACQUIRE))
+                    coded_unverified++;
+            }
     const int gpu_batch = coded_total > 0 && (cu_bits & COLI_WEX_CUDA_BATCH_HOST) &&
                           (m->wex->is_wnr4 ? (cu_bits & COLI_WEX_CUDA_NR4)
                                            : ((cu_bits & COLI_WEX_CUDA_NR2) && (cu_bits & COLI_WEX_CUDA_NR3)));
@@ -2633,26 +2646,42 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     const int io_work = coded_total == n ? n : total;
     const int threads = depth < io_work ? depth : io_work;
 #if defined(_OPENMP)
-    const int overlap = gpu_batch && coded_total > 1;
+    const int overlap = gpu_batch && (coded_total > 1 || (coded_total == 1 && coded_unverified > 0));
+    const int stream_verify = overlap && coded_unverified > 0;
     const int gpu_threads = overlap ? 1 : 0;
     const int io_threads = threads;
-    const int need_post_spare = overlap ? 1 : 0;
+    const int need_post_spare = overlap
+        ? (stream_verify ? (in_pf ? (coded_unverified < 2 ? coded_unverified : 2)
+                                  : (coded_unverified < 4 ? coded_unverified : 4))
+                         : 1)
+        : 0;
     const int min_team = overlap ? (io_threads + gpu_threads + need_post_spare) : threads;
     const int omp_max = omp_get_max_threads();
     const int team = in_pf ? min_team : (min_team > omp_max ? min_team : omp_max);
 #else
     const int overlap = 0;
+    const int stream_verify = 0;
     const int gpu_threads = 0;
     const int io_threads = threads;
 #endif
     /* 3-stage overlapped pipeline (when overlap=1):
-     *   Stage 1 (io_threads): dynamic weighted dual-NVMe O_DIRECT reads into pinned buffers,
-     *           owner-check only, push to wq (when done, help drain pq).
+     *   Stage 1 (io_threads): dynamic weighted dual-NVMe O_DIRECT reads into pinned buffers.
+     *           When stream_verify=1 and a record is unverified, reads in 2 MiB aligned chunks
+     *           and publishes chunk 0 to vq immediately so spare CPU threads stream-hash the
+     *           record concurrently with remaining NVMe chunks and Stage 2 GPU decode.
      *   Stage 2 (GPU thread 0): drains wq in batches of [min_batch..WEX_WAVE] into CUDA-pinned
      *           slabs (100% pinned PCIe DMA) and pushes to pq.
-     *   Stage 3 (spare + finished I/O threads): run deferred SHA-256 (COLI_WEX_VERIFY) +
-     *           contiguous slab copy into slot->wex_slab in parallel across CPU cores. */
-    enum { WEX_Q_CAP = 16, WEX_WAVE = 8, WEX_P_CAP = 16 };
+     *   Stage 3 (spare + finished I/O threads): unified drain of vq (streaming SHA-256) and pq
+     *           (slab copy / CPU fallback) under pq.mx — eliminates post-GPU SHA stall and any
+     *           3-way circular deadlock when n > WEX_P_CAP. */
+    enum { WEX_Q_CAP = 16, WEX_WAVE = 8, WEX_P_CAP = 16, WEX_SHA_CHUNK = 2u << 20 };
+    typedef struct {
+        uint8_t *rec;
+        int eid, rpin;
+        uint32_t total, ready;
+        int done_io; /* 0: reading, 1: complete & owner_ok, -1: aborted (owner mismatch) */
+        int refs;    /* 2 while both I/O->GPU->Post and Verify hold rec; 1->0 returns to pool */
+    } V41ShaJob;
     struct {
         pthread_mutex_t mx;
         pthread_cond_t not_empty, not_full;
@@ -2663,12 +2692,18 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     } wq;
     struct {
         pthread_mutex_t mx;
-        pthread_cond_t not_empty, not_full;
+        pthread_cond_t not_empty, not_full, chunk_cv;
         int head, tail, count, closed, gpu_done;
         int idx[WEX_P_CAP], rpin[WEX_P_CAP], spin[WEX_P_CAP], st[WEX_P_CAP];
         const WexEntry *ent[WEX_P_CAP];
         uint8_t *rec[WEX_P_CAP], *slab[WEX_P_CAP];
+        int v_head, v_tail, v_closed;
+        int *v_idx;
     } pq;
+    V41ShaJob vjobs_s[64];
+    int vq_s[64];
+    V41ShaJob *vjobs = NULL;
+    int *vq_heap = NULL;
     if (overlap) {
         memset(&wq, 0, sizeof wq);
         pthread_mutex_init(&wq.mx, NULL);
@@ -2678,6 +2713,14 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         pthread_mutex_init(&pq.mx, NULL);
         pthread_cond_init(&pq.not_empty, NULL);
         pthread_cond_init(&pq.not_full, NULL);
+        pthread_cond_init(&pq.chunk_cv, NULL);
+        if (stream_verify) {
+            vjobs = n <= 64 ? vjobs_s : (V41ShaJob *)xcalloc((size_t)n, sizeof *vjobs, "wex sha jobs");
+            if (n <= 64) memset(vjobs_s, 0, (size_t)n * sizeof *vjobs);
+            pq.v_idx = n <= 64 ? vq_s : (vq_heap = (int *)xmalloc((size_t)n * sizeof(int), "wex sha queue"));
+        } else {
+            pq.v_closed = 1;
+        }
     }
     /* Wait for at least 2 records when >= 2 NVMe drives or >= 2 reads are in flight so we launch
      * multi-record batches without delaying the first dual-NVMe wave. */
@@ -2731,7 +2774,7 @@ static void expert_fetch(Model *m, const char *kind, int layer,
                 st_w[j] = 1;
             }
             const double tg0 = now_s();
-            coli_wex_cuda_decode_batch_to_host(cnt, ew, (const unsigned char *const *)rw, 0, slabs, st_w);
+            coli_wex_cuda_decode_batch_to_host_scratch(cnt, ew, (const unsigned char *const *)rw, 0, slabs, st_w);
             gpu_s += now_s() - tg0;
             pthread_mutex_lock(&pq.mx);
             for (int j = 0; j < cnt; j++) {
@@ -2771,9 +2814,61 @@ static void expert_fetch(Model *m, const char *kind, int layer,
                     for (int q = 0; q < n; q++) if (first[q] == i) { idx = q; break; }
                     if (idx >= 0) {
                         int pin = 0;
-                        uint8_t *buf = v41_wex_read_coded(m, layer, r->eid, nr3, rep, !overlap, &pin);
-                        v41_unpick_rep(rep, req_b);
-                        if (buf) got_b = req_b;
+                        uint8_t *buf = NULL;
+                        const size_t cell = (size_t)layer * m->c.n_routed + r->eid;
+                        const int do_stream = stream_verify &&
+                            !__atomic_load_n(&m->wex->state[cell], __ATOMIC_ACQUIRE);
+                        if (do_stream) {
+                            V41ShaJob *vj = &vjobs[idx];
+                            buf = v41_wex_buf_get(m->wex, &pin);
+                            vj->rec = buf; vj->eid = r->eid; vj->rpin = pin;
+                            vj->total = nr3->total_bytes;
+                            __atomic_store_n(&vj->ready, 0u, __ATOMIC_RELAXED);
+                            __atomic_store_n(&vj->done_io, 0, __ATOMIC_RELAXED);
+                            __atomic_store_n(&vj->refs, 2, __ATOMIC_RELEASE);
+                            int queued_v = 0;
+                            for (uint64_t off = 0; off < req_b; ) {
+                                uint64_t ch = req_b - off;
+                                if (ch > WEX_SHA_CHUNK) ch = WEX_SHA_CHUNK;
+                                st_read_range_rep(&m->wex->S, m->wex->t[cell * 6].fd, rep,
+                                                  (int64_t)(nr3->file_offset + off), (int64_t)ch,
+                                                  buf + off, (int64_t)(m->wex->max_slab - off),
+                                                  1, expert_direct(), "pread WNR3/WNR4 expert");
+                                off += ch;
+                                __atomic_store_n(&vj->ready, (uint32_t)off, __ATOMIC_RELEASE);
+                                pthread_mutex_lock(&pq.mx);
+                                if (!queued_v) {
+                                    pq.v_idx[pq.v_tail++] = idx;
+                                    queued_v = 1;
+                                    pthread_cond_signal(&pq.not_empty);
+                                } else {
+                                    pthread_cond_broadcast(&pq.chunk_cv);
+                                }
+                                pthread_mutex_unlock(&pq.mx);
+                            }
+                            v41_unpick_rep(rep, req_b);
+                            if (!wex_nr3_owner_ok(nr3, buf, (uint32_t)layer, (uint32_t)r->eid, m->wex->nr3_flags)) {
+                                v41_wex_refuse(m->wex, layer, r->eid, "names another expert, or another canonical-zero form");
+                                __atomic_store_n(&vj->done_io, -1, __ATOMIC_RELEASE);
+                                pthread_mutex_lock(&pq.mx);
+                                pthread_cond_broadcast(&pq.chunk_cv);
+                                pthread_mutex_unlock(&pq.mx);
+                                if (__atomic_fetch_sub(&vj->refs, 1, __ATOMIC_ACQ_REL) == 1)
+                                    v41_wex_buf_put(m->wex, buf, pin);
+                                buf = NULL;
+                            } else {
+                                __atomic_store_n(&vj->done_io, 1, __ATOMIC_RELEASE);
+                                pthread_mutex_lock(&pq.mx);
+                                pthread_cond_broadcast(&pq.chunk_cv);
+                                pthread_mutex_unlock(&pq.mx);
+                                got_b = req_b;
+                            }
+                        } else {
+                            if (vjobs) __atomic_store_n(&vjobs[idx].refs, 1, __ATOMIC_RELEASE);
+                            buf = v41_wex_read_coded(m, layer, r->eid, nr3, rep, !overlap, &pin);
+                            v41_unpick_rep(rep, req_b);
+                            if (buf) got_b = req_b;
+                        }
                         if (overlap) {
                             pthread_mutex_lock(&wq.mx);
                             if (buf) {
@@ -2785,9 +2880,16 @@ static void expert_fetch(Model *m, const char *kind, int layer,
                                 wq.count++;
                             }
                             wq.done++;
-                            if (wq.done >= coded_total) pthread_cond_broadcast(&wq.not_empty);
+                            const int io_all_done = (wq.done >= coded_total);
+                            if (io_all_done) pthread_cond_broadcast(&wq.not_empty);
                             else pthread_cond_signal(&wq.not_empty);
                             pthread_mutex_unlock(&wq.mx);
+                            if (io_all_done && stream_verify) {
+                                pthread_mutex_lock(&pq.mx);
+                                pq.v_closed = 1;
+                                pthread_cond_broadcast(&pq.not_empty);
+                                pthread_mutex_unlock(&pq.mx);
+                            }
                         } else if (buf) {
                             v41_wex_gpu_decode_wave(m, layer, slot, eid, &idx, &nr3, &buf, &pin, 1);
                         }
@@ -2834,30 +2936,96 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
         bytes += req_b;
     }
-    /* Stage 3: spare threads (and finished I/O threads) drain pq in parallel (SHA-256 / copy / fallback). */
+    /* Stage 3: spare threads (and finished I/O threads) drain vq (streaming SHA-256) and pq (copy/fallback). */
     if (overlap) {
         for (;;) {
-            int p_idx, p_rpin, p_spin, p_st;
-            const WexEntry *p_ent;
-            uint8_t *p_rec, *p_slab;
+            int work = 0; /* 1 = pq post item, 2 = vq streaming SHA-256 item */
+            int p_idx = 0, p_rpin = 0, p_spin = 0, p_st = 0, v_idx = -1;
+            const WexEntry *p_ent = NULL;
+            uint8_t *p_rec = NULL, *p_slab = NULL;
             pthread_mutex_lock(&pq.mx);
-            while (pq.count == 0 && !pq.closed)
+            for (;;) {
+                /* Drain pq first when pq is half-full (keeps pinned slabs flowing to GPU),
+                 * otherwise grab newly-landed vq items immediately to overlap SHA with I/O + GPU. */
+                if (pq.count > 0 && (pq.count >= WEX_P_CAP / 2 || pq.v_head == pq.v_tail)) {
+                    p_idx = pq.idx[pq.head]; p_ent = pq.ent[pq.head];
+                    p_rec = pq.rec[pq.head]; p_rpin = pq.rpin[pq.head];
+                    p_slab = pq.slab[pq.head]; p_spin = pq.spin[pq.head];
+                    p_st = pq.st[pq.head];
+                    pq.head = (pq.head + 1) % WEX_P_CAP;
+                    pq.count--;
+                    pthread_cond_signal(&pq.not_full);
+                    work = 1;
+                    break;
+                }
+                if (pq.v_head < pq.v_tail) {
+                    v_idx = pq.v_idx[pq.v_head++];
+                    work = 2;
+                    break;
+                }
+                if (pq.count > 0) {
+                    p_idx = pq.idx[pq.head]; p_ent = pq.ent[pq.head];
+                    p_rec = pq.rec[pq.head]; p_rpin = pq.rpin[pq.head];
+                    p_slab = pq.slab[pq.head]; p_spin = pq.spin[pq.head];
+                    p_st = pq.st[pq.head];
+                    pq.head = (pq.head + 1) % WEX_P_CAP;
+                    pq.count--;
+                    pthread_cond_signal(&pq.not_full);
+                    work = 1;
+                    break;
+                }
+                if (pq.closed && pq.v_closed) break;
                 pthread_cond_wait(&pq.not_empty, &pq.mx);
-            if (pq.count == 0 && pq.closed) {
-                pthread_mutex_unlock(&pq.mx);
-                break;
             }
-            p_idx = pq.idx[pq.head]; p_ent = pq.ent[pq.head];
-            p_rec = pq.rec[pq.head]; p_rpin = pq.rpin[pq.head];
-            p_slab = pq.slab[pq.head]; p_spin = pq.spin[pq.head];
-            p_st = pq.st[pq.head];
-            pq.head = (pq.head + 1) % WEX_P_CAP;
-            pq.count--;
-            pthread_cond_signal(&pq.not_full);
             pthread_mutex_unlock(&pq.mx);
-            const double tp0 = now_s();
-            v41_wex_post_one(m, layer, eid[p_idx], slot[p_idx], p_ent, p_rec, p_rpin, p_slab, p_spin, p_st, 1);
-            post_s += now_s() - tp0;
+            if (!work) break;
+            if (work == 2) {
+                V41ShaJob *vj = &vjobs[v_idx];
+                Wex4Sha sha;
+                wex4_sha_init(&sha);
+                uint32_t hashed = 0;
+                int aborted = 0;
+                for (;;) {
+                    uint32_t avail = __atomic_load_n(&vj->ready, __ATOMIC_ACQUIRE);
+                    int dio = __atomic_load_n(&vj->done_io, __ATOMIC_ACQUIRE);
+                    if (dio < 0) { aborted = 1; break; }
+                    if (avail > hashed) {
+                        const double th0 = now_s();
+                        wex4_sha_update(&sha, vj->rec + hashed, (size_t)(avail - hashed));
+                        post_s += now_s() - th0;
+                        hashed = avail;
+                        continue;
+                    }
+                    if (dio > 0 && hashed >= vj->total) break;
+                    pthread_mutex_lock(&pq.mx);
+                    avail = __atomic_load_n(&vj->ready, __ATOMIC_ACQUIRE);
+                    dio = __atomic_load_n(&vj->done_io, __ATOMIC_ACQUIRE);
+                    if (dio == 0 && avail == hashed)
+                        pthread_cond_wait(&pq.chunk_cv, &pq.mx);
+                    pthread_mutex_unlock(&pq.mx);
+                }
+                if (!aborted) {
+                    unsigned char digest[32];
+                    const size_t cell = (size_t)layer * (size_t)m->wex->experts + (size_t)vj->eid;
+                    const double th0 = now_s();
+                    wex4_sha_final(&sha, digest);
+                    post_s += now_s() - th0;
+                    if (memcmp(digest, m->wex->sha + cell * 32, 32)) {
+                        v41_wex_refuse(m->wex, layer, vj->eid, "does not match its SHA-256 in the index");
+                    } else {
+                        unsigned char expected = 0;
+                        __atomic_compare_exchange_n(&m->wex->state[cell], &expected, (unsigned char)1,
+                                                    0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+                    }
+                }
+                if (__atomic_fetch_sub(&vj->refs, 1, __ATOMIC_ACQ_REL) == 1)
+                    v41_wex_buf_put(m->wex, vj->rec, vj->rpin);
+            } else {
+                const double tp0 = now_s();
+                v41_wex_post_one(m, layer, eid[p_idx], slot[p_idx], p_ent, p_rec, p_rpin, p_slab, p_spin, p_st,
+                                 !stream_verify, stream_verify ? &vjobs[p_idx].refs : NULL);
+                post_s += now_s() - tp0;
+            }
         }
     }
     }
@@ -2867,6 +3035,9 @@ static void expert_fetch(Model *m, const char *kind, int layer,
             m->wex->t_gpu += gpu_s;
             m->wex->t_post += post_s;
         }
+        if (vjobs && vjobs != vjobs_s) free(vjobs);
+        free(vq_heap);
+        pthread_cond_destroy(&pq.chunk_cv);
         pthread_cond_destroy(&pq.not_full);
         pthread_cond_destroy(&pq.not_empty);
         pthread_mutex_destroy(&pq.mx);
@@ -7515,22 +7686,49 @@ static int vk_placed(const void *data) {   /* on the device already (the dense w
     V41Home *h = v41_home_of(data);
     return h && h->gone;
 }
-static size_t vk_w8_bytes(const W8 *w) {   /* as the device holds it: fmt 12, an f32 per 32 inputs */
-    if (w->gx || vk_placed(w->q)) return 0;   /* a GGUF's ggml blocks stay on the CPU */
-    return w->q ? (size_t)w->O * w->I + (size_t)w->O * ((w->I + FP8_TILE - 1) / FP8_TILE) * 4 : 0;
+static size_t vk_align_up(size_t n, size_t a) { return a ? (n + a - 1) / a * a : n; }
+static size_t vk_w8_bytes(const W8 *w, size_t al) {   /* as the device holds it: fmt 12, an f32 per 32 inputs */
+    if (w->gx || !w->q || vk_placed(w->q)) return 0;   /* a GGUF's ggml blocks stay on the CPU */
+    VkEntry *e = vk_find(w->q, 12, w->O, w->I);
+    if (e && e->t) return 0;                           /* already uploaded (e.g. v41c_start with COLI_VK_DENSE_HOST=1) */
+    size_t wb = ((size_t)w->I + 3) / 4 * 4 * (size_t)w->O;
+    size_t sb = (size_t)w->O * ((w->I + FP8_TILE - 1) / FP8_TILE) * 4;
+    return vk_align_up(wb, al) + vk_align_up(sb, al);
 }
-static size_t vk_wb_bytes(const WB *w) { return !w->gx && w->w && !vk_placed(w->w) ? (size_t)w->O * w->I * 2 : 0; }
+static size_t vk_wb_bytes(const WB *w, size_t al) {
+    if (w->gx || !w->w || vk_placed(w->w)) return 0;
+    VkEntry *e = vk_find(w->w, 11, w->O, w->I);
+    if (e && e->t) return 0;
+    size_t wb = ((size_t)w->I * 2 + 3) / 4 * 4 * (size_t)w->O;
+    return vk_align_up(wb, al) + vk_align_up(sizeof(float), al);
+}
 /* The trunk the dense hook would put on the device, for the tier's budget. */
 static size_t vk_dense_bytes(Model *m) {
     if (!coli_vk_dense() || g_v41_partial) return 0;   /* a partial chain: the per-matrix path uploads nothing new */
-    size_t b = vk_wb_bytes(&m->head);
+    size_t al = coli_vk_buffer_alignment();
+    if (!al) al = 256;
+    /* Credit the contiguous free tail already allocated inside g_wpool (pool 0) by
+     * the dense chain's trunk upload: small unplaced matrices (such as gate_w) fit
+     * inside that existing block without allocating new device memory. */
+    ColiVkPoolStats ws;
+    coli_vk_pool_stats(0, &ws);
+    size_t avail = ws.largest_free > al ? ws.largest_free - al : 0;
+    size_t b = 0;
+    size_t hb = vk_wb_bytes(&m->head, al);
+    if (hb <= avail) avail -= hb; else b += hb;
     for (int i = 0; i < m->c.n_layers; i++) {
         Layer *L = &m->L[i];
         const W8 *w8[] = {&L->wq_a, &L->wq_b, &L->wkv, &L->wo_a, &L->wo_b, &L->idx_wq_b,
                           &L->sh_w1, &L->sh_w3, &L->sh_w2, &L->eng_wkv};
         const WB *wb[] = {&L->comp_wkv, &L->comp_wgate, &L->idx_wk, &L->idx_wproj, &L->gate_w};
-        for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) b += vk_w8_bytes(w8[k]);
-        for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) b += vk_wb_bytes(wb[k]);
+        for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) {
+            size_t nb = vk_w8_bytes(w8[k], al);
+            if (nb <= avail) avail -= nb; else b += nb;
+        }
+        for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) {
+            size_t nb = vk_wb_bytes(wb[k], al);
+            if (nb <= avail) avail -= nb; else b += nb;
+        }
     }
     return b;
 }
@@ -7810,14 +8008,24 @@ static void v41_wex_warm_start(Model *m, const int *pl, const int *pe, int n) {
     pthread_cond_init(&pq.not_empty, NULL);
     pthread_cond_init(&pq.not_full, NULL);
 
+#ifdef COLI_CUDA
+    int direct_cu_dev = -1;
+    const unsigned int warm_cu_bits = coli_wex_cuda_features();
+    const int warm_direct = xt_cuda() && (warm_cu_bits & COLI_WEX_CUDA_BATCH) &&
+                            (w->is_wnr4 ? (warm_cu_bits & COLI_WEX_CUDA_NR4)
+                                        : ((warm_cu_bits & COLI_WEX_CUDA_NR2) && (warm_cu_bits & COLI_WEX_CUDA_NR3))) &&
+                            cut_warm_direct_ready(&direct_cu_dev);
+#else
+    const int warm_direct = 0;
+#endif
     int depth = expert_read_depth();
     if (depth > 8) depth = 8;
     if (depth > n) depth = n;
-    /* Keep peak in-flight WEX buffers <= V41_WEX_PIN_SLOTS (32): 8 I/O + 8 wq + 6*2 gpu + 6*2 pq
-     * stays almost entirely inside the single pre-pinned arena (zero unpinned DMA fallback). */
+    /* Keep peak in-flight WEX buffers <= V41_WEX_PIN_SLOTS (52): 8 I/O + 8 wq + 6*2 gpu + 6*2 pq
+     * stays inside the single pre-pinned arena (zero unpinned DMA fallback). */
     const int gpu_threads = 1;
     const int io_threads = depth;
-    const int post_threads = 6;
+    const int post_threads = warm_direct ? 2 : 6;
     const int team = io_threads + gpu_threads + post_threads;
     int next_i = 0;
     uint64_t warm_reads = 0, warm_dec = 0;
@@ -7862,12 +8070,60 @@ static void v41_wex_warm_start(Model *m, const int *pl, const int *pe, int n) {
                 pthread_mutex_unlock(&wq.mx);
                 if (finished) break;
                 if (cnt == 0) continue;
+#ifdef COLI_CUDA
+                if (warm_direct) {
+                    CutWarmDirect wd[WM_WAVE];
+                    const WexEntry *dew[WM_WAVE], *hew[WM_WAVE];
+                    uint8_t *drw[WM_WAVE], *hrw[WM_WAVE];
+                    unsigned char *dds[WM_WAVE * 3], *ddw[WM_WAVE * 3];
+                    int didx[WM_WAVE], drpin[WM_WAVE], dst_w[WM_WAVE], dok[WM_WAVE];
+                    int hidx[WM_WAVE], hrpin[WM_WAVE];
+                    int nd = 0, nh = 0;
+                    for (int j = 0; j < cnt; j++) {
+                        unsigned char *tw[3], *ts[3];
+                        if (cut_warm_direct_alloc(pl[idxs[j]], pe[idxs[j]], &wd[nd], tw, ts)) {
+                            /* Tier order (0=gate,1=up,2=down) -> WEX order (0=w1/gate,1=w2/down,2=w3/up) */
+                            ddw[3 * nd + 0] = tw[0]; ddw[3 * nd + 1] = tw[2]; ddw[3 * nd + 2] = tw[1];
+                            dds[3 * nd + 0] = ts[0]; dds[3 * nd + 1] = ts[2]; dds[3 * nd + 2] = ts[1];
+                            didx[nd] = idxs[j]; dew[nd] = ew[j]; drw[nd] = rw[j]; drpin[nd] = rpin[j];
+                            dst_w[nd] = 1;
+                            nd++;
+                        } else {
+                            hidx[nh] = idxs[j]; hew[nh] = ew[j]; hrw[nh] = rw[j]; hrpin[nh] = rpin[j];
+                            nh++;
+                        }
+                    }
+                    if (nd > 0) {
+                        const double tg0 = now_s();
+                        coli_wex_cuda_decode_batch_to_device(nd, dew, (const unsigned char *const *)drw,
+                                                             direct_cu_dev, dds, ddw, dst_w);
+                        for (int j = 0; j < nd; j++) dok[j] = (dst_w[j] == 0);
+                        const int nc = cut_warm_direct_commit(wd, dok, nd);
+                        gpu_s += now_s() - tg0;
+                        warm_reads += (uint64_t)nc;
+                        warm_dec += (uint64_t)nc;
+                        for (int j = 0; j < nd; j++) {
+                            if (dok[j] && nc > 0) {
+                                v41_wex_buf_put(w, drw[j], drpin[j]);
+                            } else {
+                                hidx[nh] = didx[j]; hew[nh] = dew[j]; hrw[nh] = drw[j]; hrpin[nh] = drpin[j];
+                                nh++;
+                            }
+                        }
+                    }
+                    if (nh == 0) continue;
+                    cnt = nh;
+                    for (int j = 0; j < cnt; j++) {
+                        idxs[j] = hidx[j]; ew[j] = hew[j]; rw[j] = hrw[j]; rpin[j] = hrpin[j];
+                    }
+                }
+#endif
                 for (int j = 0; j < cnt; j++) {
                     slabs[j] = v41_wex_buf_get(w, &spin[j]);
                     st_w[j] = 1;
                 }
                 const double tg0 = now_s();
-                coli_wex_cuda_decode_batch_to_host(cnt, ew, (const unsigned char *const *)rw, 0, slabs, st_w);
+                coli_wex_cuda_decode_batch_to_host_scratch(cnt, ew, (const unsigned char *const *)rw, 0, slabs, st_w);
                 gpu_s += now_s() - tg0;
                 pthread_mutex_lock(&pq.mx);
                 for (int j = 0; j < cnt; j++) {
@@ -7904,7 +8160,9 @@ static void v41_wex_warm_start(Model *m, const int *pl, const int *pe, int n) {
                     int pin = 0;
                     if (e) {
                         const int rep = v41_pick_rep(&w->S, w->t[cell * 6].fd, expert_route(layer, eid), e->total_bytes);
-                        rec = v41_wex_read_coded(m, layer, eid, e, rep, 0, &pin);
+                        /* When warm_direct=1, verify SHA-256 across the 8 I/O threads (21+ GB/s) so
+                         * Stage 2 never stalls on serial hashing or decodes a tampered record into VRAM. */
+                        rec = v41_wex_read_coded(m, layer, eid, e, rep, warm_direct, &pin);
                         v41_unpick_rep(rep, e->total_bytes);
                     }
                     if (rec) {
@@ -8002,7 +8260,42 @@ static void v41_wex_warm_start(Model *m, const int *pl, const int *pe, int n) {
     pthread_cond_destroy(&wq.not_empty);
     pthread_mutex_destroy(&wq.mx);
 }
-static void vk_tier_start(Model *m, const char *snap, int cap) {
+/* Whether DSpark can run in this process: always possible in SERVE=1, and in
+ * reference-file mode only when V41_SPEC_FORCE != 0 or ref.json carries spec.drafts.
+ * Skipping the extra-layer VRAM pool otherwise frees 1.4-2.0 GiB (~70-97 experts)
+ * for backbone routed experts. */
+static int v41_want_spec_tier(const Model *m, int serve, const char *ref_path) {
+    if (!m->spec.active) return 0;
+    if (serve) return 1;
+    if (getenv("V41_SPEC_FORCE") && atoi(getenv("V41_SPEC_FORCE")) != 0) return 1;
+    if (!ref_path) return 0;
+    FILE *f = fopen(ref_path, "rb");
+    if (!f) return 0;
+    int has = 0;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long sz = ftell(f);
+        if (sz > 0 && sz < (64L << 20) && fseek(f, 0, SEEK_SET) == 0) {
+            char *txt = malloc((size_t)sz + 1);
+            if (txt) {
+                if (fread(txt, 1, (size_t)sz, f) == (size_t)sz) {
+                    txt[sz] = 0;
+                    char *ar = NULL;
+                    jval *rt = json_parse(txt, &ar);
+                    if (rt) {
+                        jval *sr = json_get(rt, "spec");
+                        has = sr && sr->t == J_OBJ && json_get(sr, "drafts") != NULL;
+                        json_free(rt);
+                    }
+                    free(ar);
+                }
+                free(txt);
+            }
+        }
+    }
+    fclose(f);
+    return has;
+}
+static void vk_tier_start(Model *m, const char *snap, int cap, int want_spec) {
     Cfg *c = &m->c;
     if (!v41_tier_dev() || c->n_routed < 1 || !XT(wanted)()) return;
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32}, gu = f, dn = f;
@@ -8017,7 +8310,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
      * layer on the tier"); COLI_VK_TIER_MTP=1 or 0 decides. */
     const char *tm = getenv("COLI_VK_TIER_MTP");
     int want_mtp = tm && *tm ? *tm != '0' : !v41_tier_shares_ram();
-    int stages = want_mtp && m->spec.active && c->spec_routed <= c->n_routed && c->spec_activated <= MOE_TOPK_MAX ? c->n_mtp : 0;
+    int stages = want_spec && want_mtp && m->spec.active && c->spec_routed <= c->n_routed && c->spec_activated <= MOE_TOPK_MAX ? c->n_mtp : 0;
     VktConfig vc = {.engine = "deepseek_v41", .layers = c->n_layers, .experts = c->n_routed,
                     .hidden = c->dim, .inter = c->moe_inter, .topk = c->n_activated,
                     .gate_up = gu, .down = dn, .layer_gate_up = lgu, .layer_down = ldn,
@@ -8232,6 +8525,9 @@ int main(int argc, char **argv) {
         atexit(cluster_close_all);
     }
 #endif
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    const int want_spec_tier = v41_want_spec_tier(&m, getenv("SERVE") && atoi(getenv("SERVE")), ref_path);
+#endif
 #ifdef COLI_VULKAN
     /* After the weights, as in glm53: the device is an option, never a requirement.
      * The matrices go up on their first multiply (see vk_mul), from this thread. */
@@ -8252,7 +8548,7 @@ int main(int argc, char **argv) {
             : "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower");
     v41c_start(&m);              /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
     coli_vk_window_trunk_ask();  /* trunk-first: the mapped-weights window asked around the trunk, before the tier sizes itself */
-    vk_tier_start(&m, snap, cap);
+    vk_tier_start(&m, snap, cap, want_spec_tier);
     v41c_atexit();               /* after the tier's: the chain goes before the device */
     if (g_vk_ready && !vkt_ready() && !coli_vk_dense())
         coli_vk_dense_decide("deepseek_v41", 0, 1);   /* no tier after all: the trunk to the device */
@@ -8269,7 +8565,7 @@ int main(int argc, char **argv) {
                 g_v41_cu = 1;
                 xt_use_cuda(1);
                 g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0), v41_cu_dense_bytes(&m));
-                vk_tier_start(&m, snap, cap);
+                vk_tier_start(&m, snap, cap, want_spec_tier);
                 if (!cut_ready()) { xt_use_cuda(0); g_v41_cu = 0; g_cud.on = 0; }
             }
         }

@@ -38,6 +38,7 @@
 #include <thread>
 #include <vector>
 #include "../wex_format.h"
+#include "../third_party/wnr4/wnr4.h"
 
 typedef int (*RegFn)(const unsigned char *, size_t);
 typedef int (*HostFn)(const WexEntry *, unsigned char *, size_t);
@@ -52,7 +53,8 @@ typedef unsigned int (*FeatFn)(void);
     fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
 
-static RegFn reg; static HostFn host_fn; static DevFn dev; static BatchFn batch; static BatchHostFn batch_host;
+static RegFn reg, reg_wnr4; static HostFn host_fn; static DevFn dev; static BatchFn batch;
+static BatchHostFn batch_host, batch_host_scratch;
 
 struct Rec { WexEntry e; std::vector<unsigned char> expected, record; };
 
@@ -127,9 +129,9 @@ static bool host_untouched(const std::vector<unsigned char> &v) {
     return true;
 }
 
-/* GPU batch decode of n records into host buffers (feature 32); out[i] = raw slab */
+/* GPU batch decode of n records into host buffers (feature 32 / 128); out[i] = raw slab */
 static void gpu_batch_host(const std::vector<const Rec *> &rs, const std::vector<unsigned char *> &pinned,
-                           std::vector<int> &st, std::vector<std::vector<unsigned char>> &out) {
+                           std::vector<int> &st, std::vector<std::vector<unsigned char>> &out, bool scratch = false) {
     int n = (int)rs.size();
     std::vector<const WexEntry *> es(n); std::vector<const unsigned char *> ps(n); std::vector<unsigned char *> ds(n);
     st.assign(n, 7); out.resize(n);
@@ -137,7 +139,7 @@ static void gpu_batch_host(const std::vector<const Rec *> &rs, const std::vector
         out[i].assign((size_t)rs[i]->e.scale_bytes + rs[i]->e.weight_bytes, 0xA5);
         es[i] = &rs[i]->e; ps[i] = pinned[i]; ds[i] = out[i].data();
     }
-    int bad = batch_host(n, es.data(), ps.data(), 0, ds.data(), st.data());
+    int bad = (scratch ? batch_host_scratch : batch_host)(n, es.data(), ps.data(), 0, ds.data(), st.data());
     CHECK(bad == (int)std::count_if(st.begin(), st.end(), [](int v) { return v != 0; }));
 }
 
@@ -193,11 +195,15 @@ static void compare_all_paths(Arena &a, const Rec &r, const WexNr2Model &model, 
     gpu_batch(a, {&r}, st, pin);
     CHECK(st[0] == cs);
     if (!cs) CHECK(a.fetch(0, r.e) == r.expected); else CHECK(a.untouched(0));
-    /* batch to host: dst untouched on failure */
+    /* batch to host: dst untouched on failure; batch_host_scratch: same status & bytes on success */
     { std::vector<int> hs; std::vector<std::vector<unsigned char>> ho;
-      gpu_batch_host({&r}, pin, hs, ho);
+      gpu_batch_host({&r}, pin, hs, ho, false);
       CHECK(hs[0] == cs);
       if (!cs) CHECK(ho[0] == r.expected); else CHECK(host_untouched(ho[0])); }
+    { std::vector<int> hs; std::vector<std::vector<unsigned char>> ho;
+      gpu_batch_host({&r}, pin, hs, ho, true);
+      CHECK(hs[0] == cs);
+      if (!cs) CHECK(ho[0] == r.expected); }
     /* single to device */
     unsigned char *s3[3] = {a.ds[0], a.ds[1], a.ds[2]}, *w3[3] = {a.dw[0], a.dw[1], a.dw[2]};
     CK(cudaMemset(a.base, 0xA5, a.per));
@@ -487,6 +493,153 @@ static void bin_test(Arena &a, const char *path, int mutations) {
            path, n, n, mutations, same, accepted);
 }
 
+/* 5. WNR4-MX (codec 8): 1-stream and 2-stream overlap across n=1,2,3,6,8 for to_host,
+ * to_device, batch_to_device, batch_to_host (strict untouched on failure) and
+ * batch_to_host_scratch (single-sync), including mixed clean + corrupted records in both lanes. */
+static void wnr4_gpu_test(Arena &a) {
+    WexEntry base = synth_entry(256u, 1024u);
+    WexNr2Layout layout; wex_nr2_layout(&base, &layout);
+    Wnr4Geo geo;
+    uint32_t scount[3], scols[3];
+    for (int m = 0; m < 3; m++) {
+        scount[m] = (uint32_t)base.scale_shapes[m][0] * base.scale_shapes[m][1];
+        scols[m] = base.scale_shapes[m][1];
+    }
+    CHECK(!wnr4_geo(&geo, WNR4_KIND_MX, scount, scols, base.scale_offsets, base.weight_offsets));
+    size_t raw = (size_t)base.scale_bytes + base.weight_bytes;
+    uint64_t r64, aligned; CHECK(!wex_entry_raw_sizes(&base, &r64, &aligned));
+    for (int cz = 0; cz < 2; cz++) {
+        std::vector<uint64_t> counts(wnr4_counts_words(WNR4_KIND_MX, 5u), 0);
+        std::vector<unsigned char> src(raw), coded(raw);
+        unsigned char *s[3], *w[3];
+        for (uint32_t seed = 1; seed <= 3u; seed++) {
+            synth_fill(base, src.data(), seed * 9011u + (uint32_t)cz * 37u);
+            coded = src;
+            if (cz) wex_nr3_canonical_zero(coded.data() + base.scale_bytes, base.weight_bytes);
+            views(base, coded.data(), s, w);
+            wex_nr3_ceil_forward(&layout, s, w, NULL);
+            unsigned char anchor[3];
+            for (int m = 0; m < 3; m++) anchor[m] = wnr4_anchor(s[m], scount[m]);
+            wnr4_count(&geo, coded.data(), anchor, 5u, counts.data());
+        }
+        std::vector<unsigned char> blob(wnr4_model_bytes(WNR4_KIND_MX, 5u));
+        wnr4_model_build(WNR4_KIND_MX, 5u, counts.data(), blob.data());
+        Wnr4Model model;
+        CHECK(!wnr4_model_open(blob.data(), blob.size(), &model) && reg_wnr4(blob.data(), blob.size()) == 0);
+        std::vector<Rec> recs(8);
+        std::vector<unsigned char> enc(2 * raw + 65536);
+        for (int i = 0; i < 8; i++) {
+            synth_fill(base, src.data(), 10007u + (uint32_t)i * 7919u + (uint32_t)cz * 131u);
+            coded = src;
+            if (cz) wex_nr3_canonical_zero(coded.data() + base.scale_bytes, base.weight_bytes);
+            views(base, coded.data(), s, w);
+            uint32_t flags = wex_nr3_ceil_forward(&layout, s, w, NULL) | (cz ? WNR4_FLAG_CZ : 0u);
+            std::vector<unsigned char> expected = src;
+            if (cz) wex_nr3_canonical_zero(expected.data() + base.scale_bytes, base.weight_bytes);
+            size_t total = wnr4_encode(&model, &geo, coded.data(), flags, 0x00050000u + (uint32_t)i, 4u, enc.data(), enc.size());
+            CHECK(total > 0 && total < aligned);
+            std::vector<unsigned char> cpu_dec(raw, 0);
+            CHECK(wnr4_decode(&model, &geo, enc.data(), total, 0x00050000u + (uint32_t)i, cpu_dec.data(), 1) == 0);
+            CHECK(cpu_dec == expected);
+            recs[(size_t)i].e = base;
+            recs[(size_t)i].e.flags = WEX_ENTRY_WNR4;
+            recs[(size_t)i].e.total_bytes = (uint32_t)total;
+            recs[(size_t)i].record.assign(enc.begin(), enc.begin() + total);
+            recs[(size_t)i].expected = expected;
+        }
+        a.init(recs);
+        std::vector<unsigned char *> pin(8, nullptr);
+        for (int i = 0; i < 8; i++) {
+            CK(cudaMallocHost((void **)&pin[(size_t)i], recs[(size_t)i].record.size()));
+            memcpy(pin[(size_t)i], recs[(size_t)i].record.data(), recs[(size_t)i].record.size());
+        }
+        /* Single entry points: to_host and to_device */
+        {
+            std::vector<unsigned char> slab((size_t)aligned, 0x5a);
+            size_t at = wex_record_read_offset(&recs[0].e);
+            memcpy(slab.data() + at, recs[0].record.data(), recs[0].record.size());
+            CHECK(host_fn(&recs[0].e, slab.data(), slab.size()) == 0 && !memcmp(slab.data(), recs[0].expected.data(), raw));
+            unsigned char *s3[3] = {a.ds[0], a.ds[1], a.ds[2]}, *w3[3] = {a.dw[0], a.dw[1], a.dw[2]};
+            CK(cudaMemset(a.base, 0xA5, a.per));
+            CHECK(dev(&recs[0].e, pin[0], 0, s3, w3) == 0 && a.fetch(0, recs[0].e) == recs[0].expected);
+        }
+        /* Multi-size waves (1, 2, 3, 6, 8) covering both 1-stream and 2-stream overlap */
+        static const int sizes[] = {1, 2, 3, 6, 8};
+        for (int n : sizes) {
+            std::vector<const Rec *> rs;
+            for (int i = 0; i < n; i++) rs.push_back(&recs[(size_t)i]);
+            std::vector<int> st;
+            std::vector<const WexEntry *> es((size_t)n);
+            std::vector<const unsigned char *> ps((size_t)n);
+            for (int i = 0; i < n; i++) { es[(size_t)i] = &recs[(size_t)i].e; ps[(size_t)i] = pin[(size_t)i]; }
+            st.assign((size_t)n, 7);
+            CK(cudaMemset(a.base, 0xA5, a.per * (size_t)n));
+            CHECK(batch(n, es.data(), ps.data(), 0, a.ds.data(), a.dw.data(), st.data()) == 0);
+            for (int i = 0; i < n; i++) { CHECK(st[(size_t)i] == 0); CHECK(a.fetch(i, recs[(size_t)i].e) == recs[(size_t)i].expected); }
+            std::vector<std::vector<unsigned char>> ho;
+            gpu_batch_host(rs, pin, st, ho, false);
+            for (int i = 0; i < n; i++) { CHECK(st[(size_t)i] == 0); CHECK(ho[(size_t)i] == recs[(size_t)i].expected); }
+            gpu_batch_host(rs, pin, st, ho, true);
+            for (int i = 0; i < n; i++) { CHECK(st[(size_t)i] == 0); CHECK(ho[(size_t)i] == recs[(size_t)i].expected); }
+        }
+        /* Mixed valid + corrupted 8-record 2-stream batch:
+         * lane 0 (0..3): rec 1 payload bitflip (fails on GPU hash), rec 2 header corrupt (fails plan)
+         * lane 1 (4..7): rec 5 payload bitflip (fails on GPU hash) */
+        {
+            std::vector<Rec> mix = recs;
+            mix[1].record[mix[1].record.size() / 2u] ^= 0x40u;
+            mix[2].record[0] ^= 0x01u;   /* corrupt WNR4 magic: rejected at host plan */
+            mix[5].record[mix[5].record.size() / 2u] ^= 0x20u;
+            std::vector<const Rec *> rs(8);
+            std::vector<const WexEntry *> es(8);
+            std::vector<const unsigned char *> ps(8);
+            std::vector<unsigned char *> mpin(8, nullptr);
+            for (int i = 0; i < 8; i++) {
+                rs[(size_t)i] = &mix[(size_t)i];
+                es[(size_t)i] = &mix[(size_t)i].e;
+                CK(cudaMallocHost((void **)&mpin[(size_t)i], mix[(size_t)i].record.size()));
+                memcpy(mpin[(size_t)i], mix[(size_t)i].record.data(), mix[(size_t)i].record.size());
+                ps[(size_t)i] = mpin[(size_t)i];
+            }
+            std::vector<int> expect(8, 0);
+            for (int i = 0; i < 8; i++) {
+                std::vector<unsigned char> tmp(raw, 0);
+                expect[(size_t)i] = wnr4_decode(&model, &geo, mix[(size_t)i].record.data(),
+                                                mix[(size_t)i].record.size(), 0x00050000u + (uint32_t)i, tmp.data(), 1) ? -1 : 0;
+            }
+            CHECK(expect[1] == -1 && expect[2] == -1 && expect[5] == -1);
+            CHECK(expect[0] == 0 && expect[3] == 0 && expect[4] == 0 && expect[6] == 0 && expect[7] == 0);
+            /* Strict batch_host: failed slots MUST stay untouched (0xA5) */
+            std::vector<int> st; std::vector<std::vector<unsigned char>> ho;
+            gpu_batch_host(rs, mpin, st, ho, false);
+            for (int i = 0; i < 8; i++) {
+                CHECK(st[(size_t)i] == expect[(size_t)i]);
+                if (!expect[(size_t)i]) CHECK(ho[(size_t)i] == mix[(size_t)i].expected);
+                else CHECK(host_untouched(ho[(size_t)i]));
+            }
+            /* Scratch batch_host_scratch: same status, valid slots exact */
+            gpu_batch_host(rs, mpin, st, ho, true);
+            for (int i = 0; i < 8; i++) {
+                CHECK(st[(size_t)i] == expect[(size_t)i]);
+                if (!expect[(size_t)i]) CHECK(ho[(size_t)i] == mix[(size_t)i].expected);
+            }
+            /* Device batch: same status, valid slots exact */
+            st.assign(8, 7);
+            CK(cudaMemset(a.base, 0xA5, a.per * 8u));
+            int bad = batch(8, es.data(), ps.data(), 0, a.ds.data(), a.dw.data(), st.data());
+            CHECK(bad == 3);
+            for (int i = 0; i < 8; i++) {
+                CHECK(st[(size_t)i] == expect[(size_t)i]);
+                if (!expect[(size_t)i]) CHECK(a.fetch(i, mix[(size_t)i].e) == mix[(size_t)i].expected);
+            }
+            for (auto p : mpin) if (p) cudaFreeHost(p);
+        }
+        for (auto p : pin) if (p) cudaFreeHost(p);
+        wnr4_model_free(&model);
+        printf("wnr4 cz=%d: waves {1,2,3,6,8} x {to_host,to_device,batch_dev,batch_host,batch_scratch} + mixed corrupt 2-stream OK\n", cz);
+    }
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) return 2;
@@ -495,15 +648,19 @@ int main(int argc, char **argv) {
     FeatFn abi = (FeatFn)helper_symbol(h, "wex_cuda_helper_abi");
     FeatFn feat = (FeatFn)helper_symbol(h, "wex_cuda_helper_features");
     reg = (RegFn)helper_symbol(h, "wex_cuda_register_model");
+    reg_wnr4 = (RegFn)helper_symbol(h, "wex_cuda_register_wnr4_model");
     host_fn = (HostFn)helper_symbol(h, "wex_cuda_decode_to_host");
     dev = (DevFn)helper_symbol(h, "wex_cuda_decode_to_device");
     batch = (BatchFn)helper_symbol(h, "wex_cuda_decode_batch_to_device");
     batch_host = (BatchHostFn)helper_symbol(h, "wex_cuda_decode_batch_to_host");
-    CHECK(abi && abi() == 1u && feat && (feat() & 63u) == 63u && reg && host_fn && dev && batch && batch_host);
+    batch_host_scratch = (BatchHostFn)helper_symbol(h, "wex_cuda_decode_batch_to_host_scratch");
+    CHECK(abi && abi() == 1u && feat && (feat() & 255u) == 255u && reg && reg_wnr4 && host_fn && dev && batch &&
+          batch_host && batch_host_scratch);
     printf("helper %s: ABI 1, features %u\n", argv[1], feat());
     CK(cudaSetDevice(0));
     Arena a;
     synthetic(a);
+    wnr4_gpu_test(a);
     thread_churn();
     int mutations = argc > 2 ? atoi(argv[2]) : 120;
     for (int i = 3; i < argc; i++) bin_test(a, argv[i], mutations);

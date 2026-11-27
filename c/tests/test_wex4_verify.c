@@ -158,7 +158,100 @@ static void unused_by_engines(const unsigned char *w4, size_t bytes) {
     free(data); free(coded); free(back);
 }
 
+/* FIPS 180-4 known-answer vectors plus scalar-vs-accelerated differential tests across edge
+ * lengths, unaligned pointers, and incremental chunked updates. */
+static void sha256_scalar_ref(const unsigned char *p, size_t n, unsigned char out[32]) {
+    Wex4Sha s;
+    uint64_t bits = (uint64_t)n * 8u;
+    unsigned char pad[72] = {0x80}, len[8];
+    size_t fill, pad_len;
+    unsigned int i;
+    wex4_sha_init(&s);
+    while (n >= 64u) { wex4_sha_block(s.h, p); p += 64u; n -= 64u; }
+    if (n) memcpy(s.buf, p, n);
+    fill = n;
+    pad_len = (size_t)((119u - fill) & 63u) + 1u;
+    for (i = 0; i < 8u; i++) len[i] = (unsigned char)(bits >> (56u - i * 8u));
+    for (i = 0; i < pad_len; i++) {
+        s.buf[fill++] = pad[i];
+        if (fill == 64u) { wex4_sha_block(s.h, s.buf); fill = 0; }
+    }
+    for (i = 0; i < 8u; i++) {
+        s.buf[fill++] = len[i];
+        if (fill == 64u) { wex4_sha_block(s.h, s.buf); fill = 0; }
+    }
+    assert(fill == 0);
+    for (i = 0; i < 32u; i++) out[i] = (unsigned char)(s.h[i / 4u] >> (24u - (i % 4u) * 8u));
+}
+
+static void sha256_hex(const unsigned char d[32], char hex[65]) {
+    for (unsigned int i = 0; i < 32u; i++) snprintf(hex + i * 2u, 3u, "%02x", d[i]);
+}
+
+static void sha256_tests(void) {
+    static const struct { const char *msg; const char *hex; } kat[] = {
+        {"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"},
+        {"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
+         "ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+         "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"},
+    };
+    unsigned char d_hw[32], d_sc[32], d_st[32];
+    char hex[65];
+    for (size_t k = 0; k < sizeof kat / sizeof kat[0]; k++) {
+        size_t len = strlen(kat[k].msg);
+        wex4_sha256((const unsigned char *)kat[k].msg, len, d_hw);
+        sha256_scalar_ref((const unsigned char *)kat[k].msg, len, d_sc);
+        sha256_hex(d_hw, hex);
+        assert(!strcmp(hex, kat[k].hex));
+        assert(!memcmp(d_hw, d_sc, 32u));
+    }
+    /* FIPS 180-4 1,000,000 x 'a' vector */
+    {
+        unsigned char *million = malloc(1000000u);
+        assert(million);
+        memset(million, 'a', 1000000u);
+        wex4_sha256(million, 1000000u, d_hw);
+        sha256_hex(d_hw, hex);
+        assert(!strcmp(hex, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"));
+        free(million);
+    }
+    /* Scalar vs accelerated differential on edge lengths, unaligned starts, and chunked updates */
+    static const size_t lens[] = {0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 4096, 65537};
+    static const size_t chunks[] = {1, 7, 63, 64, 65, 1000};
+    unsigned char *buf = malloc(65537u + 16u);
+    uint32_t seed = 0x12345678u;
+    assert(buf);
+    for (size_t i = 0; i < 65537u + 16u; i++) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        buf[i] = (unsigned char)seed;
+    }
+    for (size_t li = 0; li < sizeof lens / sizeof lens[0]; li++) {
+        size_t n = lens[li];
+        const unsigned char *src = buf + (li & 7u);   /* test unaligned pointers too */
+        wex4_sha256(src, n, d_hw);
+        sha256_scalar_ref(src, n, d_sc);
+        assert(!memcmp(d_hw, d_sc, 32u));
+        for (size_t ci = 0; ci < sizeof chunks / sizeof chunks[0]; ci++) {
+            Wex4Sha s;
+            size_t off = 0, step = chunks[ci];
+            wex4_sha_init(&s);
+            while (off < n) {
+                size_t take = n - off < step ? n - off : step;
+                wex4_sha_update(&s, src + off, take);
+                off += take;
+            }
+            wex4_sha_final(&s, d_st);
+            assert(!memcmp(d_st, d_sc, 32u));
+        }
+    }
+    free(buf);
+}
+
 int main(void) {
+    sha256_tests();
     size_t old_bytes, bytes;
     char root[65], got[65], other[65];
     unsigned char *old = wex1(&old_bytes), *w4 = wex4_fixture_from_wex1(old, old_bytes, &bytes, root);

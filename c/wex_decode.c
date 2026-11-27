@@ -51,6 +51,7 @@ static struct {
     WexCudaModelFn wnr4_model;
     WexCudaBatchFn batch;
     WexCudaBatchHostFn batch_host;
+    WexCudaBatchHostFn batch_host_scratch;
     WexCudaRegisterFn host_register;
     WexCudaUnregisterFn host_unregister;
     uint64_t host_decodes, device_decodes;
@@ -130,6 +131,9 @@ static void wex_cuda_load(void) {
     if (bits & COLI_WEX_CUDA_NR4)
         if ((wex_cuda.wnr4_model = (WexCudaModelFn)wex_cuda_symbol(library, "wex_cuda_register_wnr4_model")))
             have |= COLI_WEX_CUDA_NR4;
+    if (bits & COLI_WEX_CUDA_BATCH_HOST_SCRATCH)
+        if ((wex_cuda.batch_host_scratch = (WexCudaBatchHostFn)wex_cuda_symbol(library, "wex_cuda_decode_batch_to_host_scratch")))
+            have |= COLI_WEX_CUDA_BATCH_HOST_SCRATCH;
     __atomic_store_n(&wex_cuda.features, have | 0x80000000u, __ATOMIC_RELEASE);
     fprintf(stderr, "[wex] CUDA helper %s: ABI 1, features %u\n", path, have);
 }
@@ -720,8 +724,10 @@ static int wex_cuda_batch_call(int n, const WexEntry *const *entries, const unsi
         k++;
     }
     if (k) {
-        if (dst) wex_cuda.batch_host(k, e, r, device, d, st);
-        else wex_cuda.batch(k, e, r, device, s, w, st);
+        if (dst) {
+            if (feature == COLI_WEX_CUDA_BATCH_HOST_SCRATCH) wex_cuda.batch_host_scratch(k, e, r, device, d, st);
+            else wex_cuda.batch_host(k, e, r, device, d, st);
+        } else wex_cuda.batch(k, e, r, device, s, w, st);
         for (i = 0; i < k; i++) {
             status[at[i]] = st[i];
             if (st[i]) failed++;
@@ -748,6 +754,19 @@ COLI_WEX_DECODE_API int coli_wex_cuda_decode_batch_to_host(int n, const WexEntry
         for (int i = 0; status && i < n; i++) status[i] = -1;
         return n > 0 ? n : 0;
     }
+    return wex_cuda_batch_call(n, entries, records, device, NULL, NULL, dst, status, COLI_WEX_CUDA_BATCH_HOST);
+}
+
+COLI_WEX_DECODE_API int coli_wex_cuda_decode_batch_to_host_scratch(int n, const WexEntry *const *entries,
+                                                                   const unsigned char *const *records, int device,
+                                                                   unsigned char *const *dst, int *status) {
+    if (!dst) {
+        for (int i = 0; status && i < n; i++) status[i] = -1;
+        return n > 0 ? n : 0;
+    }
+    if (wex_cuda_bits() & COLI_WEX_CUDA_BATCH_HOST_SCRATCH)
+        return wex_cuda_batch_call(n, entries, records, device, NULL, NULL, dst, status,
+                                   COLI_WEX_CUDA_BATCH_HOST_SCRATCH);
     return wex_cuda_batch_call(n, entries, records, device, NULL, NULL, dst, status, COLI_WEX_CUDA_BATCH_HOST);
 }
 

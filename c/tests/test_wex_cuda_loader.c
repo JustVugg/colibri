@@ -148,7 +148,22 @@ static int child(const char *name) {
         CHECK(coli_wex_cuda_decode_batch_to_host(3, es, rs, 0, dst, status) == 1 && status[0] == 0 && status[1] == -1 &&
               status[2] == 0 && !memcmp(dev[0], raw[0], RAW) && untouched(dev[1], RAW) && !memcmp(dev[2], raw[2], RAW));
         CHECK(coli_wex_cuda_decode_count() == 4);
+        /* without feature 128: batch_to_host_scratch falls back cleanly to batch_to_host */
+        device_views();
+        CHECK(coli_wex_cuda_decode_batch_to_host_scratch(3, es, rs, 0, dst, status) == 1 && status[0] == 0 &&
+              status[1] == -1 && status[2] == 0 && !memcmp(dev[0], raw[0], RAW) && untouched(dev[1], RAW) &&
+              !memcmp(dev[2], raw[2], RAW));
+        CHECK(coli_wex_cuda_decode_count() == 6);
         CHECK(!coli_wex_cuda_host_register(dev, sizeof dev) && !coli_wex_cuda_host_unregister(dev));
+    } else if (!strcmp(name, "batch-scratch")) {   /* FAKE_WEX_FEATURES=183 (FEATURES | 128) */
+        const WexEntry *es[3] = {&ent[0], &ent[1], &ent[2]};
+        const unsigned char *rs[3] = {rec[0], rec[1], rec[2]};
+        unsigned char *dst[3] = {dev[0], dev[1], dev[2]};
+        CHECK(bits == (FEATURES | COLI_WEX_CUDA_BATCH_HOST_SCRATCH));
+        device_views();
+        CHECK(coli_wex_cuda_decode_batch_to_host_scratch(3, es, rs, 0, dst, status) == 1 && status[0] == 0 &&
+              status[1] == -1 && status[2] == 0 && !memcmp(dev[0], raw[0], RAW) && !untouched(dev[1], RAW) &&
+              !memcmp(dev[2], raw[2], RAW) && coli_wex_cuda_decode_count() == 2);
     } else if (!strcmp(name, "batch-device")) {   /* FAKE_WEX_FEATURES=63 */
         const WexEntry *es[2] = {&ent[2], &ent[0]};
         const unsigned char *rs[2] = {rec[2], rec[0]};
@@ -246,6 +261,8 @@ int main(int argc, char **argv) {
                   "a damaged record refused, its destinations untouched; the device batch reports 1 without feature 8");
     setenv("FAKE_WEX_FEATURES", "63", 1);
     run("batch-device", "with feature 8: a batch to device buffers, each record where it was asked");
+    setenv("FAKE_WEX_FEATURES", "183", 1);
+    run("batch-scratch", "with feature 128: batch to host scratch uses the single-sync export directly");
     setenv("FAKE_WEX_FEATURES", "5", 1);
     run("no-nr3", "a helper without feature 16: WNR3 records decode on the CPU, the device call reports 1");
     unsetenv("FAKE_WEX_FEATURES");

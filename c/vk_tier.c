@@ -3402,6 +3402,16 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         const char *sr = getenv("COLI_VK_TIER_STREAM_ROWS");
         int want_st = !(se && *se == '0') && T.c.load && T.c.release && T.gemm_rows > 0;
         int slots = sn && *sn ? atoi(sn) : 64;
+        if (!(sn && *sn) && T.exp_bytes) {
+            /* Bound the default streaming staging reservation to one pool block (256 MiB),
+             * rounded down to an even count (minimum 8 slots = 4 per double-buffered half,
+             * maximum 64). Small experts (<= 4 MiB) keep all 64 slots; large experts (e.g.
+             * 21.1 MiB MXFP4) use 12 slots instead of carving 1.32 GiB out of residents. */
+            long long by_b = (long long)(((size_t)256 << 20) / T.exp_bytes);
+            if (by_b < 8) by_b = 8;
+            by_b &= ~1LL;
+            if (by_b < slots) slots = (int)by_b;
+        }
         if (slots > fit_raw / 2) slots = (int)(fit_raw / 2);
         if (want_st && slots >= 2) {
             if (fit > fit_raw - slots) fit = fit_raw - slots;

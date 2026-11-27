@@ -112,6 +112,7 @@ COLI_WEX_DECODE_API int coli_wex_container_refused(uint32_t header_flags, const 
 #define COLI_WEX_CUDA_NR3 16u
 #define COLI_WEX_CUDA_BATCH_HOST 32u
 #define COLI_WEX_CUDA_NR4 64u
+#define COLI_WEX_CUDA_BATCH_HOST_SCRATCH 128u
 COLI_WEX_DECODE_API unsigned int coli_wex_cuda_features(void);
 
 /* Records decoded by the helper so far: into host slabs (coli_wex_decode_record and
@@ -145,6 +146,14 @@ COLI_WEX_DECODE_API int coli_wex_cuda_decode_batch_to_device(int n, const WexEnt
 COLI_WEX_DECODE_API int coli_wex_cuda_decode_batch_to_host(int n, const WexEntry *const *entries,
                                                            const unsigned char *const *records, int device,
                                                            unsigned char *const *dst, int *status);
+
+/* Like coli_wex_cuda_decode_batch_to_host, for callers passing temporary scratch buffers:
+ * on error (status[i] != 0) dst[i] may be overwritten, and dst[i] must not overlap any
+ * records[j]. Avoids a second GPU sync when the helper exports feature 128; gracefully
+ * falls back to coli_wex_cuda_decode_batch_to_host on older helpers without feature 128. */
+COLI_WEX_DECODE_API int coli_wex_cuda_decode_batch_to_host_scratch(int n, const WexEntry *const *entries,
+                                                                   const unsigned char *const *records, int device,
+                                                                   unsigned char *const *dst, int *status);
 
 /* Page-lock a staging buffer through the helper's CUDA runtime (feature 2): 0 done,
  * 1 not available or refused, -1 a NULL pointer or zero bytes. */

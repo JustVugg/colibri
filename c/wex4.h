@@ -47,7 +47,14 @@ enum { WEX4_OK = 0, WEX4_E_ARG = -1, WEX4_E_MAGIC = -2, WEX4_E_HASH = -3, WEX4_E
 
 /* ---- SHA-256 (FIPS 180-4) ------------------------------------------------ */
 typedef struct { uint32_t h[8]; uint64_t n; unsigned char buf[64]; } Wex4Sha;
-static const uint32_t wex4_sha_k[64] = {
+#if defined(_MSC_VER)
+#define WEX4_ALIGN16 __declspec(align(16))
+#elif defined(__GNUC__) || defined(__clang__)
+#define WEX4_ALIGN16 __attribute__((aligned(16)))
+#else
+#define WEX4_ALIGN16
+#endif
+WEX4_ALIGN16 static const uint32_t wex4_sha_k[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
     0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -74,35 +81,96 @@ static inline void wex4_sha_block(uint32_t h[8], const unsigned char *p) {
     }
     for (i = 0; i < 8u; i++) h[i] += s[i];
 }
-#if (defined(__x86_64__) || defined(__i386__)) && defined(__GNUC__)
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)) && \
+    (defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
 #include <cpuid.h>
-/* The same compression function with the SHA extensions (about 6x the portable one): what makes a
- * SHA-256 of every record at its first read affordable. Chosen at run time. */
+#endif
+/* The same compression function with x86 SHA-NI (~6x the portable scalar path): fully unrolled
+ * across 4 live XMM message-schedule registers (m0..m3) with pipelined msg1/msg2 scheduling so
+ * -O2/Clang/MSVC keep every word in registers. Chosen at run time via CPUID. */
+#if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("sha,sse4.1,ssse3")))
+#endif
 static void wex4_sha_blocks_ni(uint32_t h[8], const unsigned char *p, size_t n) {
-    const __m128i swap = _mm_set_epi64x(0x0c0d0e0f08090a0bLL, 0x0405060700010203LL);
-    __m128i t = _mm_loadu_si128((const __m128i *)h), s1 = _mm_loadu_si128((const __m128i *)(h + 4)), s0;
+    const __m128i swap = _mm_set_epi32(0x0c0d0e0f, 0x08090a0b, 0x04050607, 0x00010203);
+    const __m128i *K = (const __m128i *)(const void *)wex4_sha_k;
+    __m128i t, s0, s1;
+    const unsigned char *end;
+    if (n < 64u) return;
+    t = _mm_loadu_si128((const __m128i *)h);
+    s1 = _mm_loadu_si128((const __m128i *)(h + 4));
     t = _mm_shuffle_epi32(t, 0xb1);
     s1 = _mm_shuffle_epi32(s1, 0x1b);
     s0 = _mm_alignr_epi8(t, s1, 8);
     s1 = _mm_blend_epi16(s1, t, 0xf0);
-    for (; n >= 64u; p += 64u, n -= 64u) {
-        __m128i m[4], a = s0, b = s1;
-        unsigned int i;
-        for (i = 0; i < 16u; i++) {
-            __m128i w;
-            if (i < 4u) m[i] = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + i * 16u)), swap);
-            else {
-                w = _mm_sha256msg1_epu32(m[i & 3u], m[(i + 1u) & 3u]);
-                w = _mm_add_epi32(w, _mm_alignr_epi8(m[(i + 3u) & 3u], m[(i + 2u) & 3u], 4));
-                m[i & 3u] = _mm_sha256msg2_epu32(w, m[(i + 3u) & 3u]);
-            }
-            w = _mm_add_epi32(m[i & 3u], _mm_loadu_si128((const __m128i *)(wex4_sha_k + i * 4u)));
-            s1 = _mm_sha256rnds2_epu32(s1, s0, w);
-            s0 = _mm_sha256rnds2_epu32(s0, s1, _mm_shuffle_epi32(w, 0x0e));
-        }
-        s0 = _mm_add_epi32(s0, a); s1 = _mm_add_epi32(s1, b);
+    end = p + (n & ~(size_t)63u);
+    for (; p < end; p += 64u) {
+        __m128i a = s0, b = s1, m0, m1, m2, m3, w, tmp;
+        /* Rounds 0-3 */
+        m0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 0u)), swap);
+        w  = _mm_add_epi32(m0, _mm_load_si128(K + 0));
+        s1 = _mm_sha256rnds2_epu32(s1, s0, w);
+        s0 = _mm_sha256rnds2_epu32(s0, s1, _mm_shuffle_epi32(w, 0x0e));
+        /* Rounds 4-7 */
+        m1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 16u)), swap);
+        w  = _mm_add_epi32(m1, _mm_load_si128(K + 1));
+        s1 = _mm_sha256rnds2_epu32(s1, s0, w);
+        s0 = _mm_sha256rnds2_epu32(s0, s1, _mm_shuffle_epi32(w, 0x0e));
+        m0 = _mm_sha256msg1_epu32(m0, m1);
+        /* Rounds 8-11 */
+        m2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 32u)), swap);
+        w  = _mm_add_epi32(m2, _mm_load_si128(K + 2));
+        s1 = _mm_sha256rnds2_epu32(s1, s0, w);
+        s0 = _mm_sha256rnds2_epu32(s0, s1, _mm_shuffle_epi32(w, 0x0e));
+        m1 = _mm_sha256msg1_epu32(m1, m2);
+        /* Rounds 12-15 */
+        m3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 48u)), swap);
+        w  = _mm_add_epi32(m3, _mm_load_si128(K + 3));
+        s1 = _mm_sha256rnds2_epu32(s1, s0, w);
+        tmp = _mm_alignr_epi8(m3, m2, 4);
+        m0 = _mm_sha256msg2_epu32(_mm_add_epi32(m0, tmp), m3);
+        s0 = _mm_sha256rnds2_epu32(s0, s1, _mm_shuffle_epi32(w, 0x0e));
+        m2 = _mm_sha256msg1_epu32(m2, m3);
+        /* Rounds 16-51 */
+#define WEX4_SHA_NI_RND4(M0, M1, M2, M3, KI) \
+        w  = _mm_add_epi32((M0), _mm_load_si128(K + (KI))); \
+        s1 = _mm_sha256rnds2_epu32(s1, s0, w); \
+        tmp = _mm_alignr_epi8((M0), (M3), 4); \
+        (M1) = _mm_sha256msg2_epu32(_mm_add_epi32((M1), tmp), (M0)); \
+        s0 = _mm_sha256rnds2_epu32(s0, s1, _mm_shuffle_epi32(w, 0x0e)); \
+        (M3) = _mm_sha256msg1_epu32((M3), (M0));
+        WEX4_SHA_NI_RND4(m0, m1, m2, m3, 4)
+        WEX4_SHA_NI_RND4(m1, m2, m3, m0, 5)
+        WEX4_SHA_NI_RND4(m2, m3, m0, m1, 6)
+        WEX4_SHA_NI_RND4(m3, m0, m1, m2, 7)
+        WEX4_SHA_NI_RND4(m0, m1, m2, m3, 8)
+        WEX4_SHA_NI_RND4(m1, m2, m3, m0, 9)
+        WEX4_SHA_NI_RND4(m2, m3, m0, m1, 10)
+        WEX4_SHA_NI_RND4(m3, m0, m1, m2, 11)
+        WEX4_SHA_NI_RND4(m0, m1, m2, m3, 12)
+#undef WEX4_SHA_NI_RND4
+        /* Rounds 52-55 (no trailing msg1) */
+        w  = _mm_add_epi32(m1, _mm_load_si128(K + 13));
+        s1 = _mm_sha256rnds2_epu32(s1, s0, w);
+        tmp = _mm_alignr_epi8(m1, m0, 4);
+        m2 = _mm_sha256msg2_epu32(_mm_add_epi32(m2, tmp), m1);
+        s0 = _mm_sha256rnds2_epu32(s0, s1, _mm_shuffle_epi32(w, 0x0e));
+        /* Rounds 56-59 */
+        w  = _mm_add_epi32(m2, _mm_load_si128(K + 14));
+        s1 = _mm_sha256rnds2_epu32(s1, s0, w);
+        tmp = _mm_alignr_epi8(m2, m1, 4);
+        m3 = _mm_sha256msg2_epu32(_mm_add_epi32(m3, tmp), m2);
+        s0 = _mm_sha256rnds2_epu32(s0, s1, _mm_shuffle_epi32(w, 0x0e));
+        /* Rounds 60-63 */
+        w  = _mm_add_epi32(m3, _mm_load_si128(K + 15));
+        s1 = _mm_sha256rnds2_epu32(s1, s0, w);
+        s0 = _mm_sha256rnds2_epu32(s0, s1, _mm_shuffle_epi32(w, 0x0e));
+        s0 = _mm_add_epi32(s0, a);
+        s1 = _mm_add_epi32(s1, b);
     }
     t = _mm_shuffle_epi32(s0, 0x1b);
     s1 = _mm_shuffle_epi32(s1, 0xb1);
@@ -110,16 +178,111 @@ static void wex4_sha_blocks_ni(uint32_t h[8], const unsigned char *p, size_t n) 
     _mm_storeu_si128((__m128i *)(h + 4), _mm_alignr_epi8(s1, t, 8));
 }
 static inline int wex4_sha_ni(void) {
+#if defined(__GNUC__) || defined(__clang__)
     static int known = -1;
-    if (known < 0) {
-        unsigned int a, b = 0, c, d;
-        known = __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b >> 29 & 1u);
+    int v = __atomic_load_n(&known, __ATOMIC_RELAXED);
+    if (v < 0) {
+        int ok = 0;
+#if defined(_MSC_VER)
+        int info[4] = {0, 0, 0, 0};
+        __cpuid(info, 0);
+        if (info[0] >= 7) {
+            __cpuid(info, 1);
+            if (((unsigned int)info[2] >> 9 & 1u) && ((unsigned int)info[2] >> 19 & 1u)) {
+                __cpuidex(info, 7, 0);
+                if ((unsigned int)info[1] >> 29 & 1u) ok = 1;
+            }
+        }
+#else
+        unsigned int a = 0, b = 0, c = 0, d = 0;
+        if (__get_cpuid(1u, &a, &b, &c, &d) && (c >> 9 & 1u) && (c >> 19 & 1u) &&
+            __get_cpuid_count(7u, 0u, &a, &b, &c, &d) && (b >> 29 & 1u))
+            ok = 1;
+#endif
+        v = ok;
+        __atomic_store_n(&known, v, __ATOMIC_RELAXED);
     }
-    return known;
+    return v;
+#else
+    static volatile long known = -1;
+    long v = known;
+    if (v < 0) {
+        int info[4] = {0, 0, 0, 0};
+        long ok = 0;
+        __cpuid(info, 0);
+        if (info[0] >= 7) {
+            __cpuid(info, 1);
+            if (((unsigned int)info[2] >> 9 & 1u) && ((unsigned int)info[2] >> 19 & 1u)) {
+                __cpuidex(info, 7, 0);
+                if ((unsigned int)info[1] >> 29 & 1u) ok = 1;
+            }
+        }
+        v = ok;
+        _InterlockedExchange(&known, v);
+    }
+    return (int)v;
+#endif
 }
 static inline void wex4_sha_blocks(uint32_t h[8], const unsigned char *p, size_t n) {
     if (wex4_sha_ni()) wex4_sha_blocks_ni(h, p, n);
     else for (; n >= 64u; p += 64u, n -= 64u) wex4_sha_block(h, p);
+}
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_SHA2)
+#include <arm_neon.h>
+/* ARMv8 Crypto SHA-256 compression function: 4 live NEON message-schedule registers (m0..m3). */
+static inline void wex4_sha_blocks(uint32_t h[8], const unsigned char *p, size_t n) {
+    uint32x4_t s0, s1;
+    const unsigned char *end;
+    if (n < 64u) return;
+    s0 = vld1q_u32(h);
+    s1 = vld1q_u32(h + 4);
+    end = p + (n & ~(size_t)63u);
+#if defined(__AARCH64EB__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#define WEX4_SHA_ARM_LD(ptr) vreinterpretq_u32_u8(vld1q_u8(ptr))
+#else
+#define WEX4_SHA_ARM_LD(ptr) vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(ptr)))
+#endif
+    for (; p < end; p += 64u) {
+        uint32x4_t a = s0, b = s1, t, wk;
+        uint32x4_t m0 = WEX4_SHA_ARM_LD(p + 0u);
+        uint32x4_t m1 = WEX4_SHA_ARM_LD(p + 16u);
+        uint32x4_t m2 = WEX4_SHA_ARM_LD(p + 32u);
+        uint32x4_t m3 = WEX4_SHA_ARM_LD(p + 48u);
+#define WEX4_SHA_ARM_RND4(M0, M1, M2, M3, KO) \
+        wk = vaddq_u32((M0), vld1q_u32(wex4_sha_k + (KO))); \
+        t  = s0; \
+        s0 = vsha256hq_u32(s0, s1, wk); \
+        s1 = vsha256h2q_u32(s1, t, wk); \
+        (M0) = vsha256su1q_u32(vsha256su0q_u32((M0), (M1)), (M2), (M3));
+#define WEX4_SHA_ARM_LAST(M0, KO) \
+        wk = vaddq_u32((M0), vld1q_u32(wex4_sha_k + (KO))); \
+        t  = s0; \
+        s0 = vsha256hq_u32(s0, s1, wk); \
+        s1 = vsha256h2q_u32(s1, t, wk);
+        WEX4_SHA_ARM_RND4(m0, m1, m2, m3, 0)
+        WEX4_SHA_ARM_RND4(m1, m2, m3, m0, 4)
+        WEX4_SHA_ARM_RND4(m2, m3, m0, m1, 8)
+        WEX4_SHA_ARM_RND4(m3, m0, m1, m2, 12)
+        WEX4_SHA_ARM_RND4(m0, m1, m2, m3, 16)
+        WEX4_SHA_ARM_RND4(m1, m2, m3, m0, 20)
+        WEX4_SHA_ARM_RND4(m2, m3, m0, m1, 24)
+        WEX4_SHA_ARM_RND4(m3, m0, m1, m2, 28)
+        WEX4_SHA_ARM_RND4(m0, m1, m2, m3, 32)
+        WEX4_SHA_ARM_RND4(m1, m2, m3, m0, 36)
+        WEX4_SHA_ARM_RND4(m2, m3, m0, m1, 40)
+        WEX4_SHA_ARM_RND4(m3, m0, m1, m2, 44)
+        WEX4_SHA_ARM_LAST(m0, 48)
+        WEX4_SHA_ARM_LAST(m1, 52)
+        WEX4_SHA_ARM_LAST(m2, 56)
+        WEX4_SHA_ARM_LAST(m3, 60)
+#undef WEX4_SHA_ARM_RND4
+#undef WEX4_SHA_ARM_LAST
+        s0 = vaddq_u32(s0, a);
+        s1 = vaddq_u32(s1, b);
+    }
+#undef WEX4_SHA_ARM_LD
+    vst1q_u32(h, s0);
+    vst1q_u32(h + 4, s1);
 }
 #else
 static inline void wex4_sha_blocks(uint32_t h[8], const unsigned char *p, size_t n) {

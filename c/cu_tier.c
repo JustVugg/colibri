@@ -146,4 +146,128 @@ static const CuTierOps *cut_ops(void) {
 #define CUT_VULKAN_DEFINED 1
 #endif
 #include "vk_tier.c"
+
+/* ---- direct-to-device MXFP4 (fmt 7, E8M0) warm-start hooks ------------------
+ * Lets WEX4 (WNR4/WNR3) warm-start decode experts directly into primary CUDA
+ * device VRAM (pool 1) via coli_wex_cuda_decode_batch_to_device, eliminating
+ * D2H -> host slab -> CPU E8M0 conversion -> second H2D bounce. Resolves the
+ * two optional cu_xb.cu exports lazily (gracefully returns 0 on older DLLs,
+ * HIP builds, or fake-tier unit tests). */
+typedef int (*CutAllocMxfp4Fn)(int, ColiVkTensor **, int, int, int, size_t, size_t,
+                               int *, unsigned char **, unsigned char **);
+typedef int (*CutExpandE8m0Fn)(ColiVkTensor *const *, int);
+
+#ifdef _WIN32
+static pthread_once_t g_cut_direct_once = PTHREAD_ONCE_INIT;
+static struct { CutAllocMxfp4Fn alloc; CutExpandE8m0Fn expand; } g_cut_direct;
+static void cut_direct_load_once(void) {
+#ifndef COLI_HIP_DLL
+    HMODULE h = GetModuleHandleA("coli_cuda.dll");
+    if (!h) return;
+#if defined(__GNUC__) || defined(__clang__)
+    _Pragma("GCC diagnostic push")
+    _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
+#endif
+    CutAllocMxfp4Fn a = (CutAllocMxfp4Fn)GetProcAddress(h, "coli_cuda_tier_alloc_mxfp4");
+    CutExpandE8m0Fn e = (CutExpandE8m0Fn)GetProcAddress(h, "coli_cuda_tier_expand_e8m0");
+#if defined(__GNUC__) || defined(__clang__)
+    _Pragma("GCC diagnostic pop")
+#endif
+    if (a && e) { g_cut_direct.alloc = a; g_cut_direct.expand = e; }
+#endif
+}
+static int cut_direct_load(void) {
+    pthread_once(&g_cut_direct_once, cut_direct_load_once);
+    return g_cut_direct.alloc != NULL && g_cut_direct.expand != NULL;
+}
+#define cut_direct_alloc_fn  g_cut_direct.alloc
+#define cut_direct_expand_fn g_cut_direct.expand
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) extern int coli_cuda_tier_alloc_mxfp4(int, ColiVkTensor **, int, int, int, size_t, size_t,
+                                                            int *, unsigned char **, unsigned char **);
+__attribute__((weak)) extern int coli_cuda_tier_expand_e8m0(ColiVkTensor *const *, int);
+static int cut_direct_load(void) {
+    return coli_cuda_tier_alloc_mxfp4 != NULL && coli_cuda_tier_expand_e8m0 != NULL;
+}
+#define cut_direct_alloc_fn  coli_cuda_tier_alloc_mxfp4
+#define cut_direct_expand_fn coli_cuda_tier_expand_e8m0
+#else
+static int cut_direct_load(void) { return 0; }
+static int cut_direct_alloc_stub(int d, ColiVkTensor **t, int I, int O, int g, size_t pw, size_t ps,
+                                 int *cd, unsigned char **w, unsigned char **s) {
+    (void)d; (void)t; (void)I; (void)O; (void)g; (void)pw; (void)ps; (void)cd; (void)w; (void)s; return 0;
+}
+static int cut_direct_expand_stub(ColiVkTensor *const *t, int n) { (void)t; (void)n; return 0; }
+#define cut_direct_alloc_fn  cut_direct_alloc_stub
+#define cut_direct_expand_fn cut_direct_expand_stub
+#endif
+
+int cut_warm_direct_ready(int *cuda_dev_out) {
+    if (!T.on || T.full || T.c.hidden < 32 || (T.c.hidden % 32) != 0 || T.c.inter < 32 || (T.c.inter % 32) != 0)
+        return 0;
+    if (T.form[0].gu.kind != VKT_SRC_MXFP4_E8M0 || T.form[0].dn.kind != VKT_SRC_MXFP4_E8M0 ||
+        T.form[0].gu_gs != 32 || T.form[0].dn_gs != 32)
+        return 0;
+    if (!cut_direct_load()) return 0;
+    int dev = coli_cuda_device_at(0);
+    if (dev < 0) return 0;
+    if (cuda_dev_out) *cuda_dev_out = dev;
+    return 1;
+}
+
+int cut_warm_direct_alloc(int layer, int eid, CutWarmDirect *out,
+                          unsigned char *dev_w[3], unsigned char *dev_s[3]) {
+    if (!T.on || T.full || !out || !dev_w || !dev_s) return 0;
+    if (layer < 0 || layer >= T.main_layers || eid < 0 || eid >= T.c.experts) return 0;
+    if (place_of(slot(layer, eid)) != 0) return 0;
+    const __typeof__(T.form[0]) *fm = &T.form[form_of(layer)];
+    if (fm->gu.kind != VKT_SRC_MXFP4_E8M0 || fm->dn.kind != VKT_SRC_MXFP4_E8M0 ||
+        fm->gu_gs != 32 || fm->dn_gs != 32)
+        return 0;
+    if (!cut_direct_load()) return 0;
+    const int H = T.c.hidden, F = T.c.inter;
+    ColiVkTensor *t[3] = {NULL, NULL, NULL};
+    for (int k = 0; k < 3; k++) {
+        const int I = k < 2 ? H : F, O = k < 2 ? F : H;
+        if (!cut_direct_alloc_fn(0, &t[k], I, O, 32, pad_w_of(layer, k == 2), pad_s_of(layer, k == 2),
+                                 NULL, &dev_w[k], &dev_s[k])) {
+            for (int j = 0; j < k; j++) coli_vk_tensor_free(t[j]);
+            return 0;
+        }
+    }
+    out->layer = layer;
+    out->eid = eid;
+    for (int k = 0; k < 3; k++) out->t[k] = t[k];
+    return 1;
+}
+
+int cut_warm_direct_commit(CutWarmDirect *items, const int *ok, int n) {
+    if (!T.on || !items || !ok || n <= 0) return 0;
+    ColiVkTensor *stack_t[192];
+    ColiVkTensor **all_t = n <= 64 ? stack_t : (ColiVkTensor **)malloc((size_t)n * 3u * sizeof(*all_t));
+    int nt = 0, committed = 0;
+    int expand_ok = 0;
+    if (all_t) {
+        for (int i = 0; i < n; i++) {
+            if (!ok[i] || !items[i].t[0] || !items[i].t[1] || !items[i].t[2]) continue;
+            for (int k = 0; k < 3; k++) all_t[nt++] = (ColiVkTensor *)items[i].t[k];
+        }
+        expand_ok = nt == 0 ? 1 : (cut_direct_load() && cut_direct_expand_fn(all_t, nt));
+        if (all_t != stack_t) free(all_t);
+    }
+    for (int i = 0; i < n; i++) {
+        ColiVkTensor *t[3] = {
+            (ColiVkTensor *)items[i].t[0], (ColiVkTensor *)items[i].t[1], (ColiVkTensor *)items[i].t[2]
+        };
+        items[i].t[0] = items[i].t[1] = items[i].t[2] = NULL;
+        if (expand_ok && ok[i] && t[0] && t[1] && t[2]) {
+            push_done(items[i].layer, items[i].eid, 1, 0, t, NULL);
+            __atomic_add_fetch(&T.warm, 1, __ATOMIC_RELAXED);
+            committed++;
+        } else {
+            for (int k = 0; k < 3; k++) if (t[k]) coli_vk_tensor_free(t[k]);
+        }
+    }
+    return committed;
+}
 #endif /* COLI_CUDA */
