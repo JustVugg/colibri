@@ -6024,7 +6024,9 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     serve_line("\x01\x01READY\x01\x01\n");
     /* Fra READY e STAT: il gateway lo legge nella stretta di mano, quindi sa
      * che modalita' serve prima della prima richiesta (docs/serve_protocol.md). */
-    serve_line("CAPS vision=%d\n", m->has_vision ? 1 : 0);
+    /* concurrent=1: one request at a time over the KV_SLOTS conversations (serve_cancel_read answers SLOT_BUSY to
+     * a second): the gateway keeps the others in its queue */
+    serve_line("CAPS vision=%d concurrent=1\n", m->has_vision ? 1 : 0);
     serve_line("STAT 0 0.00 0.0 %.1f\n", rss_gb());
     /* La griglia va DOPO READY: il lettore di boot del server scarta tutto
      * fino al sentinel, e colibri.c fa lo stesso (READY, STAT, poi EMAP). */

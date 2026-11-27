@@ -36,7 +36,11 @@ served modalities are known before the first request. Today the one key is `visi
 (`1`: a vision tower is loaded; `0`: none — a text-only checkpoint, or a config that
 declares a tower whose tensors are not in the container). Engines that say nothing
 leave the server's flag unknown. glm53, qwen38, qwen36 and deepseek_v41 emit it;
-`openai_server.py` derives `/v1/models` `input_modalities` from it.
+`openai_server.py` derives `/v1/models` `input_modalities` from it. `concurrent=N` says
+the engine runs at most N requests at once over its `KV_SLOTS` slots (glm53: `1`, one
+request at a time, each slot a cached conversation); the server then keeps the others
+in its queue instead of sending a `SUBMIT` the engine would answer `SLOT_BUSY`. Without
+it the server runs as many requests at once as there are slots.
 
 Two more keys say what kind of engine answers. `decide=1`: the engine takes
 `DECIDE` (below), and the gateway sends `POST /v1/systemone` to it as one record

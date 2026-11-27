@@ -200,6 +200,9 @@ class GenerationScheduler:
         self.max_queue = max_queue
         self.queue_timeout = queue_timeout
         self.capacity = capacity
+        # the requests the engine runs at once: its slots, or fewer when its CAPS line says so (`concurrent=N`,
+        # set_concurrency): an engine that serves one request at a time keeps `capacity` cached conversations
+        self.max_active = capacity
         self.free_slots = set(range(capacity))
         self.slot_keys = {}
         self.slot_last_used = {}
@@ -306,9 +309,17 @@ class GenerationScheduler:
             self.paused = False
             self.condition.notify_all()
 
+    def set_concurrency(self, n):
+        """At most `n` requests run at once (1 to the slots): the engine's CAPS `concurrent`."""
+        with self.condition:
+            self.max_active = max(1, min(int(n), self.capacity))
+            self.condition.notify_all()
+
     def _available_slot(self, slot, ticket=None, prefer=None, cache_key=None):
         # Caller holds the condition lock. Pinned waiters reserve only their
         # target; an older any-slot waiter has priority over every free slot.
+        if self.active >= self.max_active:
+            return None
         # For any-slot waiters with a cache_key: exact prefix hit first, then
         # an unused slot (preferring `prefer`), then the LRU cold slot so a
         # hash collision or busy slot never evicts a recently active conversation.
@@ -8388,6 +8399,18 @@ def is_image_engine(engine):
     return getattr(engine, "modality", "text") == "image"
 
 
+def engine_concurrency(engine, kv_slots):
+    """The requests an engine runs at once: CAPS `concurrent=N` when it says so, else its slots. glm53 serves
+    one request at a time over its KV_SLOTS conversations: four requests at once on four slots had three
+    answered SLOT_BUSY (HTTP 500) before the scheduler kept them in its queue."""
+    caps = getattr(engine, "caps", None) or {}
+    try:
+        n = int(caps.get("concurrent", kv_slots))
+    except (TypeError, ValueError):
+        n = kv_slots
+    return max(1, min(n, kv_slots))
+
+
 def engine_gone_error(error):
     """The error a request gets when its engine's process ended under it (the dispatcher saw it go,
     or the request was written to an engine already gone): the engine's, not the request's."""
@@ -8492,6 +8515,7 @@ class APIServer(ThreadingHTTPServer):
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
+        self.scheduler.set_concurrency(engine_concurrency(engine, kv_slots))
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         # Extra Host header values trusted past the DNS-rebinding guard, for a
@@ -11092,6 +11116,7 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
             if not stopping.is_set():
                 server.engine, fresh = fresh, None
                 server.engine_restarts += 1
+                server.scheduler.set_concurrency(engine_concurrency(server.engine, server.kv_slots))
                 # its RAM plan ran again (chat_context_env), so the context it holds may differ
                 server.context_limit = getattr(server.engine, "context_limit", None)
                 server.max_tokens = getattr(server.engine, "max_tokens", None) or server.max_tokens
