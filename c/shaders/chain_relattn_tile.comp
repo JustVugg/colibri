@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : enable
 // chain_relattn.comp's mode 0 for a prompt chunk's rows (vk_chain.c, vkc_relattn): a workgroup a KV head and
 // a block of rb consecutive rows, with the G = H / KVH query heads of that KV head: rb * G (row, head) pairs that
 // read each K and V row of a tile from memory once, through shared memory, where mode 0 reads it once a pair.
@@ -75,8 +76,8 @@ void split_main() {
     int span = 128 + row_t0(qlast) - tb0;
     int tb = tb0 + 128 * c, tend = min(tb + span, qlast + 1);
     int i = tid & 127, hp = tid >> 7;
-    float sa[NU];
-    for (int u = 0; u < NU; u++) sa[u] = 0.0;
+    float sa[12];
+    [[unroll]] for (int u = 0; u < NU; u++) sa[u] = 0.0;
     for (int dc = 0; dc < p.hd; dc += DC) {
         barrier();
         for (int idx = tid; idx < span * DC; idx += 256) {
@@ -89,7 +90,7 @@ void split_main() {
         }
         barrier();
         int dn = min(DC, p.hd - dc);
-        for (int u = 0; u < NU; u++) {
+        [[unroll]] for (int u = 0; u < NU; u++) {
             int pp = hp + 2 * u;
             if (pp >= P) continue;
             int ko = (row_t0(qb0 + pp / G) - tb0 + i) * (DC + 1);
@@ -97,8 +98,8 @@ void split_main() {
         }
     }
     barrier();
-    float sv[NU];
-    for (int u = 0; u < NU; u++) {
+    float sv[12];
+    [[unroll]] for (int u = 0; u < NU; u++) {
         int pp = hp + 2 * u;
         sv[u] = -3.0e38;
         if (pp >= P) continue;
@@ -116,19 +117,19 @@ void split_main() {
     }
     for (int off = 64; off > 0; off >>= 1) {   // the tile's maximum, mode 1's tree
         barrier();
-        for (int u = 0; u < NU; u++) {
+        [[unroll]] for (int u = 0; u < NU; u++) {
             int pp = hp + 2 * u;
             if (pp < P && i < off) kv[pp * 128 + i] = max(kv[pp * 128 + i], kv[pp * 128 + i + off]);
         }
     }
     barrier();
-    float mn[NU];
-    for (int u = 0; u < NU; u++) {
+    float mn[12];
+    [[unroll]] for (int u = 0; u < NU; u++) {
         int pp = hp + 2 * u;
         mn[u] = pp < P ? max(-3.0e38, kv[pp * 128]) : 0.0;
     }
     barrier();
-    for (int u = 0; u < NU; u++) {
+    [[unroll]] for (int u = 0; u < NU; u++) {
         int pp = hp + 2 * u;
         if (pp >= P) continue;
         int qpos = qb0 + pp / G;
@@ -138,22 +139,22 @@ void split_main() {
     }
     for (int off = 64; off > 0; off >>= 1) {   // its sum, mode 1's tree
         barrier();
-        for (int u = 0; u < NU; u++) {
+        [[unroll]] for (int u = 0; u < NU; u++) {
             int pp = hp + 2 * u;
             if (pp < P && i < off) kv[pp * 128 + i] += kv[pp * 128 + i + off];
         }
     }
     barrier();
     if (i == 0)
-        for (int u = 0; u < NU; u++) {
+        [[unroll]] for (int u = 0; u < NU; u++) {
             int pp = hp + 2 * u;
             if (pp >= P) continue;
             int b = (((p.s0 + sb + pp / G) * p.H + kvh * G + pp % G) * p.nc + c) * (p.hd + 2);
             o[b] = mn[u];
             o[b + 1] = kv[pp * 128];
         }
-    float oacc[NU * ND];
-    for (int u = 0; u < NU * ND; u++) oacc[u] = 0.0;
+    float oacc[24];
+    [[unroll]] for (int u = 0; u < NU * ND; u++) oacc[u] = 0.0;
     int w = p.jc + rb - 1, dg = tid & 127;
     for (int j0 = 0; j0 < 128; j0 += p.jc) {
         barrier();
@@ -162,25 +163,25 @@ void split_main() {
             kv[idx] = t < tend ? v_at(t, kvh, d) : 0.0;
         }
         barrier();
-        for (int u = 0; u < NU; u++) {
+        [[unroll]] for (int u = 0; u < NU; u++) {
             int pp = hp + 2 * u;
             if (pp >= P) continue;
             int qpos = qb0 + pp / G, vo = row_t0(qpos) - tb0;
             int cnt = min(128, qpos - row_t0(qpos) + 1 - 128 * c) - j0;
             for (int uu = 0; uu < min(p.jc, cnt); uu++) {
                 float wt = sc[pp * 128 + j0 + uu];
-                for (int e = 0; e < ND; e++) {
+                [[unroll]] for (int e = 0; e < ND; e++) {
                     int d = dg + 128 * e;
                     if (d < p.hd) oacc[u * ND + e] += wt * kv[(vo + uu) * p.hd + d];
                 }
             }
         }
     }
-    for (int u = 0; u < NU; u++) {
+    [[unroll]] for (int u = 0; u < NU; u++) {
         int pp = hp + 2 * u;
         if (pp >= P) continue;
         int b = (((p.s0 + sb + pp / G) * p.H + kvh * G + pp % G) * p.nc + c) * (p.hd + 2);
-        for (int e = 0; e < ND; e++) {
+        [[unroll]] for (int e = 0; e < ND; e++) {
             int d = dg + 128 * e;
             if (d < p.hd) o[b + 2 + d] = oacc[u * ND + e];
         }
@@ -202,12 +203,12 @@ void main() {
         sl[tid] = on ? 1.0 : 0.0;
     }
     int rg = tid >> 5, j = tid & 31, ph = tid >> 7, dg = tid & 127;
-    float oacc[NB * G * ND];
-    for (int i = 0; i < NB * G * ND; i++) oacc[i] = 0.0;
+    float oacc[24];
+    [[unroll]] for (int i = 0; i < NB * G * ND; i++) oacc[i] = 0.0;
     for (int k = 0; k < KT; k++) {
         int tb = tb0 + 128 * k, tend = min(tb + span, qlast + 1);   // this step's positions [tb, tend)
-        float sa[NA * G * 4];
-        for (int i = 0; i < NA * G * 4; i++) sa[i] = 0.0;
+        float sa[16];
+        [[unroll]] for (int i = 0; i < NA * G * 4; i++) sa[i] = 0.0;
         for (int dc = 0; dc < p.hd; dc += DC) {
             barrier();
             for (int idx = tid; idx < span * DC; idx += 256) {
@@ -220,14 +221,14 @@ void main() {
             }
             barrier();
             int dn = min(DC, p.hd - dc);
-            for (int a = 0; a < NA; a++) {
+            [[unroll]] for (int a = 0; a < NA; a++) {
                 int rr = rg + 8 * a;
                 if (rr >= nrows) continue;
                 int ko = (row_t0(qb0 + rr) - tb0 + j) * (DC + 1);
                 for (int dd = 0; dd < dn; dd++) {
                     float k0 = kv[ko + dd], k1 = kv[ko + 32 * (DC + 1) + dd];
                     float k2 = kv[ko + 64 * (DC + 1) + dd], k3 = kv[ko + 96 * (DC + 1) + dd];
-                    for (int hh = 0; hh < G; hh++) {
+                    [[unroll]] for (int hh = 0; hh < G; hh++) {
                         float qv = qsh[(rr * G + hh) * DC + dd];
                         int b = (a * G + hh) * 4;
                         sa[b] += qv * k0; sa[b + 1] += qv * k1; sa[b + 2] += qv * k2; sa[b + 3] += qv * k3;
@@ -236,17 +237,17 @@ void main() {
             }
         }
         // the scores, each thread's maximum of its 4 lanes a pair into kv (its K rows read: the barrier first)
-        float sv[NA * G * 4];
+        float sv[16];
         barrier();
-        for (int a = 0; a < NA; a++) {
+        [[unroll]] for (int a = 0; a < NA; a++) {
             int rr = rg + 8 * a, s = sb + rr, qpos = qb0 + rr;
             int t0 = row_t0(qpos), n = qpos - t0 + 1;
             bool live = rr < nrows && 128 * k < n;
             float ts = live ? tau[p.tau_off + s] : 0.0;
-            for (int hh = 0; hh < G; hh++) {
+            [[unroll]] for (int hh = 0; hh < G; hh++) {
                 int b = (a * G + hh) * 4, h = kvh * G + hh;
                 float mx = -3.0e38;
-                for (int li = 0; li < 4; li++) {
+                [[unroll]] for (int li = 0; li < 4; li++) {
                     int i = 128 * k + j + 32 * li;
                     float v = -3.0e38;
                     if (live && i < n) {
@@ -276,14 +277,14 @@ void main() {
         }
         barrier();
         // the exponentials into sc, their sum's first two levels of mode 0's tree in each thread, into kv
-        for (int a = 0; a < NA; a++) {
+        [[unroll]] for (int a = 0; a < NA; a++) {
             int rr = rg + 8 * a, qpos = qb0 + rr;
             if (rr >= nrows) continue;
             bool live = 128 * k < qpos - row_t0(qpos) + 1;
-            for (int hh = 0; hh < G; hh++) {
+            [[unroll]] for (int hh = 0; hh < G; hh++) {
                 int b = (a * G + hh) * 4, pp = rr * G + hh;
                 float mn = live ? sn[pp] : 0.0, e[4];
-                for (int li = 0; li < 4; li++) {
+                [[unroll]] for (int li = 0; li < 4; li++) {
                     int i = 128 * k + j + 32 * li;
                     e[li] = live && i < qpos - row_t0(qpos) + 1 ? exp(sv[b + li] - mn) : 0.0;
                     sc[pp * 128 + j + 32 * li] = e[li];
@@ -296,10 +297,10 @@ void main() {
             int rr = tid / G, qpos = qb0 + rr;
             if (rr < nrows && 128 * k < qpos - row_t0(qpos) + 1) {
                 float v[16];
-                for (int i = 0; i < 16; i++) v[i] = kv[tid * 32 + i] + kv[tid * 32 + i + 16];
-                for (int i = 0; i < 8; i++) v[i] = v[i] + v[i + 8];
-                for (int i = 0; i < 4; i++) v[i] = v[i] + v[i + 4];
-                for (int i = 0; i < 2; i++) v[i] = v[i] + v[i + 2];
+                [[unroll]] for (int i = 0; i < 16; i++) v[i] = kv[tid * 32 + i] + kv[tid * 32 + i + 16];
+                [[unroll]] for (int i = 0; i < 8; i++) v[i] = v[i] + v[i + 8];
+                [[unroll]] for (int i = 0; i < 4; i++) v[i] = v[i] + v[i + 4];
+                [[unroll]] for (int i = 0; i < 2; i++) v[i] = v[i] + v[i + 2];
                 v[0] = v[0] + v[1];
                 sl[tid] = sl[tid] * scr[tid] + v[0];
                 sm[tid] = sn[tid];
@@ -307,12 +308,12 @@ void main() {
         }
         barrier();
         // the weighted V: each row's sum rescaled, then its tile's positions in order, jc V rows a pass
-        for (int b = 0; b < NB; b++) {
+        [[unroll]] for (int b = 0; b < NB; b++) {
             int rr = ph + 2 * b, qpos = qb0 + rr;
             if (rr >= nrows || 128 * k >= qpos - row_t0(qpos) + 1) continue;
-            for (int hh = 0; hh < G; hh++) {
+            [[unroll]] for (int hh = 0; hh < G; hh++) {
                 float c = scr[rr * G + hh];
-                for (int e = 0; e < ND; e++) oacc[(b * G + hh) * ND + e] *= c;
+                [[unroll]] for (int e = 0; e < ND; e++) oacc[(b * G + hh) * ND + e] *= c;
             }
         }
         int w = p.jc + rb - 1;
@@ -323,17 +324,17 @@ void main() {
                 kv[idx] = t < tend ? v_at(t, kvh, d) : 0.0;
             }
             barrier();
-            for (int b = 0; b < NB; b++) {
+            [[unroll]] for (int b = 0; b < NB; b++) {
                 int rr = ph + 2 * b, qpos = qb0 + rr;
                 if (rr >= nrows) continue;
                 int cnt = min(128, qpos - row_t0(qpos) + 1 - 128 * k) - j0;   // this pass's positions of the row's tile
                 int vo = row_t0(qpos) - tb0;
                 for (int u = 0; u < min(p.jc, cnt); u++) {
-                    for (int e = 0; e < ND; e++) {
+                    [[unroll]] for (int e = 0; e < ND; e++) {
                         int d = dg + 128 * e;
                         if (d >= p.hd) continue;
                         float vv = kv[(vo + u) * p.hd + d];
-                        for (int hh = 0; hh < G; hh++)
+                        [[unroll]] for (int hh = 0; hh < G; hh++)
                             oacc[(b * G + hh) * ND + e] += sc[(rr * G + hh) * 128 + j0 + u] * vv;
                     }
                 }
@@ -341,13 +342,13 @@ void main() {
         }
     }
     barrier();
-    for (int b = 0; b < NB; b++) {
+    [[unroll]] for (int b = 0; b < NB; b++) {
         int rr = ph + 2 * b;
         if (rr >= nrows) continue;
-        for (int hh = 0; hh < G; hh++) {
+        [[unroll]] for (int hh = 0; hh < G; hh++) {
             float l = sl[rr * G + hh], inv = l > 0.0 ? 1.0 / l : 0.0;
             int ob = p.o_off + (sb + rr) * p.o_row + (kvh * G + hh) * p.hd;
-            for (int e = 0; e < ND; e++) {
+            [[unroll]] for (int e = 0; e < ND; e++) {
                 int d = dg + 128 * e;
                 if (d < p.hd) o[ob + d] = oacc[(b * G + hh) * ND + e] * inv;
             }
