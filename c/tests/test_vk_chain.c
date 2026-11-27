@@ -897,6 +897,28 @@ static void test_relattn_h(int S, int pos_base, int window, int cap, int hd, int
           "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d heads %d/%d: err %.2e, tiles %.2e (%s), %zu of %zu differ",
           S, pos_base, window, cap, hd, dr, ext, sink, H, KVH, e, et, tiled ? "ran" : "did not run", diff, no);
     free(tile);
+    /* the ring in float16 (vkc_relattn_kv16): mode 0 and the tiles the same bits again, the values within the halves'
+     * rounding of the reference */
+    if (vkc_relattn_kv16_ready() && hd % 2 == 0 && koff % 2 == 0) {
+        uint16_t *kh = calloc(nr, sizeof *kh), *vh = calloc(nr, sizeof *vh);
+        kv16_pack(kh, kr, (int64_t)nr); kv16_pack(vh, vr, (int64_t)nr);
+        VkcBuf *khb = vkc_buf((nr + 1) / 2 * 4, VKC_UP), *vhb = vkc_buf((nr + 1) / 2 * 4, VKC_UP);
+        memcpy(vkc_ptr(khb), kh, nr * 2); memcpy(vkc_ptr(vhb), vh, nr * 2);
+        float *t16 = malloc(no * sizeof *t16);
+        const int w16 = vkc_relattn_kv16(1), wt = vkc_relattn_tile_rows(1);
+        vkc_begin(); int ok16 = vkc_relattn(qb, khb, vhb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+        memcpy(t16, vkc_ptr(ob), no * sizeof *t16);
+        vkc_relattn_tile_rows(0);
+        vkc_begin(); ok16 = ok16 && vkc_relattn(qb, khb, vhb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+        vkc_relattn_tile_rows(wt); vkc_relattn_kv16(w16);
+        double e16 = relerr((float *)vkc_ptr(ob), ref, no, 1e-3), et16 = relerr(t16, ref, no, 1e-3);
+        size_t d16 = 0;
+        for (size_t i = 0; i < no; i++) d16 += memcmp(t16 + i, (float *)vkc_ptr(ob) + i, 4) != 0;
+        CHECK(ok16 && e16 < 4e-3 && et16 < 4e-3 && (H / KVH > 4 || !d16),
+              "relattn KV16 S %d pos %d window %d hd %d heads %d/%d: err %.2e, tiles %.2e, %zu of %zu differ",
+              S, pos_base, window, hd, H, KVH, e16, et16, d16, no);
+        free(t16); free(kh); free(vh); vkc_free(khb); vkc_free(vhb);
+    }
     /* a decode-sized step over more than a tile: the split (mode 1's partials, mode 2's join) on
      * chain_relattn_tile.comp's SPLIT and on mode 1, the same bits */
     int nmax = pos_base + S;

@@ -627,7 +627,8 @@ static int ink2mc_save(Model *m, int pb, int n) {
         int nr = 0;
         for (int r = 0; r < n; r++) for (int h = 0; h < KV; h++, nr++) {
             const size_t off = ((size_t)h * cap + (size_t)(pb + r) % cap) * hd, s = o + (size_t)nr * hd;
-            rg[nr] = (VkcRegion){s, off, (size_t)hd};
+            /* float16 mirrors (ch->kvh): the row's halves as words, two a word, at half the offsets (hd is even) */
+            rg[nr] = ch->kvh ? (VkcRegion){s / 2, off / 2, (size_t)hd / 2} : (VkcRegion){s, off, (size_t)hd};
             memcpy(mc->hsv + s, m->K[v] + off, hd * sizeof(float));
             memcpy(mc->hsv + mc->sv_n + s, m->V[v] + off, hd * sizeof(float));
         }
@@ -650,7 +651,7 @@ static int ink2mc_rollback(Model *m, int t, int n, int a) {
         for (int r = 0; r < n; r++) for (int h = 0; h < KV; h++, k++) {
             if (r <= a) continue;
             const size_t off = ((size_t)h * cap + (size_t)(t + r) % cap) * hd, s = o + (size_t)k * hd;
-            rg[nr++] = (VkcRegion){off, s, (size_t)hd};
+            rg[nr++] = ch->kvh ? (VkcRegion){off / 2, s / 2, (size_t)hd / 2} : (VkcRegion){off, s, (size_t)hd};   /* as saved */
             memcpy(m->K[v] + off, mc->hsv + s, hd * sizeof(float));
             memcpy(m->V[v] + off, mc->hsv + mc->sv_n + s, hd * sizeof(float));
         }
