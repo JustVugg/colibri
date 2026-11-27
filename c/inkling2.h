@@ -283,58 +283,88 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
     const int win = kv_ring_rows(c, li, m->max_t);
     const float scale = (float)(1.0 / sqrt((double)hd));
     float *ctx = falloc((int64_t)S * qdim);
+    /* a (KV head, row) at a time with the KV head's `group` query heads: each K and V row read once for
+     * all of them (pairs of heads through dot_f32_lanes_x2, the same bits as dot_f32_lanes), the bias bank
+     * mixed over the distances the row reaches with the bank's rows outermost (each distance's sum over the
+     * bank in the same order). Each head's arithmetic is a head's alone, in its order. */
     #pragma omp parallel
     {
-        float *rl = malloc((size_t)ext * sizeof(float));
-        float *sc = malloc((size_t)m->max_t * sizeof(float));
+        float *rl = malloc((size_t)group * ext * sizeof(float));
+        float *sc = malloc((size_t)group * m->max_t * sizeof(float));
+        float *mxh = malloc((size_t)group * 2 * sizeof(float)), *den = mxh + group;
         #pragma omp for collapse(2) schedule(static)
-        for (int h = 0; h < H; h++) {
+        for (int g = 0; g < KV; g++) {
             for (int s = 0; s < S; s++) {
                 const int qpos = mr ? mr[s].pos : pos0 + s;
                 const int sp0 = mr ? qpos : pos0;
                 const int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
                 const int tb = sp0 > t0 ? sp0 : t0;
+                const int n = qpos - t0 + 1, ne = n < ext ? n : ext;   /* the distances 0 .. n - 1 */
                 float **Kc = mr ? mr[s].seq->K : m->K, **Vc = mr ? mr[s].seq->V : m->V;
                 const int64_t srow = mr ? (int64_t)s * kvdim : 0;
-                const float *rv = rr + (int64_t)s * H * dr + h * dr;
-                for (int e = 0; e < ext; e++) {
-                    float acc = 0.f;
-                    for (int d = 0; d < dr; d++) acc += rv[d] * l->relp[(int64_t)d * ext + e];
-                    rl[e] = acc;
+                for (int hh = 0; hh < group; hh++) {
+                    const float *rv = rr + (int64_t)s * H * dr + (g * group + hh) * dr;
+                    float *rh = rl + (int64_t)hh * ext;
+                    for (int e = 0; e < ne; e++) rh[e] = 0.f;
+                    for (int d = 0; d < dr; d++) {
+                        const float w = rv[d], *pr = l->relp + (int64_t)d * ext;
+                        for (int e = 0; e < ne; e++) rh[e] += w * pr[e];
+                    }
                 }
                 float tau = 1.f;   /* global layers: log-length scaling of q and the relative states */
                 if (!local && c->log_floor > 0) {
                     double en = (double)(qpos + 1) / c->log_floor;
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
-                const float *qv = q + (int64_t)s * qdim + h * hd;
-                const float *Kh = Kc[li] + ((int64_t)(h / group) * win) * hd;
-                const float *Kb = k + srow + (int64_t)(h / group) * hd;
-                float mx = sk[(int64_t)s * H + h];
+                const float *qg = q + (int64_t)s * qdim + (int64_t)g * group * hd;
+                const float *Kh = Kc[li] + ((int64_t)g * win) * hd;
+                const float *Kb = k + srow + (int64_t)g * hd;
+                for (int hh = 0; hh < group; hh++) mxh[hh] = sk[(int64_t)s * H + g * group + hh];
                 for (int t = t0; t <= qpos; t++) {
                     const float *kv = t < tb ? Kh + (int64_t)(t % win) * hd : Kb + (int64_t)(t - sp0) * kvdim;
                     const int dist = qpos - t;
-                    float lg = tau * (dot_f32_lanes(qv, kv, hd) * scale + (dist < ext ? rl[dist] : 0.f));
-                    sc[t - t0] = lg;
-                    if (lg > mx) mx = lg;
+                    int hh = 0;
+                    for (; hh + 2 <= group; hh += 2) {
+                        float dt[2];
+                        dot_f32_lanes_x2(dt, qg + (int64_t)hh * hd, qg + (int64_t)(hh + 1) * hd, kv, hd);
+                        for (int u = 0; u < 2; u++) {
+                            float lg = tau * (dt[u] * scale + (dist < ext ? rl[(int64_t)(hh + u) * ext + dist] : 0.f));
+                            sc[(int64_t)(hh + u) * m->max_t + (t - t0)] = lg;
+                            if (lg > mxh[hh + u]) mxh[hh + u] = lg;
+                        }
+                    }
+                    for (; hh < group; hh++) {
+                        float lg = tau * (dot_f32_lanes(qg + (int64_t)hh * hd, kv, hd) * scale + (dist < ext ? rl[(int64_t)hh * ext + dist] : 0.f));
+                        sc[(int64_t)hh * m->max_t + (t - t0)] = lg;
+                        if (lg > mxh[hh]) mxh[hh] = lg;
+                    }
                 }
-                const int n = qpos - t0 + 1;
-                float den = expf(sk[(int64_t)s * H + h] - mx);   /* the sink: in the denominator only */
-                for (int j = 0; j < n; j++) { sc[j] = expf(sc[j] - mx); den += sc[j]; }
-                float *cx = ctx + (int64_t)s * qdim + h * hd;
-                for (int d = 0; d < hd; d++) cx[d] = 0.f;
-                const float *Vh = Vc[li] + ((int64_t)(h / group) * win) * hd;
-                const float *Vb = vv + srow + (int64_t)(h / group) * hd;
+                for (int hh = 0; hh < group; hh++) {
+                    float *sh = sc + (int64_t)hh * m->max_t, dn = expf(sk[(int64_t)s * H + g * group + hh] - mxh[hh]);   /* the sink: in the denominator only */
+                    for (int j = 0; j < n; j++) { sh[j] = expf(sh[j] - mxh[hh]); dn += sh[j]; }
+                    den[hh] = dn;
+                    float *cx = ctx + (int64_t)s * qdim + (int64_t)(g * group + hh) * hd;
+                    for (int d = 0; d < hd; d++) cx[d] = 0.f;
+                }
+                const float *Vh = Vc[li] + ((int64_t)g * win) * hd;
+                const float *Vb = vv + srow + (int64_t)g * hd;
+                float *cg = ctx + (int64_t)s * qdim + (int64_t)g * group * hd;
                 for (int t = t0; t <= qpos; t++) {
                     const float *vrow = t < tb ? Vh + (int64_t)(t % win) * hd : Vb + (int64_t)(t - sp0) * kvdim;
-                    const float a = sc[t - t0] / den;
-                    for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
+                    for (int hh = 0; hh < group; hh++) {
+                        const float a = sc[(int64_t)hh * m->max_t + (t - t0)] / den[hh];
+                        float *cx = cg + (int64_t)hh * hd;
+                        for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
+                    }
                 }
-                const float *gr = gt + (int64_t)s * qdim + h * hd;
-                for (int d = 0; d < hd; d++) cx[d] *= 1.f / (1.f + expf(-gr[d]));
+                for (int hh = 0; hh < group; hh++) {
+                    const float *gr = gt + (int64_t)s * qdim + (int64_t)(g * group + hh) * hd;
+                    float *cx = cg + (int64_t)hh * hd;
+                    for (int d = 0; d < hd; d++) cx[d] *= 1.f / (1.f + expf(-gr[d]));
+                }
             }
         }
-        free(rl); free(sc);
+        free(rl); free(sc); free(mxh);
     }
     const int s0 = !mr && S - win > 0 ? S - win : 0;
     for (int s = s0; s < S; s++) for (int h = 0; h < KV; h++) {

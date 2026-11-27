@@ -594,7 +594,6 @@ static int ink2cc_attn_dyn_pb(Ink2CuChain *ch, Model *m, int i, int v, int n, in
     int cap = ch->cap[v], local = c->local[i], R = ch->rows;
     size_t vs = ch->vs_off;
     int nc = local ? (c->window + 127) / 128 : nc_glob;
-    if (nc > 64) nc = 64;
     CcRelAttn a = {n, H, KV, hd, 0, cap, local ? c->window : 0, L_EXT(c, i), dr,
                     0, H * hd, 0, H * hd, 0, 0, 0, (int)vs, kvo, 0, H * dr, (int)ch->o_relp[i], local ? R : 0,
                     (float)(1.0 / sqrt((double)hd)), 1, 2 * R};
@@ -1023,11 +1022,13 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
             for (int vi = 0; vi < ch->NS && all_dl; vi++) if (n > ch->cap[vi]) all_dl = 0;
         }
         if (all_dl) {
-            /* Compute bucketed split-K tile count nc_glob so the graph stays valid across long runs without re-capturing. */
+            /* Compute bucketed split-K tile count nc_glob so the graph stays valid across long runs without re-capturing.
+             * Every tile of the positions: a split block takes one tile, so a count capped below them (64, 8192
+             * positions) left a global layer's later positions out of a decode step's attention. No room for the
+             * partials: nc_glob 1, a block a (head, row) over every tile. */
             int nc_need = (pb + n + 127) / 128, nc_glob = 1;
-            if (nc_need > 1) { nc_glob = 4; while (nc_glob < nc_need && nc_glob < 64) nc_glob <<= 1; }
-            int nc_loc = c->window > 0 ? (c->window + 127) / 128 : 1;
-            if (nc_loc > 64) nc_loc = 64;
+            if (nc_need > 1) { nc_glob = 4; while (nc_glob < nc_need) nc_glob <<= 1; }
+            int nc_loc = c->window > 0 ? (c->window + 127) / 128 : 1;   /* a sliding layer's tiles, as ink2cc_attn_dyn_pb takes them */
             int nc_max = nc_glob > nc_loc ? nc_glob : nc_loc;
             if (nc_max >= 2) {
                 int hd_max = 0;

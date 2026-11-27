@@ -433,6 +433,14 @@ int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcB
  * * (hd + 2) floats at most, the engine's for its widest step (NULL: no split, as before).
  * COLI_VK_RELATTN_SPLIT=0 keeps every step whole. */
 void vkc_relattn_part(VkcBuf *part);
+/* From COLI_VK_RELATTN_TILE rows (9; 0 never) a step's attention runs chain_relattn_tile.comp: a workgroup a
+ * KV head and a block of rows with that head's query heads (H / KVH <= 4), each K and V row of a tile read once
+ * for all of them, the arithmetic chain_relattn's mode 0's in its order (the same bits). rows >= 0 sets the
+ * threshold (tests); returns the one before. */
+int  vkc_relattn_tile_rows(int rows);
+/* COLI_VK_RELATTN_TILE_DEC (off): the split decode's partials on chain_relattn_tile.comp (a KV head's query
+ * heads a workgroup, the same bits as mode 1); on >= 0 sets it (tests), returns the one before */
+int  vkc_relattn_tile_dec(int on);
 /* Inkling-2's ops (chain_ink2.comp, made on first use; inkling2_chain.h):
  *   vkc_ink2_mix   the attention residuals' mix of nb block states (b_off + s*b_row + e*D) and
  *                  the partial stream (x_off + s*x_row), each RMS-normalised without a weight,
@@ -934,6 +942,7 @@ typedef struct {
     unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
     unsigned long long dsa_tiled;      /* DeepSeek V4's indexer scores in tiles of rows (chain_dsv4_idx.comp, mode 11) */
     unsigned long long moe_pipes;      /* chain_moe.comp's pipelines made (a driver's compile each: 20 minutes on a Radeon RX 580) */
+    unsigned long long relattn_tile;   /* Inkling attention dispatches on chain_relattn_tile.comp */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* A chain's frame failed and the chain turns itself off: the device lost only when it said so; a frame refused for

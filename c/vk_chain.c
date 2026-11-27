@@ -3574,12 +3574,40 @@ static VkPipeline kx_pipe(int k) {
     if ((KX.mod[k] = load_module(KC.core.spv_path, file[k]))) KX.pipe[k] = make_pipe(KX.mod[k], NULL);
     return KX.pipe[k];
 }
+/* chain_relattn_tile.comp (a prompt chunk's rows, vkc_relattn below): a pipeline per (G, ND), its
+ * specialization constants, G = H / KVH from 1 to 4, ND 1 for hd <= 128 and 2 for hd <= 256 */
+static struct { VkShaderModule mod; VkPipeline pipe[4][2][2]; int tried, ptried[4][2][2]; } g_kt[2];
+#define KRT (g_kt[g_kd])
+#define RELATTN_TILE_SHARED ((4096 + 24 * 16 + 24 * 128 + 4 * 24) * 4)   /* the shader's shared arrays */
+static VkPipeline kt_pipe(int G, int nd, int split) {
+    if (G < 1 || G > 4 || nd < 1 || nd > 2 || split < 0 || split > 1 || !vkc_ready()) return VK_NULL_HANDLE;
+    if (KRT.pipe[G - 1][nd - 1][split] || KRT.ptried[G - 1][nd - 1][split]) return KRT.pipe[G - 1][nd - 1][split];
+    KRT.ptried[G - 1][nd - 1][split] = 1;
+    if (!KRT.tried) { KRT.tried = 1; KRT.mod = load_module(KC.core.spv_path, "chain_relattn_tile.spv"); }
+    if (!KRT.mod || kc_shared_limit() < RELATTN_TILE_SHARED) return VK_NULL_HANDLE;
+    int32_t v[3] = {G, nd, split};
+    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+    VkSpecializationInfo si = {3, me, sizeof v, v};
+    return KRT.pipe[G - 1][nd - 1][split] = make_pipe(KRT.mod, &si);
+}
+/* rb and jc for chain_relattn_tile.comp: rb rows a block (24 / G at most), jc V rows a pass, (jc + rb - 1) * hd
+ * within its 4096 floats */
+static void kt_block(int G, int hd, int *rb, int *jc) {
+    int b = 24 / G;
+    while (b > 1 && 4096 / hd - b + 1 < 4) b--;
+    int j = 4096 / hd - b + 1;
+    *rb = b; *jc = j > 32 ? 32 : j;
+}
 static void kx_shutdown(void) {
     for (int k = 0; k < 3; k++) {
         if (KX.pipe[k]) vkDestroyPipeline(KC.dev, KX.pipe[k], NULL);
         if (KX.mod[k]) vkDestroyShaderModule(KC.dev, KX.mod[k], NULL);
     }
     memset(&KX, 0, sizeof KX);
+    for (int g = 0; g < 4; g++) for (int n = 0; n < 2; n++) for (int t = 0; t < 2; t++)
+        if (KRT.pipe[g][n][t]) vkDestroyPipeline(KC.dev, KRT.pipe[g][n][t], NULL);
+    if (KRT.mod) vkDestroyShaderModule(KC.dev, KRT.mod, NULL);
+    memset(&KRT, 0, sizeof KRT);
 }
 int vkc_sconv_ready(void) { return kx_pipe(0) != VK_NULL_HANDLE; }
 int vkc_relattn_ready(void) { return kx_pipe(1) != VK_NULL_HANDLE; }
@@ -3640,6 +3668,25 @@ static int relattn_split_wanted(void) {
     if (on < 0) { const char *e = getenv("COLI_VK_RELATTN_SPLIT"); on = !(e && *e == '0'); }
     return on;
 }
+/* COLI_VK_RELATTN_TILE: the rows from which a step's attention runs chain_relattn_tile.comp (9, past the
+ * split decode's 8; 0 never), the same arithmetic as chain_relattn's mode 0 */
+static int g_relattn_tile = -1;
+int vkc_relattn_tile_rows(int rows) {
+    if (g_relattn_tile < 0) { const char *e = getenv("COLI_VK_RELATTN_TILE"); g_relattn_tile = e && *e ? atoi(e) : 9; }
+    int was = g_relattn_tile;
+    if (rows >= 0) g_relattn_tile = rows;
+    return was;
+}
+/* COLI_VK_RELATTN_TILE_DEC=1: the split decode on chain_relattn_tile.comp's SPLIT (a workgroup a KV head and tile,
+ * its query heads at once) instead of chain_relattn.comp's mode 1 (a workgroup a (head, row, tile)). Off: Inkling-2-Mini
+ * UD-Q3_K_XL on an RTX PRO 4000 decoded 37.0 tok/s at 10K positions on mode 1 and 36.6 on it */
+static int g_relattn_tile_dec = -1;
+int vkc_relattn_tile_dec(int on) {
+    if (g_relattn_tile_dec < 0) { const char *e = getenv("COLI_VK_RELATTN_TILE_DEC"); g_relattn_tile_dec = e && *e == '1'; }
+    int was = g_relattn_tile_dec;
+    if (on >= 0) g_relattn_tile_dec = on;
+    return was;
+}
 int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                 const VkcRelAttn *p) {
     VkPipeline pipe = kx_pipe(1);
@@ -3655,7 +3702,17 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
             struct { VkcRelAttn a; int s0, mode, nc; } x = {*p, 0, 1, nc};
             VkcBind b1[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(g_relattn_part, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
             VkcBind b2[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(g_relattn_part, 0), B(r, 0), B(relp, 0), B(tau, 0)};
-            if (!record(pipe, b1, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)p->S, (uint32_t)nc)) return 0;
+            /* the tiles: a workgroup a KV head and tile with its query heads (chain_relattn_tile.comp SPLIT),
+             * the same partials as mode 1's */
+            const int G = p->H / p->KVH;
+            VkPipeline sp = G <= 4 && vkc_relattn_tile_dec(-1) ? kt_pipe(G, p->hd > 128 ? 2 : 1, 1) : VK_NULL_HANDLE;
+            if (sp) {
+                int rb, jc;
+                kt_block(G, p->hd, &rb, &jc);
+                struct { VkcRelAttn a; int s0, rb, jc, nc; } xs = {*p, 0, rb, jc, nc};
+                if (!record(sp, b1, 8, &xs, sizeof xs, (uint32_t)p->KVH, (uint32_t)((p->S + rb - 1) / rb), (uint32_t)nc)) return 0;
+                KC.st.relattn_tile++;
+            } else if (!record(pipe, b1, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)p->S, (uint32_t)nc)) return 0;
             x.mode = 2;
             return record(pipe, b2, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)p->S, 1);
         }
@@ -3664,6 +3721,23 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows): the
      * shader's s0 is the slice's first row, pos_base stays the step's */
     int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1, p->H), ok = 1;
+    /* a prompt chunk's rows: chain_relattn_tile.comp, rb rows of a KV head's G heads a workgroup */
+    const int G = p->H / p->KVH, tile_rows = vkc_relattn_tile_rows(-1);
+    VkPipeline tp = tile_rows > 0 && S >= tile_rows && G <= 4 ? kt_pipe(G, p->hd > 128 ? 2 : 1, 0) : VK_NULL_HANDLE;
+    if (tp) {
+        int rb, jc;
+        kt_block(G, p->hd, &rb, &jc);
+        for (int r0 = 0; ok && r0 < S; r0 += rr) {
+            struct { VkcRelAttn a; int s0, rb, jc, nc; } x = {*p, r0, rb, jc, 0};
+            x.a.S = S - r0 < rr ? S - r0 : rr;
+            x.a.q_off += r0 * p->q_row; x.a.o_off += r0 * p->o_row; x.a.r_off += r0 * p->r_row; x.a.tau_off += r0;
+            if (p->has_sink) x.a.sink_off += r0 * p->H;
+            if (r0 && !attn_slice_next()) return 0;
+            ok = record(tp, bd, 8, &x, sizeof x, (uint32_t)p->KVH, (uint32_t)((x.a.S + rb - 1) / rb), 1);
+            KC.st.relattn_tile += ok;
+        }
+        return ok;
+    }
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         struct { VkcRelAttn a; int s0, mode, nc; } x = {*p, r0, 0, 0};
         x.a.S = S - r0 < rr ? S - r0 : rr;
