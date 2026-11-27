@@ -1,0 +1,33 @@
+AMD Radeon RX 9060 XT (RADV GFX1200), memory type 3 (heap 1, 15.92 GiB), 5 rounds of 13 x 1 GiB, polled every 1000 us for 3000 ms
+tier budget = free - 1.00 reserve - 0.00 dense - 2.44 chain (GiB)
+
+round 1: free 15.81 GiB before, 13 GiB allocated in 0.2 ms (free then 2.81), freed
+  just after the free: 2.81 GiB (13.00 of 13 GiB still counted)
+  back within 64 MiB of before: 159.3 ms
+  GiB still counted over time: 13.0@0ms 12.0@21ms 11.0@35ms 10.0@46ms 9.0@58ms 8.0@68ms 7.0@80ms 6.0@91ms 5.0@102ms 4.0@114ms 3.0@125ms 2.0@137ms 1.0@148ms 0.0@159ms
+  if the tier sized itself at: 20 ms -> 0.00 GiB (NO ROOM) 40 ms -> 1.37 GiB 60 ms -> 3.37 GiB 100 ms -> 6.37 GiB 150 ms -> 11.37 GiB 170 ms -> 12.37 GiB
+
+round 2: free 15.81 GiB before, 13 GiB allocated in 0.3 ms (free then 2.81), freed
+  just after the free: 2.81 GiB (13.00 of 13 GiB still counted)
+  back within 64 MiB of before: 96.2 ms
+  GiB still counted over time: 13.0@0ms 11.0@21ms 9.0@36ms 7.0@48ms 5.0@60ms 3.0@73ms 1.0@85ms 0.0@96ms
+  if the tier sized itself at: 20 ms -> 0.00 GiB (NO ROOM) 40 ms -> 3.37 GiB 60 ms -> 5.37 GiB 100 ms -> 12.37 GiB 150 ms -> 12.37 GiB 170 ms -> 12.37 GiB
+
+round 3: free 15.81 GiB before, 13 GiB allocated in 0.2 ms (free then 2.81), freed
+  just after the free: 2.81 GiB (13.00 of 13 GiB still counted)
+  back within 64 MiB of before: 97.2 ms
+  GiB still counted over time: 13.0@0ms 11.0@21ms 9.0@37ms 7.0@49ms 5.0@61ms 3.0@74ms 1.0@86ms 0.0@97ms
+  if the tier sized itself at: 20 ms -> 0.00 GiB (NO ROOM) 40 ms -> 3.37 GiB 60 ms -> 5.37 GiB 100 ms -> 12.37 GiB 150 ms -> 12.37 GiB 170 ms -> 12.37 GiB
+
+round 4: free 15.81 GiB before, 13 GiB allocated in 0.2 ms (free then 2.81), freed
+  just after the free: 2.81 GiB (13.00 of 13 GiB still counted)
+  back within 64 MiB of before: 158.6 ms
+  GiB still counted over time: 13.0@0ms 12.0@20ms 11.0@34ms 10.0@46ms 9.0@57ms 8.0@68ms 7.0@79ms 6.0@91ms 5.0@103ms 4.0@113ms 3.0@125ms 2.0@135ms 1.0@147ms 0.0@159ms
+  if the tier sized itself at: 20 ms -> 0.00 GiB (NO ROOM) 40 ms -> 1.37 GiB 60 ms -> 3.37 GiB 100 ms -> 6.37 GiB 150 ms -> 11.37 GiB 170 ms -> 12.37 GiB
+
+round 5: free 15.81 GiB before, 13 GiB allocated in 0.1 ms (free then 2.81), freed
+  just after the free: 2.81 GiB (13.00 of 13 GiB still counted)
+  back within 64 MiB of before: 159.8 ms
+  GiB still counted over time: 13.0@0ms 12.0@20ms 11.0@35ms 10.0@46ms 9.0@57ms 8.0@69ms 7.0@80ms 6.0@92ms 5.0@103ms 4.0@114ms 3.0@126ms 2.0@138ms 1.0@148ms 0.0@160ms
+  if the tier sized itself at: 20 ms -> 0.00 GiB (NO ROOM) 40 ms -> 1.37 GiB 60 ms -> 3.37 GiB 100 ms -> 6.37 GiB 150 ms -> 11.37 GiB 170 ms -> 12.37 GiB
+
