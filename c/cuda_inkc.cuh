@@ -46,7 +46,11 @@ __global__ static void ccg_sconv_k(float *x, const float *w, float *ring, CcScon
 
 /* tile b0 (128 positions from b0) of a (head, row)'s attention into its running max m, sum l and
  * weighted V (acc0: dims tid, acc1: tid + 128): chain_relattn.comp's online softmax step */
-__device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, const float *__restrict__ vc, const float *__restrict__ kvs,
+/* the ring's K and V as floats: float32, or float16 (relattn_kv16) */
+__device__ __forceinline__ float ccg_ldf(float x) { return x; }
+__device__ __forceinline__ float ccg_ldf(__half x) { return __half2float(x); }
+template <typename KT>
+__device__ __forceinline__ void ccg_relattn_tile(const KT *__restrict__ kc, const KT *__restrict__ vc, const float *__restrict__ kvs,
         const float *__restrict__ relp, const CcRelAttn &p, const float *qs, const float *rs, float *pe, float *red, int *pt,
         int kvh, int qpos, int t0, int n, float ts, int b0, int tid, float &m, float &l, float &acc0, float &acc1) {
     const int i = b0 + tid;
@@ -55,7 +59,7 @@ __device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, c
         const int t = t0 + i;
         pt[tid] = t;
         float a = 0.f;
-        if (t < p.pos_base) { const float *kr = kc + p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d]; }
+        if (t < p.pos_base) { const KT *kr = kc + p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * ccg_ldf(kr[d]); }
         else { const float *kr = kvs + p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d]; }
         const int dist = qpos - t;
         float bias = 0.f;
@@ -78,10 +82,15 @@ __device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, c
     for (int j = 0; j < cnt; j++) {
         const int t = pt[j];
         const float w = pe[j];
-        const float *vr = t < p.pos_base ? vc + p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd
-                                         : kvs + p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd;
-        if (d0 < p.hd) acc0 += w * vr[d0];
-        if (d1 < p.hd) acc1 += w * vr[d1];
+        if (t < p.pos_base) {
+            const KT *vr = vc + p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd;
+            if (d0 < p.hd) acc0 += w * ccg_ldf(vr[d0]);
+            if (d1 < p.hd) acc1 += w * ccg_ldf(vr[d1]);
+        } else {
+            const float *vr = kvs + p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd;
+            if (d0 < p.hd) acc0 += w * vr[d0];
+            if (d1 < p.hd) acc1 += w * vr[d1];
+        }
     }
     m = mn;
     __syncthreads();
@@ -89,7 +98,8 @@ __device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, c
 /* one block of 128 per (head, row): chain_relattn.comp's online softmax over tiles of 128 positions.
  * part (the split, a decode step's rows): block z takes tile z alone, its max, sum and weighted V into
  * part (hd + 2 floats a (row, head, tile)), and ccg_relattn_join_k joins the tiles */
-__global__ static void ccg_relattn_k(const float *q, const float *kc, const float *vc, float *o, const float *kvs,
+template <typename KT>
+__global__ static void ccg_relattn_k(const float *q, const KT *kc, const KT *vc, float *o, const float *kvs,
                                      const float *r, const float *relp, const float *tau, CcRelAttn p, float *part,
                                      const int *pb_ptr) {
     if (pb_ptr) p.pos_base = *pb_ptr;
@@ -244,9 +254,9 @@ static int cc_sconv(CcBuf *x, CcBuf *w, CcBuf *ring, const CcSconv *p) {
 /* chain_relattn_tile.comp on CUDA (its header has the contract and the layout): a block a KV head and rb consecutive
  * rows with that head's G query heads, each K and V row of a tile read once for the rb * G (row, head) pairs through
  * shared memory, each pair's arithmetic ccg_relattn_k's in its order: the same bits */
-template <int G, int ND>
-__global__ static void __launch_bounds__(256) ccg_relattn_tile_k(const float *__restrict__ q, const float *__restrict__ kc,
-        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ kvs, const float *__restrict__ r,
+template <int G, int ND, typename KT>
+__global__ static void __launch_bounds__(256) ccg_relattn_tile_k(const float *__restrict__ q, const KT *__restrict__ kc,
+        const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ kvs, const float *__restrict__ r,
         const float *__restrict__ relp, const float *__restrict__ tau, CcRelAttn p, int rb, int jc) {
     constexpr int PM = 24, RBM = PM / G, NA = (RBM + 7) / 8, NB = (RBM + 1) / 2, DC = 16, KVN = 4096;
     __shared__ float kv[KVN], qsh[PM * DC], sc[PM * 128], sm[PM], sl[PM], sn[PM], scr[PM];
@@ -257,11 +267,11 @@ __global__ static void __launch_bounds__(256) ccg_relattn_tile_k(const float *__
     const int tb0 = row_t0(qb0), span = 128 + row_t0(qlast) - tb0;
     const int KT = (qlast - row_t0(qlast) + 1 + 127) / 128;
     auto k_at = [&](int t, int d) {
-        return t < p.pos_base ? kc[p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d]
+        return t < p.pos_base ? ccg_ldf(kc[p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d])
                               : kvs[p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd + d];
     };
     auto v_at = [&](int t, int d) {
-        return t < p.pos_base ? vc[p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d]
+        return t < p.pos_base ? ccg_ldf(vc[p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d])
                               : kvs[p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd + d];
     };
     if (tid < rb * G) {
@@ -447,9 +457,9 @@ __global__ static void __launch_bounds__(256) ccg_relattn_tile_k(const float *__
 /* chain_relattn_tile.comp's SPLIT on CUDA: a decode step's partials (ccg_relattn_k's with part, the same bits), a block a
  * KV head, a block of rows and the tile blockIdx.z of nc, the KV head's query heads at once: each K and V row read once
  * for them; pb_ptr: pos_base from the device (the graphs) */
-template <int G, int ND>
-__global__ static void __launch_bounds__(256) ccg_relattn_split_k(const float *__restrict__ q, const float *__restrict__ kc,
-        const float *__restrict__ vc, const float *__restrict__ kvs, const float *__restrict__ r, const float *__restrict__ relp,
+template <int G, int ND, typename KT>
+__global__ static void __launch_bounds__(256) ccg_relattn_split_k(const float *__restrict__ q, const KT *__restrict__ kc,
+        const KT *__restrict__ vc, const float *__restrict__ kvs, const float *__restrict__ r, const float *__restrict__ relp,
         const float *__restrict__ tau, CcRelAttn p, int rb, int jc, float *__restrict__ part, const int *pb_ptr) {
     constexpr int PM = 24, NU = PM / 2, DC = 16, KVN = 4096;
     __shared__ float kv[KVN], qsh[PM * DC], sc[PM * 128];
@@ -461,11 +471,11 @@ __global__ static void __launch_bounds__(256) ccg_relattn_split_k(const float *_
     const int tb0 = row_t0(qb0), span = 128 + row_t0(qlast) - tb0;
     const int tb = tb0 + 128 * c, tend = min(tb + span, qlast + 1);
     auto k_at = [&](int t, int d) {
-        return t < p.pos_base ? kc[p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d]
+        return t < p.pos_base ? ccg_ldf(kc[p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d])
                               : kvs[p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd + d];
     };
     auto v_at = [&](int t, int d) {
-        return t < p.pos_base ? vc[p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d]
+        return t < p.pos_base ? ccg_ldf(vc[p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd + d])
                               : kvs[p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd + d];
     };
     const int i = tid & 127, hp = tid >> 7;
@@ -584,11 +594,17 @@ __global__ static void __launch_bounds__(256) ccg_relattn_split_k(const float *_
         for (int e = 0; e < ND; e++) { const int d = dg + 128 * e; if (d < p.hd) pz[2 + d] = oacc[u * ND + e]; }
     }
 }
+/* the rings' pointers as the kernels take them: float32, or float16 under relattn_kv16 (g_cc_rel16) */
+#define CC_KF(b) ((const float *)fp(b))
+#define CC_KH(b) ((const __half *)fp(b))
 template <int G>
 static void cc_relattn_split_launch(int nd, dim3 g, cudaStream_t st, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *r,
                                     CcBuf *relp, CcBuf *tau, const CcRelAttn *p, int rb, int jc, float *part, const int *pb) {
-    if (nd == 1) coli_launch(ccg_relattn_split_k<G, 1>, g, 256, 0, st, fp(q), fp(kc), fp(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc, part, pb);
-    else coli_launch(ccg_relattn_split_k<G, 2>, g, 256, 0, st, fp(q), fp(kc), fp(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc, part, pb);
+    if (g_cc_rel16) {
+        if (nd == 1) coli_launch(ccg_relattn_split_k<G, 1, __half>, g, 256, 0, st, fp(q), CC_KH(kc), CC_KH(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc, part, pb);
+        else coli_launch(ccg_relattn_split_k<G, 2, __half>, g, 256, 0, st, fp(q), CC_KH(kc), CC_KH(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc, part, pb);
+    } else if (nd == 1) coli_launch(ccg_relattn_split_k<G, 1, float>, g, 256, 0, st, fp(q), CC_KF(kc), CC_KF(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc, part, pb);
+    else coli_launch(ccg_relattn_split_k<G, 2, float>, g, 256, 0, st, fp(q), CC_KF(kc), CC_KF(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc, part, pb);
 }
 /* a decode step's partials on the KV heads (0 when they do not apply: more than 4 heads a KV head, or switched off) */
 static int cc_relattn_split_tiles(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
@@ -612,9 +628,16 @@ static int cc_relattn_split_tiles(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBu
 template <int G>
 static void cc_relattn_tile_launch(int nd, dim3 g, cudaStream_t st, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs,
                                    CcBuf *r, CcBuf *relp, CcBuf *tau, const CcRelAttn *p, int rb, int jc) {
-    if (nd == 1) coli_launch(ccg_relattn_tile_k<G, 1>, g, 256, 0, st, fp(q), fp(kc), fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc);
-    else coli_launch(ccg_relattn_tile_k<G, 2>, g, 256, 0, st, fp(q), fp(kc), fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc);
+    if (g_cc_rel16) {
+        if (nd == 1) coli_launch(ccg_relattn_tile_k<G, 1, __half>, g, 256, 0, st, fp(q), CC_KH(kc), CC_KH(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc);
+        else coli_launch(ccg_relattn_tile_k<G, 2, __half>, g, 256, 0, st, fp(q), CC_KH(kc), CC_KH(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc);
+    } else if (nd == 1) coli_launch(ccg_relattn_tile_k<G, 1, float>, g, 256, 0, st, fp(q), CC_KF(kc), CC_KF(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc);
+    else coli_launch(ccg_relattn_tile_k<G, 2, float>, g, 256, 0, st, fp(q), CC_KF(kc), CC_KF(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, rb, jc);
 }
+/* ccg_relattn_k over the rings' type (g_cc_rel16): its grid and the arguments after the rings */
+#define CC_RELATTN_K(grid, ...) do { \
+        if (g_cc_rel16) coli_launch(ccg_relattn_k<__half>, grid, 128, 0, c->stream, fp(q), CC_KH(kc), CC_KH(vc), __VA_ARGS__); \
+        else coli_launch(ccg_relattn_k<float>, grid, 128, 0, c->stream, fp(q), CC_KF(kc), CC_KF(vc), __VA_ARGS__); } while (0)
 /* a prompt chunk's rows on the tiles: 0 when they do not apply (more than 4 heads a KV head) */
 static int cc_relattn_tile(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
                            const CcRelAttn *p) {
@@ -649,21 +672,23 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
         const size_t pb = (size_t)p->S * p->H * nc * (p->hd + 2) * sizeof(float);
         if (cudaMallocAsync((void **)&part, pb, c->stream) == cudaSuccess) {
             if (!cc_relattn_split_tiles(c, q, kc, vc, kvs, r, relp, tau, p, nc, part, nullptr))
-                coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o),
-                            fp(kvs), fp(r), fp(relp), fp(tau), *p, part, (const int *)nullptr);
+                CC_RELATTN_K(dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, part,
+                             (const int *)nullptr);
             coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, (const float *)part, fp(tau), fpw(o), *p, nc);
             (void)cudaFreeAsync(part, c->stream);
             return launched(c, "relattn split");
         }
         (void)cudaGetLastError();
     }
-    coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o), fp(kvs),
-                fp(r), fp(relp), fp(tau), *p, (float *)nullptr, (const int *)nullptr);
+    CC_RELATTN_K(dim3((unsigned)p->H, (unsigned)p->S), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, (float *)nullptr, (const int *)nullptr);
     return launched(c, "relattn");
 }
 /* CUDA-Graph-safe relattn + KV scatter reading pos_base from a 1-int device buffer (no host-side pb dependency,
  * no cudaMallocAsync inside capture). */
-__global__ static void ccg_ink2_kv_put_k(float *kc, float *vc, const float *kvs, const int *pb_ptr,
+__device__ __forceinline__ void ccg_stf(float *p, float x) { *p = x; }
+__device__ __forceinline__ void ccg_stf(__half *p, float x) { *p = __float2half_rn(x); }
+template <typename KT>
+__global__ static void ccg_ink2_kv_put_k(KT *kc, KT *vc, const float *kvs, const int *pb_ptr,
                                          int S, int KV, int hd, int cap, int vs_off) {
     const long idx = (long)(blockIdx.x + blockIdx.y * gridDim.x) * 256 + threadIdx.x;
     const long kvo = (long)KV * hd;
@@ -675,8 +700,8 @@ __global__ static void ccg_ink2_kv_put_k(float *kc, float *vc, const float *kvs,
     const int d = rem - h * hd;
     const int pb = *pb_ptr;
     const long dst = ((long)h * cap + (long)((pb + s) % cap)) * hd + d;
-    kc[dst] = kvs[idx];
-    vc[dst] = kvs[(long)vs_off + idx];
+    ccg_stf(kc + dst, kvs[idx]);
+    ccg_stf(vc + dst, kvs[(long)vs_off + idx]);
 }
 static int cc_relattn_pb(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
                          CcBuf *pb_buf, CcBuf *part_buf, int nc, const CcRelAttn *p) {
@@ -685,13 +710,12 @@ static int cc_relattn_pb(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, C
     if (p->S <= 0) return 1;
     if (part_buf && nc >= 2) {
         if (!cc_relattn_split_tiles(c, q, kc, vc, kvs, r, relp, tau, p, nc, fpw(part_buf), (const int *)fp(pb_buf)))
-            coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o),
-                        fp(kvs), fp(r), fp(relp), fp(tau), *p, fpw(part_buf), (const int *)fp(pb_buf));
+            CC_RELATTN_K(dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, fpw(part_buf),
+                         (const int *)fp(pb_buf));
         coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, fp(part_buf), fp(tau), fpw(o), *p, nc);
         return launched(c, "relattn pb split");
     }
-    coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o), fp(kvs),
-                fp(r), fp(relp), fp(tau), *p, (float *)nullptr, (const int *)fp(pb_buf));
+    CC_RELATTN_K(dim3((unsigned)p->H, (unsigned)p->S), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, (float *)nullptr, (const int *)fp(pb_buf));
     return launched(c, "relattn pb");
 }
 static int cc_ink2_kv_put(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb_buf, int S, int KV, int hd, int cap, int vs_off) {
@@ -700,8 +724,16 @@ static int cc_ink2_kv_put(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb_buf, int S
     if (S <= 0) return 1;
     const long total = (long)S * KV * hd;
     dim3 g; cg_grid((total + 255) / 256, &g);
-    coli_launch(ccg_ink2_kv_put_k, g, 256, 0, c->stream, fpw(kc), fpw(vc), fp(kvs), (const int *)fp(pb_buf), S, KV, hd, cap, vs_off);
+    if (g_cc_rel16) coli_launch(ccg_ink2_kv_put_k<__half>, g, 256, 0, c->stream, (__half *)fpw(kc), (__half *)fpw(vc), fp(kvs), (const int *)fp(pb_buf), S, KV, hd, cap, vs_off);
+    else coli_launch(ccg_ink2_kv_put_k<float>, g, 256, 0, c->stream, fpw(kc), fpw(vc), fp(kvs), (const int *)fp(pb_buf), S, KV, hd, cap, vs_off);
     return launched(c, "ink2 kv put");
+}
+/* relattn_kv16: the rings relattn, relattn_pb and ink2_kv_put take (kc, vc) in float16, offsets in halves, for the
+ * calls after; returns the one before (on < 0: asks) */
+static int cc_relattn_kv16_set(int on) {
+    const int was = g_cc_rel16;
+    if (on >= 0) g_cc_rel16 = on != 0;
+    return was;
 }
 static int cc_ink2_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcInk2Mix *p) {
     CcCtx *c = live();

@@ -546,6 +546,9 @@ typedef struct ColiCudaChainOps {
     int  (*relattn_pb)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau,
                        CcBuf *pb, CcBuf *part, int nc, const CcRelAttn *p);
     int  (*ink2_kv_put)(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb, int S, int KV, int hd, int cap, int vs_off);
+    /* relattn, relattn_pb and ink2_kv_put over rings (kc, vc) of float16, offsets in halves, for the calls after
+     * (on 1) or of float32 (0); returns the one before, on < 0 asks */
+    int  (*relattn_kv16)(int on);
 } ColiCudaChainOps;
 #define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
 #define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
@@ -932,6 +935,12 @@ static inline int cc_relattn_pb(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf 
 static inline int cc_ink2_kv_put(CcBuf *kc, CcBuf *vc, CcBuf *kvs, CcBuf *pb, int S, int KV, int hd, int cap, int vs_off) {
     return cc_ink2_pb_ready() ? cc_ops()->ink2_kv_put(kc, vc, kvs, pb, S, KV, hd, cap, vs_off) : 0;
 }
+/* Inkling's rings in float16 (relattn_kv16): 1 when the module takes them and the float16 copies (kvh) */
+static inline int cc_relattn_kv16_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, relattn_kv16) + sizeof t->relattn_kv16 && t->relattn_kv16 && cc_kvh_ready();
+}
+static inline int cc_relattn_kv16(int on) { return cc_relattn_kv16_ready() ? cc_ops()->relattn_kv16(on) : 0; }
 #endif
 
 #ifdef __cplusplus

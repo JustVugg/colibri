@@ -16,6 +16,7 @@
 #include <vector>
 #include "../backend_cuda.h"
 #include "../cuda_chain.h"
+#include "../kv16.h"
 
 static const ColiCudaChainOps *T;
 static int fails;
@@ -127,6 +128,32 @@ static void test_relattn_h(int S, int pos_base, int window, int cap, int hd, int
         for (size_t i = 0; i < y.size(); i++) diff += memcmp(&y[i], &yt[i], 4) != 0;
         printf("  %s %s: tiles and a block a (head, row): %zu of %zu floats differ\n", diff ? "FAIL" : "ok  ", what, diff, y.size());
         if (diff) fails++;
+    }
+    /* the rings in float16 (relattn_kv16): the tiles and a block a (head, row) the same bits again, within the halves'
+     * rounding of the reference */
+    if (T->size >= offsetof(ColiCudaChainOps, relattn_kv16) + sizeof T->relattn_kv16 && T->relattn_kv16 && hd % 2 == 0) {
+        std::vector<uint16_t> kh(nr), vh(nr);
+        kv16_pack(kh.data(), kr.data(), (int64_t)nr); kv16_pack(vh.data(), vr.data(), (int64_t)nr);
+        CcBuf *bkh = T->buf((nr + 1) / 2 * 4, CC_DEV), *bvh = T->buf((nr + 1) / 2 * 4, CC_DEV);
+        int ok16 = bkh && bvh && T->begin() && T->write(bkh, 0, kh.data(), nr * 2) && T->write(bvh, 0, vh.data(), nr * 2) && T->submit(1);
+        const int was = T->relattn_kv16(1);
+        setenv("COLI_CUDA_RELATTN_TILE", "1", 1);
+        ok16 = ok16 && T->begin() && T->relattn(bq, bkh, bvh, bo, bs, brr, bp, bt, &p) && T->submit(1);
+        std::vector<float> t16 = down(bo, 0, ref.size());
+        setenv("COLI_CUDA_RELATTN_TILE", "0", 1);
+        ok16 = ok16 && T->begin() && T->relattn(bq, bkh, bvh, bo, bs, brr, bp, bt, &p) && T->submit(1);
+        std::vector<float> m16 = down(bo, 0, ref.size());
+        unsetenv("COLI_CUDA_RELATTN_TILE");
+        T->relattn_kv16(was);
+        char w16[200]; snprintf(w16, sizeof w16, "%s, float16 rings", what);
+        check(ok16 ? rel_to_max(t16.data(), ref.data(), ref.size()) : 1e30, 4e-3, w16);
+        if (H / KVH <= 4 && !(S <= 8 && nc >= 2)) {
+            size_t diff = 0;
+            for (size_t i = 0; i < m16.size(); i++) diff += memcmp(&m16[i], &t16[i], 4) != 0;
+            printf("  %s %s: tiles and a block a (head, row) on float16 rings: %zu of %zu floats differ\n", diff ? "FAIL" : "ok  ", what, diff, m16.size());
+            if (diff) fails++;
+        }
+        T->free(bkh); T->free(bvh);
     }
     if (H / KVH <= 4 && S <= 8 && nc >= 2) {   /* the split decode: on the KV heads and a block a (head, row, tile) */
         setenv("COLI_CUDA_RELATTN_TILE", "0", 1);

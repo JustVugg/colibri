@@ -79,6 +79,7 @@ typedef struct {
     Ink2CcGraph *gr, *gr_full;
     CcBuf *pb_dev, *rel_part;
     unsigned long long g_tick, g_capture, g_launch, g_eager, g_full_capture, g_full_launch;
+    int kvh, kvh_set;                          /* the K/V mirrors in float16 (ink2cc_kvh_want), decided at the first */
 } Ink2CuChain;
 
 static void ink2cc_fatal(const char *what) {
@@ -116,6 +117,14 @@ static int ink2cc_geometry_ok(const Model *m, int say) {
  * convolution states, the K/V mirrors at the served context (ink_ctx_max), the loop's gates and
  * state, the routed experts' table and buffers and the scratch of a prompt chunk of 256 rows. The
  * tier's budget leaves them (ink_vk_dense_bytes). */
+/* COLI_CUDA_KV16 (on): the K/V mirrors in float16 (relattn_kv16), where the module takes them; the host's cache stays
+ * float32: the device's attention reads each earlier position rounded to the nearest half */
+static int ink2cc_kvh_want(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_KV16"); on = !(e && *e == '0'); }
+    return on;
+}
+static size_t ink2cc_kves_plan(void) { return ink2cc_kvh_want() && (!cc_ops() || cc_relattn_kv16_ready()) ? 2 : 4; }
 static size_t ink2cc_plan_bytes(const Model *m) {
     const Cfg *c = &m->c;
     size_t D = (size_t)c->hidden, E = (size_t)c->n_experts, CK = (size_t)c->conv_k, K = (size_t)c->topk, b = 0, row = 0;
@@ -125,7 +134,7 @@ static size_t ink2cc_plan_bytes(const Model *m) {
     for (int v = 0; v < c->n_state; v++) { size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v); if (kvo > kvm) kvm = kvo; }
     for (int v = c->n_layers; v < c->n_state; v++) {                   /* the loop's later passes' state */
         size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v);
-        b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2 + 2 * kvo * (size_t)kv_ring_rows(c, v, t) * 4;
+        b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2 + 2 * kvo * (size_t)kv_ring_rows(c, v, t) * ink2cc_kves_plan();
     }
     if (c->loop_p > 1) {                                               /* the gates and the queries */
         size_t nl = (size_t)(c->loop_e - c->loop_s), r = (size_t)c->loop_r;
@@ -137,7 +146,7 @@ static size_t ink2cc_plan_bytes(const Model *m) {
         if (!c->local[i]) b += 2 * KV * CK * D * 4;                   /* the dynamic taps' projections */
         b += (6 * D + H * hd + H * c->d_rel + (size_t)c->d_rel * L_EXT(c, i) + 2 * kvo * CK + 2 * D * CK + E) * 4;
         b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2;                     /* the states and their read-back */
-        b += 2 * kvo * (size_t)kv_ring_rows(c, i, t) * 4;             /* the K/V mirror */
+        b += 2 * kvo * (size_t)kv_ring_rows(c, i, t) * ink2cc_kves_plan();             /* the K/V mirror */
         size_t r1 = (14 * D + 3 * H * hd + 4 * kvo + H * c->d_rel + 2 * E + KV * CK + 2 * H) * 4;
         if (r1 > row) row = r1;
     }
@@ -425,13 +434,20 @@ static int ink2cc_chunk_rows(Ink2CuChain *ch, Model *m) {
 static int ink2cc_mirror(Ink2CuChain *ch, Model *m) {
     Cfg *c = &m->c;
     if (ch->max_t == m->max_t && ch->hostK == m->K) return 1;
+    if (!ch->kvh_set) {   /* float16 mirrors where the module takes them (every head dim even) */
+        int even = 1;
+        for (int i = 0; i < ch->NS; i++) even &= L_HD(c, i) % 2 == 0;
+        ch->kvh = ink2cc_kvh_want() && even && cc_relattn_kv16_ready();
+        ch->kvh_set = 1;
+    }
+    cc_relattn_kv16(ch->kvh);
     for (int i = 0; i < ch->NS; i++) {
         cc_free(ch->kc[i]); cc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
         int cap = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i), KV = L_KV(c, i);
         ch->cap[i] = cap;
         ch->dlo[i] = 0; ch->dhi[i] = cap < m->max_t ? m->max_t : m->kv_len;   /* a ring: every row; else the positions held */
-        ch->kc[i] = cc_buf((size_t)KV * cap * hd * sizeof(float), CC_DEV);
-        ch->vc[i] = cc_buf((size_t)KV * cap * hd * sizeof(float), CC_DEV);
+        ch->kc[i] = cc_buf((size_t)KV * cap * hd * (ch->kvh ? 2 : sizeof(float)), CC_DEV);
+        ch->vc[i] = cc_buf((size_t)KV * cap * hd * (ch->kvh ? 2 : sizeof(float)), CC_DEV);
         if (!ch->kc[i] || !ch->vc[i]) { ch->max_t = 0; ch->hostK = NULL; return 0; }
     }
     ch->max_t = m->max_t; ch->hostK = m->K;
@@ -493,8 +509,17 @@ static int ink2cc_push_state(Ink2CuChain *ch, Model *m) {
             int row = t % cap, run = ch->dhi[i] - t < cap - row ? ch->dhi[i] - t : cap - row;
             for (int h = 0; h < KV && ok; h++) {
                 size_t off = ((size_t)h * cap + row) * hd;
-                ok = cc_write(ch->kc[i], off, m->K[i] + off, (size_t)run * hd * sizeof(float)) &&
-                     cc_write(ch->vc[i], off, m->V[i] + off, (size_t)run * hd * sizeof(float));
+                if (ch->kvh) {   /* the host's rows rounded to halves, at half the offset (off even: hd is) */
+                    uint16_t *hk = malloc((size_t)run * hd * 2 * sizeof(uint16_t)), *hv = hk ? hk + (size_t)run * hd : NULL;
+                    ok = hk != NULL;
+                    if (ok) {
+                        kv16_pack(hk, m->K[i] + off, (int64_t)run * hd); kv16_pack(hv, m->V[i] + off, (int64_t)run * hd);
+                        ok = cc_write(ch->kc[i], off / 2, hk, (size_t)run * hd * 2) && cc_write(ch->vc[i], off / 2, hv, (size_t)run * hd * 2);
+                    }
+                    free(hk);
+                } else
+                    ok = cc_write(ch->kc[i], off, m->K[i] + off, (size_t)run * hd * sizeof(float)) &&
+                         cc_write(ch->vc[i], off, m->V[i] + off, (size_t)run * hd * sizeof(float));
             }
             t += run;
         }
@@ -582,7 +607,8 @@ static int ink2cc_attn_dyn(Ink2CuChain *ch, Model *m, int i, int v, int n, int p
         rk[(s - s0) * KV + h] = (CcRegion){dst, src, (size_t)hd};
         rv[(s - s0) * KV + h] = (CcRegion){dst, vs + src, (size_t)hd};
     }
-    ok = cc_copy_regions(ch->kc[v], ch->kvs, rk, nr) && cc_copy_regions(ch->vc[v], ch->kvs, rv, nr);
+    ok = ch->kvh ? cc_copy_regions_h(ch->kc[v], ch->kvs, rk, nr) && cc_copy_regions_h(ch->vc[v], ch->kvs, rv, nr)
+                 : cc_copy_regions(ch->kc[v], ch->kvs, rk, nr) && cc_copy_regions(ch->vc[v], ch->kvs, rv, nr);
     free(rk);
     return ok;
 }
