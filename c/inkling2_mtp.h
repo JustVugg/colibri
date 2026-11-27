@@ -76,19 +76,33 @@ static float *ink2m_vec(Model *m, const char *name, int n) {
  * a quarter of the bf16 rows' bytes. On an RTX 5090 the bf16 head's GEMV took 1.9-2.0 ms a row,
  * three of them a step at K = 3: the drafts' largest cost. A draft only proposes; the verify's
  * head is the target's own. INK2_MTP_HEAD=bf16: the target's head for the drafts too. Made at load
- * (about a second), so the first prompt does not wait for it. */
+ * (about a second), so the first prompt does not wait for it.
+ * The rows come from the file where it holds floats (read_f32_slice: F32, BF16, F16), and a GGUF's
+ * from the target's own table, a row at a time (wt_row_f32): read as F16, a GGUF head's blocks
+ * (unsloth's Inkling-2-Mini UD-Q3_K_XL: Q5_K) made a head no draft agreed with, 0 of 23 kept and
+ * plain steps from there on. Any other form keeps the target's head for the drafts. */
 static void ink2m_lm_q4(Model *m, Ink2Mtp *mt) {
     const char *e = getenv("INK2_MTP_HEAD"), *nm = "model.llm.unembed.weight";
     if ((e && !strcmp(e, "bf16")) || !st_has(&m->S, nm)) return;
     const int I = m->c.hidden, O = m->c.unpad_vocab, gs = 64, ng = I / gs;
     if (I % gs) return;
+    const st_tensor *t = st_find(&m->S, nm);
+    const int gguf = m->lm_head.gq != NULL;
+    if (!gguf && !st_f32_dtype(t->dtype)) {
+        fprintf(stderr, "[inkling2] INK2_MTP: %s is %s, not a float table; the drafts use the target's head\n",
+                nm, st_dtype_name(t->dtype));
+        return;
+    }
     uint8_t *q = malloc((size_t)O * I / 2); float *sc = malloc((size_t)O * ng * sizeof(float));
     const int blk = 4096;
     float *w = malloc((size_t)blk * I * sizeof(float));
     if (q && sc && w) {
         for (int r0 = 0; r0 < O; r0 += blk) {
             const int nr = O - r0 < blk ? O - r0 : blk;
-            read_f32_slice(&m->S, nm, w, (int64_t)r0 * I, (int64_t)nr * I);
+            if (gguf) {
+                #pragma omp parallel for schedule(static)
+                for (int r = 0; r < nr; r++) wt_row_f32(m->lm_head, (int64_t)(r0 + r) * I, w + (size_t)r * I, I);
+            } else read_f32_slice(&m->S, nm, w, (int64_t)r0 * I, (int64_t)nr * I);
             #pragma omp parallel for schedule(static)
             for (int r = 0; r < nr; r++)
                 for (int g = 0; g < ng; g++) {
@@ -836,7 +850,7 @@ static int ink2mc_step(Model *m, int tok, int t, int *out) {
     mt->t_verify += now_s() - t1;
     m->kv_len = t + n;
     kv_prefix_record(&m->kvp, ids, t, n);
-    int tf[INK2M_MAXB];
+    int tf[INK2M_MAXB] = {0};
     for (int r = 0; r < n; r++) {
         const float *lr = vl + (int64_t)r * V;
         int best = 0;
