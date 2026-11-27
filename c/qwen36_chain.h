@@ -1747,6 +1747,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     double t_fwd = tm_now();   /* the hybrid steps' gate times the forward (vkc_dmoe_forward_done) */
     *rows_only = 0; *lost = 0;
     Cfg *c = &m->c; int D = c->hidden, L = ch->n, lo = ch->lo, hi = lo + L, E = c->n_experts;   /* L: the layers on the device */
+    const char *why = "";   /* the step a chunk's frame stopped at, for the line at lost: */
     int part = hi < c->n_layers || !ch->head;
     if (part) { want_x = 1; nlogits = 0; }   /* the residual comes back; the CPU runs the rest and the head */
     /* a multiplexed step's places are grown (q36c_mux_step); the held conversation's place to
@@ -1806,9 +1807,15 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
         if (ns < 0) ns = 0;
         if (ns) snapped = c0 + ns;
-        if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
-            !(ch->mx_rows ? q36c_mux_push(ch, m, c0, n) : q36c_push_state(ch, m, pb, n))) goto lost;
+        why = "its frame did not begin";
+        if (!vkc_begin()) goto lost;
+        why = "its rows could not be staged";
+        if (!vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float))) goto lost;
+        why = "the conversation's state could not be staged";
+        if (!(ch->mx_rows ? q36c_mux_push(ch, m, c0, n) : q36c_push_state(ch, m, pb, n))) goto lost;
+        why = "the experts' table could not be written";
         if (dmoe && !vkc_dmoe_upload(&ch->dm)) goto lost;   /* the tier's residents changed: the table again */
+        why = "its frame could not be recorded";
         if (half && c->lfm3) {   /* LFM3's (rope_head_zt): the full layers' rot_full at theta, the rest
                                   * unrotated; the sliding layers' every frequency at theta_swa */
             float *cs = (float *)vkc_ptr(ch->cs), *cw = cs + (size_t)ch->rows * c->rotary_dim;
@@ -1956,7 +1963,11 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     vkc_gemm_rows(-1);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    if (!vkc_lost()) {   /* no error from the device (vk_chain.c says those): a step of ours it refused */
+        fprintf(stderr, "[VK] qwen36 chain: a step of %d rows at position %d stopped (%s) with no error from the device; "
+                "the chain and the device's experts are off, the CPU takes over (#2793)\n", S, pos_base, why);
+        vkc_finish(); coli_vk_mark_lost_dev(ch->d);
+    }
     vkc_device(0);
     if (!ch->mx_rows) q36c_recover(m, pos_base);   /* the held conversation (none in a multiplexed step) */
     g_vk_chain = 0; ch->failed = 1;
