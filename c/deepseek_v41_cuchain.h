@@ -26,6 +26,7 @@
  * layers; KV_SLOTS above 1. COLI_CUDA_CHAIN=0: never. COLI_CUDA_V41_ROWS: a chunk's rows (256). */
 #ifndef DEEPSEEK_V41_CUCHAIN_H
 #define DEEPSEEK_V41_CUCHAIN_H
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "cuda_chain.h"
 
 typedef struct {

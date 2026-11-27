@@ -3718,6 +3718,7 @@ static int64_t ink_cs_cells(Cfg *c, int bank, int layer);
 #endif
 #ifdef COLI_CUDA
 #include "cuda_chain.h"
+#include "kv16.h"            /* kv16_pack: the float16 mirrors (COLI_CUDA_KV16) */
 #include "inkling2_cuchain.h"   /* COLI_CUDA_CHAIN: Inkling-2's on a CUDA device */
 #endif
 

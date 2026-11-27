@@ -46,6 +46,7 @@
  * recurrent state on the CPU from the prefix record and runs there from then on
  * (q36cc_recover, as q36c_recover). COLI_CUDA_CHAIN_FAULT=n fakes it at the n-th
  * frame, for the tests. */
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "cuda_chain.h"
 #include "qwen36_cuda_profile.h"
 #include "qwen36_cuda_checkpoint.h"

@@ -87,6 +87,7 @@
  * primary's layers, then the second device's from the streams it hands over. A second
  * device that is lost, or declines a forward, leaves the CPU to run its layers from
  * there (the host's state is current: nothing to rebuild); lost, both chains go off. */
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 

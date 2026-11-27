@@ -31,6 +31,7 @@
  * CPU's layers. */
 #ifndef GLM53_CUCHAIN_H
 #define GLM53_CUCHAIN_H
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "cuda_chain.h"
 
 #define G53U_HOST 0

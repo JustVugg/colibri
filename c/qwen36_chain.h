@@ -72,6 +72,7 @@
  * verify snapshots); every loop over layers here runs over the N. A device lost
  * mid-forward rebuilds the N layers' recurrent state from the prefix record: the CPU's
  * layers have not run that forward yet, so theirs is already the host's. */
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 #include "vk_dmoe.h"

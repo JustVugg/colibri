@@ -58,6 +58,7 @@
  * memory. It needs the dense matrices on the device (the per-matrix path's copies); the router,
  * the sink projection and the dynamic taps' projections go up as f32. */
 
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "vk_dmoe.h"   /* the routed experts in the frame */
 
 #define INK2C_HOST 0   /* the host's convolution states are newer than the device's */

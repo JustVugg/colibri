@@ -71,6 +71,7 @@
  * neither): the second device's is read back first, so a read that fails leaves the
  * primary's untouched; the primary's record of input rows rebuilds both. Losing either
  * device turns both off. */
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
