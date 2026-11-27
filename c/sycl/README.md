@@ -39,6 +39,32 @@ MIGRATION.md sections 25–29 also record a separate SYCL port of the DeepSeek V
 against an earlier version of that engine; it is not part of this backend, and DeepSeek V4 builds
 and runs here as `Makefile.deepseek-v4` has it.
 
+## B60 Qwen3.6 defaults
+
+On PCI device `8086:e211` (Arc Pro B60), the native Qwen3.6 35B A3B int4
+model uses an expert arena when its full host-resident expert tier is active.
+With two B60s, automatic placement also puts the complete dense trunk on the
+first card if every expert still fits on its original card. This keeps the
+dense chain available. Other geometries, incomplete offers, streamed experts,
+insufficient memory and other devices keep the general placement.
+
+`COLI_PLATFORM_DEFAULTS=0` disables both B60 choices. An explicit
+`COLI_CUDA_EXPERT_ARENA` controls the arena; an explicit `COLI_PLACE` controls
+placement. `COLI_CUDA_CHAIN=0` or `QT_HOME=layer` also prevents the B60 trunk
+co-location. The profile and placement tests cover these eligibility rules.
+The initial B60 measurements were made on a development snapshot and are
+[recorded separately](https://github.com/mrighini/colibri/blob/28d7abf7aa76da29c0653135a4e2e4c3deef9387/reports/b60/REPORT.md).
+They do not qualify three or four cards, long contexts, or other model variants.
+
+For an experimental synchronous peer-copy API, `COLI_SYCL_PEER_CONTEXT=1`
+requests a shared context for two to four B60s on one Level Zero platform. All
+directed peer pairs must be supported; otherwise independent contexts are
+retained and cross-device copies are refused. `coli_cuda_pipe_peer_copy`
+checks buffer ownership, waits for source queues and completes the copy before
+returning. This does not put Qwen's routed experts on a P2P pipeline; its
+asynchronous cross-device expert path remains disabled. Only a two-card B60
+host has been tested, and the driver may choose its own transfer mechanism.
+
 ## Building
 
 The toolchain is oneAPI 2025.3 (icpx 2025.3.3, clang 21) in `intel/oneapi-basekit:2025.3.2-0-devel-ubuntu24.04`;

@@ -224,17 +224,15 @@ static size_t backend_booked_bytes(int device) {
     coli_cuda_stats(device, nullptr, &bytes);
     return bytes;
 }
-/* cudaMemcpyPeerAsync: a plain memcpy on the queue where both devices are in one SYCL context
- * (USM device memory of a context is accessible to its devices); each device opened by
- * coli_sycl_open has a context of its own, so a copy between two of them is refused (1, an
- * error the caller reports) until the GLM pipe asks for a shared context. */
+/* A peer copy needs a shared, peer-enabled context. Independent contexts
+ * retain the existing refusal; the driver chooses its transfer mechanism. */
 static int peer_copy(sycl::queue *q, int dst_dev, void *dst, int src_dev, const void *src, size_t bytes, int wait) {
     if (dst_dev != src_dev && !(coli_sycl_is_open(dst_dev) && coli_sycl_is_open(src_dev) &&
                                 coli_sycl_context(dst_dev) == coli_sycl_context(src_dev))) {
         std::fprintf(stderr, "[CUDA] peer copy device %d -> %d: the devices are in different SYCL contexts (unsupported)\n", src_dev, dst_dev);
         return 1;
     }
-    return COLI_SYCL_TRY(sycl::event ev = q->memcpy(dst, src, bytes); if (wait) ev.wait());
+    return COLI_SYCL_TRY(sycl::event ev = q->memcpy(dst, src, bytes); if (wait) ev.wait_and_throw());
 }
 /* the matrix engines as the family would run them: the profile has the f16 8x16x16 shape (and
  * COLI_SYCL_XMX is not 0). Without it the family would run its plain f32 tile over the same
@@ -1882,6 +1880,12 @@ extern "C" int coli_cuda_available_device_count(void) {
 }
 
 extern "C" void coli_cuda_shutdown(void) {
+    /* When peer access is enabled, another device's queue may hold an address
+     * owned here. Drain all queues before freeing any device's allocations. */
+    for (int i = 0; i < g_nctx; i++) {
+        DeviceContext *ctx = &g_ctx[i];
+        try { coli_sycl_queue(ctx->device).wait(); coli_sycl_copy_queue(ctx->device).wait(); } catch (...) {}
+    }
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx)) continue;
@@ -1890,7 +1894,6 @@ extern "C" void coli_cuda_shutdown(void) {
          * group open) and the uploader's last copy queued, writing host_y and reading the
          * staging: both queues drained before anything they touch goes (the chain's shutdown,
          * before this by atexit's order, does the same) */
-        try { coli_sycl_queue(ctx->device).wait(); coli_sycl_copy_queue(ctx->device).wait(); } catch (...) {}
         if (ctx->bdtab) sycl::free(ctx->bdtab, dq());
         if (ctx->mxfp4_weights)
             sycl::free(ctx->mxfp4_weights, dq());
@@ -2634,9 +2637,9 @@ catch (sycl::exception const &exc) {
  * (coli_sycl_tuned_default), only where every device gives the same value; the first use of each switch that
  * takes a measured value says so on stderr. The devices: the opened ones; before coli_cuda_init (an engine
  * deciding its defaults before it opens anything), the ones it will open -- COLI_GPUS's ordinals, else every
- * listed GPU -- read without opening them (coli_sycl_listed_arch). */
-static coli_sycl_arch tuned_arch_at(int k, const int *pre, int npre) {
-    return g_nctx > 0 ? coli_sycl_profile_for(g_ctx[k].device).arch : k < npre ? coli_sycl_listed_arch(pre[k]) : COLI_SYCL_ARCH_NONE;
+ * listed GPU -- read without opening them (coli_sycl_listed_profile). */
+static coli_sycl_profile tuned_profile_at(int k, const int *pre, int npre) {
+    return g_nctx > 0 ? coli_sycl_profile_for(g_ctx[k].device) : k < npre ? coli_sycl_listed_profile(pre[k]) : coli_sycl_profile{};
 }
 extern "C" int coli_cuda_tuned_default(const char *knob, int generic) {
     if (!knob) return generic;
@@ -2660,13 +2663,11 @@ extern "C" int coli_cuda_tuned_default(const char *knob, int generic) {
         }
         if (n <= 0) return generic;
     }
-    coli_sycl_profile p;
-    std::memset(&p, 0, sizeof p);
-    p.arch = tuned_arch_at(0, pre, n);
+    coli_sycl_profile p = tuned_profile_at(0, pre, n);
     const coli_sycl_arch arch0 = p.arch;
     const int v = coli_sycl_tuned_default(p, pd, knob, generic);
     for (int i = 1; i < n; i++) {
-        p.arch = tuned_arch_at(i, pre, n);
+        p = tuned_profile_at(i, pre, n);
         if (coli_sycl_tuned_default(p, pd, knob, generic) != v) return generic;   /* devices of different architectures */
     }
     if (v != generic) {
@@ -6685,6 +6686,9 @@ extern "C" int coli_cuda_expert_group_resident_issue(
     for(int i=0;i<count;i++)   /* the block formats: the chain's GEMVs only */
         if((gates[i]&&gates[i]->fmt>=100)||(ups[i]&&ups[i]->fmt>=100)||(downs[i]&&downs[i]->fmt>=100)) return 0;
     int device=first->device,D=first->I,I=first->O;
+    /* This API has asynchronous peer lifetimes; keep cross-device issues
+     * refused until the resident-expert pipeline has its own P2P tests. */
+    if (device != home_device) return 0;
     GroupDesc host[64];
     int total=0,all_s4=1;
     for(int c=0;c<count;c++){
@@ -6970,8 +6974,22 @@ extern "C" int coli_cuda_pipe_peer_copy(int dst_dev, float *dst, int src_dev,
     if(!dst||!src) return 0;
     if(dst_dev==src_dev){ DeviceContext *c=find_ctx(dst_dev); if(!select_ctx(c)) return 0;
         return cuda_ok(COLI_SYCL_TRY(dq().memcpy(dst, src, bytes)),"pipe intra copy"); }
-    DeviceContext *c=find_ctx(dst_dev); if(!select_ctx(c)) return 0;
-    return cuda_ok(peer_copy(&dq(), dst_dev, dst, src_dev, src, bytes, 1), "pipe peer copy");
+    DeviceContext *c=find_ctx(dst_dev), *source=find_ctx(src_dev);
+    if(!c || !source || !select_ctx(c) || coli_sycl_context(dst_dev)!=coli_sycl_context(src_dev)) return 0;
+    sycl::context &context = coli_sycl_context(dst_dev);
+    /* The API's buffers must belong to the named devices; passing a pointer
+     * from the wrong context/device is an error, not an implicit host copy. */
+    if (sycl::get_pointer_type(src,context)!=sycl::usm::alloc::device ||
+        sycl::get_pointer_type(dst,context)!=sycl::usm::alloc::device ||
+        sycl::get_pointer_device(src,context)!=coli_sycl_device(src_dev) ||
+        sycl::get_pointer_device(dst,context)!=coli_sycl_device(dst_dev)) return 0;
+    /* Wait for source writes before submitting to the destination queue.
+     * The copy itself is synchronous, including before either buffer is freed. */
+    coli_sycl_queue(src_dev).wait_and_throw();
+    coli_sycl_copy_queue(src_dev).wait_and_throw();
+    if (coli_sycl_lost(src_dev) || coli_sycl_lost(dst_dev)) return 0;
+    int ok = cuda_ok(peer_copy(&dq(), dst_dev, dst, src_dev, src, bytes, 1), "pipe peer copy");
+    return ok && !coli_sycl_lost(dst_dev);
 }
 catch (sycl::exception const &exc) { return sycl_caught(exc, "coli_cuda_pipe_peer_copy"); }
 /* come attention_project_batch_dev ma l'uscita di o_proj RESTA sul device (out_dev). */

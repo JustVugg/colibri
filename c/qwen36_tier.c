@@ -809,6 +809,52 @@ void qt_experts_withdraw(const char *why){
             why ? why : "withdrawn");
 }
 
+#ifdef COLI_SYCL
+/* On two B60s, splitting the small Qwen3.6 trunk disables its device chain.
+ * Keep that trunk together only for the measured model, when all its experts
+ * still fit on their existing homes. Otherwise retain the general placer. */
+static int auto_place_b60_qwen(int nl, int ne, int topk, const size_t *capacity, int enabled){
+    const char *chain = getenv("COLI_CUDA_CHAIN");
+    if(!enabled || G.ndev!=2 || nl!=40 || ne!=256 || topk!=8 || G.D!=2048 || G.Ih!=512 ||
+       G.wfmt!=4 || G.egs!=64 || G_stream || G_trunk_only || G_home_layer || !G.exp_bytes ||
+       (chain && *chain=='0')) return 0;
+
+    unsigned char dn[40]={0}, dno[40]={0}, attn[40]={0}, shared[40]={0};
+    int lm=0, ndn=0, nattn=0;
+    size_t trunk=0;
+    for(int o=0;o<G_offer_n;o++){
+        int l=G_offer[o].layer; size_t bytes=G_offer[o].bytes;
+        if(l<0 || l>=nl || bytes>(size_t)-1-trunk) return 0;
+        trunk+=bytes;
+        if(!strcmp(G_offer[o].name,"lmhead")){ if(l!=0 || lm++) return 0; }
+        else if(!strcmp(G_offer[o].name,"dnproj")){ if(dn[l]++) return 0; ndn++; }
+        else if(!strcmp(G_offer[o].name,"dnout")){ if(dno[l]++) return 0; }
+        else if(!strcmp(G_offer[o].name,"attnproj")){ if(attn[l]++) return 0; nattn++; }
+        else if(!strcmp(G_offer[o].name,"shexp")){ if(shared[l]++) return 0; }
+        else return 0;
+    }
+    if(lm!=1 || ndn!=30 || nattn!=10) return 0;
+    for(int l=0;l<nl;l++)
+        if(!shared[l] || (dn[l] ? (!dno[l] || attn[l]) : (dno[l] || !attn[l]))) return 0;
+
+    size_t need[2]={0,0};
+    for(int l=0;l<nl;l++) for(int e=0;e<ne;e++){
+        int di=home2(l,e);
+        if(di<0 || di>=2 || G.exp_bytes>capacity[di] || need[di]>capacity[di]-G.exp_bytes) return 0;
+        need[di]+=G.exp_bytes;
+    }
+    if(trunk>capacity[0]-need[0]) return 0;
+
+    for(int o=0;o<G_offer_n;o++){
+        G_offer[o].dev=G.dev[0];
+        if(!strcmp(G_offer[o].name,"dnproj")) G_auto_dnp[G_offer[o].layer]=G.dev[0];
+    }
+    G_auto_lmh=G.dev[0]; G_trunk_bytes[0]=trunk; G_trunk_bytes[1]=0; G_auto_on=1;
+    fprintf(stderr,"[place] auto: Qwen3.6 trunk together on B60 dev %d; all experts still fit on their two homes\n",G.dev[0]);
+    return 1;
+}
+#endif
+
 static void auto_place(int nl, int ne, int topk, const size_t *capacity, const uint32_t *heat0){
     size_t room[QT_MAX_DEV];
     for(int i = 0; i < G.ndev; i++){ room[i] = capacity[i]; G_trunk_bytes[i] = 0; }
@@ -818,6 +864,12 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
     /* lmhead first (one call per token, latency-tolerant), then the
      * projections in layer order */
     for(int o = 0; o < G_offer_n; o++) G_offer[o].dev = QT_PLACE_CPU;
+#ifdef COLI_SYCL
+    if(G.ndev==2 && nl==40 && ne==256 && topk==8 && G.D==2048 && G.Ih==512 && G.wfmt==4 &&
+       G.egs==64 && !G_stream && !G_trunk_only && !G_home_layer &&
+       auto_place_b60_qwen(nl, ne, topk, capacity,
+                          coli_cuda_tuned_default("Q36_SYCL_CHAIN_COLOCATE", 0))) return;
+#endif
     /* lmhead first (one call per token, latency-tolerant), then every other
      * offered component in offer order -- the engine offers in layer order,
      * so a partial placement is a prefix of the layers (#1361: whole
@@ -1074,9 +1126,13 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         const int int4_ok = G.wfmt==4 && G.egs>0 && !G_trunk_only && mat_bytes%256==0 && (G.sc_gu*sizeof(float))%64==0;
         const char *ae = getenv("COLI_CUDA_EXPERT_ARENA");
         char ae_t[2] = {0, 0};
-        if(int4_ok && !(ae && *ae)){   /* unset: the platform's measured default (2 on Data Center GPU Max cards), for
-                                        * the native int4 experts only: qwen38's FP8 tier takes it from qwen38's table */
-            const int t = coli_cuda_tuned_default("COLI_CUDA_EXPERT_ARENA", 0);
+        if(int4_ok && !(ae && *ae)){   /* native int4 only; qwen38's FP8 tier has its own defaults */
+            int t = coli_cuda_tuned_default("COLI_CUDA_EXPERT_ARENA", 0);
+#ifdef COLI_SYCL
+            /* B60's value was measured on the full-resident Qwen3.6 35B model. */
+            if(!t && nl==40 && ne==256 && D==2048 && Ih==512 && topk==8 && expert_gs==64 && !G_stream)
+                t = coli_cuda_tuned_default("Q36_SYCL_EXPERT_ARENA", 0);
+#endif
             if(t == 1 || t == 2){ ae_t[0] = (char)('0' + t); ae = ae_t; }
         }
         G_stg_want = 0; G_stg_used = 0; G_slots_lost = 0;

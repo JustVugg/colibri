@@ -68,6 +68,10 @@ extern coli_sycl_profile coli_sycl_profile_detect(const sycl::device &d);
  * is not open yields the generic profile of nothing (arch NONE, every count 0) rather than a
  * fault, so a caller may print it. */
 extern const coli_sycl_profile &coli_sycl_profile_for(int device);
+/* The full profile a listed GPU would have once open. An invalid ordinal
+ * returns an empty profile. This also exposes its PCI device ID to decisions
+ * made before the backend opens the GPU. */
+extern coli_sycl_profile coli_sycl_listed_profile(int ordinal);
 /* The architecture listed GPU `ordinal` would have once open, read without opening it (NONE past the
  * list): for decisions taken before coli_sycl_open (coli_cuda_tuned_default before an engine's init). */
 extern coli_sycl_arch coli_sycl_listed_arch(int ordinal);
@@ -83,10 +87,11 @@ extern "C" void coli_sycl_print_profiles(void);
  * OpenCL view of the same cards is not listed twice): the ordinals the engine's COLI_GPUS /
  * COLI_GPU name, before any is opened. 0 when the runtime finds no GPU. Host only. */
 extern int coli_sycl_available_device_count(void);
-/* Opens the devices of `devices` (ordinals, as coli_cuda_init takes them): a context and an
+/* Opens the devices of `devices` (ordinals, as coli_cuda_init takes them): normally a context and an
  * in-order queue per device (the backend's stream), a second in-order queue for the chain's copies
  * (cuda_chain.cu's c->cs), the profile. Repeating the same list keeps everything; a different list
- * while devices are open returns 0, as coli_cuda_init documents. 1 on success. */
+ * while devices are open returns 0, as coli_cuda_init documents. The experimental
+ * COLI_SYCL_PEER_CONTEXT=1 may share a context across eligible B60s. 1 on success. */
 extern int coli_sycl_open(const int *devices, int count);
 extern void coli_sycl_close(void);
 extern int coli_sycl_is_open(int device);

@@ -19,6 +19,9 @@ int main(void) {
     assert(coli_env_find("V41_READ_DEPTH")->engines == CE_DSV41);
     assert(coli_env_find("Q38_TRUNK_GPU")->engines == CE_QWEN38);
     assert(coli_env_find("COLI_PLACE")->engines == (CE_QWEN | CE_QWEN38));
+    assert(coli_env_find("COLI_SYCL_XMX")->engines & CE_QWEN);
+    assert(coli_env_find("COLI_SYCL_PEER_CONTEXT")->engines & CE_QWEN);
+    assert(coli_env_find("OMP_PROC_BIND")->engines & CE_QWEN);
     assert(coli_env_find("CACHE_ROUTE")->engines & CE_QWEN);
     assert(coli_env_find("SNAP")->engines & CE_DSV41);
     assert(coli_env_find("MIMO_CAP")->engines == CE_MIMO);   /* read through mimo.c's env_int() */
@@ -46,7 +49,11 @@ int main(void) {
     assert(!(coli_env_find("NGEN")->engines & CE_QWEN) && !(coli_env_find("SERVE_BATCH")->engines & CE_QWEN));
     assert(!coli_env_find("COLI_SERVE_PORT") && coli_env_launcher_only("COLI_SERVE_PORT"));
     unsetenv("COLI_ENV_STRICT");
+    unsetenv("COLI_SYCL_XMX"); unsetenv("COLI_SYCL_PEER_CONTEXT"); unsetenv("OMP_PROC_BIND");
     const int base = coli_env_check(CE_QWEN, "qwen36");   /* whatever the runner's environment holds */
+    setenv("COLI_SYCL_XMX", "0", 1); setenv("COLI_SYCL_PEER_CONTEXT", "1", 1); setenv("OMP_PROC_BIND", "close", 1);
+    assert(coli_env_check(CE_QWEN, "qwen36") == base);
+    unsetenv("COLI_SYCL_XMX"); unsetenv("COLI_SYCL_PEER_CONTEXT"); unsetenv("OMP_PROC_BIND");
     setenv("NGEN", "512", 1); setenv("SERVE_BATCH", "1", 1); setenv("COLI_SERVE_PORT", "8000", 1);
     assert(coli_env_check(CE_QWEN, "qwen36") == base);
     setenv("K3_BITS", "8", 1);

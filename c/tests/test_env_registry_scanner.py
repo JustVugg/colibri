@@ -48,3 +48,19 @@ class RegistryScannerTest(unittest.TestCase):
         (self.root / "tests").mkdir()
         (self.root / "tests" / "fixture.c").write_text('getenv("FIXTURE_ONLY");')
         self.assertEqual(registry.scan_sources(), {})
+
+    def test_sycl_and_runtime_consumers_keep_registry_rows(self):
+        (self.root / "sycl").mkdir()
+        backend = self.root / "sycl" / "backend.cpp"
+        backend.write_text('getenv("COLI_TEST");\n')
+        (self.root / "coli_env.h").write_text(
+            'static const ColiEnvVar coli_env_table[] = {\n'
+            '    {"COLI_TEST", CE_BOOL, CE_QWEN, 0, NULL},\n'
+            '    {"OMP_PROC_BIND", CE_STR, CE_QWEN, 0, NULL},\n};\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(registry.main(), 0)
+        backend.write_text('// getenv("COLI_TEST")\n')
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(registry.main(), 1)
+        self.assertIn("no code reads it: COLI_TEST", error.getvalue())

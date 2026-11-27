@@ -137,6 +137,12 @@ static const struct { coli_sycl_arch arch; const char *knob; int value; } tuned_
 };
 int coli_sycl_tuned_default(const coli_sycl_profile &p, const char *platform_defaults, const char *knob, int generic) {
     if (!knob || (platform_defaults && !strcmp(platform_defaults, "0"))) return generic;
+    /* B60, not every Battlemage part: measured on the 24 GiB e211 cards.
+     * The tier checks its format and memory before taking either choice. */
+    if (p.arch == COLI_SYCL_ARCH_BMG && p.pci_device_id == 0xe211) {
+        if (!strcmp(knob, "Q36_SYCL_EXPERT_ARENA")) return 2;
+        if (!strcmp(knob, "Q36_SYCL_CHAIN_COLOCATE")) return 1;
+    }
     for (const auto &r : tuned_rows)
         if (r.arch == p.arch && !strcmp(r.knob, knob)) return r.value;
     return generic;

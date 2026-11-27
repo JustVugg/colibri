@@ -12,7 +12,9 @@ Run it with `make -C c check-env`. It fails when:
     coli_env_find(), or contains a duplicate name.
 
 c/tests/ is excluded: fixtures read their own variables (EXPERT_RAW, TMPDIR)
-which are not part of the engines' surface.
+which are not part of the engines' surface. SYCL backend C++ reads count when
+checking whether a registry entry is stale; missing backend-only entries are
+not yet checked, because the registry's engine masks cover engine call sites.
 """
 
 import os
@@ -35,6 +37,9 @@ SOURCE_TOKEN = re.compile(
     r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/|'
     + GETENV.pattern, re.DOTALL)
 ROW = re.compile(r'^\s*\{"([A-Z0-9_]+)"\s*,')
+# The OpenMP runtime reads this before entering the engine; it is not a C
+# getenv call, but the strict environment check must still accept it.
+RUNTIME_ENV = {"OMP_PROC_BIND"}
 
 
 def scan_sources():
@@ -78,6 +83,22 @@ def scan_registry():
     return rows
 
 
+def scan_sycl_backend_reads():
+    """Backend C++ consumers make a registered variable non-stale."""
+    reads = set()
+    backend = os.path.join(C_DIR, "sycl")
+    if not os.path.isdir(backend):
+        return reads
+    for name in os.listdir(backend):
+        if not name.endswith((".cpp", ".hpp")):
+            continue
+        with open(os.path.join(backend, name), errors="replace") as fh:
+            for match in SOURCE_TOKEN.finditer(fh.read()):
+                if match.group(1) is not None:
+                    reads.add(match.group(1))
+    return reads
+
+
 def main():
     code = scan_sources()
     rows = scan_registry()
@@ -104,7 +125,7 @@ def main():
         problems.append("read by the code but missing from coli_env.h: %s (%s)"
                         % (v, code[v][0]))
 
-    stale = sorted(set(rows) - set(code))
+    stale = sorted(set(rows) - set(code) - scan_sycl_backend_reads() - RUNTIME_ENV)
     for v in stale:
         problems.append("in coli_env.h but no code reads it: %s" % v)
 

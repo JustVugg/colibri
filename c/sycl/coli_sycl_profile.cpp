@@ -203,10 +203,13 @@ int coli_sycl_available_device_count(void) {
  * overrides), read without opening it: COLI_SYCL_ARCH_NONE past the list. For a decision taken before
  * coli_sycl_open (coli_cuda_tuned_default asked by an engine before its first init). Quiet: nothing is
  * said here that the open does not say again. */
-coli_sycl_arch coli_sycl_listed_arch(int ordinal) {
+coli_sycl_profile coli_sycl_listed_profile(int ordinal) {
     const std::vector<sycl::device> &l = gpu_list();
-    if (ordinal < 0 || ordinal >= (int)l.size()) return COLI_SYCL_ARCH_NONE;
-    return coli_sycl_profile_derive(read_props(l[(size_t)ordinal]), coli_sycl_env_read(), nullptr).arch;
+    if (ordinal < 0 || ordinal >= (int)l.size()) return {};
+    return coli_sycl_profile_derive(read_props(l[(size_t)ordinal]), coli_sycl_env_read(), nullptr);
+}
+coli_sycl_arch coli_sycl_listed_arch(int ordinal) {
+    return coli_sycl_listed_profile(ordinal).arch;
 }
 
 /* An open device: its context, the two in-order queues (compute, the chain's copies), the
@@ -219,6 +222,16 @@ coli_sycl_arch coli_sycl_listed_arch(int ordinal) {
  * address. */
 #define COLI_SYCL_SLOTS 4
 #define COLI_SYCL_RETIRED_MAX 8   /* retired blocks held before a grow must wait for the queues */
+static sycl::async_handler async_handler(std::shared_ptr<coli_sycl_host_sync> state) {
+    return [state](sycl::exception_list el) {
+        for (auto &e : el) {
+            try { std::rethrow_exception(e); }
+            catch (const sycl::exception &ex) { std::fprintf(stderr, "[SYCL] async error (the device is lost): %s\n", ex.what()); }
+            catch (...) { std::fprintf(stderr, "[SYCL] async error (the device is lost)\n"); }
+        }
+        state->cancel();
+    };
+}
 struct Dev {
     std::shared_ptr<coli_sycl_host_sync> loss;  // constructed before handlers/queues
     sycl::device dev;
@@ -228,22 +241,17 @@ struct Dev {
     struct { void *p; size_t bytes; } slot[COLI_SYCL_SLOTS];
     void *retired[COLI_SYCL_RETIRED_MAX]; int n_retired; size_t retired_bytes;
     int free_query;          /* the device answers ext_intel_free_memory (Level Zero with ZES_ENABLE_SYSMAN=1) */
-    Dev(const sycl::device &d, const sycl::property_list &props)
-        : loss(std::make_shared<coli_sycl_host_sync>()), dev(d), ctx(d, handler()), q(ctx, d, handler(), props), cq(ctx, d, handler(), props) {
+    Dev(const sycl::device &d, const sycl::property_list &props,
+        const sycl::context *shared = nullptr, std::shared_ptr<coli_sycl_host_sync> shared_loss = {})
+        : loss(shared_loss ? shared_loss : std::make_shared<coli_sycl_host_sync>()), dev(d),
+          ctx(shared ? *shared : sycl::context(d, handler())), q(ctx, d, handler(), props), cq(ctx, d, handler(), props) {
         memset(&prof, 0, sizeof prof);
         memset(slot, 0, sizeof slot);
         memset(retired, 0, sizeof retired); n_retired = 0; retired_bytes = 0;
         free_query = 0;
     }
     sycl::async_handler handler(void) {
-        return [state = loss](sycl::exception_list el) {
-            for (auto &e : el) {
-                try { std::rethrow_exception(e); }
-                catch (const sycl::exception &ex) { std::fprintf(stderr, "[SYCL] async error (the device is lost): %s\n", ex.what()); }
-                catch (...) { std::fprintf(stderr, "[SYCL] async error (the device is lost)\n"); }
-            }
-            state->cancel();
-        };
+        return async_handler(loss);
     }
 };
 /* the retired blocks, freed: the caller saw the queues pass whatever read them */
@@ -266,6 +274,7 @@ static void retire(Dev &dv, int device, void *p, size_t bytes) {
  * begun its own shutdown, is a known way to hang at exit. */
 static Dev *g_dev[COLI_CUDA_MAX_DEVICES];                    /* by the engine's ordinal */
 static int g_open[COLI_CUDA_MAX_DEVICES], g_nopen = 0;      /* the list coli_sycl_open took */
+static bool g_peer_open = false;
 static std::mutex g_mutex;                                   /* open / close / the arena */
 
 static void fprof_enable(int level);   /* section 5, below */
@@ -320,21 +329,64 @@ int coli_sycl_open(const int *devices, int count) {
     const int fprof = fp_env && *fp_env && strcmp(fp_env, "0") ? (atoi(fp_env) > 1 ? 2 : 1) : 0;
     const bool profiling = (prof_env && !strcmp(prof_env, "1")) || fprof > 0;   /* event timestamps (cu_xb's elapsed times): off by default */
     if (fprof) fprof_enable(fprof);
+    /* Experimental B60-only peer context. Require every directed pair and a
+     * common Level Zero platform. A refusal leaves independent contexts. */
+    std::unique_ptr<sycl::context> shared;
+    std::shared_ptr<coli_sycl_host_sync> shared_loss;
+    const char *peer_env = getenv("COLI_SYCL_PEER_CONTEXT");
+    if (peer_env && !strcmp(peer_env, "1") && count >= 2 && count <= 4) {
+        std::vector<sycl::device> peer;
+        std::vector<std::pair<int,int>> enabled;
+        try {
+            bool capable = true;
+            for (int i = 0; i < count; i++) {
+                peer.push_back(list[devices[i]]);
+                coli_sycl_profile p = coli_sycl_profile_detect(peer.back());
+                if (p.arch != COLI_SYCL_ARCH_BMG || p.pci_device_id != 0xe211 ||
+                    peer.back().get_platform().get_backend() != sycl::backend::ext_oneapi_level_zero ||
+                    (i && peer.back().get_platform() != peer[0].get_platform())) capable = false;
+            }
+            for (int i = 0; capable && i < count; i++)
+                for (int j = 0; capable && j < count; j++)
+                    if (i != j && !peer[i].ext_oneapi_can_access_peer(peer[j])) capable = false;
+            if (capable) {
+                enabled.reserve((size_t)count * (count - 1));
+                for (int i = 0; i < count; i++)
+                    for (int j = 0; j < count; j++) if (i != j) {
+                        peer[i].ext_oneapi_enable_peer_access(peer[j]); enabled.emplace_back(i,j);
+                    }
+                shared_loss = std::make_shared<coli_sycl_host_sync>();
+                shared = std::make_unique<sycl::context>(peer, async_handler(shared_loss));
+                g_peer_open = true;
+                std::fprintf(stderr, "[SYCL] experimental B60 peer context enabled for %d devices\n", count);
+            } else std::fprintf(stderr, "[SYCL] peer context unavailable; independent contexts retained\n");
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "[SYCL] peer context unavailable: %s; independent contexts retained\n", e.what());
+            shared.reset(); shared_loss.reset();
+            for (auto p : enabled) try { peer[p.first].ext_oneapi_disable_peer_access(peer[p.second]); } catch (const sycl::exception &) {}
+        }
+    }
     for (int i = 0; i < count; i++) {
         const int ordinal = devices[i];
         try {
             sycl::property_list props = profiling
                 ? sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}
                 : sycl::property_list{sycl::property::queue::in_order()};
-            Dev *dv = new Dev(list[ordinal], props);
+            auto dv = std::make_unique<Dev>(list[ordinal], props, shared.get(), shared_loss);
             dv->prof = coli_sycl_profile_detect(dv->dev);
             dv->free_query = dv->dev.has(sycl::aspect::ext_intel_free_memory) ? 1 : 0;
-            g_dev[ordinal] = dv;
+            g_dev[ordinal] = dv.release();
             g_open[g_nopen++] = ordinal;
-        } catch (const sycl::exception &e) {
+        } catch (const std::exception &e) {
             std::fprintf(stderr, "[SYCL] device %d: cannot open: %s\n", ordinal, e.what());
             for (int j = 0; j < g_nopen; j++) { delete g_dev[g_open[j]]; g_dev[g_open[j]] = nullptr; }
             g_nopen = 0;
+            shared.reset();
+            if (g_peer_open) {
+                for (int a = 0; a < count; a++) for (int b = 0; b < count; b++) if (a != b)
+                    try { auto d=list[devices[a]]; d.ext_oneapi_disable_peer_access(list[devices[b]]); } catch (const sycl::exception &) {}
+                g_peer_open = false;
+            }
             return 0;
         }
         const coli_sycl_profile &p = g_dev[ordinal]->prof;
@@ -349,6 +401,12 @@ int coli_sycl_open(const int *devices, int count) {
 
 void coli_sycl_close(void) {
     std::lock_guard<std::mutex> lock(g_mutex);
+    /* Peer work can access another device's allocation: drain all queues
+     * before releasing the first device's memory. */
+    for (int j = 0; j < g_nopen; j++) {
+        Dev *dv = g_dev[g_open[j]];
+        if (dv) try { dv->q.wait(); dv->cq.wait(); } catch (const sycl::exception &) {}
+    }
     for (int j = 0; j < g_nopen; j++) {
         Dev *dv = g_dev[g_open[j]];
         if (!dv) continue;
@@ -361,6 +419,12 @@ void coli_sycl_close(void) {
         }
         delete dv;
         g_dev[g_open[j]] = nullptr;
+    }
+    if (g_peer_open) {
+        const auto &list = gpu_list();
+        for (int a = 0; a < g_nopen; a++) for (int b = 0; b < g_nopen; b++) if (a != b)
+            try { auto d=list[g_open[a]]; d.ext_oneapi_disable_peer_access(list[g_open[b]]); } catch (const sycl::exception &) {}
+        g_peer_open = false;
     }
     g_nopen = 0;
 }

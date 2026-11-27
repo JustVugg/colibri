@@ -309,6 +309,18 @@ int main(void) {
         }
         CHECK(coli_sycl_tuned_default(p_pvc, nullptr, "COLI_SOMETHING_ELSE", 7) == 7);
         CHECK(coli_sycl_tuned_default(p_pvc, nullptr, nullptr, 5) == 5);
+        /* B60's choices must not leak to other Battlemage PCI IDs. */
+        coli_sycl_profile p_b60 = coli_sycl_profile_derive(bmg, no_env, nullptr);
+        p_b60.pci_device_id = 0xe211;
+        CHECK(coli_sycl_tuned_default(p_b60, nullptr, "Q36_SYCL_EXPERT_ARENA", 0) == 2);
+        CHECK(coli_sycl_tuned_default(p_b60, nullptr, "Q36_SYCL_CHAIN_COLOCATE", 0) == 1);
+        CHECK(coli_sycl_tuned_default(p_b60, "0", "Q36_SYCL_EXPERT_ARENA", 0) == 0);
+        CHECK(coli_sycl_tuned_default(p_b60, "0", "Q36_SYCL_CHAIN_COLOCATE", 0) == 0);
+        p_b60.pci_device_id = 0xe20b; /* B580 */
+        CHECK(coli_sycl_tuned_default(p_b60, nullptr, "Q36_SYCL_EXPERT_ARENA", 0) == 0);
+        CHECK(coli_sycl_tuned_default(p_b60, nullptr, "Q36_SYCL_CHAIN_COLOCATE", 0) == 0);
+        p_b60.pci_device_id = 0; /* unknown device ID is not proof of a B60 */
+        CHECK(coli_sycl_tuned_default(p_b60, nullptr, "Q36_SYCL_EXPERT_ARENA", 0) == 0);
         /* COLI_SYCL_PROFILE=pvc on another part takes pvc's arch tag, and so pvc's rows */
         const coli_sycl_env as_pvc = { nullptr, nullptr, "pvc" };
         const coli_sycl_profile bmg_as_pvc = coli_sycl_profile_derive(bmg, as_pvc, nullptr);
