@@ -25,6 +25,7 @@ SMALLEST_DEVICE = 32768
 # checks maxComputeSharedMemorySize against before it creates the pipeline.
 CHECKED_BY_HOST = {
     "chain_attn_full.spv": ("vk_chain.c", "ATTN_FULL_SHARED"),
+    "chain_relattn_t.spv": ("vk_chain.c", "RELATTN_T_SHARED"),
     "qmatmul_grp_gate_up.spv": ("backend_vulkan.c", "GRP_GATE_UP_SHARED"),
     "qmatmul_gemm_bd.spv": ("vk_chain.c", "GEMM_BD_SHARED"),
     "qmatmul_gemm_bdc.spv": ("vk_chain.c", "GEMM_BDC_SHARED"),

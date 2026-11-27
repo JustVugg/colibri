@@ -433,6 +433,10 @@ int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcB
  * * (hd + 2) floats at most, the engine's for its widest step (NULL: no split, as before).
  * COLI_VK_RELATTN_SPLIT=0 keeps every step whole. */
 void vkc_relattn_part(VkcBuf *part);
+/* A prompt chunk of 16 rows or more goes through chain_relattn_t.comp, 32 rows a workgroup over
+ * tiles of K and V in shared memory (hd <= 128, d_rel <= 32, a device with the shader's shared
+ * memory); COLI_VK_RELATTN_TILE=0 keeps mode 0, as does vkc_relattn_tile(0) (tests). */
+void vkc_relattn_tile(int on);
 /* Inkling-2's ops (chain_ink2.comp, made on first use; inkling2_chain.h):
  *   vkc_ink2_mix   the attention residuals' mix of nb block states (b_off + s*b_row + e*D) and
  *                  the partial stream (x_off + s*x_row), each RMS-normalised without a weight,
@@ -932,6 +936,7 @@ typedef struct {
     unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
     unsigned long long dsa_tiled;      /* DeepSeek V4's indexer scores in tiles of rows (chain_dsv4_idx.comp, mode 11) */
     unsigned long long moe_pipes;      /* chain_moe.comp's pipelines made (a driver's compile each: 20 minutes on a Radeon RX 580) */
+    unsigned long long relattn_tiled;  /* Inkling's prompt attentions in tiles of rows (chain_relattn_t.comp) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

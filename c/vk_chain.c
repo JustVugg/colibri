@@ -3331,17 +3331,22 @@ int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, i
 }
 /* ---- inkling's ops: chain_sconv.comp, chain_relattn.comp and Inkling-2's chain_ink2.comp,
  * made on first use ---- */
-static struct { VkShaderModule mod[3]; VkPipeline pipe[3]; int tried[3]; } g_kx[2];
+static struct { VkShaderModule mod[4]; VkPipeline pipe[4]; int tried[4]; } g_kx[2];
 #define KX (g_kx[g_kd])
+/* chain_relattn_t.comp's shared arrays (its query, K/V, score and bias tiles: 2 * 32 * 129 + 32 * 33
+ * + 32 * 32 floats): a device with less keeps mode 0 for every step. tests/test_vk_shared_memory.py
+ * holds this number to the compiled shader's. */
+#define RELATTN_T_SHARED 41344u
 static VkPipeline kx_pipe(int k) {
-    static const char *const file[3] = {"chain_sconv.spv", "chain_relattn.spv", "chain_ink2.spv"};
+    static const char *const file[4] = {"chain_sconv.spv", "chain_relattn.spv", "chain_ink2.spv", "chain_relattn_t.spv"};
     if (KX.pipe[k] || KX.tried[k] || !vkc_ready()) return KX.pipe[k];
     KX.tried[k] = 1;
+    if (k == 3 && kc_shared_limit() < RELATTN_T_SHARED) return VK_NULL_HANDLE;
     if ((KX.mod[k] = load_module(KC.core.spv_path, file[k]))) KX.pipe[k] = make_pipe(KX.mod[k], NULL);
     return KX.pipe[k];
 }
 static void kx_shutdown(void) {
-    for (int k = 0; k < 3; k++) {
+    for (int k = 0; k < 4; k++) {
         if (KX.pipe[k]) vkDestroyPipeline(KC.dev, KX.pipe[k], NULL);
         if (KX.mod[k]) vkDestroyShaderModule(KC.dev, KX.mod[k], NULL);
     }
@@ -3406,6 +3411,13 @@ static int relattn_split_wanted(void) {
     if (on < 0) { const char *e = getenv("COLI_VK_RELATTN_SPLIT"); on = !(e && *e == '0'); }
     return on;
 }
+/* COLI_VK_RELATTN_TILE=0: a prompt chunk's attention in mode 0 too (vkc_relattn_tile: tests set it) */
+static int g_relattn_tile = -1;
+void vkc_relattn_tile(int on) { g_relattn_tile = on ? 1 : 0; }
+static int relattn_tile_wanted(void) {
+    if (g_relattn_tile < 0) { const char *e = getenv("COLI_VK_RELATTN_TILE"); g_relattn_tile = !(e && *e == '0'); }
+    return g_relattn_tile;
+}
 int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                 const VkcRelAttn *p) {
     VkPipeline pipe = kx_pipe(1);
@@ -3427,6 +3439,23 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
         }
     }
     VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
+    /* a prompt chunk's rows in tiles of 32 a workgroup (chain_relattn_t.comp), each tile of K and V
+     * read once for them, the same slices of rows a submission (on a 32-row boundary); fewer rows,
+     * a head past 128, a bias bank past 32 or a device short of its shared memory: mode 0 */
+    VkPipeline tp = p->S >= 16 && p->hd <= 128 && p->d_rel <= 32 && relattn_tile_wanted() ? kx_pipe(3) : VK_NULL_HANDLE;
+    if (tp) {
+        int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 32, p->H), ok = 1;
+        for (int r0 = 0; ok && r0 < S; r0 += rr) {
+            struct { VkcRelAttn a; int s0, mode, nc; } x = {*p, r0, 0, 0};
+            x.a.S = S - r0 < rr ? S - r0 : rr;
+            x.a.q_off += r0 * p->q_row; x.a.o_off += r0 * p->o_row; x.a.r_off += r0 * p->r_row; x.a.tau_off += r0;
+            if (p->has_sink) x.a.sink_off += r0 * p->H;
+            if (r0 && !attn_slice_next()) return 0;
+            ok = record(tp, bd, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)((x.a.S + 31) / 32), 1);
+        }
+        KC.st.relattn_tiled += ok;
+        return ok;
+    }
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows): the
      * shader's s0 is the slice's first row, pos_base stays the step's */
     int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1, p->H), ok = 1;

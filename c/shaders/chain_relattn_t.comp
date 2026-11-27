@@ -1,0 +1,136 @@
+#version 450
+// chain_relattn.comp's attention for a prompt chunk, its rows in tiles (vk_chain.c, vkc_relattn;
+// COLI_VK_RELATTN_TILE=0 keeps mode 0). Mode 0 runs a workgroup a (head, row) and reads every
+// position's K and V row once for that row and head: at 8K and 16K positions on an RX 9060 XT
+// that was 96-97% of an Inkling-2-Mini prompt's device time (#3149). Here a workgroup takes a
+// head and BR rows, and each tile of BC positions' K, then V, comes into shared memory once for
+// all of them.
+//   score  = tau[s] * (q . k_t * scale + (d < ext ? bias(d) : 0)),   d = qpos - t,
+//   bias(d) = sum_j r[s][h][j] * relp[j][d],
+// the same window, ring and step rows as mode 0 (positions before pos_base from the ring at
+// t % cap, the others from kvs), the same online softmax over the tiles and the same sink
+// (m = sink, l = 1 at the start). The sums go in another order than mode 0's, so the two agree
+// to rounding. Thread (r, l8) of the 256: row r = tid / 8 of the tile; the scores of positions
+// 4*l8 .. 4*l8+3 of each tile; dims l8*DPT .. of the output.
+// Limits: hd <= 128, d_rel <= 32 (the host keeps mode 0 past them), shared memory RELATTN_T_SHARED.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QB { float q[]; };
+layout(std430, binding = 1) readonly buffer KB { float kc[]; };
+layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+layout(std430, binding = 3) writeonly buffer OB { float o[]; };
+layout(std430, binding = 4) readonly buffer SB { float kvs[]; };
+layout(std430, binding = 5) readonly buffer RB { float r[]; };
+layout(std430, binding = 6) readonly buffer PB { float relp[]; };
+layout(std430, binding = 7) readonly buffer TB { float tau[]; };
+
+layout(push_constant) uniform P {   // chain_relattn.comp's, mode and nc unused
+    int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
+    int q_off, q_row, o_off, o_row;
+    int k_off, v_off, ks_off, vs_off, kv_row;
+    int r_off, r_row, relp_off, tau_off;
+    float scale;
+    int has_sink, sink_off;
+    int s0;
+    int mode, nc;
+} p;
+
+const int BR = 32, BC = 32;       // rows a workgroup, positions a tile
+const int HP = 129, RP = 33;      // padded rows of the K/V and query tiles (hd <= 128) and of the scores
+const int DR = 32;                // the bias bank's rows held (d_rel <= 32)
+const float NEG = -3.0e38;
+
+shared float qs[BR * HP];
+shared float kv[BC * HP];          // the tile's K, then its V
+shared float ps[BR * RP];          // the tile's scores, then their exps
+shared float rsh[BR * DR];
+
+void main() {
+    const int h = int(gl_WorkGroupID.x), tile = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    const int rr = tid >> 3, l8 = tid & 7;
+    const int kvh = h / (p.H / p.KVH), hd = p.hd, dpt = (hd + 7) / 8, dbase = l8 * dpt;
+    const int s = tile * BR + rr;                       // this thread's row of the slice
+    const bool rv = s < p.S;
+    const int qpos = p.pos_base + p.s0 + s;
+    const int t0 = p.window > 0 ? max(0, qpos - p.window + 1) : 0;
+    // the tile's positions: from the first row's window start to its last row
+    const int sl = min(p.S, tile * BR + BR) - 1;
+    const int qfirst = p.pos_base + p.s0 + tile * BR, qlast = p.pos_base + p.s0 + sl;
+    const int tlo = p.window > 0 ? max(0, qfirst - p.window + 1) : 0, thi = qlast;
+
+    for (int i = tid; i < BR * hd; i += 256) {
+        int row = i / hd, d = i - row * hd, sr = tile * BR + row;
+        qs[row * HP + d] = sr < p.S ? q[p.q_off + sr * p.q_row + h * hd + d] : 0.0;
+    }
+    for (int i = tid; i < BR * p.d_rel; i += 256) {
+        int row = i / p.d_rel, j = i - row * p.d_rel, sr = tile * BR + row;
+        rsh[row * DR + j] = sr < p.S ? r[p.r_off + sr * p.r_row + h * p.d_rel + j] : 0.0;
+    }
+    float m = NEG, l = 0.0;
+    if (rv && p.has_sink != 0) { m = tau[p.sink_off + s * p.H + h]; l = 1.0; }
+    const float ts = rv ? tau[p.tau_off + s] : 0.0;
+    float acc[16];
+    for (int i = 0; i < 16; i++) acc[i] = 0.0;
+    barrier();
+
+    for (int tb = tlo; tb <= thi; tb += BC) {
+        for (int i = tid; i < BC * hd; i += 256) {   // the tile's K
+            int c = i / hd, d = i - c * hd, t = tb + c;
+            float v = 0.0;
+            if (t <= thi) v = t < p.pos_base ? kc[p.k_off + (kvh * p.cap + t % p.cap) * hd + d]
+                                             : kvs[p.ks_off + (t - p.pos_base) * p.kv_row + kvh * hd + d];
+            kv[c * HP + d] = v;
+        }
+        barrier();
+        for (int k = 0; k < 4; k++) {   // this thread's four scores
+            int c = l8 * 4 + k, t = tb + c;
+            float sc = NEG;
+            if (rv && t >= t0 && t <= qpos) {
+                float a = 0.0;
+                for (int d = 0; d < hd; d++) a += qs[rr * HP + d] * kv[c * HP + d];
+                int dist = qpos - t;
+                float bias = 0.0;
+                if (dist < p.ext)
+                    for (int j = 0; j < p.d_rel; j++) bias += rsh[rr * DR + j] * relp[p.relp_off + j * p.ext + dist];
+                sc = ts * (a * p.scale + bias);
+            }
+            ps[rr * RP + c] = sc;
+        }
+        barrier();
+        float tmax = NEG;
+        for (int c = 0; c < BC; c++) tmax = max(tmax, ps[rr * RP + c]);
+        const float mn = max(m, tmax), corr = exp(m - mn);
+        barrier();   // every row's maximum read before its scores turn into exps, and K read before V comes
+        for (int k = 0; k < 4; k++) {
+            int c = l8 * 4 + k;
+            float sc = ps[rr * RP + c];
+            ps[rr * RP + c] = sc > -1.0e38 ? exp(sc - mn) : 0.0;
+        }
+        for (int i = tid; i < BC * hd; i += 256) {   // the tile's V over its K
+            int c = i / hd, d = i - c * hd, t = tb + c;
+            float v = 0.0;
+            if (t <= thi) v = t < p.pos_base ? vc[p.v_off + (kvh * p.cap + t % p.cap) * hd + d]
+                                             : kvs[p.vs_off + (t - p.pos_base) * p.kv_row + kvh * hd + d];
+            kv[c * HP + d] = v;
+        }
+        barrier();
+        float sum = 0.0;
+        for (int c = 0; c < BC; c++) sum += ps[rr * RP + c];
+        l = l * corr + sum;
+        for (int i = 0; i < 16; i++) {
+            if (i >= dpt || dbase + i >= hd) break;
+            float a = acc[i] * corr;
+            for (int c = 0; c < BC; c++) a += ps[rr * RP + c] * kv[c * HP + dbase + i];
+            acc[i] = a;
+        }
+        m = mn;
+        barrier();   // the tile's exps and V read before the next tile's K comes
+    }
+    if (!rv) return;
+    const float inv = l > 0.0 ? 1.0 / l : 0.0;
+    const int ob = p.o_off + s * p.o_row + h * hd;
+    for (int i = 0; i < 16; i++) {
+        if (i >= dpt || dbase + i >= hd) break;
+        o[ob + dbase + i] = acc[i] * inv;
+    }
+}

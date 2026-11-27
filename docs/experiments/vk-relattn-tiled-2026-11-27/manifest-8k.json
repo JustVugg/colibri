@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "hypothesis": "Reading each tile of K and V into shared memory once for 32 query rows instead of once per row and head makes Inkling's prompt attention, 96-97% of a prompt's device time, several times faster, and the prompt with it",
+  "commit": "ab98f29f8acef3a48dc37838c3d896c9acc9b908",
+  "model": "unsloth Inkling-2-Mini UD-Q3_K_XL GGUF (tools/gguf_import.py --mode link)",
+  "command": "make -C c inkling VK=1 (this branch); ab.sh: prof.sh <n> <tile> <round> = a fresh coli serve --ctx 24576 on a fresh copy of one .coli_usage history, a warm-up request, then the prompt with max_tokens 8 (prefill = time to the first streamed token); tile on and off interleaved, three rounds",
+  "prompt_hash": "49e72e323435fe19cb804187b39c5e064da3027b8ab9b9b68d43d854b3333788",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 7800X3D, 8 cores / 16 threads",
+    "ram": "32 GB DDR5",
+    "storage": "ZFS on LUKS2 over two NVMe SSDs",
+    "os": "NixOS, Linux 7.2.9, gcc 16.2.0, Mesa 26.2.5 RADV, AMD Radeon RX 9060 XT 16 GB (all 3072 experts resident)"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "COLI_VK_RELATTN_TILE"
+  ],
+  "baseline": {
+    "config": {
+      "model": "unsloth Inkling-2-Mini UD-Q3_K_XL GGUF (tools/gguf_import.py --mode link)",
+      "COLI_VULKAN": "1",
+      "COLI_VK_STAGED": "1",
+      "COLI_PREFIX_STORE": "0",
+      "COLI_VK_CHAIN_PROF": "1",
+      "ctx": 24576,
+      "max_tokens": 8,
+      "prompt_tokens": 8021,
+      "COLI_VK_RELATTN_TILE": "0"
+    },
+    "samples": {
+      "tok_s": [
+        70.1,
+        72.9,
+        72.0
+      ],
+      "prefill_s": [
+        114.39,
+        109.99,
+        111.4
+      ]
+    },
+    "median_tok_s": 72.0,
+    "quality": {
+      "method": "mode 0, the attention as before",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vk-relattn-tiled-2026-11-27/raw.txt",
+      "sha256": "d8d9e144407dae93705c20dd1a69de48f96f0c4ab89016a86d09603c43b2d0de"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "unsloth Inkling-2-Mini UD-Q3_K_XL GGUF (tools/gguf_import.py --mode link)",
+      "COLI_VULKAN": "1",
+      "COLI_VK_STAGED": "1",
+      "COLI_PREFIX_STORE": "0",
+      "COLI_VK_CHAIN_PROF": "1",
+      "ctx": 24576,
+      "max_tokens": 8,
+      "prompt_tokens": 8021,
+      "COLI_VK_RELATTN_TILE": "1"
+    },
+    "samples": {
+      "tok_s": [
+        182.8,
+        177.1,
+        165.8
+      ],
+      "prefill_s": [
+        43.88,
+        45.3,
+        48.39
+      ]
+    },
+    "median_tok_s": 177.1,
+    "quality": {
+      "method": "tests/test_vk_chain: every tiled case within 2e-5 of the double reference (Inkling-2-Mini's hd 128, window 1024, ring 1024, d_rel 16, ext 1024, sinks, slices); the needle (5 facts) 5/5 at 8K, 32K and 64K with the tiles on",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vk-relattn-tiled-2026-11-27/raw.txt",
+      "sha256": "d8d9e144407dae93705c20dd1a69de48f96f0c4ab89016a86d09603c43b2d0de"
+    }
+  },
+  "outcome": "improvement"
+}

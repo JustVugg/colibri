@@ -967,6 +967,36 @@ static void test_ink2_dconv(int KV, int hd, int K, int S1, int S2) {
     CHECK(ok && e < 2e-6, "ink2 dconv %d heads of %d, %d taps, rows %d + %d: err %.2e", KV, hd, K, S1, S2, e);
     vkc_free(xb); vkc_free(db); vkc_free(wb); vkc_free(rb); free(x); free(dyn); free(st); free(ring0); free(ref); free(y);
 }
+/* a prompt chunk's attention in tiles of rows (chain_relattn_t.comp) against the same double
+ * reference, and mode 0 for the same steps with the tiles off (vkc_relattn_tile(0)) */
+static void test_relattn_tiled(void) {
+    VkcStats s0; vkc_stats(&s0);
+    vkc_relattn_tile(0);
+    test_relattn(20, 30, 16, 16, 16, 4, 16); test_relattn(130, 3, 0, 200, 24, 4, 200);
+    test_relattn_s(130, 3, 0, 200, 24, 4, 200, 1);
+    VkcStats s1; vkc_stats(&s1);
+    CHECK(s1.relattn_tiled == s0.relattn_tiled, "relattn: tiles with COLI_VK_RELATTN_TILE off");
+    vkc_relattn_tile(1);
+    test_relattn(16, 0, 0, 64, 32, 8, 64);              /* one tile of rows exactly, from the first position */
+    test_relattn(33, 7, 0, 64, 128, 16, 64);            /* two tiles, the second of one row, hd 128 */
+    test_relattn(20, 30, 16, 16, 16, 4, 16);            /* a step that wraps the ring more than once */
+    test_relattn(130, 3, 0, 200, 24, 4, 200);           /* five tiles of rows over a global layer */
+    test_relattn(100, 1500, 1024, 1024, 128, 16, 1024); /* Inkling-2-Mini's window, ring, bank and head */
+    test_relattn_s(100, 1500, 1024, 1024, 128, 16, 1024, 1);
+    test_relattn_s(64, 200, 0, 300, 128, 16, 64, 1);    /* a global layer past ext, with sinks */
+    test_relattn(40, 10, 0, 64, 32, 33, 64);            /* a bank past 32: mode 0 */
+    VkcStats s2; vkc_stats(&s2);
+    CHECK(s2.relattn_tiled >= s1.relattn_tiled + 7, "relattn: %llu prompt attentions in tiles, 7 expected",
+          s2.relattn_tiled - s1.relattn_tiled);
+    setenv("COLI_VK_ATTN_SLICE", "300000", 1);          /* slices of rows on 32-row boundaries */
+    VkcStats s3; vkc_stats(&s3);
+    test_relattn_s(130, 3, 0, 200, 24, 4, 200, 1); test_relattn(100, 1500, 1024, 1024, 128, 16, 1024);
+    unsetenv("COLI_VK_ATTN_SLICE");
+    VkcStats s4; vkc_stats(&s4);
+    CHECK(s4.attn_slices > s3.attn_slices && s4.relattn_tiled > s3.relattn_tiled, "relattn: no tiled slice");
+    printf("  relative attention in tiles: %llu prompt steps, %llu extra submissions in slices\n",
+           s4.relattn_tiled - s1.relattn_tiled, s4.attn_slices - s3.attn_slices);
+}
 static void test_inkling2(void) {
     if (!vkc_ink2_ready()) { printf("skip: chain_ink2.spv\n"); return; }
     test_relattn_s(1, 0, 0, 64, 16, 4, 32, 1);          /* the first position: the sink and one key */
@@ -4920,6 +4950,7 @@ int main(int argc, char **argv) {
     if (vkc_sconv_ready() && vkc_relattn_ready()) {
         test_inkling();
         test_inkling2();
+        test_relattn_tiled();
         VkcStats s0; vkc_stats(&s0);
         setenv("COLI_VK_ATTN_SLICE", "30000", 1);   /* the relative attention over slices of rows */
         test_relattn(20, 30, 16, 16, 16, 4, 16); test_relattn(130, 3, 0, 200, 24, 4, 200); test_relattn(40, 10, 0, 64, 32, 16, 64);

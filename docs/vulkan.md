@@ -1810,7 +1810,13 @@ normalised states (one pass over the vectors for every sum, the subgroups' sums 
 order), the L2 clip of each head, and the dynamic convolution over a step's rows with its
 state. `chain_relattn.comp` takes the sink: a logit per (row, head) that starts the online
 softmax (m = sink, l = 1), as `ink2_attention` starts its maximum and sum, and follows its
-rows over the slices of a long prompt chunk. The dense matrices are the per-matrix path's
+rows over the slices of a long prompt chunk. A prompt chunk of 16 rows or more goes through
+`chain_relattn_t.comp` instead (`COLI_VK_RELATTN_TILE=0` keeps the old mode): 32 rows a workgroup,
+each tile of 32 positions' K and V read into shared memory once for all of them rather than once
+for every row and head, the same bias, window, sink and online softmax. On an RX 9060 XT that cut
+Inkling-2-Mini UD-Q3_K_XL's prompt attention from 83.5 s to 16.9 s of device time at 8K positions
+and from 262 s to 52 s at 16K, the prompt from 111 s to 45 s and from 320 s to 109 s
+([the record](experiments/vk-relattn-tiled-2026-11-27/)). The dense matrices are the per-matrix path's
 copies; the router, the sink projection and the dynamic taps' projections go up as f32 (the
 router as bf16 where that is exact), and the tier's budget leaves the chain's buffers and
 its K/V mirrors at the served context (`ink2c_plan_bytes`). It declines, and the per-matrix
