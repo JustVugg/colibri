@@ -3340,12 +3340,31 @@ static VkPipeline kx_pipe(int k) {
     if ((KX.mod[k] = load_module(KC.core.spv_path, file[k]))) KX.pipe[k] = make_pipe(KX.mod[k], NULL);
     return KX.pipe[k];
 }
+/* chain_relattn_tile.comp (a prompt chunk's rows, vkc_relattn below): a pipeline per (G, ND), its
+ * specialization constants, G = H / KVH from 1 to 4, ND 1 for hd <= 128 and 2 for hd <= 256 */
+static struct { VkShaderModule mod; VkPipeline pipe[4][2]; int tried, ptried[4][2]; } g_kt[2];
+#define KT (g_kt[g_kd])
+#define RELATTN_TILE_SHARED ((4096 + 24 * 16 + 24 * 128 + 4 * 24) * 4)   /* the shader's shared arrays */
+static VkPipeline kt_pipe(int G, int nd) {
+    if (G < 1 || G > 4 || nd < 1 || nd > 2 || !vkc_ready()) return VK_NULL_HANDLE;
+    if (KT.pipe[G - 1][nd - 1] || KT.ptried[G - 1][nd - 1]) return KT.pipe[G - 1][nd - 1];
+    KT.ptried[G - 1][nd - 1] = 1;
+    if (!KT.tried) { KT.tried = 1; KT.mod = load_module(KC.core.spv_path, "chain_relattn_tile.spv"); }
+    if (!KT.mod || kc_shared_limit() < RELATTN_TILE_SHARED) return VK_NULL_HANDLE;
+    int32_t v[2] = {G, nd};
+    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    VkSpecializationInfo si = {2, me, sizeof v, v};
+    return KT.pipe[G - 1][nd - 1] = make_pipe(KT.mod, &si);
+}
 static void kx_shutdown(void) {
     for (int k = 0; k < 3; k++) {
         if (KX.pipe[k]) vkDestroyPipeline(KC.dev, KX.pipe[k], NULL);
         if (KX.mod[k]) vkDestroyShaderModule(KC.dev, KX.mod[k], NULL);
     }
     memset(&KX, 0, sizeof KX);
+    for (int g = 0; g < 4; g++) for (int n = 0; n < 2; n++) if (KT.pipe[g][n]) vkDestroyPipeline(KC.dev, KT.pipe[g][n], NULL);
+    if (KT.mod) vkDestroyShaderModule(KC.dev, KT.mod, NULL);
+    memset(&KT, 0, sizeof KT);
 }
 int vkc_sconv_ready(void) { return kx_pipe(0) != VK_NULL_HANDLE; }
 int vkc_relattn_ready(void) { return kx_pipe(1) != VK_NULL_HANDLE; }
@@ -3406,6 +3425,15 @@ static int relattn_split_wanted(void) {
     if (on < 0) { const char *e = getenv("COLI_VK_RELATTN_SPLIT"); on = !(e && *e == '0'); }
     return on;
 }
+/* COLI_VK_RELATTN_TILE: the rows from which a step's attention runs chain_relattn_tile.comp (9, past the
+ * split decode's 8; 0 never), the same arithmetic as chain_relattn's mode 0 */
+static int g_relattn_tile = -1;
+int vkc_relattn_tile_rows(int rows) {
+    if (g_relattn_tile < 0) { const char *e = getenv("COLI_VK_RELATTN_TILE"); g_relattn_tile = e && *e ? atoi(e) : 9; }
+    int was = g_relattn_tile;
+    if (rows >= 0) g_relattn_tile = rows;
+    return was;
+}
 int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                 const VkcRelAttn *p) {
     VkPipeline pipe = kx_pipe(1);
@@ -3430,6 +3458,25 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows): the
      * shader's s0 is the slice's first row, pos_base stays the step's */
     int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1, p->H), ok = 1;
+    /* a prompt chunk's rows: chain_relattn_tile.comp, rb rows of a KV head's G heads a workgroup */
+    const int G = p->H / p->KVH, tile_rows = vkc_relattn_tile_rows(-1);
+    VkPipeline tp = tile_rows > 0 && S >= tile_rows && G <= 4 ? kt_pipe(G, p->hd > 128 ? 2 : 1) : VK_NULL_HANDLE;
+    if (tp) {
+        int rb = 24 / G;
+        while (rb > 1 && 4096 / p->hd - rb + 1 < 4) rb--;
+        int jc = 4096 / p->hd - rb + 1;
+        if (jc > 32) jc = 32;
+        for (int r0 = 0; ok && r0 < S; r0 += rr) {
+            struct { VkcRelAttn a; int s0, rb, jc; } x = {*p, r0, rb, jc};
+            x.a.S = S - r0 < rr ? S - r0 : rr;
+            x.a.q_off += r0 * p->q_row; x.a.o_off += r0 * p->o_row; x.a.r_off += r0 * p->r_row; x.a.tau_off += r0;
+            if (p->has_sink) x.a.sink_off += r0 * p->H;
+            if (r0 && !attn_slice_next()) return 0;
+            ok = record(tp, bd, 8, &x, sizeof x, (uint32_t)p->KVH, (uint32_t)((x.a.S + rb - 1) / rb), 1);
+            KC.st.relattn_tile += ok;
+        }
+        return ok;
+    }
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         struct { VkcRelAttn a; int s0, mode, nc; } x = {*p, r0, 0, 0};
         x.a.S = S - r0 < rr ? S - r0 : rr;
