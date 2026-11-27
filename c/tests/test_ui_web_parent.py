@@ -87,5 +87,72 @@ class LifetimeTest(unittest.TestCase):
             self.fail("the UI outlived its parent")
 
 
+class ParentTest(unittest.TestCase):
+    """ui/server.py --exit-with-parent, as `coli web` starts it now: no pipe on stdin, the
+    parent's pid; the UI answers while the parent runs and ends when it does"""
+
+    def start(self, port):
+        parent = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, subprocess, sys, time\n"
+             "ui = subprocess.Popen([sys.executable, sys.argv[1], '--port', sys.argv[2], '--backend', "
+             "'http://127.0.0.1:9', '--exit-with-parent', str(os.getpid())], stdin=subprocess.DEVNULL, "
+             "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+             "print(ui.pid, flush=True)\n"
+             "sys.stdin.read()\n",
+             str(C.parent / "ui/server.py"), str(port)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        ui = int(parent.stdout.readline())
+        self.addCleanup(lambda: self._kill(ui))
+        return parent, ui
+
+    @staticmethod
+    def _kill(pid):
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _runs(pid):
+        if sys.platform.startswith("linux"):
+            return os.path.exists("/proc/%d" % pid) and "Z" not in Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1][:3]
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    @unittest.skipIf(os.name == "nt", "os.kill(pid, 0) ends a process on Windows")
+    def test_the_ui_answers_and_ends_with_its_parent(self):
+        import socket
+        import urllib.error
+        import urllib.request
+        with socket.socket() as sk:
+            sk.bind(("127.0.0.1", 0))
+            port = sk.getsockname()[1]
+        parent, ui = self.start(port)
+        code = None
+        for _ in range(100):   # the page itself: no gateway behind this UI
+            try:
+                code = urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=5).status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            except OSError:
+                time.sleep(0.1)
+                continue
+            break
+        self.assertEqual(code, 200, "the UI did not answer")
+        self.assertTrue(self._runs(ui))
+        parent.kill()
+        parent.wait()
+        for _ in range(50):
+            if not self._runs(ui):
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the UI outlived its parent")
+
+
 if __name__ == "__main__":
     unittest.main()

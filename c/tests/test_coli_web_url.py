@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import subprocess
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -66,8 +68,9 @@ class WebUrlTest(unittest.TestCase):
         self.assertEqual(opened, ["http://127.0.0.1:8913/"])
         argv, kw = started[0]
         self.assertEqual(argv[1:], ["/x/ui/server.py", "--host", "0.0.0.0", "--port", "8913",
-                                    "--backend", "http://127.0.0.1:8123", "--exit-with-stdin"])
-        self.assertIsNotNone(kw.get("stdin"))   # a pipe: the UI ends with this process
+                                    "--backend", "http://127.0.0.1:8123", "--exit-with-parent", str(os.getpid())])
+        # the UI ends with this process by its pid, and its stdin is no pipe (#3140)
+        self.assertEqual(kw.get("stdin"), subprocess.DEVNULL)
 
     def test_named_host_is_kept(self):
         polled, opened, started = self._run("192.168.1.20")

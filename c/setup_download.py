@@ -321,7 +321,7 @@ def windows_curl():
 def wsl_windows_path(path):
     try:
         out = subprocess.run(["wslpath", "-w", os.path.abspath(path)], capture_output=True,
-                             text=True, errors="replace", timeout=10).stdout.strip()
+                             text=True, errors="replace", timeout=10, stdin=subprocess.DEVNULL).stdout.strip()
         return out or None
     except (OSError, subprocess.SubprocessError):
         return None
@@ -361,7 +361,7 @@ def probe_throughput_windows(url, curl, *, token=None, max_bytes=4 << 20, max_se
         cmd[1:1] = ["-H", f"Authorization: Bearer {token}"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                                timeout=max_seconds + 20)
+                                timeout=max_seconds + 20, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     # Exit 28 is the expected bound when a slow ranged sample hits --max-time;
@@ -408,7 +408,7 @@ def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, v
         if token:
             cmd[1:1] = ["-H", f"Authorization: Bearer {token}"]
         with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as errors, \
-                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errors) as process:
+                subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors) as process:
             while process.poll() is None:
                 time.sleep(1.0)
                 if os.path.exists(part):

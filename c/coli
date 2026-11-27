@@ -4034,10 +4034,12 @@ def cmd_web(a):
     elif not port_free(a.host, ui_port):
         print(f"{C.yel}port {ui_port} is taken{C.r}: no chat UI (--ui-port picks another); serving the API only, at {api}v1", flush=True)
     else:
-        # stdin a pipe this process holds: the UI exits when it closes, so `coli stop` (which
-        # ends this process by its pid) or a crash does not leave it holding its port
+        # The UI exits when this process ends (--exit-with-parent), so `coli stop` (which ends this
+        # process by its pid) or a crash does not leave it holding its port. Its stdin is no pipe:
+        # on Windows a thread waiting on one (the UI watched for it to close) held it, and a child
+        # the UI started, which inherits it, could not start until that read ended (#3140)
         ui = subprocess.Popen([sys.executable, server, "--host", a.host, "--port", str(ui_port), "--backend", api.rstrip("/"),
-                               "--exit-with-stdin"], stdin=subprocess.PIPE)
+                               "--exit-with-parent", str(os.getpid())], stdin=subprocess.DEVNULL)
     if ui is not None and not getattr(a, "no_browser", False):
         import threading, urllib.request, webbrowser
         def opener():

@@ -318,6 +318,51 @@ def _alive(pid):
     return os.path.exists("/proc/%d" % pid)
 
 
+def _parent_watch(pid):
+    """a function that returns once the process pid has ended. Windows: a handle to the process
+    taken now and waited on (a pid reused later is another process); elsewhere this process's
+    parent polled, which changes when pid ends (this UI is its child)"""
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        k32.WaitForSingleObject.restype = ctypes.c_uint32
+        h = k32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
+
+        def gone():
+            while h:
+                r = k32.WaitForSingleObject(h, 1000)
+                if r == 0:   # WAIT_OBJECT_0: it ended
+                    return
+                if r != 0x102:   # not WAIT_TIMEOUT: the wait failed, its pid decides
+                    break
+            while _pid_runs(pid):   # no handle (gone already, or not ours to wait on)
+                time.sleep(1)
+        return gone
+
+    def gone():
+        while os.getppid() == pid:
+            time.sleep(1)
+    return gone
+
+
+def _pid_runs(pid):
+    """Windows: the process pid still runs (a handle with the least access, its exit code)"""
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+    k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    code = ctypes.c_uint32(0)
+    ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+    k32.CloseHandle(h)
+    return bool(ok) and code.value == 259   # STILL_ACTIVE
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8790)
@@ -340,19 +385,28 @@ def main():
                     help="let a caller on another machine use the page-only routes (/agents, /models, /web, "
                          "/doc/extract): they download and switch models and open agents, and are answered "
                          "only to this machine unless this is set (or COLI_UI_ALLOW_REMOTE=1)")
+    ap.add_argument("--exit-with-parent", type=int, default=0, metavar="PID",
+                    help="exit when the process PID (`coli web`, this UI's parent) ends, however it ends "
+                         "(coli stop, Ctrl-C, a crash)")
     ap.add_argument("--exit-with-stdin", action="store_true",
-                    help="exit when stdin closes: `coli web` holds it open, so the UI ends with the launcher "
-                         "however that ends (coli stop, Ctrl-C, a crash)")
+                    help="exit when stdin closes (an older `coli web`; on Windows: when the parent ends)")
     a = ap.parse_args()
-    if a.exit_with_stdin:
+    if a.exit_with_parent or a.exit_with_stdin:
         import threading
+        if a.exit_with_parent or os.name == "nt":
+            # No read of stdin: on Windows a read that waits on the pipe holds it, and what else
+            # touches that pipe waits with it, a child process that inherits it among them.
+            gone = _parent_watch(a.exit_with_parent or os.getppid())
+        else:
+            def gone():
+                try:
+                    while sys.stdin.read(4096):
+                        pass
+                except (OSError, ValueError):
+                    pass
 
         def watch():
-            try:
-                while sys.stdin.read(4096):
-                    pass
-            except (OSError, ValueError):
-                pass
+            gone()
             # `coli web` is gone. The Models page may have stopped it to start the gateway on
             # another model (models.LIFE): then this UI follows the new gateway's process instead
             life = getattr(Handler.models, "LIFE", None) or {}
