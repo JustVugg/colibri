@@ -940,6 +940,10 @@ void vkc_stats(VkcStats *st);
  * want of memory leaves it to the per-matrix path and the expert tier. One line (stderr and the event log) says which,
  * what the memory refused last, at which position (#2793). */
 void vkc_frame_failed(const char *engine, int pos, int rows);
+/* After a stop with the device alive (vkc_frame_failed's second case), 1 when the engine may bring its chain back at
+ * this request: the first after the stop, then the 2nd, 4th ... 64th after each further one, so a cause that persists
+ * costs one failed frame ever more rarely. The frames' staging is given back first. 0 after a lost device. */
+int  vkc_chain_retry(const char *engine);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
 void vkc_prof_print(void);
 

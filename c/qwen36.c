@@ -10837,6 +10837,9 @@ static int q36cc_reuses_live_prefix(Model *m, const int *ids, int np) {
 static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
                            Q36ReqClock *clk){
     int *ids=NULL, np=0;
+#ifdef COLI_VULKAN
+    q36c_retry(m);   /* a chain that stopped with the device alive comes back (vkc_chain_retry) */
+#endif
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
     if(g_pending_image.present){
         Cfg *vc = &m->c;

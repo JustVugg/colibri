@@ -954,19 +954,41 @@ int vkc_finish(void) {
  * to the backend's per-matrix path and the expert tier, where every such frame had marked it lost and the CPU had
  * taken everything until the process ended (#2793: "the device stopped answering", 300 s for a 12.7k prompt and
  * 7 tok/s after). The line says which of the two, what the chain's memory refused last, at which position. */
+/* every submitted frame waited for, their temporaries and staging buffers given back (stage_relieve's, between two
+ * requests: no frame open after vkc_finish) */
+static void stage_relieve_idle(void) {
+    if (KC.lost || !vkc_finish()) return;
+    for (int i = 0; i < VKC_FRAMES; i++) {
+        VkcFrame *g = &KC.fr[i];
+        frame_reclaim(g);
+        if (g->stage) { buf_release(g->stage); g->stage = NULL; }
+    }
+}
+/* the soft stops (vkc_frame_failed with the device alive) and the requests to wait before the next try */
+static int g_chain_soft, g_chain_wait;
+int vkc_chain_retry(const char *engine) {
+    if (!g_chain_soft || KC.lost || !KC.ready) return 0;
+    if (--g_chain_wait > 0) return 0;
+    stage_relieve_idle();
+    coli_event("[VK] %s chain: back on the device after its stop (%d so far); the state goes up from the host's", engine, g_chain_soft);
+    return 1;
+}
 void vkc_frame_failed(const char *engine, int pos, int rows) {
     const int dead = KC.lost || !vkc_finish();
     if (dead) {
         coli_event("[VK] %s chain: the device is lost at position %d (%d rows); the CPU runs from here on", engine, pos, rows);
         return;
     }
+    g_chain_soft++;
+    g_chain_wait = 1 << (g_chain_soft - 1 < 6 ? g_chain_soft - 1 : 6);   /* the next request, then 2, 4, ... 64 later */
     if (g_kc_ref.n)
         coli_event("[VK] %s chain: a frame failed at position %d (%d rows) without a device error: %s of %.1f MiB was refused; "
-                   "the chain off, the device stays (the per-matrix path and the expert tier)",
-                   engine, pos, rows, g_kc_ref.what, g_kc_ref.bytes / 1048576.0);
+                   "the chain off, the device stays (the per-matrix path and the expert tier), the chain again in %d request%s",
+                   engine, pos, rows, g_kc_ref.what, g_kc_ref.bytes / 1048576.0, g_chain_wait, g_chain_wait == 1 ? "" : "s");
     else
         coli_event("[VK] %s chain: a frame failed at position %d (%d rows) without a device error or a refused buffer; "
-                   "the chain off, the device stays (the per-matrix path and the expert tier)", engine, pos, rows);
+                   "the chain off, the device stays (the per-matrix path and the expert tier), the chain again in %d request%s",
+                   engine, pos, rows, g_chain_wait, g_chain_wait == 1 ? "" : "s");
     g_kc_ref.n = 0;
 }
 

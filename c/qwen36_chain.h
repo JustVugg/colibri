@@ -1969,6 +1969,18 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
     return 0;
 }
 
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. q36c_recover left the state on the host, so the mirrors' rows and the DeltaNet state go up from it at the
+ * next forward, as at a first; one device, one conversation (the places and a second device stay on the host). */
+static void q36c_retry(Model *m) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || q36c_of(m, 1) || ch->conv || !vkc_chain_retry("qwen36")) return;
+    Cfg *c = &m->c;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++)
+        if (c->is_attn[i]) { ch->kv_valid[i] = 0; if (ch->ks.on) vkc_kv_lower(&ch->ks, ch->attn_ord[i], 0); }
+    ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+    ch->failed = 0; g_vk_chain = 1;
+}
 /* One decode step of several conversations in the chain (serve_mux, KV_SLOTS > 1): row s is
  * the token whose embedding is xh's row s, at rows[s].pos of rows[s].seq, every conversation
  * parked. The matrices and the routed experts run once over the S rows, each row's
