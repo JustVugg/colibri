@@ -438,7 +438,7 @@ void vkc_relattn_part(VkcBuf *part);
  * for all of them, the arithmetic chain_relattn's mode 0's in its order (the same bits). rows >= 0 sets the
  * threshold (tests); returns the one before. */
 int  vkc_relattn_tile_rows(int rows);
-/* COLI_VK_RELATTN_TILE_DEC (on): the split decode's partials on chain_relattn_tile.comp (a KV head's query
+/* COLI_VK_RELATTN_TILE_DEC (off): the split decode's partials on chain_relattn_tile.comp (a KV head's query
  * heads a workgroup, the same bits as mode 1); on >= 0 sets it (tests), returns the one before */
 int  vkc_relattn_tile_dec(int on);
 /* Inkling-2's ops (chain_ink2.comp, made on first use; inkling2_chain.h):

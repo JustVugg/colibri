@@ -130,7 +130,7 @@ static void test_relattn_h(int S, int pos_base, int window, int cap, int hd, int
     }
     if (H / KVH <= 4 && S <= 8 && nc >= 2) {   /* the split decode: on the KV heads and a block a (head, row, tile) */
         setenv("COLI_CUDA_RELATTN_TILE", "0", 1);
-        setenv("COLI_CUDA_RELATTN_TILE_DEC", "1", 1);
+        setenv("COLI_CUDA_RELATTN_TILE_DEC", "1", 1);   /* opt-in: the test turns it on */
         int okd = T->begin() && T->relattn(bq, bk, bv, bo, bs, brr, bp, bt, &p) && T->submit(1);
         std::vector<float> yd = down(bo, 0, ref.size());
         setenv("COLI_CUDA_RELATTN_TILE_DEC", "0", 1);

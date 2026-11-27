@@ -5346,15 +5346,15 @@ static int cc_relattn_split(void) {
     return on;
 }
 /* COLI_CUDA_RELATTN_TILE: the rows from which a step's Inkling attention runs ccg_relattn_tile_k (9, past the split
- * decode's 8; 0 never); COLI_CUDA_RELATTN_TILE_DEC=0: the split decode a block a (head, row, tile) (ccg_relattn_k)
- * instead of a block a KV head and tile with its query heads (ccg_relattn_split_k). Read at each call (the tests). */
+ * decode's 8; 0 never); COLI_CUDA_RELATTN_TILE_DEC=1: the split decode a block a KV head and tile with its query heads
+ * (ccg_relattn_split_k) instead of a block a (head, row, tile) (ccg_relattn_k). Read at each call (the tests). */
 static int cc_relattn_tile_rows(void) {
     const char *e = getenv("COLI_CUDA_RELATTN_TILE");
     return e && *e ? atoi(e) : 9;
 }
-static int cc_relattn_tile_dec(void) {
+static int cc_relattn_tile_dec(void) {   /* off: on an RTX PRO 4000 the decode ran 48.7 -> 45.7 tok/s on it (one row, few blocks) */
     const char *e = getenv("COLI_CUDA_RELATTN_TILE_DEC");
-    return !(e && *e == '0');
+    return e && *e == '1';
 }
 #include "cuda_inkc.cuh"    /* Inkling's and Inkling-2's ops */
 #include "cuda_dflash.cuh"  /* DFlash2's drafter's convolution */

@@ -3443,11 +3443,12 @@ int vkc_relattn_tile_rows(int rows) {
     if (rows >= 0) g_relattn_tile = rows;
     return was;
 }
-/* COLI_VK_RELATTN_TILE_DEC=0: the split decode on chain_relattn.comp's mode 1 (a workgroup a (head, row, tile))
- * instead of chain_relattn_tile.comp's SPLIT (a workgroup a KV head and tile, its query heads at once) */
+/* COLI_VK_RELATTN_TILE_DEC=1: the split decode on chain_relattn_tile.comp's SPLIT (a workgroup a KV head and tile,
+ * its query heads at once) instead of chain_relattn.comp's mode 1 (a workgroup a (head, row, tile)). Off: Inkling-2-Mini
+ * UD-Q3_K_XL on an RTX PRO 4000 decoded 37.0 tok/s at 10K positions on mode 1 and 36.6 on it */
 static int g_relattn_tile_dec = -1;
 int vkc_relattn_tile_dec(int on) {
-    if (g_relattn_tile_dec < 0) { const char *e = getenv("COLI_VK_RELATTN_TILE_DEC"); g_relattn_tile_dec = !(e && *e == '0'); }
+    if (g_relattn_tile_dec < 0) { const char *e = getenv("COLI_VK_RELATTN_TILE_DEC"); g_relattn_tile_dec = e && *e == '1'; }
     int was = g_relattn_tile_dec;
     if (on >= 0) g_relattn_tile_dec = on;
     return was;
