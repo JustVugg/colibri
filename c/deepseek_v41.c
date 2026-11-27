@@ -918,7 +918,38 @@ static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xst
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->w);
 #endif
-    for (int r = 0; r < rows; r++) mvb_cpu(y + (size_t)r * ystride, w, x + (size_t)r * xstride);
+    if (rows <= 1) {
+        if (rows == 1) mvb_cpu(y, w, x);
+        return;
+    }
+    const int I = w->I, O = w->O;
+    enum { MVB_BLK = 8 };
+    for (int r0 = 0; r0 < rows; r0 += MVB_BLK) {
+        const int nr = rows - r0 < MVB_BLK ? rows - r0 : MVB_BLK;
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint16_t *row = w->w + (size_t)o * I;
+            float sum[MVB_BLK];
+            int i = 0;
+#if defined(__AVX2__)
+            __m256 acc[MVB_BLK];
+            for (int r = 0; r < nr; r++) acc[r] = _mm256_setzero_ps();
+            for (; i + 8 <= I; i += 8) {
+                __m256 wv = bf16_decode8(row + i);
+                for (int r = 0; r < nr; r++)
+                    acc[r] = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x + (size_t)(r0 + r) * xstride + i), acc[r]);
+            }
+            for (int r = 0; r < nr; r++) sum[r] = hsum256(acc[r]);
+#else
+            for (int r = 0; r < nr; r++) sum[r] = 0.0f;
+#endif
+            for (; i < I; i++) {
+                float wv = bf16_to_f32(row[i]);
+                for (int r = 0; r < nr; r++) sum[r] += wv * x[(size_t)(r0 + r) * xstride + i];
+            }
+            for (int r = 0; r < nr; r++) y[(size_t)(r0 + r) * ystride + o] = sum[r];
+        }
+    }
 }
 
 /* ------------------------------------------------------------- engram ------ */
@@ -1239,6 +1270,10 @@ typedef struct {
      * window and the six pointers above are republished from these once the read
      * lands. Only the read path needs the windows. */
     uint8_t *base[V41_EXPERT_TENSORS];
+    /* Contiguous decoded WEX4 slab when serving WNR3/WNR4 backbone experts: avoids
+     * 6-part scatter memcpy and lets GPU decode D2H straight into the slot. base[0..5]
+     * are lazily allocated only if a refused record falls back to safetensors. */
+    uint8_t *wex_slab;
     uint64_t used;
     /* A GGUF's expert (Model.gx): each matrix's ggml type as held (w1, w3, w2), -1 for the
      * checkpoint's FP4 and scales (an MXFP4 GGUF's are laid out so); and while the Vulkan
@@ -1429,6 +1464,7 @@ typedef struct {
      * the same id whatever the picture was, so consuming one taints the record
      * (see kv_prefix.h). */
     kv_prefix kvp;
+    struct V41Wex *wex;   /* COLI_WEX_PATH: the WEX4 container the backbone's experts come from, or NULL */
 } Model;
 
 /* One conversation's state for a multiplexed serve (KV_SLOTS>1, serve_mux below):
@@ -1529,7 +1565,12 @@ static void rms_into(float *out, const float *x, const float *weight, int n, flo
 
 static int g_mirror = 0;                 /* 1 = at least one replica accepted */
 static int g_mir_nrep = 1;               /* replicas incl. the primary */
+static int g_mir_explicit = 0;           /* 1 = COLI_DISK_WEIGHTS explicitly set (honor deterministic expert_route) */
 static int g_mir_cut[V41_MIR_REPS] = {256};   /* cumulative hash cuts of 256 */
+static double g_mir_bw[V41_MIR_REPS] = {1.0}; /* measured/configured relative read bandwidth per replica */
+static uint64_t g_mir_inflight[V41_MIR_REPS]; /* active O_DIRECT read bytes per replica */
+static uint64_t g_mir_issued[V41_MIR_REPS];   /* weighted-deficit byte counter for balanced O_DIRECT dispatch */
+static pthread_mutex_t g_mir_mx = PTHREAD_MUTEX_INITIALIZER;
 static int g_mir_epl = 384;              /* experts per layer, for the hash */
 static uint64_t g_mir_bytes[V41_MIR_REPS];
 static uint64_t g_mir_nread[V41_MIR_REPS];
@@ -1593,13 +1634,20 @@ static double mirror_probe_bw(shards *S, int rep) {
 
 /* Register the replicas and derive the split. Runs after the shard index is
  * open and before the first expert read, so nothing is already cached from the
- * primary by the time the split exists. */
-static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer) {
+ * primary by the time the split exists.
+ *
+ * W, when not NULL, is a WEX4 container's file set (COLI_WEX_PATH): a mirror dir
+ * may hold a byte copy of it under the same file name, with or without copies of
+ * the shards. Each dir that holds either becomes one replica of both sets
+ * (st_mirror_add_slot), so expert_route's replica numbers mean the same drive for
+ * a shard tensor and for a container record. */
+static void mirror_setup(shards *S, shards *W, const char *model_dir, int experts_per_layer) {
     if (experts_per_layer > 0) g_mir_epl = experts_per_layer;
     const char *dirs = getenv("COLI_MODEL_MIRROR");
     if (!dirs || !*dirs) dirs = getenv("SNAP_MIRROR");
     if (!dirs || !*dirs) return;
     st_mirror_reset(S);
+    if (W) st_mirror_reset(W);
     int nrep = 1;
     char buf[4096];
     snprintf(buf, sizeof(buf), "%s", dirs);
@@ -1616,7 +1664,7 @@ static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer
                 fprintf(stderr, "[MIRROR] %s equals the model dir — ignored\n", p);
             else if (nrep >= V41_MIR_REPS)
                 fprintf(stderr, "[MIRROR] %s: too many mirrors (max %d) — ignored\n", p, ST_MAX_MIR);
-            else {
+            else if (!W) {
                 int nf = st_mirror_add(S, p);
                 if (nf <= 0)
                     fprintf(stderr, "[MIRROR] %s: no usable shard (missing or divergent "
@@ -1624,6 +1672,17 @@ static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer
                 else {
                     fprintf(stderr, "[MIRROR] %s: %d/%d shards (replica %d)\n",
                             p, nf, S->nfd, nrep);
+                    nrep++;
+                }
+            } else {
+                int nf = st_mirror_add_slot(S, p), nw = st_mirror_add_slot(W, p);
+                if (nf <= 0 && nw <= 0) {
+                    S->nrep--; W->nrep--;   /* neither set has a copy there: no replica */
+                    fprintf(stderr, "[MIRROR] %s: no usable shard and no copy of the WEX4 container "
+                                    "(missing or divergent) — skipped\n", p);
+                } else {
+                    fprintf(stderr, "[MIRROR] %s: %d/%d shards, %s (replica %d)\n", p, nf, S->nfd,
+                            nw > 0 ? "the WEX4 container" : "no copy of the WEX4 container", nrep);
                     nrep++;
                 }
             }
@@ -1634,7 +1693,9 @@ static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer
         fprintf(stderr, "[MIRROR] no usable mirror — reading the primary drive only\n");
         return;
     }
-    g_mirror = 1; g_mir_nrep = nrep;
+    g_mirror = 1; g_mir_nrep = nrep; g_mir_explicit = 0;
+    memset(g_mir_inflight, 0, sizeof g_mir_inflight);
+    memset(g_mir_issued, 0, sizeof g_mir_issued);
     double weight[V41_MIR_REPS];
     int have = 0;
     const char *spec = getenv("COLI_DISK_WEIGHTS");
@@ -1648,7 +1709,7 @@ static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer
             if (v <= 0 || n >= V41_MIR_REPS) { bad = 1; break; }
             weight[n++] = v;
         }
-        if (!bad && n == nrep) have = 1;
+        if (!bad && n == nrep) { have = 1; g_mir_explicit = 1; }
         else
             fprintf(stderr, "[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want %d positive "
                             "comma-separated weights, e.g. 9,3) — probing instead\n", spec, nrep);
@@ -1657,7 +1718,9 @@ static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer
         how = "measured";
         have = 1;
         for (int r = 0; r < nrep; r++) {
-            weight[r] = mirror_probe_bw(S, r);
+            /* the container when the replica holds it: the experts' bytes are read there */
+            weight[r] = W ? mirror_probe_bw(W, r) : 0;
+            if (weight[r] <= 0) weight[r] = mirror_probe_bw(S, r);
             if (weight[r] <= 0) have = 0;
         }
         if (have) {
@@ -1672,7 +1735,10 @@ static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer
         }
     }
     double sum = 0;
-    for (int r = 0; r < nrep; r++) sum += weight[r];
+    for (int r = 0; r < nrep; r++) {
+        g_mir_bw[r] = weight[r] > 0.01 ? weight[r] : 1.0;
+        sum += weight[r];
+    }
     int acc = 0;
     double cum = 0;
     for (int r = 0; r < nrep; r++) {
@@ -1721,6 +1787,8 @@ typedef struct {
     int part;
     int rep;
     int gx_layer;         /* a GGUF expert's matrix: its layer (its type and form), else -1 */
+    shards *S;            /* the file set t is in: the checkpoint's, or the WEX4 container's */
+    int eid;              /* the expert */
 } ExpertRead;
 
 /* Bytes one part of an expert occupies, from the config rather than the file:
@@ -1819,6 +1887,360 @@ static void v41_gx_geometry(Model *m) {
                 gq_type_name(m->gx_t[3 * L + 2]), m->gx_t[3 * L] == GQ_MXFP4 ? ", as the checkpoint's FP4" : "");
 }
 
+/* ---- routed experts from a WEX4 container (COLI_WEX_PATH; docs/wex.md) ----------
+ * A WEX4 file of the checkpoint's routed experts: one record per (layer, expert), the w1,
+ * w2, w3 scales then the w1, w2, w3 weights, back to back, padded to 4096. A RAW record's
+ * six tensors become six st_tensor entries over the container's one file (wex->t), so
+ * expert_fetch reads them as it reads the shards' (the same windows, O_DIRECT, reader
+ * threads), only from a contiguous record of one file. A WNR3 record (codec 5: those bytes
+ * coded with the container's WNM2 model) is read whole by one reader, decoded on its thread
+ * (v41_wex_fetch_nr3, wex_decode.c) and its six parts copied into the windows. The
+ * backbone's experts only; the DSpark stages, a GGUF's experts and every other tensor stay
+ * on the shards.
+ *
+ * At open (v41_wex_open): the header page and the index (wex4.h), the grid (n_layers x
+ * n_routed), COLI_WEX_ROOT (64 hex digits) when set, and every expert record RAW or WNR3
+ * with the checkpoint's shapes and part sizes; WNR3 records need one WNM2 blob, matching its
+ * SHA-256 in the index, and all or none value-exact. Any failure leaves every expert on the
+ * safetensors with a "[v41_wex]" line; an expert the container lacks is read from them too.
+ * COLI_WEX_VERIFY (on with COLI_WEX_ROOT, else off) hashes each record at its first read
+ * (RAW: v41_wex_check, the six parts in record order and its zero padding; WNR3: its stored
+ * bytes): one that fails is read again from the safetensors and stays on them for the run,
+ * as does a WNR3 record that names another expert or does not decode. */
+#include "wex4.h"
+#define COLI_WEX_DECODE_API static inline
+#include "wex_decode.c"
+
+#define V41_WEX_BUF_POOL 64
+#define V41_WEX_PIN_SLOTS 40
+typedef struct V41Wex {
+    shards S;                  /* the container: its one file */
+    st_tensor *t;              /* [cell * 6 + part]: the part's bytes in the file (RAW) or in the decoded
+                                * record (WNR3/WNR4); fd < 0: not in it */
+    WexEntry *nr3;             /* WNR3/WNR4 records: [cell] the record's entry (flags 5 or 8), else NULL */
+    uint32_t nr3_flags;        /* WEX_HEADER_CANONICAL_ZERO when the coded records are value-exact, else 0 */
+    int is_wnr4;               /* 1: WNR4-MX (codec 8) container; 0: RAW or WNR3 (codec 5) */
+    unsigned char *sha;        /* COLI_WEX_VERIFY: [cell * 32] the index's SHA-256 of each record, else NULL */
+    unsigned char *state;      /* [cell]: 0 not hashed yet, 1 passed, 2 refused (the shards serve it) */
+    int64_t pad;               /* a RAW record's zero padding: stored - decoded */
+    size_t max_slab;           /* aligned decoded size of one expert: uniform size for WEX scratch buffers */
+    int experts;               /* n_routed: cell = layer * experts + expert */
+    uint64_t reads, refused, decoded;
+    /* Single contiguous CUDA-pinned arena sliced into V41_WEX_PIN_SLOTS fixed-size buffers:
+     * one cudaHostRegister() call instead of 64 serialized WDDM kernel locks (~4.7s saved). */
+    pthread_mutex_t buf_mx;
+    uint8_t *pin_arena;        /* contiguous V41_WEX_PIN_SLOTS * max_slab arena (owned, freed on close) */
+    int pin_arena_reg;         /* 1: pin_arena is registered with coli_wex_cuda_host_register */
+    int pin_arena_init;        /* 1: lazy arena init has run */
+    uint8_t *buf_p[V41_WEX_BUF_POOL];
+    int buf_pin[V41_WEX_BUF_POOL];   /* 1: slice of pin_arena (never individually freed), 0: heap fallback */
+    int buf_cnt;
+    int buf_pin_on;            /* 1: helper exports COLI_WEX_CUDA_REGISTER */
+    double t_gpu, t_post;      /* cumulative GPU decode and parallel post (SHA+copy) thread-seconds */
+} V41Wex;
+
+/* the container's tensor order in a record (w1, w2, w3 scales, then weights) as expert_read_list's parts */
+static const int v41_wex_part[6] = {1, 5, 3, 0, 4, 2};
+
+static int v41_wex_pin(unsigned char pin[32]) {   /* COLI_WEX_ROOT: 0 unset, 1 a root, -1 not 64 hex digits */
+    const char *text = getenv("COLI_WEX_ROOT");
+    if (!text || !*text) return 0;
+    if (strlen(text) != 64) return -1;
+    for (int i = 0; i < 64; i++) {
+        int ch = text[i], v = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                            : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+        if (v < 0) return -1;
+        if (i & 1) pin[i / 2] |= (unsigned char)v; else pin[i / 2] = (unsigned char)(v << 4);
+    }
+    return 1;
+}
+
+static uint8_t *v41_wex_buf_get(V41Wex *w, int *pinned_out) {
+    uint8_t *p = NULL;
+    int pin = 0;
+    const size_t sz = w->max_slab ? w->max_slab : WEX4_PAGE;
+    pthread_mutex_lock(&w->buf_mx);
+    if (!w->pin_arena_init) {
+        w->pin_arena_init = 1;
+        if (w->buf_pin_on) {
+            void *arena = NULL;
+            const size_t total = sz * (size_t)V41_WEX_PIN_SLOTS;
+            if (posix_memalign(&arena, ST_DIRECT_ALIGN, total) == 0 && arena) {
+                w->pin_arena = (uint8_t *)arena;
+                if (coli_wex_cuda_host_register(arena, total) == 0) {
+                    w->pin_arena_reg = 1;
+                } else {
+                    fprintf(stderr, "[v41_wex] host pinning unavailable for %.1f MiB arena (continuing unpinned)\n",
+                            total / 1048576.0);
+                }
+                for (int i = 0; i < V41_WEX_PIN_SLOTS && w->buf_cnt < V41_WEX_BUF_POOL; i++) {
+                    w->buf_p[w->buf_cnt] = w->pin_arena + (size_t)i * sz;
+                    w->buf_pin[w->buf_cnt] = 1;
+                    w->buf_cnt++;
+                }
+            }
+        }
+    }
+    if (w->buf_cnt > 0) {
+        /* Always prefer an arena-pinned slice so unpinned overflow buffers never shadow pinned ones. */
+        int pick = w->buf_cnt - 1;
+        for (int i = w->buf_cnt - 1; i >= 0; i--) {
+            if (w->buf_pin[i]) { pick = i; break; }
+        }
+        p = w->buf_p[pick];
+        pin = w->buf_pin[pick];
+        w->buf_cnt--;
+        w->buf_p[pick] = w->buf_p[w->buf_cnt];
+        w->buf_pin[pick] = w->buf_pin[w->buf_cnt];
+    }
+    pthread_mutex_unlock(&w->buf_mx);
+    if (!p) {
+        if (posix_memalign((void **)&p, ST_DIRECT_ALIGN, sz)) {
+            fprintf(stderr, "OOM allocating WEX scratch buffer\n"); exit(1);
+        }
+    }
+    if (pinned_out) *pinned_out = pin;
+    return p;
+}
+
+static void v41_wex_buf_put(V41Wex *w, uint8_t *p, int pinned) {
+    if (!p) return;
+    pthread_mutex_lock(&w->buf_mx);
+    if (w->buf_cnt < V41_WEX_BUF_POOL) {
+        w->buf_p[w->buf_cnt] = p;
+        w->buf_pin[w->buf_cnt] = pinned;
+        w->buf_cnt++;
+        p = NULL;
+    } else if (pinned) {
+        /* Arena slice must never be freed individually: evict an unpinned heap buffer instead. */
+        for (int i = 0; i < w->buf_cnt; i++) {
+            if (!w->buf_pin[i]) {
+                uint8_t *ev = w->buf_p[i];
+                w->buf_p[i] = p; w->buf_pin[i] = 1;
+                p = ev; pinned = 0;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&w->buf_mx);
+    if (p && !pinned) compat_aligned_free(p);
+}
+
+static void v41_wex_free(V41Wex *w) {
+    if (!w) return;
+    for (int i = 0; i < w->buf_cnt; i++) {
+        if (!w->buf_pin[i]) compat_aligned_free(w->buf_p[i]);
+    }
+    if (w->pin_arena) {
+        if (w->pin_arena_reg) coli_wex_cuda_host_unregister(w->pin_arena);
+        compat_aligned_free(w->pin_arena);
+    }
+    pthread_mutex_destroy(&w->buf_mx);
+    st_destroy(&w->S);
+    free(w->t); free(w->nr3); free(w->sha); free(w->state); free(w);
+}
+
+static void v41_wex_open(Model *m) {
+    const char *path = getenv("COLI_WEX_PATH");
+    if (!path || !*path) return;
+    const Cfg *c = &m->c;
+    char why[300] = "", root[65] = "";
+    unsigned char *page = NULL, *index = NULL, pin[32];
+    V41Wex *w = NULL;
+    if (m->gx) { snprintf(why, sizeof why, "is not used with a GGUF's experts"); goto refuse; }
+    int probe = open(path, COMPAT_O_RDONLY);
+    if (probe < 0) { snprintf(why, sizeof why, "cannot be opened (%s)", strerror(errno)); goto refuse; }
+    close(probe);
+    w = xcalloc(1, sizeof *w, "WEX4 container");
+    pthread_mutex_init(&w->buf_mx, NULL);
+    w->experts = c->n_routed;
+    const int fd = st_open_fd(&w->S, path);
+    const int64_t size = w->S.sizes[0];
+    page = xmalloc(WEX4_PAGE, "WEX4 header page");
+    if (size < (int64_t)WEX4_PAGE) { snprintf(why, sizeof why, "has no header page"); goto refuse; }
+    st_pread_full(fd, page, WEX4_PAGE, 0, "pread WEX4 header page");
+    Wex4Header h;
+    Wex4View view;
+    int rc = wex4_parse_header(page, (uint64_t)size, &h);
+    if (rc) {
+        const uint32_t magic = wex_read_u32_le(page);
+        if (magic == WEX_MAGIC_V1 || magic == WEX_MAGIC_V2 || magic == WEX_MAGIC_V3)
+            snprintf(why, sizeof why, "is a WEX1-WEX3 container, not WEX4");
+        else snprintf(why, sizeof why, "is not a valid WEX4 container (header page: wex4.h error %d)", rc);
+        goto refuse;
+    }
+    for (int i = 0; i < 32; i++) snprintf(root + 2 * i, 3, "%02x", h.root[i]);
+    if (h.layers != (uint32_t)c->n_layers || h.experts != (uint32_t)c->n_routed) {
+        snprintf(why, sizeof why, "was written for another model (a grid of %u x %u experts, the model has %d x %d)",
+                 h.layers, h.experts, c->n_layers, c->n_routed);
+        goto refuse;
+    }
+    const int pinned = v41_wex_pin(pin);
+    if (pinned < 0) { snprintf(why, sizeof why, "is not used: COLI_WEX_ROOT is not 64 hex digits"); goto refuse; }
+    if (pinned && memcmp(pin, h.root, 32)) {
+        snprintf(why, sizeof why, "is not the pinned COLI_WEX_ROOT (its root is %s)", root);
+        goto refuse;
+    }
+    const size_t index_len = (size_t)wex4_align(h.index_bytes);
+    index = xmalloc(index_len ? index_len : 1, "WEX4 index");
+    if (index_len) st_pread_full(fd, index, (int64_t)index_len, (int64_t)h.index_offset, "pread WEX4 index");
+    if ((rc = wex4_open(&h, index, index_len, &view))) {
+        snprintf(why, sizeof why, "is not a valid WEX4 container (index: wex4.h error %d)", rc);
+        goto refuse;
+    }
+    const size_t cells = (size_t)c->n_layers * (size_t)c->n_routed;
+    w->t = xcalloc(cells * 6, sizeof *w->t, "WEX4 expert tensors");
+    w->state = xcalloc(cells, 1, "WEX4 expert state");
+    unsigned char *sha = xmalloc(cells * 32, "WEX4 record hashes");
+    for (size_t k = 0; k < cells * 6; k++) w->t[k].fd = -1;
+    int64_t decoded = 0;
+    for (int part = 0; part < 6; part++) decoded += expert_part_bytes(c, part);
+    w->max_slab = (size_t)wex4_align((uint64_t)decoded);
+    w->pad = (int64_t)w->max_slab - decoded;
+    int held = 0, nr3 = 0, nr4 = 0, exact = 0, wnr4_cz = -1;
+    uint32_t model_blob = 0;   /* the WNR3/WNR4 records' WNM2/WNM4 blob, 1-based */
+    for (uint32_t r = 0; r < h.records; r++) {
+        Wex4Record rec;
+        wex4_get_record(&view, r, &rec);
+        if (!(rec.flags & WEX4_REC_EXPERT)) continue;   /* other tensors: not the experts' */
+        const int layer = (int)(rec.owner >> 16), eid = (int)(rec.owner & 0xffffu);   /* bounded by wex4_open */
+        const size_t cell = (size_t)layer * c->n_routed + eid;
+        const int is_nr3 = rec.codec == WEX4_CODEC_WNR3, is_nr4 = rec.codec == WEX4_CODEC_WNR4;
+        const int coded = is_nr3 || is_nr4;   /* wex4_open admits RAW, WNR3 and WNR4 expert records */
+        if (coded) {
+            if ((nr3 && is_nr4) || (nr4 && is_nr3)) {
+                snprintf(why, sizeof why, "mixes WNR3 and WNR4 expert records");
+                free(sha);
+                goto refuse;
+            }
+            if (model_blob && rec.blob != model_blob) {
+                snprintf(why, sizeof why, "has coded records of two models (one is read)");
+                free(sha);
+                goto refuse;
+            }
+            model_blob = rec.blob;
+            if (!w->nr3) w->nr3 = xcalloc(cells, sizeof *w->nr3, "WEX4 coded entries");
+            if (wex4_expert_entry(&view, r, &w->nr3[cell])) {
+                snprintf(why, sizeof why, "has an invalid %s record (layer %d expert %d)", is_nr4 ? "WNR4" : "WNR3", layer, eid);
+                free(sha);
+                goto refuse;
+            }
+            if (is_nr4) {
+                nr4++;
+                if (wnr4_cz < 0) {
+                    unsigned char *rpage = xmalloc(WEX4_PAGE, "WEX4 WNR4 record header");
+                    st_pread_full(fd, rpage, WEX4_PAGE, (int64_t)rec.offset, "pread WNR4 record header");
+                    wnr4_cz = !!(rpage[13] & 8u) || !!(rec.flags & WEX4_REC_VALUE_EXACT);
+                    free(rpage);
+                }
+            } else {
+                nr3++;
+                exact += !!(rec.flags & WEX4_REC_VALUE_EXACT);
+            }
+        }
+        int ok = rec.tensor_count == 6 && (int64_t)rec.decoded == decoded;
+        for (int j = 0; j < 6 && ok; j++) {
+            Wex4Tensor t;
+            wex4_get_tensor(&view, rec.first_tensor + (uint32_t)j, &t);
+            const int part = v41_wex_part[j], scale = part & 1, down = part >= 4;
+            const int64_t rows = down ? c->dim : c->moe_inter, k = down ? c->moe_inter : c->dim;
+            const int64_t cols = scale ? k / 32 : k / 2;
+            ok = t.rank == 2 && t.record_count == 1 && (int64_t)t.shape[0] == rows && (int64_t)t.shape[1] == cols &&
+                 (int64_t)t.nbytes == expert_part_bytes(c, part) &&
+                 (scale ? t.dtype == WEX4_DT_U8 || t.dtype == WEX4_DT_F8_E8M0 : t.dtype == WEX4_DT_U8 || t.dtype == WEX4_DT_I8);
+            if (!ok) break;
+            st_tensor *dst = &w->t[cell * 6 + part];
+            dst->name = (char *)"a WEX4 record's tensor";
+            /* RAW: where the part is in the file; WNR3: where it is in the decoded record */
+            dst->fd = fd; dst->off = (int64_t)((coded ? 0 : rec.offset) + t.offset); dst->nbytes = (int64_t)t.nbytes;
+            dst->dtype = 3; dst->rank = 2; dst->shape[0] = rows; dst->shape[1] = cols; dst->numel = rows * cols;
+        }
+        if (!ok) {
+            snprintf(why, sizeof why, "has a record (layer %d expert %d) that is not the checkpoint's expert "
+                                      "(shapes or sizes differ)", layer, eid);
+            free(sha);
+            goto refuse;
+        }
+        memcpy(sha + cell * 32, rec.sha, 32);
+        held++;
+    }
+    char model[64] = "";
+    if (model_blob) {   /* the WNM2/WNM4 model, checked against its SHA-256 in the index, registered for the decode */
+        Wex4Blob blob;
+        wex4_get_blob(&view, model_blob - 1u, &blob);
+        const size_t stored = (size_t)wex4_align(blob.bytes);
+        unsigned char *bytes = xmalloc(stored, "WEX4 model blob");
+        st_pread_full(fd, bytes, (int64_t)stored, (int64_t)blob.offset, "pread WEX4 model blob");
+        const int bad = nr4 ? coli_wex4_register_wnr4_model(bytes, (size_t)blob.bytes, stored, blob.sha, blob.id)
+                            : coli_wex4_register_model(bytes, (size_t)blob.bytes, stored, blob.sha, blob.id);
+        free(bytes);
+        if (bad || (!nr4 && exact && exact != nr3)) {
+            snprintf(why, sizeof why, "%s", bad ? (nr4 ? "has a WNM4 model blob that does not match its SHA-256 in the index"
+                                                       : "has a WNM2 model blob that does not match its SHA-256 in the index")
+                                                : "has WNR3 records both value-exact and not (all or none are read)");
+            free(sha);
+            goto refuse;
+        }
+        w->is_wnr4 = nr4 > 0;
+        w->buf_pin_on = (coli_wex_cuda_features() & COLI_WEX_CUDA_REGISTER) != 0;
+        const int cz_on = nr4 ? (wnr4_cz > 0) : (exact > 0);
+        w->nr3_flags = cz_on ? WEX_HEADER_CANONICAL_ZERO : 0u;
+        snprintf(model, sizeof model, " (%d %s, model %08x%s)", nr4 ? nr4 : nr3, nr4 ? "WNR4" : "WNR3",
+                 blob.id, cz_on ? ", value-exact" : "");
+    }
+    const char *verify = getenv("COLI_WEX_VERIFY");
+    if (verify && *verify ? atoi(verify) != 0 : pinned > 0) w->sha = sha; else free(sha);
+    fprintf(stderr, "[v41_wex] WEX4 container %s: %d of %zu experts%s, root %s%s; first-read SHA-256 %s\n", path,
+            held, cells, model, root, pinned ? " (pinned)" : "", w->sha ? "on" : "off");
+    free(page); free(index);
+    m->wex = w;
+    return;
+refuse:
+    fprintf(stderr, "[v41_wex] %s %s; the experts come from the safetensors\n", path, why);
+    free(page); free(index);
+    v41_wex_free(w);
+}
+
+/* Whether the container serves this backbone expert. */
+static int v41_wex_has(const Model *m, const char *kind, int layer, int eid) {
+    const V41Wex *w = m->wex;
+    if (!w || strcmp(kind, "layers")) return 0;
+    const size_t cell = (size_t)layer * m->c.n_routed + eid;
+    return w->t[cell * 6].fd >= 0 && __atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE) != 2;
+}
+
+/* A record that failed: refused for the run, the shards serve its expert from now on. */
+static void v41_wex_refuse(V41Wex *w, int layer, int eid, const char *why) {
+    __atomic_store_n(&w->state[(size_t)layer * (size_t)w->experts + (size_t)eid], (unsigned char)2, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&w->refused, UINT64_C(1), __ATOMIC_RELAXED);
+    fprintf(stderr, "[v41_wex] layer %d expert %d: the record %s; this expert comes from the safetensors from now on\n",
+            layer, eid, why);
+}
+
+/* COLI_WEX_VERIFY: the record of an expert just read from the container, hashed from its
+ * six windows in record order plus its zero padding. 1 = it is the index's record. */
+static int v41_wex_check(Model *m, int layer, int eid, Slot *s) {
+    V41Wex *w = m->wex;
+    const size_t cell = (size_t)layer * m->c.n_routed + eid;
+    if (!w->sha || __atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE) == 1) return 1;
+    static const unsigned char zero[WEX4_PAGE];
+    unsigned char digest[32];
+    Wex4Sha sha;
+    wex4_sha_init(&sha);
+    for (int j = 0; j < 6; j++) {
+        const st_tensor *t = &w->t[cell * 6 + v41_wex_part[j]];
+        wex4_sha_update(&sha, s->base[v41_wex_part[j]] + t->off % ST_DIRECT_ALIGN, (size_t)t->nbytes);
+    }
+    wex4_sha_update(&sha, zero, (size_t)w->pad);
+    wex4_sha_final(&sha, digest);
+    if (memcmp(digest, w->sha + cell * 32, 32)) {
+        v41_wex_refuse(w, layer, eid, "does not match its SHA-256 in the index");
+        return 0;
+    }
+    __atomic_store_n(&w->state[cell], (unsigned char)1, __ATOMIC_RELEASE);
+    return 1;
+}
+
 /* Fill in the six reads that make up one expert. Naming them into a list instead
  * of reading them on the spot is the whole point: the list is what lets a layer's
  * misses go to the device together rather than one behind another. Resolution
@@ -1833,17 +2255,25 @@ static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot
     char name[160];
     int n = 0;
     const int gi = v41_gx_index(m, kind, layer), gx = gi >= 0;   /* a GGUF's: the three matrices, no scales */
+    const int wex = !gx && v41_wex_has(m, kind, layer, eid);     /* COLI_WEX_PATH: the container's record */
     for (int i = 0; i < 3; i++) {
         for (int f = 0; f < 2 - gx; f++) {
-            snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.%s",
-                     kind, layer, eid, part[i].suffix, leaf[f]);
-            const st_tensor *t = st_find(&m->S, name);
-            if (!t) st_die_missing(&m->S, name);
+            const int which = f ? part[i].scale_part : part[i].weight_part;
+            const st_tensor *t;
+            if (wex) t = &m->wex->t[((size_t)layer * m->c.n_routed + eid) * 6 + which];
+            else {
+                snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.%s",
+                         kind, layer, eid, part[i].suffix, leaf[f]);
+                t = st_find(&m->S, name);
+                if (!t) st_die_missing(&m->S, name);
+            }
             out[n].t = t;
+            out[n].S = wex ? &m->wex->S : &m->S;
             out[n].slot = s;
-            out[n].part = f ? part[i].scale_part : part[i].weight_part;
-            out[n].rep = rep;
+            out[n].part = which;
+            out[n].rep = rep;   /* the same drive for the shards' tensors and the container's record */
             out[n].gx_layer = gi;
+            out[n].eid = eid;
             n++;
         }
     }
@@ -1861,10 +2291,74 @@ static int expert_read_depth(void) {
     static int depth = -1;
     if (depth < 0) {
         const char *env = getenv("V41_READ_DEPTH");
-        depth = env ? atoi(env) : 8;
+        if (env && *env) depth = atoi(env);
+        else {
+            depth = 8 * (g_mir_nrep > 0 ? g_mir_nrep : 1);
+            if (depth > 24) depth = 24;
+        }
         if (depth < 1) depth = 1;
     }
     return depth;
+}
+
+/* TLS flag set by prefetch_main around expert_fetch: keeps background prefetch from
+ * spawning a full-width OpenMP team on top of the main thread's AVX2 matmuls and from
+ * polluting main-thread m->t_disk with overlapped I/O wall time. */
+static __thread int g_v41_in_prefetch = 0;
+
+/* Lazily allocate the six separate O_DIRECT windows of a slot when a WNR3/WNR4 slot
+ * (which normally holds only one contiguous wex_slab) falls back to safetensors. */
+static void slot_ensure_windows(const Model *m, Slot *s, int stage) {
+    if (s->base[0]) return;
+    for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
+        size_t bytes = (size_t)(stage ? stage_part_bytes(m, part) : slot_part_bytes(m, part)) + ST_DIRECT_ALIGN;
+        void *window = NULL;
+        if (posix_memalign(&window, ST_DIRECT_ALIGN, bytes) != 0) {
+            fprintf(stderr, "OOM allocating expert window (%zu bytes)\n", bytes);
+            exit(1);
+        }
+        s->base[part] = window;
+    }
+}
+
+static int expert_direct(void);
+
+/* Under O_DIRECT (no OS page cache), pick the available replica with the lowest active
+ * queue time (inflight / bw), tie-breaking idle drives by weighted cumulative deficit
+ * (issued / bw) so both single-read waves and multi-read waves stay balanced across NVMe drives.
+ * Under buffered I/O, keep deterministic expert_route() for OS page-cache affinity. */
+static int v41_pick_rep(shards *S, int fd, int fallback, uint64_t req_bytes) {
+    if (!g_mirror || g_mir_nrep < 2 || g_mir_explicit) return st_fd_rep(S, fd, fallback) < 0 ? 0 : fallback;
+    if (!expert_direct()) return st_fd_rep(S, fd, fallback) < 0 ? 0 : fallback;
+    pthread_mutex_lock(&g_mir_mx);
+    int best = -1;
+    double best_act = 0.0, best_def = 0.0;
+    for (int r = 0; r < g_mir_nrep; r++) {
+        if (st_fd_rep(S, fd, r) < 0) continue;
+        const double bw = g_mir_bw[r] > 0.01 ? g_mir_bw[r] : 1.0;
+        const double act = (double)g_mir_inflight[r] / bw;
+        const double def = (double)g_mir_issued[r] / bw;
+        if (best < 0 || act < best_act - 1e-6 || (act <= best_act + 1e-6 && def < best_def)) {
+            best = r; best_act = act; best_def = def;
+        }
+    }
+    if (best < 0) best = 0;
+    g_mir_inflight[best] += req_bytes;
+    g_mir_issued[best] += req_bytes;
+    if (g_mir_issued[best] > (UINT64_C(1) << 30)) {
+        uint64_t mn = g_mir_issued[0];
+        for (int r = 1; r < g_mir_nrep; r++) if (g_mir_issued[r] < mn) mn = g_mir_issued[r];
+        for (int r = 0; r < g_mir_nrep; r++) g_mir_issued[r] -= mn;
+    }
+    pthread_mutex_unlock(&g_mir_mx);
+    return best;
+}
+static void v41_unpick_rep(int rep, uint64_t req_bytes) {
+    if (g_mirror && g_mir_nrep >= 2 && !g_mir_explicit && expert_direct() && rep >= 0 && rep < g_mir_nrep) {
+        pthread_mutex_lock(&g_mir_mx);
+        g_mir_inflight[rep] = g_mir_inflight[rep] >= req_bytes ? g_mir_inflight[rep] - req_bytes : 0;
+        pthread_mutex_unlock(&g_mir_mx);
+    }
 }
 
 /* O_DIRECT for the expert reads. On by default, as in the V4 engine, because of
@@ -1943,6 +2437,147 @@ static void scratch_put(uint8_t *p, int64_t n) {
     if (p) compat_aligned_free(p);
 }
 
+/* The container's WNR3/WNR4 entry of a backbone expert it serves, or NULL (RAW, or not the container's). */
+static const WexEntry *v41_wex_nr3(const Model *m, const ExpertRead *r, int layer) {
+    const V41Wex *w = m->wex;
+    if (!w || !w->nr3 || r->S != &w->S) return NULL;
+    const WexEntry *e = &w->nr3[(size_t)layer * m->c.n_routed + r->eid];
+    return (e->flags == WEX_ENTRY_NEURAL_RANS3 || e->flags == WEX_ENTRY_WNR4) ? e : NULL;
+}
+
+/* Fill slot window pointers in WEX record order (w1, w2, w3 scales then weights). */
+static void v41_wex_slot_ptrs(const V41Wex *w, size_t cell, const WexEntry *e, Slot *s,
+                              unsigned char *scales[3], unsigned char *weights[3]) {
+    if (s->wex_slab && e) {
+        for (int m = 0; m < 3; m++) {
+            scales[m] = s->wex_slab + e->scale_offsets[m];
+            weights[m] = s->wex_slab + e->weight_offsets[m];
+        }
+        return;
+    }
+    for (int j = 0; j < 6; j++) {
+        const int part = v41_wex_part[j];
+        const st_tensor *t = &w->t[cell * 6 + part];
+        if (j < 3) scales[j] = s->base[part] + t->off % ST_DIRECT_ALIGN;
+        else weights[j - 3] = s->base[part] + t->off % ST_DIRECT_ALIGN;
+    }
+}
+
+/* Verify first-read SHA-256 of a coded record (when COLI_WEX_VERIFY is on). 1 = ok, 0 = refused. */
+static int v41_wex_verify_coded(V41Wex *w, int layer, int eid, const WexEntry *e, const uint8_t *record) {
+    const size_t cell = (size_t)layer * (size_t)w->experts + (size_t)eid;
+    if (!w->sha || __atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE)) return 1;
+    unsigned char digest[32];
+    wex4_sha256(record, e->total_bytes, digest);
+    if (memcmp(digest, w->sha + cell * 32, 32)) {
+        v41_wex_refuse(w, layer, eid, "does not match its SHA-256 in the index");
+        return 0;
+    }
+    __atomic_store_n(&w->state[cell], (unsigned char)1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+/* Read one WNR3/WNR4 record from disk into a fixed-size, page-aligned (and CUDA-pinned when
+ * the helper exports feature 2) buffer from w's pool, and check its owner/CZ header. When
+ * check_sha != 0 also verifies its first-read SHA-256 here; when 0, the caller runs
+ * v41_wex_verify_coded concurrently with GPU decode so I/O threads never stall on hashing. */
+static uint8_t *v41_wex_read_coded(Model *m, int layer, int eid, const WexEntry *e, int rep, int check_sha, int *pinned_out) {
+    V41Wex *w = m->wex;
+    const size_t cell = (size_t)layer * m->c.n_routed + eid;
+    int pinned = 0;
+    uint8_t *record = v41_wex_buf_get(w, &pinned);
+    st_read_range_rep(&w->S, w->t[cell * 6].fd, rep, (int64_t)e->file_offset, (int64_t)e->total_bytes, record,
+                      (int64_t)w->max_slab, 1, expert_direct(), "pread WNR3/WNR4 expert");
+    if (check_sha && !v41_wex_verify_coded(w, layer, eid, e, record)) {
+        v41_wex_buf_put(w, record, pinned);
+        if (pinned_out) *pinned_out = 0;
+        return NULL;
+    }
+    if (!wex_nr3_owner_ok(e, record, (uint32_t)layer, (uint32_t)eid, w->nr3_flags)) {
+        v41_wex_refuse(w, layer, eid, "names another expert, or another canonical-zero form");
+        v41_wex_buf_put(w, record, pinned);
+        if (pinned_out) *pinned_out = 0;
+        return NULL;
+    }
+    if (pinned_out) *pinned_out = pinned;
+    return record;
+}
+
+static uint64_t v41_wex_fetch_nr3(Model *m, int layer, int eid, const WexEntry *e, Slot *s, int rep) {
+    V41Wex *w = m->wex;
+    const size_t cell = (size_t)layer * m->c.n_routed + eid;
+    unsigned char *scales[3], *weights[3];
+    v41_wex_slot_ptrs(w, cell, e, s, scales, weights);
+    int pinned = 0;
+    uint8_t *record = v41_wex_read_coded(m, layer, eid, e, rep, 1, &pinned);
+    if (!record) return 0;
+    const int bad = coli_wex_decode_record_to(e, record, scales, weights);
+    if (bad) v41_wex_refuse(w, layer, eid, "does not decode (a WNR3/WNR4 stream check failed)");
+    v41_wex_buf_put(w, record, pinned);
+    return bad ? 0 : e->total_bytes;
+}
+
+/* Finalize one GPU-decoded coded record on a worker thread: run deferred first-read SHA-256
+ * (when check_sha != 0), scatter/copy from `slab` into `slot` when `slab != NULL` (skipped
+ * when GPU decoded straight into `slot->wex_slab`), handle CPU fallback/refusal, and return
+ * pooled buffers. */
+static void v41_wex_post_one(Model *m, int layer, int eid, Slot *s, const WexEntry *e,
+                             uint8_t *rec, int rpin, uint8_t *slab, int spin, int st, int check_sha) {
+    V41Wex *w = m->wex;
+    const size_t cell = (size_t)layer * m->c.n_routed + eid;
+    if (!check_sha || v41_wex_verify_coded(w, layer, eid, e, rec)) {
+        unsigned char *scales[3], *weights[3];
+        v41_wex_slot_ptrs(w, cell, e, s, scales, weights);
+        if (!st) {
+            if (slab) {
+                if (s->wex_slab) {
+                    uint64_t raw = 0, aligned = 0;
+                    if (!wex_entry_raw_sizes(e, &raw, &aligned))
+                        memcpy(s->wex_slab, slab, (size_t)raw);
+                } else {
+                    for (int mat = 0; mat < 3; mat++) {
+                        memcpy(scales[mat], slab + e->scale_offsets[mat],
+                               (size_t)e->scale_shapes[mat][0] * e->scale_shapes[mat][1]);
+                        memcpy(weights[mat], slab + e->weight_offsets[mat],
+                               (size_t)e->weight_shapes[mat][0] * e->weight_shapes[mat][1]);
+                    }
+                }
+            }
+        } else if (st == 1) {
+            if (coli_wex_decode_record_to(e, rec, scales, weights))
+                v41_wex_refuse(w, layer, eid, "does not decode (a WNR3/WNR4 stream check failed)");
+        } else {
+            v41_wex_refuse(w, layer, eid, "does not decode (a WNR3/WNR4 stream check failed)");
+        }
+    }
+    if (slab) v41_wex_buf_put(w, slab, spin);
+    v41_wex_buf_put(w, rec, rpin);
+}
+
+/* Always decode GPU batches into CUDA-pinned slabs (never pageable slot memory, which
+ * forces synchronous WDDM bounce copies); Stage 3 copies the contiguous slab into slot->wex_slab
+ * in parallel with NVMe I/O and GPU decode. */
+static void v41_wex_gpu_decode_wave(Model *m, int layer, Slot *const *slot, const int *eid,
+                                    const int *idxs, const WexEntry *const *ew, uint8_t **rw, const int *rpin, int cnt) {
+    enum { WEX_WAVE = 8 };
+    V41Wex *w = m->wex;
+    unsigned char *slabs[WEX_WAVE];
+    int spin[WEX_WAVE], st_w[WEX_WAVE];
+    for (int j = 0; j < cnt; j++) {
+        slabs[j] = v41_wex_buf_get(w, &spin[j]);
+        st_w[j] = 1;
+    }
+    const double tg0 = now_s();
+    coli_wex_cuda_decode_batch_to_host(cnt, ew, (const unsigned char *const *)rw, 0, slabs, st_w);
+    const double tg1 = now_s();
+    if (!g_v41_in_prefetch) w->t_gpu += tg1 - tg0;
+    for (int j = 0; j < cnt; j++) {
+        const int idx = idxs[j];
+        v41_wex_post_one(m, layer, eid[idx], slot[idx], ew[j], rw[j], rpin[j], slabs[j], spin[j], st_w[j], 1);
+    }
+    if (!g_v41_in_prefetch) w->t_post += now_s() - tg1;
+}
+
 /* Read `n` reserved experts at once. The slot ids are stamped only after every
  * read has landed, so a slot never advertises an expert it does not yet hold. */
 static void expert_fetch(Model *m, const char *kind, int layer,
@@ -1951,9 +2586,13 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     int total = 0;
     ExpertRead *list = xmalloc((size_t)n * V41_EXPERT_TENSORS * sizeof(ExpertRead),
                                "expert read list");
-    for (int i = 0; i < n; i++)
+    /* each expert's first read, for the container's checks below (none without a container) */
+    int *first = m->wex ? xmalloc((size_t)n * sizeof(int), "expert read list") : NULL;
+    for (int i = 0; i < n; i++) {
+        if (first) first[i] = total;
         total += expert_read_list(m, kind, layer, eid[i], slot[i],
                                   expert_route(layer, eid[i]), list + total);
+    }
     /* The window is sized from the config, so a container whose tensor declares
      * more than that must not be read into it -- same refusal st_read_raw_cap
      * applied when the read went by name. */
@@ -1968,16 +2607,86 @@ static void expert_fetch(Model *m, const char *kind, int layer,
             exit(1);
         }
     }
+    /* Ensure non-coded reads (partial WEX fallback to safetensors, MTP stages, GGUF) have
+     * their six O_DIRECT windows allocated before parallel threads read into list[i].slot. */
+    const int is_stage = strcmp(kind, "layers") != 0;
+    for (int i = 0; i < total; i++) {
+        if (!list[i].slot->base[list[i].part] && !v41_wex_nr3(m, &list[i], layer))
+            slot_ensure_windows(m, list[i].slot, is_stage);
+    }
     double started = now_s();
-    const int depth = expert_read_depth();
-    const int threads = depth < total ? depth : total;
+    const unsigned int cu_bits = m->wex && m->wex->nr3 ? coli_wex_cuda_features() : 0u;
+    int coded_total = 0;
+    if (m->wex && m->wex->nr3 && first)
+        for (int q = 0; q < n; q++)
+            if (v41_wex_nr3(m, &list[first[q]], layer)) coded_total++;
+    const int gpu_batch = coded_total > 0 && (cu_bits & COLI_WEX_CUDA_BATCH_HOST) &&
+                          (m->wex->is_wnr4 ? (cu_bits & COLI_WEX_CUDA_NR4)
+                                           : ((cu_bits & COLI_WEX_CUDA_NR2) && (cu_bits & COLI_WEX_CUDA_NR3)));
+    const int in_pf = g_v41_in_prefetch;
+    int depth = expert_read_depth();
+    if (in_pf) {
+        int pf_cap = 2 * (g_mir_nrep > 0 ? g_mir_nrep : 1);
+        if (pf_cap > 4) pf_cap = 4;
+        if (depth > pf_cap) depth = pf_cap;
+    }
+    const int io_work = coded_total == n ? n : total;
+    const int threads = depth < io_work ? depth : io_work;
+#if defined(_OPENMP)
+    const int overlap = gpu_batch && coded_total > 1;
+    const int gpu_threads = overlap ? 1 : 0;
+    const int io_threads = threads;
+    const int need_post_spare = overlap ? 1 : 0;
+    const int min_team = overlap ? (io_threads + gpu_threads + need_post_spare) : threads;
+    const int omp_max = omp_get_max_threads();
+    const int team = in_pf ? min_team : (min_team > omp_max ? min_team : omp_max);
+#else
+    const int overlap = 0;
+    const int gpu_threads = 0;
+    const int io_threads = threads;
+#endif
+    /* 3-stage overlapped pipeline (when overlap=1):
+     *   Stage 1 (io_threads): dynamic weighted dual-NVMe O_DIRECT reads into pinned buffers,
+     *           owner-check only, push to wq (when done, help drain pq).
+     *   Stage 2 (GPU thread 0): drains wq in batches of [min_batch..WEX_WAVE] into CUDA-pinned
+     *           slabs (100% pinned PCIe DMA) and pushes to pq.
+     *   Stage 3 (spare + finished I/O threads): run deferred SHA-256 (COLI_WEX_VERIFY) +
+     *           contiguous slab copy into slot->wex_slab in parallel across CPU cores. */
+    enum { WEX_Q_CAP = 16, WEX_WAVE = 8, WEX_P_CAP = 16 };
+    struct {
+        pthread_mutex_t mx;
+        pthread_cond_t not_empty, not_full;
+        int head, tail, count, done, popped;
+        int idx[WEX_Q_CAP], pin[WEX_Q_CAP];
+        const WexEntry *ent[WEX_Q_CAP];
+        uint8_t *buf[WEX_Q_CAP];
+    } wq;
+    struct {
+        pthread_mutex_t mx;
+        pthread_cond_t not_empty, not_full;
+        int head, tail, count, closed, gpu_done;
+        int idx[WEX_P_CAP], rpin[WEX_P_CAP], spin[WEX_P_CAP], st[WEX_P_CAP];
+        const WexEntry *ent[WEX_P_CAP];
+        uint8_t *rec[WEX_P_CAP], *slab[WEX_P_CAP];
+    } pq;
+    if (overlap) {
+        memset(&wq, 0, sizeof wq);
+        pthread_mutex_init(&wq.mx, NULL);
+        pthread_cond_init(&wq.not_empty, NULL);
+        pthread_cond_init(&wq.not_full, NULL);
+        memset(&pq, 0, sizeof pq);
+        pthread_mutex_init(&pq.mx, NULL);
+        pthread_cond_init(&pq.not_empty, NULL);
+        pthread_cond_init(&pq.not_full, NULL);
+    }
+    /* Wait for at least 2 records when >= 2 NVMe drives or >= 2 reads are in flight so we launch
+     * multi-record batches without delaying the first dual-NVMe wave. */
+    const int min_batch = (coded_total >= 2 && io_threads >= 2) ? 2 : 1;
     uint64_t bytes = 0;
+    double gpu_s = 0.0, post_s = 0.0;
     int next_read = 0;
 #if defined(_OPENMP)
-    /* Run at the default team width: a narrower region makes libgomp retire and respawn pool
-     * threads on every call. Only `threads` of the team read; the counter hands out the work. */
-    const int team = depth > omp_get_max_threads() ? depth : omp_get_max_threads();
-    #pragma omp parallel num_threads(team) reduction(+:bytes)
+    #pragma omp parallel num_threads(team) reduction(+:bytes,gpu_s,post_s)
 #endif
     {
 #if defined(_OPENMP)
@@ -1985,19 +2694,126 @@ static void expert_fetch(Model *m, const char *kind, int layer,
 #else
     const int tid = 0;
 #endif
-    if (tid < threads)
+    if (overlap && tid < gpu_threads) {
+        /* Stage 2: GPU-only consumer thread. Never blocks on copy or SHA-256. */
+        int idxs[WEX_WAVE], rpin[WEX_WAVE], spin[WEX_WAVE], st_w[WEX_WAVE];
+        const WexEntry *ew[WEX_WAVE];
+        uint8_t *rw[WEX_WAVE];
+        unsigned char *slabs[WEX_WAVE];
+        for (;;) {
+            int cnt = 0;
+            pthread_mutex_lock(&wq.mx);
+            while (wq.done < coded_total) {
+                int rem = coded_total - wq.popped;
+                int want = min_batch < rem ? min_batch : rem;
+                if (want > WEX_WAVE) want = WEX_WAVE;
+                if (want < 1) want = 1;
+                if (wq.count >= want || wq.count >= WEX_WAVE) break;
+                pthread_cond_wait(&wq.not_empty, &wq.mx);
+            }
+            while (wq.count > 0 && cnt < WEX_WAVE) {
+                idxs[cnt] = wq.idx[wq.head];
+                ew[cnt] = wq.ent[wq.head];
+                rw[cnt] = wq.buf[wq.head];
+                rpin[cnt] = wq.pin[wq.head];
+                wq.head = (wq.head + 1) % WEX_Q_CAP;
+                wq.count--;
+                wq.popped++;
+                cnt++;
+            }
+            if (cnt > 0) pthread_cond_broadcast(&wq.not_full);
+            const int finished = (cnt == 0 && wq.done >= coded_total);
+            pthread_mutex_unlock(&wq.mx);
+            if (finished) break;
+            if (cnt == 0) continue;
+            for (int j = 0; j < cnt; j++) {
+                slabs[j] = v41_wex_buf_get(m->wex, &spin[j]);
+                st_w[j] = 1;
+            }
+            const double tg0 = now_s();
+            coli_wex_cuda_decode_batch_to_host(cnt, ew, (const unsigned char *const *)rw, 0, slabs, st_w);
+            gpu_s += now_s() - tg0;
+            pthread_mutex_lock(&pq.mx);
+            for (int j = 0; j < cnt; j++) {
+                while (pq.count >= WEX_P_CAP)
+                    pthread_cond_wait(&pq.not_full, &pq.mx);
+                pq.idx[pq.tail] = idxs[j]; pq.ent[pq.tail] = ew[j];
+                pq.rec[pq.tail] = rw[j]; pq.rpin[pq.tail] = rpin[j];
+                pq.slab[pq.tail] = slabs[j]; pq.spin[pq.tail] = spin[j];
+                pq.st[pq.tail] = st_w[j];
+                pq.tail = (pq.tail + 1) % WEX_P_CAP;
+                pq.count++;
+            }
+            pthread_cond_broadcast(&pq.not_empty);
+            pthread_mutex_unlock(&pq.mx);
+        }
+        pthread_mutex_lock(&pq.mx);
+        if (++pq.gpu_done >= gpu_threads) {
+            pq.closed = 1;
+            pthread_cond_broadcast(&pq.not_empty);
+        }
+        pthread_mutex_unlock(&pq.mx);
+    } else {
+    if (overlap ? (tid >= gpu_threads && tid < gpu_threads + io_threads) : (tid < io_threads))
     for (;;) {
         const int i = __atomic_fetch_add(&next_read, 1, __ATOMIC_RELAXED);
         if (i >= total) break;
         const ExpertRead *r = &list[i];
         int64_t pad = r->t->off % ST_DIRECT_ALIGN;
+        const WexEntry *nr3 = v41_wex_nr3(m, r, layer);
+        if (nr3) {   /* a WNR3/WNR4 record: one reader handles it, at its first part */
+            if (r->part == 0) {
+                const uint64_t req_b = nr3->total_bytes;
+                const int rep = v41_pick_rep(r->S, r->t->fd, r->rep, req_b);
+                uint64_t got_b = 0;
+                if (gpu_batch) {
+                    int idx = -1;
+                    for (int q = 0; q < n; q++) if (first[q] == i) { idx = q; break; }
+                    if (idx >= 0) {
+                        int pin = 0;
+                        uint8_t *buf = v41_wex_read_coded(m, layer, r->eid, nr3, rep, !overlap, &pin);
+                        v41_unpick_rep(rep, req_b);
+                        if (buf) got_b = req_b;
+                        if (overlap) {
+                            pthread_mutex_lock(&wq.mx);
+                            if (buf) {
+                                while (wq.count >= WEX_Q_CAP)
+                                    pthread_cond_wait(&wq.not_full, &wq.mx);
+                                wq.idx[wq.tail] = idx; wq.ent[wq.tail] = nr3;
+                                wq.buf[wq.tail] = buf; wq.pin[wq.tail] = pin;
+                                wq.tail = (wq.tail + 1) % WEX_Q_CAP;
+                                wq.count++;
+                            }
+                            wq.done++;
+                            if (wq.done >= coded_total) pthread_cond_broadcast(&wq.not_empty);
+                            else pthread_cond_signal(&wq.not_empty);
+                            pthread_mutex_unlock(&wq.mx);
+                        } else if (buf) {
+                            v41_wex_gpu_decode_wave(m, layer, slot, eid, &idx, &nr3, &buf, &pin, 1);
+                        }
+                    } else {
+                        v41_unpick_rep(rep, req_b);
+                    }
+                } else {
+                    got_b = v41_wex_fetch_nr3(m, layer, r->eid, nr3, r->slot, rep);
+                    v41_unpick_rep(rep, req_b);
+                }
+                __atomic_fetch_add(&g_mir_bytes[rep], got_b, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
+                bytes += got_b;
+            }
+            continue;
+        }
+        const uint64_t req_b = (uint64_t)r->t->nbytes;
+        const int rep = v41_pick_rep(r->S, r->t->fd, r->rep, req_b);
         if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
             /* A GGUF matrix the slot holds in another form: read into a pooled scratch
              * buffer, then interleaved by 16 rows or laid out as FP4 and scales. */
             int64_t raw_n = 0;
             uint8_t *raw = scratch_get(r->t->nbytes + 2 * ST_DIRECT_ALIGN, &raw_n);
-            st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
+            st_read_range_rep(r->S, r->t->fd, rep, r->t->off, r->t->nbytes, raw + pad,
                               r->t->nbytes, 1, expert_direct(), "pread expert");
+            v41_unpick_rep(rep, req_b);
             const int k = r->part / 2, held = m->gx_h[3 * r->gx_layer + k];
             int64_t shape[2];
             v41_gx_shape(&m->c, k, shape);
@@ -2005,37 +2821,116 @@ static void expert_fetch(Model *m, const char *kind, int layer,
                                              shape[0] * shape[1] / 32);
             else gq_r16_pack(held, r->slot->base[r->part], raw + pad, (int)shape[0], (int)shape[1]);
             scratch_put(raw, raw_n);
-        } else
-        /* The payload pointer carries the slack st_read_range_rep needs to read
-         * from the enclosing block boundary, so an O_DIRECT transfer lands the
-         * data exactly where the slot wants it and nothing is copied afterwards. */
-        st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes,
-                          r->slot->base[r->part] + pad, r->t->nbytes, 1, expert_direct(),
-                          "pread expert");
-        /* Which drive actually answered. A partial mirror leaves shards on the
-         * primary, so the replica the route picked is not always the one that read. */
-        int rep = r->rep;
-        if (st_fd_rep(&m->S, r->t->fd, rep) < 0) rep = 0;
-        __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
+        } else {
+            /* The payload pointer carries the slack st_read_range_rep needs to read
+             * from the enclosing block boundary, so an O_DIRECT transfer lands the
+             * data exactly where the slot wants it and nothing is copied afterwards. */
+            st_read_range_rep(r->S, r->t->fd, rep, r->t->off, r->t->nbytes,
+                              r->slot->base[r->part] + pad, r->t->nbytes, 1, expert_direct(),
+                              "pread expert");
+            v41_unpick_rep(rep, req_b);
+        }
+        __atomic_fetch_add(&g_mir_bytes[rep], req_b, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
-        bytes += (uint64_t)r->t->nbytes;
+        bytes += req_b;
+    }
+    /* Stage 3: spare threads (and finished I/O threads) drain pq in parallel (SHA-256 / copy / fallback). */
+    if (overlap) {
+        for (;;) {
+            int p_idx, p_rpin, p_spin, p_st;
+            const WexEntry *p_ent;
+            uint8_t *p_rec, *p_slab;
+            pthread_mutex_lock(&pq.mx);
+            while (pq.count == 0 && !pq.closed)
+                pthread_cond_wait(&pq.not_empty, &pq.mx);
+            if (pq.count == 0 && pq.closed) {
+                pthread_mutex_unlock(&pq.mx);
+                break;
+            }
+            p_idx = pq.idx[pq.head]; p_ent = pq.ent[pq.head];
+            p_rec = pq.rec[pq.head]; p_rpin = pq.rpin[pq.head];
+            p_slab = pq.slab[pq.head]; p_spin = pq.spin[pq.head];
+            p_st = pq.st[pq.head];
+            pq.head = (pq.head + 1) % WEX_P_CAP;
+            pq.count--;
+            pthread_cond_signal(&pq.not_full);
+            pthread_mutex_unlock(&pq.mx);
+            const double tp0 = now_s();
+            v41_wex_post_one(m, layer, eid[p_idx], slot[p_idx], p_ent, p_rec, p_rpin, p_slab, p_spin, p_st, 1);
+            post_s += now_s() - tp0;
+        }
+    }
+    }
+    }
+    if (overlap) {
+        if (!in_pf) {
+            m->wex->t_gpu += gpu_s;
+            m->wex->t_post += post_s;
+        }
+        pthread_cond_destroy(&pq.not_full);
+        pthread_cond_destroy(&pq.not_empty);
+        pthread_mutex_destroy(&pq.mx);
+        pthread_cond_destroy(&wq.not_full);
+        pthread_cond_destroy(&wq.not_empty);
+        pthread_mutex_destroy(&wq.mx);
+    }
+    /* COLI_WEX_VERIFY: each RAW record the container served, hashed at its first read; one
+     * that fails is read again, here, from the checkpoint's shards (v41_wex_check refused it,
+     * so expert_read_list now names the shards' tensors). A WNR3/WNR4 record was checked and
+     * decoded by its reader; one it refused is read again here the same way. */
+    if (m->wex) {
+#if defined(_OPENMP)
+    const int hashing = m->wex->sha && n > 1 && !in_pf;
+    #pragma omp parallel for schedule(dynamic, 1) if (hashing)
+#endif
+    for (int i = 0; i < n; i++) {
+        ExpertRead *r = list + first[i];
+        if (r->S != &m->wex->S) continue;
+        const int coded = v41_wex_nr3(m, r, layer) != NULL;
+        const size_t cell = (size_t)layer * m->c.n_routed + eid[i];
+        if (coded ? __atomic_load_n(&m->wex->state[cell], __ATOMIC_ACQUIRE) != 2 : v41_wex_check(m, layer, eid[i], slot[i])) {
+            __atomic_fetch_add(&m->wex->reads, UINT64_C(1), __ATOMIC_RELAXED);
+            if (coded) __atomic_fetch_add(&m->wex->decoded, UINT64_C(1), __ATOMIC_RELAXED);
+            continue;
+        }
+        slot_ensure_windows(m, slot[i], 0);
+        expert_read_list(m, kind, layer, eid[i], slot[i], expert_route(layer, eid[i]), r);
+        for (int k = 0; k < V41_EXPERT_TENSORS; k++)
+            st_read_range_rep(&m->S, r[k].t->fd, r[k].rep, r[k].t->off, r[k].t->nbytes,
+                              r[k].slot->base[r[k].part] + r[k].t->off % ST_DIRECT_ALIGN, r[k].t->nbytes, 1,
+                              expert_direct(), "pread expert");
     }
     }
     /* Publish the payload pointers only now. A slot that advertises an expert has
      * to address that expert, and until the read landed the window base was the
      * only pointer that meant anything. */
-    for (int i = 0; i < total; i++) {
-        const ExpertRead *r = &list[i];
-        if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {   /* the copy's own */
-            *slot_part(r->slot, r->part) = r->slot->base[r->part];
-            *slot_part(r->slot, r->part + 1) = m->gx_h[3 * r->gx_layer + r->part / 2] < 0 ? r->slot->base[r->part + 1] : NULL;
-        } else {
-            *slot_part(r->slot, r->part) = r->slot->base[r->part] + (r->t->off % ST_DIRECT_ALIGN);
-            if (r->gx_layer >= 0) *slot_part(r->slot, r->part + 1) = NULL;
+    for (int q = 0; q < n; q++) {
+        const int i0 = first ? first[q] : q * V41_EXPERT_TENSORS;
+        const WexEntry *nr3 = first ? v41_wex_nr3(m, &list[i0], layer) : NULL;
+        if (nr3 && slot[q]->wex_slab) {
+            slot[q]->s1 = slot[q]->wex_slab + nr3->scale_offsets[0];
+            slot[q]->s2 = slot[q]->wex_slab + nr3->scale_offsets[1];
+            slot[q]->s3 = slot[q]->wex_slab + nr3->scale_offsets[2];
+            slot[q]->w1 = slot[q]->wex_slab + nr3->weight_offsets[0];
+            slot[q]->w2 = slot[q]->wex_slab + nr3->weight_offsets[1];
+            slot[q]->w3 = slot[q]->wex_slab + nr3->weight_offsets[2];
+            continue;
+        }
+        const int i1 = (q + 1 < n && first) ? first[q + 1] : (first ? total : i0 + V41_EXPERT_TENSORS);
+        for (int i = i0; i < i1 && i < total; i++) {
+            const ExpertRead *r = &list[i];
+            if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {   /* the copy's own */
+                *slot_part(r->slot, r->part) = r->slot->base[r->part];
+                *slot_part(r->slot, r->part + 1) = m->gx_h[3 * r->gx_layer + r->part / 2] < 0 ? r->slot->base[r->part + 1] : NULL;
+            } else {
+                *slot_part(r->slot, r->part) = r->slot->base[r->part] + (r->t->off % ST_DIRECT_ALIGN);
+                if (r->gx_layer >= 0) *slot_part(r->slot, r->part + 1) = NULL;
+            }
         }
     }
-    m->expert_bytes += bytes;
-    m->t_disk += now_s() - started;
+    free(first);
+    __atomic_fetch_add(&m->expert_bytes, bytes, __ATOMIC_RELAXED);
+    if (!in_pf) m->t_disk += now_s() - started;
     const int gi = v41_gx_index(m, kind, layer);
     for (int i = 0; i < n; i++) {
         slot[i]->eid = eid[i];
@@ -2184,15 +3079,27 @@ static void spec_load(Model *m, int ecap);
 static void cache_init(Model *m, LCache *cache, int ecap, int stage) {
     cache->cap = ecap; cache->n = 0;
     cache->slot = xmalloc((size_t)ecap * sizeof(Slot), "expert slots");
+    const int use_wex_slab = !stage && m->wex && m->wex->nr3 && m->wex->max_slab > 0;
     for (int k = 0; k < ecap; k++) {
         Slot *s = &cache->slot[k];
+        memset(s, 0, sizeof *s);
         s->eid = -1; s->used = 0;
+        s->gt[0] = s->gt[1] = s->gt[2] = -1; s->vk_rows = NULL;
+        if (use_wex_slab) {
+            void *slab = NULL;
+            if (posix_memalign(&slab, ST_DIRECT_ALIGN, m->wex->max_slab) != 0) {
+                fprintf(stderr, "OOM allocating WEX expert slab (%zu bytes)\n", m->wex->max_slab);
+                exit(1);
+            }
+            s->wex_slab = slab;
+            for (int part = 0; part < V41_EXPERT_TENSORS; part++) *slot_part(s, part) = slab;
+            continue;
+        }
         /* One window per tensor, page-aligned and with ST_DIRECT_ALIGN of slack
          * past its payload. The slack is not padding for its own sake: it is what
          * lets st_read_range_rep turn an unaligned safetensors range into one
          * aligned O_DIRECT pread, instead of bouncing every expert through a
          * scratch buffer and copying it again (see the expert reader). */
-        s->gt[0] = s->gt[1] = s->gt[2] = -1; s->vk_rows = NULL;
         for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
             size_t bytes = (size_t)(stage ? stage_part_bytes(m, part) : slot_part_bytes(m, part)) + ST_DIRECT_ALIGN;
             void *window = NULL;
@@ -2390,16 +3297,18 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
     const char *extra_dirs = getenv("COLI_MODEL_DIRS");
     st_init_multi(&m->S, snap, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
     if (g_v41_dry) g_v41_used = xcalloc((size_t)m->S.n + 1, 1, "tensors read");
-    /* DUAL-SSD: register COLI_MODEL_MIRROR copies and settle the read split
-     * before the first expert read, so nothing has been pulled from the primary
-     * by the time the replicas exist. */
-    mirror_setup(&m->S, snap, c->n_routed);
-    engram_load_sidecar(&m->engram, snap);
     {   /* a GGUF (st_gguf.h): the trunk's matrices, and the experts, in ggml blocks */
         const st_tensor *t = st_find(&m->S, "layers.0.attn.wq_a.weight");
         m->gguf = t && st_ggml_type_any(t->dtype) >= 0;
         v41_gx_geometry(m);
     }
+    v41_wex_open(m);   /* COLI_WEX_PATH: the backbone's routed experts from a WEX4 container */
+    /* DUAL-SSD: register COLI_MODEL_MIRROR copies (of the shards, and of the
+     * container when there is one) and settle the read split before the first
+     * expert read, so nothing has been pulled from the primary by the time the
+     * replicas exist. */
+    mirror_setup(&m->S, m->wex ? &m->wex->S : NULL, snap, c->n_routed);
+    engram_load_sidecar(&m->engram, snap);
 #ifdef COLI_VULKAN
     if (!m->gguf) v41_dho_open(m);   /* COLI_VK_DENSE_HOST: the trunk to the device as it is read, its host pages back */
 #endif
@@ -3615,7 +4524,7 @@ static int cluster_worker_run(const char *snap, int port) {
     cfg_load(&m.c, snap);
     const char *extra_dirs = getenv("COLI_MODEL_DIRS");   /* SPLIT across drives, as model_load */
     st_init_multi(&m.S, snap, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
-    mirror_setup(&m.S, snap, m.c.n_routed);                /* DUAL-SSD replicas, as model_load */
+    mirror_setup(&m.S, NULL, snap, m.c.n_routed);          /* DUAL-SSD replicas, as model_load (no container) */
     int nr_layers = m.c.n_layers;
     /* Cache depth: 1 slot/layer kept the worker honest but meant every routed read
      * after the first was a cold SSD read; the coordinator runs a RAM-plan cache
@@ -3738,10 +4647,11 @@ typedef struct {
     uint32_t hit[MOE_TOPK_MAX], tried[MOE_TOPK_MAX];
 } Prefetch;
 static Prefetch g_pf = { .mx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
-static int g_pf_on = -1, g_pf_min;
+static int g_pf_on = -1, g_pf_min, g_pf_explicit = 0;
 static int prefetch_on(void) {
     if (g_pf_on < 0) {
         const char *e = getenv("V41_PREFETCH"), *mn = getenv("V41_PREFETCH_MIN");
+        g_pf_explicit = (e && *e) ? 1 : 0;
         g_pf_on = !e || !*e || *e != '0';
         g_pf_min = mn && *mn ? atoi(mn) : V41_PREFETCH_MIN_DEFAULT;
     }
@@ -3753,7 +4663,9 @@ static void *prefetch_main(void *arg) {
     for (;;) {
         while (!g_pf.busy) pthread_cond_wait(&g_pf.cv, &g_pf.mx);
         pthread_mutex_unlock(&g_pf.mx);
+        g_v41_in_prefetch = 1;
         expert_fetch(g_pf.m, "layers", g_pf.layer, g_pf.slot, g_pf.eid, g_pf.n);
+        g_v41_in_prefetch = 0;
         pthread_mutex_lock(&g_pf.mx);
         g_pf.busy = 0;
         pthread_cond_broadcast(&g_pf.cv);
@@ -3801,6 +4713,12 @@ static void prefetch_after_reads(Model *m, const char *kind, int layer, const fl
 
     LCache *cache = &m->cache[next];
     if (cache->cap < c->n_activated + 1) return;   /* the step's own experts need every slot */
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    /* With a GPU expert tier active and a tight RAM cache (< 2 * topk slots/layer), speculative
+     * prefetch evicts live LRU entries and inflates NVMe reads (+75% measured on cap=8). Skip
+     * unless V41_PREFETCH was set explicitly. */
+    if (!g_pf_explicit && XT(ready)() && cache->cap < 4 * c->n_activated) return;
+#endif
     int want[MOE_TOPK_MAX], n = 0;
     for (int k = 0; k < c->n_activated; k++)
         if (!g_pf.held[next][k] && prefetch_rank_ok(k)) want[n++] = g_pf.guess[next][k];
@@ -4732,6 +5650,7 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
      * token drafted for the one before it, which is the only thing tying the block
      * together -- the stages saw the noise id at every position but the first */
     float *final_x = xmalloc((size_t)block * dim * sizeof(float), "spec final");
+    float *norm_x = xmalloc((size_t)block * dim * sizeof(float), "spec norm");
     float *logits = xmalloc((size_t)block * vocab * sizeof(float), "spec logits");
     float *bias = xmalloc((size_t)vocab * sizeof(float), "spec markov bias");
     float *embed = xmalloc((size_t)rank * sizeof(float), "spec markov embed");
@@ -4745,9 +5664,12 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
                 sum += mix[copy] * h[((size_t)i * hc + copy) * dim + j];
             x[j] = sum;
         }
-        rms_into(collapsed, x, sp->norm.w, dim, c->norm_eps);
-        mvb(logits + (size_t)i * vocab, &m->head, collapsed);
+        rms_into(norm_x + (size_t)i * dim, x, sp->norm.w, dim, c->norm_eps);
     }
+    /* One batched projection over all `block` draft positions instead of streaming the
+     * 1.32 GB lm_head matrix `block` separate times. */
+    mvb_rows(logits, vocab, &m->head, norm_x, dim, block);
+    free(norm_x);
     draft[0] = token;
     for (int i = 0; i < block; i++) {
         const uint16_t *row = sp->markov_embed.w + (size_t)draft[i] * rank;
@@ -6652,6 +7574,9 @@ static size_t v41_cu_wb(const WB *w) {
     return w->w ? v41_cu_float(w->O, w->I) : 0;
 }
 static size_t v41_cu_dense_bytes(const Model *m) {
+    /* On safetensors (!m->gguf), mv8/mvb never upload matrices to cu_dense.h; returning
+     * 0 avoids stealing ~2.7 GiB (~125 expert slots) from cu_tier. */
+    if (!m->gguf) return 0;
     size_t b = v41_cu_wb(&m->head);
     for (int i = 0; i < m->c.n_layers; i++) {
         const Layer *l = &m->L[i];
@@ -6715,10 +7640,12 @@ static void vk_ram_given(void *ctx, size_t bytes) {
         if (cap < c->n_activated) cap = c->n_activated;
         if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
         if (cap > lc->cap) cap = lc->cap;
-        for (int k = cap; k < lc->cap; k++)   /* never read: their windows back (posix_memalign'd: _aligned_malloc on Windows) */
+        for (int k = cap; k < lc->cap; k++) {  /* never read: their windows back (posix_memalign'd: _aligned_malloc on Windows) */
+            compat_aligned_free(lc->slot[k].wex_slab); lc->slot[k].wex_slab = NULL;
             for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
                 compat_aligned_free(lc->slot[k].base[part]); lc->slot[k].base[part] = NULL; *slot_part(&lc->slot[k], part) = NULL;
             }
+        }
         was = lc->cap; now = cap; lc->cap = cap;
     }
     fprintf(stderr, "%s deepseek_v41: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n", XT_TAG,
@@ -6815,6 +7742,266 @@ static size_t v41_state_later(const Model *m) {
     }
     return b * (size_t)(g_v41_mux_slots > 1 ? g_v41_mux_slots - 1 : 0);
 }
+/* Read one warm-start expert from safetensors (or RAW WEX4) using a caller-owned
+ * aligned buffer and dynamic O_DIRECT/mirror routing, then call XT(put). */
+static void v41_warm_put_shards(Model *m, int layer, int eid, uint8_t *buf, size_t buf_cap) {
+    static const char *const part[V41_EXPERT_TENSORS] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
+    const Cfg *c = &m->c;
+    const int use_raw_wex = m->wex && !m->wex->nr3 && v41_wex_has(m, "layers", layer, eid);
+    const size_t cell = (size_t)layer * (size_t)c->n_routed + (size_t)eid;
+    uint8_t *at = buf, *p[V41_EXPERT_TENSORS];
+    for (int k = 0; k < V41_EXPERT_TENSORS; k++) {
+        const int64_t nb = expert_part_bytes(c, k);
+        const st_tensor *t = NULL;
+        shards *S = &m->S;
+        if (use_raw_wex) { t = &m->wex->t[cell * 6 + k]; S = &m->wex->S; }
+        else {
+            char name[160];
+            snprintf(name, sizeof name, "layers.%d.ffn.experts.%d.%s", layer, eid, part[k]);
+            t = st_find(&m->S, name);
+        }
+        if (!t || t->nbytes != nb) { XT(put)(layer, eid, NULL); return; }
+        const int64_t pad = t->off % ST_DIRECT_ALIGN;
+        const int rep = v41_pick_rep(S, t->fd, expert_route(layer, eid), (uint64_t)nb);
+        st_read_range_rep(S, t->fd, rep, t->off, nb, at + pad, nb, 1, expert_direct(), "warm-start expert");
+        v41_unpick_rep(rep, (uint64_t)nb);
+        p[k] = at + pad;
+        at += (size_t)(((nb + ST_DIRECT_ALIGN * 2 - 1) / ST_DIRECT_ALIGN) * ST_DIRECT_ALIGN);
+        (void)buf_cap;
+    }
+    VktExpertSrc src = {p[0], p[2], p[4], p[1], p[3], p[5]};
+    XT(put)(layer, eid, &src);
+}
+
+/* 3-stage overlapped WNR3/WNR4 warm-start pipeline:
+ *   Stage 1 (I/O threads): dynamic weighted dual-NVMe O_DIRECT reads into pinned buffers.
+ *   Stage 2 (2 GPU threads): full WEX_WAVE=8 CUDA decode batches on 2 concurrent streams.
+ *   Stage 3 (CPU upload threads): deferred SHA-256 (COLI_WEX_VERIFY) + zero-scatter XT(put)
+ *           pointing directly into the decoded slab (fallback to safetensors on refusal). */
+static void v41_wex_warm_start(Model *m, const int *pl, const int *pe, int n) {
+    V41Wex *w = m->wex;
+    const Cfg *c = &m->c;
+    size_t fallback_sz = 0;
+    for (int k = 0; k < V41_EXPERT_TENSORS; k++)
+        fallback_sz += (size_t)(((expert_part_bytes(c, k) + ST_DIRECT_ALIGN * 2 - 1) / ST_DIRECT_ALIGN) * ST_DIRECT_ALIGN);
+    enum { WM_Q_CAP = 8, WM_WAVE = 6, WM_P_CAP = 6 };
+    struct {
+        pthread_mutex_t mx;
+        pthread_cond_t not_empty, not_full;
+        int head, tail, count, done, popped;
+        int idx[WM_Q_CAP], pin[WM_Q_CAP];
+        const WexEntry *ent[WM_Q_CAP];
+        uint8_t *buf[WM_Q_CAP];
+    } wq;
+    struct {
+        pthread_mutex_t mx;
+        pthread_cond_t not_empty, not_full;
+        int head, tail, count, closed, gpu_done;
+        int idx[WM_P_CAP], rpin[WM_P_CAP], spin[WM_P_CAP], st[WM_P_CAP];
+        const WexEntry *ent[WM_P_CAP];
+        uint8_t *rec[WM_P_CAP], *slab[WM_P_CAP];
+    } pq;
+    memset(&wq, 0, sizeof wq);
+    pthread_mutex_init(&wq.mx, NULL);
+    pthread_cond_init(&wq.not_empty, NULL);
+    pthread_cond_init(&wq.not_full, NULL);
+    memset(&pq, 0, sizeof pq);
+    pthread_mutex_init(&pq.mx, NULL);
+    pthread_cond_init(&pq.not_empty, NULL);
+    pthread_cond_init(&pq.not_full, NULL);
+
+    int depth = expert_read_depth();
+    if (depth > 8) depth = 8;
+    if (depth > n) depth = n;
+    /* Keep peak in-flight WEX buffers <= V41_WEX_PIN_SLOTS (32): 8 I/O + 8 wq + 6*2 gpu + 6*2 pq
+     * stays almost entirely inside the single pre-pinned arena (zero unpinned DMA fallback). */
+    const int gpu_threads = 1;
+    const int io_threads = depth;
+    const int post_threads = 6;
+    const int team = io_threads + gpu_threads + post_threads;
+    int next_i = 0;
+    uint64_t warm_reads = 0, warm_dec = 0;
+    double gpu_s = 0.0;
+
+#if defined(_OPENMP)
+    #pragma omp parallel num_threads(team) reduction(+:warm_reads,warm_dec,gpu_s)
+#endif
+    {
+#if defined(_OPENMP)
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        if (tid < gpu_threads) {
+            int idxs[WM_WAVE], rpin[WM_WAVE], spin[WM_WAVE], st_w[WM_WAVE];
+            const WexEntry *ew[WM_WAVE];
+            uint8_t *rw[WM_WAVE];
+            unsigned char *slabs[WM_WAVE];
+            for (;;) {
+                int cnt = 0;
+                pthread_mutex_lock(&wq.mx);
+                while (wq.done < n) {
+                    int rem = n - wq.popped;
+                    int want = WM_WAVE < rem ? WM_WAVE : rem;
+                    if (want < 1) want = 1;
+                    if (wq.count >= want) break;
+                    pthread_cond_wait(&wq.not_empty, &wq.mx);
+                }
+                while (wq.count > 0 && cnt < WM_WAVE) {
+                    idxs[cnt] = wq.idx[wq.head];
+                    ew[cnt] = wq.ent[wq.head];
+                    rw[cnt] = wq.buf[wq.head];
+                    rpin[cnt] = wq.pin[wq.head];
+                    wq.head = (wq.head + 1) % WM_Q_CAP;
+                    wq.count--;
+                    wq.popped++;
+                    cnt++;
+                }
+                if (cnt > 0) pthread_cond_broadcast(&wq.not_full);
+                const int finished = (cnt == 0 && wq.done >= n);
+                pthread_mutex_unlock(&wq.mx);
+                if (finished) break;
+                if (cnt == 0) continue;
+                for (int j = 0; j < cnt; j++) {
+                    slabs[j] = v41_wex_buf_get(w, &spin[j]);
+                    st_w[j] = 1;
+                }
+                const double tg0 = now_s();
+                coli_wex_cuda_decode_batch_to_host(cnt, ew, (const unsigned char *const *)rw, 0, slabs, st_w);
+                gpu_s += now_s() - tg0;
+                pthread_mutex_lock(&pq.mx);
+                for (int j = 0; j < cnt; j++) {
+                    while (pq.count >= WM_P_CAP)
+                        pthread_cond_wait(&pq.not_full, &pq.mx);
+                    pq.idx[pq.tail] = idxs[j]; pq.ent[pq.tail] = ew[j];
+                    pq.rec[pq.tail] = rw[j]; pq.rpin[pq.tail] = rpin[j];
+                    pq.slab[pq.tail] = slabs[j]; pq.spin[pq.tail] = spin[j];
+                    pq.st[pq.tail] = st_w[j];
+                    pq.tail = (pq.tail + 1) % WM_P_CAP;
+                    pq.count++;
+                }
+                pthread_cond_broadcast(&pq.not_empty);
+                pthread_mutex_unlock(&pq.mx);
+            }
+            pthread_mutex_lock(&pq.mx);
+            if (++pq.gpu_done >= gpu_threads) {
+                pq.closed = 1;
+                pthread_cond_broadcast(&pq.not_empty);
+            }
+            pthread_mutex_unlock(&pq.mx);
+        } else {
+            uint8_t *fb = NULL;
+            if (tid < gpu_threads + io_threads) {
+                for (;;) {
+                    const int i = __atomic_fetch_add(&next_i, 1, __ATOMIC_RELAXED);
+                    if (i >= n) break;
+                    const int layer = pl[i], eid = pe[i];
+                    const size_t cell = (size_t)layer * (size_t)c->n_routed + (size_t)eid;
+                    const WexEntry *e = (v41_wex_has(m, "layers", layer, eid) &&
+                                         (w->nr3[cell].flags == WEX_ENTRY_NEURAL_RANS3 || w->nr3[cell].flags == WEX_ENTRY_WNR4))
+                                        ? &w->nr3[cell] : NULL;
+                    uint8_t *rec = NULL;
+                    int pin = 0;
+                    if (e) {
+                        const int rep = v41_pick_rep(&w->S, w->t[cell * 6].fd, expert_route(layer, eid), e->total_bytes);
+                        rec = v41_wex_read_coded(m, layer, eid, e, rep, 0, &pin);
+                        v41_unpick_rep(rep, e->total_bytes);
+                    }
+                    if (rec) {
+                        pthread_mutex_lock(&wq.mx);
+                        while (wq.count >= WM_Q_CAP)
+                            pthread_cond_wait(&wq.not_full, &wq.mx);
+                        wq.idx[wq.tail] = i; wq.ent[wq.tail] = e;
+                        wq.buf[wq.tail] = rec; wq.pin[wq.tail] = pin;
+                        wq.tail = (wq.tail + 1) % WM_Q_CAP;
+                        wq.count++;
+                        wq.done++;
+                        if (wq.done >= n) pthread_cond_broadcast(&wq.not_empty);
+                        else pthread_cond_signal(&wq.not_empty);
+                        pthread_mutex_unlock(&wq.mx);
+                    } else {
+                        if (!fb) { if (posix_memalign((void **)&fb, ST_DIRECT_ALIGN, fallback_sz) != 0) fb = NULL; }
+                        if (fb) v41_warm_put_shards(m, layer, eid, fb, fallback_sz);
+                        else XT(put)(layer, eid, NULL);
+                        pthread_mutex_lock(&wq.mx);
+                        wq.done++;
+                        if (wq.done >= n) pthread_cond_broadcast(&wq.not_empty);
+                        pthread_mutex_unlock(&wq.mx);
+                    }
+                }
+            }
+            for (;;) {
+                int p_idx, p_rpin, p_spin, p_st;
+                const WexEntry *p_ent;
+                uint8_t *p_rec, *p_slab;
+                pthread_mutex_lock(&pq.mx);
+                while (pq.count == 0 && !pq.closed)
+                    pthread_cond_wait(&pq.not_empty, &pq.mx);
+                if (pq.count == 0 && pq.closed) {
+                    pthread_mutex_unlock(&pq.mx);
+                    break;
+                }
+                p_idx = pq.idx[pq.head]; p_ent = pq.ent[pq.head];
+                p_rec = pq.rec[pq.head]; p_rpin = pq.rpin[pq.head];
+                p_slab = pq.slab[pq.head]; p_spin = pq.spin[pq.head];
+                p_st = pq.st[pq.head];
+                pq.head = (pq.head + 1) % WM_P_CAP;
+                pq.count--;
+                pthread_cond_signal(&pq.not_full);
+                pthread_mutex_unlock(&pq.mx);
+                const int layer = pl[p_idx], eid = pe[p_idx];
+                int ok = v41_wex_verify_coded(w, layer, eid, p_ent, p_rec);
+                if (ok) {
+                    if (p_st == 1) {
+                        unsigned char *sc[3], *wt[3];
+                        for (int mat = 0; mat < 3; mat++) {
+                            sc[mat] = p_slab + p_ent->scale_offsets[mat];
+                            wt[mat] = p_slab + p_ent->weight_offsets[mat];
+                        }
+                        if (coli_wex_decode_record_to(p_ent, p_rec, sc, wt)) {
+                            v41_wex_refuse(w, layer, eid, "does not decode (a WNR3/WNR4 stream check failed)");
+                            ok = 0;
+                        }
+                    } else if (p_st != 0) {
+                        v41_wex_refuse(w, layer, eid, "does not decode (a WNR3/WNR4 stream check failed)");
+                        ok = 0;
+                    }
+                }
+                if (ok) {
+                    /* Return the compressed record buffer before XT(put) to keep arena pressure minimal. */
+                    v41_wex_buf_put(w, p_rec, p_rpin);
+                    p_rec = NULL;
+                    /* WEX order is (0=w1, 1=w2, 2=w3); VktExpertSrc order is (w1, w3, w2, s1, s3, s2). */
+                    VktExpertSrc src = {
+                        p_slab + p_ent->weight_offsets[0], p_slab + p_ent->weight_offsets[2], p_slab + p_ent->weight_offsets[1],
+                        p_slab + p_ent->scale_offsets[0],  p_slab + p_ent->scale_offsets[2],  p_slab + p_ent->scale_offsets[1]
+                    };
+                    XT(put)(layer, eid, &src);
+                    warm_reads++;
+                    warm_dec++;
+                } else {
+                    v41_wex_buf_put(w, p_rec, p_rpin);
+                    p_rec = NULL;
+                    if (!fb) { if (posix_memalign((void **)&fb, ST_DIRECT_ALIGN, fallback_sz) != 0) fb = NULL; }
+                    if (fb) v41_warm_put_shards(m, layer, eid, fb, fallback_sz);
+                    else XT(put)(layer, eid, NULL);
+                }
+                v41_wex_buf_put(w, p_slab, p_spin);
+                if (p_rec) v41_wex_buf_put(w, p_rec, p_rpin);
+            }
+            if (fb) compat_aligned_free(fb);
+        }
+    }
+    w->reads += warm_reads;
+    w->decoded += warm_dec;
+    w->t_gpu += gpu_s;
+    pthread_cond_destroy(&pq.not_full);
+    pthread_cond_destroy(&pq.not_empty);
+    pthread_mutex_destroy(&pq.mx);
+    pthread_cond_destroy(&wq.not_full);
+    pthread_cond_destroy(&wq.not_empty);
+    pthread_mutex_destroy(&wq.mx);
+}
 static void vk_tier_start(Model *m, const char *snap, int cap) {
     Cfg *c = &m->c;
     if (!v41_tier_dev() || c->n_routed < 1 || !XT(wanted)()) return;
@@ -6866,28 +8053,49 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
     int n = pl && pe && !(warm && *warm == '0') ? XT(plan)(pl, pe, all) : 0;
     if (n > 0) {
         double t0 = now_s();
-        static const char *const part[V41_EXPERT_TENSORS] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
-        #pragma omp parallel for schedule(dynamic, 4)
-        for (int i = 0; i < n; i++) {
-            if (m->gx) {   /* a GGUF's: the file's rows */
+        const unsigned int cu_bits = m->wex && m->wex->nr3 ? coli_wex_cuda_features() : 0u;
+        const int wex_warm_gpu = !m->gx && m->wex && m->wex->nr3 && (cu_bits & COLI_WEX_CUDA_BATCH_HOST) &&
+                                 (m->wex->is_wnr4 ? (cu_bits & COLI_WEX_CUDA_NR4)
+                                                  : ((cu_bits & COLI_WEX_CUDA_NR2) && (cu_bits & COLI_WEX_CUDA_NR3)));
+        if (wex_warm_gpu) {
+#if defined(_OPENMP)
+            v41_wex_warm_start(m, pl, pe, n);
+#else
+            size_t buf_sz = 0;
+            for (int k = 0; k < V41_EXPERT_TENSORS; k++)
+                buf_sz += (size_t)(((expert_part_bytes(c, k) + ST_DIRECT_ALIGN * 2 - 1) / ST_DIRECT_ALIGN) * ST_DIRECT_ALIGN);
+            uint8_t *buf = NULL;
+            if (posix_memalign((void **)&buf, ST_DIRECT_ALIGN, buf_sz) != 0) buf = NULL;
+            for (int i = 0; i < n; i++) {
+                if (!buf) { XT(put)(pl[i], pe[i], NULL); continue; }
+                v41_warm_put_shards(m, pl[i], pe[i], buf, buf_sz);
+            }
+            if (buf) compat_aligned_free(buf);
+#endif
+        } else if (m->gx) {
+            #pragma omp parallel for schedule(dynamic, 4)
+            for (int i = 0; i < n; i++) {
                 uint8_t *rows = NULL;
                 VktExpertSrc src;
                 if (!v41_gx_expert_rows(m, pl[i], pe[i], &rows, &src)) XT(put)(pl[i], pe[i], &src);
                 else XT(put)(pl[i], pe[i], NULL);   /* no memory: the planned slot is given back */
                 free(rows);
-                continue;
             }
-            uint8_t *buf = malloc(expert), *at = buf, *p[V41_EXPERT_TENSORS];
-            if (!buf) continue;
-            for (int k = 0; k < V41_EXPERT_TENSORS; k++) {
-                char name[160];
-                snprintf(name, sizeof name, "layers.%d.ffn.experts.%d.%s", pl[i], pe[i], part[k]);
-                st_read_raw_cap(&m->S, name, at, expert_part_bytes(c, k), 0);
-                p[k] = at; at += expert_part_bytes(c, k);
+        } else {
+            size_t buf_sz = 0;
+            for (int k = 0; k < V41_EXPERT_TENSORS; k++)
+                buf_sz += (size_t)(((expert_part_bytes(c, k) + ST_DIRECT_ALIGN * 2 - 1) / ST_DIRECT_ALIGN) * ST_DIRECT_ALIGN);
+            #pragma omp parallel
+            {
+                uint8_t *buf = NULL;
+                if (posix_memalign((void **)&buf, ST_DIRECT_ALIGN, buf_sz) != 0) buf = NULL;
+                #pragma omp for schedule(dynamic, 4)
+                for (int i = 0; i < n; i++) {
+                    if (!buf) { XT(put)(pl[i], pe[i], NULL); continue; }
+                    v41_warm_put_shards(m, pl[i], pe[i], buf, buf_sz);
+                }
+                if (buf) compat_aligned_free(buf);
             }
-            VktExpertSrc src = {p[0], p[2], p[4], p[1], p[3], p[5]};
-            XT(put)(pl[i], pe[i], &src);
-            free(buf);
         }
         XT(put_done)();
         XT(warm_report)("deepseek_v41", n, now_s() - t0);
@@ -7138,25 +8346,22 @@ int main(int argc, char **argv) {
         }
     }
 
-    float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
-    double prefill_started = now_s();
-    forward(&m, prompt, n_prompt, logits);
-    if (m.spec.active) spec_step(&m, 0, m.last_start, m.last_rows, NULL, NULL);
-    double prefill = now_s() - prefill_started;
-
-    /* DSpark, when the fixture describes it. Two things are checked, and they are
-     * different things: that the draft head produces the vendor's block (the reference
-     * records one per step), and that a block VERIFIED in a single forward emits the
-     * same tokens as decoding them one at a time. The second is what makes accepting a
-     * draft safe, and a tiny fixture's random draft head never proposes anything worth
-     * accepting, so V41_SPEC_FORCE drafts the reference's own next tokens instead:
-     * 1 accepts the whole block, 2 corrupts the last draft so the round is rejected
-     * part way and the rollback runs. */
     jval *spec_ref = json_get(root, "spec");
     jval *spec_drafts = spec_ref && spec_ref->t == J_OBJ ? json_get(spec_ref, "drafts") : NULL;
     jval *spec_conf = spec_ref && spec_ref->t == J_OBJ ? json_get(spec_ref, "confidence") : NULL;
     int force = getenv("V41_SPEC_FORCE") ? atoi(getenv("V41_SPEC_FORCE")) : 0;
-    int block = m.spec.active ? c->spec_block : 0;
+    const int run_spec = m.spec.active && (spec_drafts != NULL || force != 0);
+
+    float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
+    double prefill_started = now_s();
+    forward(&m, prompt, n_prompt, logits);
+    if (run_spec) spec_step(&m, 0, m.last_start, m.last_rows, NULL, NULL);
+    double prefill = now_s() - prefill_started;
+
+    /* DSpark, when the fixture describes it or V41_SPEC_FORCE asks to verify drafts.
+     * Skipping spec_step when neither is requested avoids running all three draft stages
+     * and discarding the drafts on every plain-oracle step. */
+    int block = run_spec ? c->spec_block : 0;
     int *draft = block ? xmalloc((size_t)(block + 1) * sizeof(int), "drafts") : NULL;
     float *confidence = block ? xmalloc((size_t)block * sizeof(float), "draft confidence") : NULL;
     int spec_failed = 0, spec_checked = 0, round = 0;
@@ -7173,7 +8378,7 @@ int main(int argc, char **argv) {
         if (step >= n_expected) break;
 
         int one_at_a_time = m.last_rows == 1;
-        int drafted = m.spec.active
+        int drafted = run_spec
                     ? spec_step(&m, token, m.last_start, m.last_rows, draft, confidence) : 0;
         /* The reference drafts after every single-token forward. Once a round has been
          * accepted the engine is a step ahead of that loop -- it committed several
@@ -7244,10 +8449,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[v41] prefill %d tokens in %.2fs | decode %d in %.2fs (%.2f tok/s)\n",
             n_prompt, prefill, n_expected, decode, n_expected / (decode > 0 ? decode : 1));
     fprintf(stderr, "[v41] experts: %llu hits, %llu misses, %.1f MB read | disk %.2fs, "
-                    "expert matmul %.2fs, attention %.2fs, engram %.2fs\n",
+                    "expert matmul %.2fs, attention %.2fs, engram %.2fs%s",
             (unsigned long long)m.hits, (unsigned long long)m.miss,
-            m.expert_bytes / 1e6, m.t_disk, m.t_expert, m.t_attn, m.t_engram);
+            m.expert_bytes / 1e6, m.t_disk, m.t_expert, m.t_attn, m.t_engram,
+            m.t_spec > 0.0 ? "" : "\n");
+    if (m.t_spec > 0.0) fprintf(stderr, ", spec %.2fs\n", m.t_spec);
     mirror_report(NULL, NULL);
+    if (m.wex)
+        fprintf(stderr, "[v41_wex] container: %llu records read (%llu %s decoded), %llu refused (gpu=%.2fs post_cpu=%.2fs)\n",
+                (unsigned long long)m.wex->reads, (unsigned long long)m.wex->decoded,
+                m.wex->is_wnr4 ? "WNR4" : "WNR3", (unsigned long long)m.wex->refused,
+                m.wex->t_gpu, m.wex->t_post);
     if (m.engram.active)
         for (int t = 0; t < m.engram.n_layers; t++)
             fprintf(stderr, "[v41] engram table %d (layer %d): %lld rows, %llu cache hits, "

@@ -147,16 +147,49 @@ static __thread DWORD compat_pread_lasterr __attribute__((unused));
  * handle may return before it is done, and is then waited for on an event that
  * belongs to this call -- the file handle itself is signalled by every thread's
  * completions. On a synchronous handle the event is set and never needed. */
+/* Cached per-thread manual-reset event for overlapped ReadFile(), released
+ * automatically on thread exit via FLS callback so thread churn never leaks
+ * handles and hot pread loops avoid per-call CreateEventA/CloseHandle. */
+static VOID WINAPI compat_pread_ev_free(PVOID p){
+    if(p) CloseHandle((HANDLE)p);
+}
+static inline HANDLE compat_pread_event(int *owned_out){
+    static volatile LONG fls_state = 0;
+    static DWORD fls_idx = FLS_OUT_OF_INDEXES;
+    if(fls_state != 2){
+        if(InterlockedCompareExchange(&fls_state, 1, 0) == 0){
+            fls_idx = FlsAlloc(compat_pread_ev_free);
+            InterlockedExchange(&fls_state, 2);
+        } else {
+            while(fls_state != 2) SwitchToThread();
+        }
+    }
+    if(fls_idx != FLS_OUT_OF_INDEXES){
+        HANDLE ev = (HANDLE)FlsGetValue(fls_idx);
+        if(!ev){
+            ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+            if(ev && !FlsSetValue(fls_idx, ev)){ CloseHandle(ev); ev = NULL; }
+        }
+        if(ev){ ResetEvent(ev); *owned_out = 0; return ev; }
+    }
+    *owned_out = 1;
+    return CreateEventA(NULL, TRUE, FALSE, NULL);
+}
 static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
     HANDLE h = (HANDLE)osfh;
-    HANDLE done = CreateEventA(NULL, TRUE, FALSE, NULL);
+    int owned_ev = 0;
+    HANDLE done = compat_pread_event(&owned_ev);
     if(!done){ compat_pread_lasterr = GetLastError(); errno = EIO; return -1; }
     size_t total = 0;
     while(total < n){
         size_t chunk = n - total;
-        DWORD chunk32 = (chunk > 0x7FFFFFFF) ? 0x7FFFFFFF : (DWORD)chunk;
+        /* Cap each Windows overlapped ReadFile() to 16 MiB (#3139): larger single
+         * uncached/overlapped transfers on shared chipset PCIe switches (e.g. AMD X670E)
+         * can lock up Realtek 2.5GbE RX DMA (NDIS 10400). */
+        DWORD chunk32 = (chunk > 0x1000000u) ? 0x1000000u : (DWORD)chunk;
+        if(total > 0) ResetEvent(done);
         OVERLAPPED ov = {0};
         ov.Offset     = (DWORD)( (off + (off_t)total)        & 0xFFFFFFFFULL);
         ov.OffsetHigh = (DWORD)(((off + (off_t)total) >> 32) & 0xFFFFFFFFULL);
@@ -170,13 +203,13 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
             compat_pread_lasterr = err;         /* preserva il codice VERO per il report (#307) */
             if(err == ERROR_INVALID_HANDLE || err == ERROR_INVALID_FUNCTION) errno = EBADF;
             else errno = EIO;
-            CloseHandle(done);
+            if(owned_ev) CloseHandle(done);
             return -1;
         }
         total += rd;
         if(rd == 0 || rd < chunk32) break;  /* EOF or partial (file truncated) */
     }
-    CloseHandle(done);
+    if(owned_ev) CloseHandle(done);
     return (ssize_t)total;
 }
 #define pread(fd,buf,n,off) compat_pread(fd,buf,n,off)

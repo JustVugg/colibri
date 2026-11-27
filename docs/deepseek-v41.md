@@ -298,6 +298,22 @@ expert disk phase and the engine reaches the device's own ceiling; the measureme
 and the regime in which neither is worth anything, are in
 [the experiment record](experiments/dsv41-expert-io-2026-09-14.md).
 
+### From a WEX4 container (`COLI_WEX_PATH`, opt-in)
+
+`COLI_WEX_PATH=<file>` reads the backbone's routed experts from a WEX4 container: each
+expert's six tensors sit back to back in one 4096-aligned record of one file, and are read
+into the same windows by the same readers. `COLI_WEX_ROOT=<root>` (printed by
+`tools/wex4_verify`) refuses any other file and hashes each record at its first read; a
+record that fails is read from the shards instead. The DSpark stages and the rest of the
+checkpoint stay on the shards. A container of WNR3 records (the published REAP-192 one: 7,680
+records, 123.3 GB against 144.4 GB as RAW) is read a record at a time and decoded on the CPU by
+the reader threads. It gives the same tokens. On an i7-7700K (4 cores), the container on NVMe and
+the trunk on a SATA SSD, 8 greedy tokens decoded in 71.1 s with the default fast CPU decoder
+against 62.5-91.6 s from the shards, and in 35.2 s with the CUDA helper (`COLI_WEX_CUDA_LIB`, an
+RTX 3070); with the reference decoder (`COLI_WEX_FAST_DECODE=0`) the decode is the bottleneck,
+293.2 s (engram off, cap 8). Details: [wex.md](wex.md#deepseek-v41-deepseek_v41) and
+[the fast CPU decoder](wex.md#the-fast-cpu-decoder).
+
 ### The cheapest resident tier there is
 
 The expert cache has a floor that no cache size can move: a turn's *first* touch of

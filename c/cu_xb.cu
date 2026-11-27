@@ -77,8 +77,55 @@ struct ColiVkTensor {
     uint8_t *w; float *s;              /* what the kernels read (the host pool's: device pointers of the mapping) */
     uint8_t *hw; float *hs;            /* the host pool's rows and scales as the CPU reads them */
     uint8_t *img;                      /* a device pool tensor's host image until it is committed */
+    size_t img_cap;
+    int img_pinned;
 };
 struct ColiVkExpert { ColiVkTensor *g, *u, *d; };
+
+/* Small pool of page-locked staging buffers for device-pool tensor uploads: avoids
+ * per-expert calloc zero-fill page-fault storms and blocking pageable cudaMemcpyAsync. */
+#define CU_STAGE_MAX 32
+struct CuStageBuf { uint8_t *p; size_t cap; };
+static std::mutex g_cu_stage_mx;
+static CuStageBuf g_cu_stage[CU_STAGE_MAX];
+static int g_cu_stage_cnt;
+
+static uint8_t *cu_stage_get(size_t need, size_t *cap_out, int *pinned_out) {
+    uint8_t *p = NULL;
+    size_t cap = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_cu_stage_mx);
+        for (int i = 0; i < g_cu_stage_cnt; i++) {
+            if (g_cu_stage[i].cap >= need) {
+                p = g_cu_stage[i].p; cap = g_cu_stage[i].cap;
+                g_cu_stage[i] = g_cu_stage[--g_cu_stage_cnt];
+                break;
+            }
+        }
+    }
+    if (p) { *cap_out = cap; *pinned_out = 1; return p; }
+    void *hp = NULL;
+    if (cudaHostAlloc(&hp, need, cudaHostAllocDefault) == cudaSuccess && hp) {
+        *cap_out = need; *pinned_out = 1; return (uint8_t *)hp;
+    }
+    cudaGetLastError();
+    p = (uint8_t *)malloc(need);
+    *cap_out = p ? need : 0; *pinned_out = 0;
+    return p;
+}
+static void cu_stage_put(uint8_t *p, size_t cap, int pinned) {
+    if (!p) return;
+    if (pinned) {
+        std::lock_guard<std::mutex> lk(g_cu_stage_mx);
+        if (g_cu_stage_cnt < CU_STAGE_MAX) {
+            g_cu_stage[g_cu_stage_cnt++] = {p, cap};
+            return;
+        }
+        cudaFreeHost(p);
+    } else {
+        free(p);
+    }
+}
 
 static struct {
     std::mutex mx;                     /* the pools, the pending frees */
@@ -295,18 +342,25 @@ static size_t cu_tensor_alloc_bytes(int fmt, int I, int O, int gs, size_t *scale
     return (size_t)cu_row_words(fmt, I) * 4 * (size_t)O;
 }
 
-/* the rows and scales to fill: the host pool's mapping, else a host image (committed later) */
+/* the rows and scales to fill: the host pool's mapping, else a page-locked host image (committed later) */
 static int hand_out(ColiVkTensor *t, uint8_t **rows, size_t *stride, float **scales) {
+    const size_t st = (size_t)t->rowWords * 4;
+    const size_t rb = cu_row_bytes(t->fmt, t->I);
     if (C.pool[t->pool].host) {
-        memset(t->hw, 0, t->wbytes);
+        if (st > rb) {
+            for (int o = 0; o < t->O; o++) memset(t->hw + (size_t)o * st + rb, 0, st - rb);
+        }
         *rows = t->hw; *scales = t->hs;
     } else {
-        free(t->img);
-        t->img = (uint8_t *)calloc(1, t->wbytes + t->sbytes);
+        if (t->img) { cu_stage_put(t->img, t->img_cap, t->img_pinned); t->img = NULL; t->img_cap = 0; t->img_pinned = 0; }
+        t->img = cu_stage_get(t->wbytes + t->sbytes, &t->img_cap, &t->img_pinned);
         if (!t->img) return 0;
+        if (st > rb) {
+            for (int o = 0; o < t->O; o++) memset(t->img + (size_t)o * st + rb, 0, st - rb);
+        }
         *rows = t->img; *scales = (float *)(t->img + t->wbytes);
     }
-    *stride = (size_t)t->rowWords * 4;
+    *stride = st;
     return 1;
 }
 /* a tensor of fmt/I/O/gs in pool k with ranges of at least pad_w and pad_s bytes */
@@ -336,7 +390,7 @@ static ColiVkTensor *tensor_new(int k, int fmt, int I, int O, int gs, size_t pad
 static void tensor_release(ColiVkTensor *t) {   /* C.mx held */
     pool_give(t->pool, t->wr); pool_give(t->pool, t->sr);
     C.pool[t->pool].tensors--; C.pool[t->pool].payload -= t->wbytes + t->sbytes;
-    free(t->img); free(t);
+    cu_stage_put(t->img, t->img_cap, t->img_pinned); free(t);
 }
 static int cu_tier_tensor_pad(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
                               uint8_t **rows, size_t *stride, float **scales) {
@@ -380,7 +434,10 @@ static int cu_tensor_commit(ColiVkTensor *const *t, int n) {
         ok &= cudaStreamSynchronize(cs) == cudaSuccess;
     }
     cu_set();
-    for (int i = 0; i < n; i++) if (t[i]) { free(t[i]->img); t[i]->img = NULL; }
+    for (int i = 0; i < n; i++) if (t[i] && t[i]->img) {
+        cu_stage_put(t[i]->img, t[i]->img_cap, t[i]->img_pinned);
+        t[i]->img = NULL; t[i]->img_cap = 0; t[i]->img_pinned = 0;
+    }
     if (!ok) cudaGetLastError();
     return ok;
 }
