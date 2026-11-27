@@ -68,5 +68,16 @@ class ConcurrencyTest(unittest.TestCase):
             t.join(10)
 
 
+class ServeWiringTest(unittest.TestCase):
+    def test_serve_sets_it_from_the_engine_it_started(self):
+        """serve() binds the port first (APIServer with no engine), then starts the engine: the concurrency must
+        come from the engine's CAPS there and at each restart, not at the server's creation"""
+        import inspect
+        src = inspect.getsource(srv.serve)
+        i = src.index("server.engine = runtime")
+        self.assertIn("set_concurrency(engine_concurrency(runtime", src[i:i + 200])
+        self.assertIn("set_concurrency(engine_concurrency(server.engine", inspect.getsource(srv.keep_engine))
+
+
 if __name__ == "__main__":
     unittest.main()

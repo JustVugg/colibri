@@ -11228,6 +11228,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                       file=sys.stderr)
                 sys.exit(1)
         server.engine = runtime
+        server.scheduler.set_concurrency(engine_concurrency(runtime, kv_slots))   # its CAPS, read at its start
         server.context_limit = getattr(runtime, "context_limit", None)
         if not max_tokens:   # the engine resolved it: the context it holds
             server.max_tokens = getattr(runtime, "max_tokens", None) or 1024
