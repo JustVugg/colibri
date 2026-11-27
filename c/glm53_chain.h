@@ -731,7 +731,7 @@ static void g53c_recover(GModel *m, GSession *s, int start, int dev0, int dev2, 
     }
     const char *nm = g53c_name(who);
     if (!had) {
-        fprintf(stderr, "[VK] %s chain: the device was lost; the host's state is current, the CPU runs from here on\n", nm);
+        fprintf(stderr, "[VK] %s chain: %s; the host's state is current, the host's path runs from here on\n", nm, vkc_lost() ? "the device was lost" : "the chain stopped, the device stays");
         return;
     }
     const Cfg *c = &m->c; int H = c->hc_mult, D = c->hidden;
@@ -741,8 +741,8 @@ static void g53c_recover(GModel *m, GSession *s, int start, int dev0, int dev2, 
         exit(1);
     }
     int n = start - ch->rec_base;
-    fprintf(stderr, "[VK] %s chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on\n", nm, n);
+    fprintf(stderr, "[VK] %s chain: %s; rebuilding the state of %d positions on the host's path, "
+                    "which runs from here on\n", nm, vkc_lost() ? "the device was lost" : "the chain stopped, the device stays", n);
     /* the devices' layers only: a partial chain's CPU layers ran every position already */
     if (n <= 0) return;
     float *xs = malloc((size_t)n * H * D * sizeof(float)), *xn = malloc((size_t)n * H * D * sizeof(float));
@@ -859,7 +859,7 @@ static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams
     return ch->n;
 lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(outs);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("glm53", start, n);   /* the device lost only when it said so (#2793) */
     *lost = 1;
     return 0;
 }

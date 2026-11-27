@@ -1556,7 +1556,7 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
     return ch->n;
 lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(f.keyl); free(f.praw); free(need); free(outs); free(pres); free(wl); free(cs_); free(er); free(pc);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("deepseek_v41", start, n);   /* the device lost only when it said so (#2793) */
     *lost = 1;
     return 0;
 }

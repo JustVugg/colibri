@@ -25,6 +25,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include "coli_event_log.h"   /* the tier's stops kept in a file too (#2793) */
 #include "compat.h"
 #include <errno.h>
 #include "vk_tier.h"
@@ -1567,7 +1568,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         T.big = 0;
         if (T.sy_step) { coli_vk_xb_step_end(); T.sy_step = NULL; }
         if (T.big_fail) {
-            fprintf(stderr, VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
+            coli_event(VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops", T.engine);
             T.on = 0;
         }
         return 0;
@@ -1616,7 +1617,7 @@ static int join_big(const float **rows) {
                 : hn && T.hy_of[i] >= 0 ? T.hy_out + (size_t)T.hy_of[i] * T.c.hidden : NULL;
     for (int i = 0; T.st && i < T.st_n; i++) if (T.st[i].state == SS_BUSY) { T.st[i].state = SS_FREE; T.st[i].pending = 0; }
     if (!ok) {
-        fprintf(stderr, VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
+        coli_event(VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops", T.engine);
         T.on = 0;
         return 0;
     }
@@ -2527,7 +2528,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
     if (!coli_vk_xb_ready()) {
-        if (T.on) { fprintf(stderr, VKT_TAG " tier %s: the device stopped answering, the experts stay on the CPU\n", T.engine); T.on = 0; }
+        if (T.on) { coli_event(VKT_TAG " tier %s: the device stopped answering, the experts stay on the CPU", T.engine); T.on = 0; }
         return 0;
     }
     if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
@@ -2732,7 +2733,7 @@ int vkt_join(const float **rows) {
         rows[i] = !(ok && ok1 && hok) ? NULL : T.map[i] >= 0 ? T.by[T.map[i]]
                 : hn && T.hy_of[i] >= 0 ? T.hy_out + (size_t)T.hy_of[i] * T.c.hidden : NULL;
     if (!ok) {
-        fprintf(stderr, VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
+        coli_event(VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops", T.engine);
         T.on = 0;
         return 0;
     }

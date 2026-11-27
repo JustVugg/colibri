@@ -829,8 +829,8 @@ static void q38c_recover(Model *m, int upto) {
     if (upto <= 0) return;
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         q38c_fatal("the device was lost with a recurrent state its token ids do not describe (an image)");
-    fprintf(stderr, "[VK] qwen38 chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on\n", upto);
+    fprintf(stderr, "[VK] qwen38 chain: %s; rebuilding the state of %d positions on the host's path, "
+                    "which runs from here on\n", vkc_lost() ? "the device was lost" : "the chain stopped, the device stays", upto);
     int *ids = (int *)malloc((size_t)upto * sizeof(int));
     float *hyper = falloc((int64_t)upto * W), *mixed = falloc((int64_t)upto * H);
     float *inject = falloc((int64_t)upto * C), *block = falloc((int64_t)upto * H);
@@ -1496,7 +1496,7 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
     return ch->head ? 1 : 2;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     vkc_gemm_rows(-1);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("qwen38", pos_base, S);   /* the device lost only when it said so (#2793) */
     vkc_device(0);
     q38c_recover(m, pos_base);
     *lost = 1;
@@ -1654,7 +1654,7 @@ static int q38c_mtp_rows(Model *m, const float *streams, const int *next, int S,
 lost:   /* a frame failed: the device is gone; the CPU takes over, the head too */
     vkc_gemm_rows(-1);
     free(emb);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
+    vkc_frame_failed("qwen38 MTP", pos_base, S);   /* the device lost only when it said so (#2793) */
     vkc_device(0);
     q38c_recover(m, m->kv_len);
     return 0;

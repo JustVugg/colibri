@@ -317,7 +317,7 @@ static int qic_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, fl
         qic_unstream(d, 0); qic_unstream(d, 1);
     }
     if (!ok) {
-        if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
+        vkc_frame_failed("qwenimage", -1, -1);   /* the device lost only when it said so (#2793) */
         qic_off("a frame failed (the device was lost); this step runs again on the CPU");
         return 0;
     }

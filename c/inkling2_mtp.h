@@ -856,7 +856,7 @@ static int ink2mc_step(Model *m, int tok, int t, int *out) {
         m->kv_len = t + a + 1;
         if (m->kvp.len > t + a + 1) m->kvp.len = t + a + 1;
         if (!ink2mc_rollback(m, t, n, a)) {   /* the device was lost: the CPU from the kept rows on */
-            if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
+            vkc_frame_failed("inkling2 MTP", t, 1);   /* the device lost only when it said so (#2793) */
             ink2c_recover(m, t + a + 1);
         }
         mt->t_redo += now_s() - t2;

@@ -914,6 +914,7 @@ int vkc_vae_ready(void);
 /* counters, for the engines' [VK] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, gemms, barriers, bytes_up, bytes_down;
+    unsigned long long stage_relieved;   /* staging refused, the frames so far done and their staging back (vkc_write) */
     double wait_ms;               /* host time blocked in fence waits */
     size_t dev_bytes;             /* live chain buffers */
     unsigned long long attn_blocked;   /* attention calls through chain_attnb (blocks of rows) */
@@ -934,6 +935,10 @@ typedef struct {
     unsigned long long moe_pipes;      /* chain_moe.comp's pipelines made (a driver's compile each: 20 minutes on a Radeon RX 580) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
+/* A chain's frame failed and the chain turns itself off: the device lost only when it said so; a frame refused for
+ * want of memory leaves it to the per-matrix path and the expert tier. One line (stderr and the event log) says which,
+ * what the memory refused last, at which position (#2793). */
+void vkc_frame_failed(const char *engine, int pos, int rows);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
 void vkc_prof_print(void);
 

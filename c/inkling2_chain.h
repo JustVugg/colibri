@@ -452,8 +452,8 @@ static void ink2c_recover(Model *m, int upto) {
     if (upto <= 0) return;
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         ink2c_fatal("the device was lost with a state its token ids do not describe (audio or an image)");
-    fprintf(stderr, "[VK] inkling2 chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on\n", upto);
+    fprintf(stderr, "[VK] inkling2 chain: %s; rebuilding the state of %d positions on the host's path, "
+                    "which runs from here on\n", vkc_lost() ? "the device was lost" : "the chain stopped, the device stays", upto);
     float *x = falloc((int64_t)upto * D);
     for (int s = 0; s < upto; s++) {
         wt_row_f32(m->embed, (int64_t)m->kvp.fed[s] * D, x + (int64_t)s * D, D);
@@ -809,7 +809,7 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
     ch->forwards++;
     return 1;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
+    vkc_frame_failed("inkling2", pos_base, S);   /* the device lost only when it said so (#2793) */
     free(xfin); free(dq);
     vkc_relattn_part(NULL);
     ink2c_recover(m, pos_base);

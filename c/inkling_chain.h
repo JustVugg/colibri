@@ -764,8 +764,8 @@ static void inkc_recover(Model *m, int upto) {
     if (upto <= 0) return;
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         inkc_fatal("the device was lost with a state its token ids do not describe (audio)");
-    fprintf(stderr, "[VK] inkling chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on%s\n", upto, nl < c->n_layers ? " (the device's layers; the CPU's have theirs)" : "");
+    fprintf(stderr, "[VK] inkling chain: %s; rebuilding the state of %d positions on the host's path, "
+                    "which runs from here on%s\n", vkc_lost() ? "the device was lost" : "the chain stopped, the device stays", upto, nl < c->n_layers ? " (the device's layers; the CPU's have theirs)" : "");
     int *ids = malloc((size_t)upto * sizeof(int));
     float *x = falloc((int64_t)upto * D);
     if (!ids) { fprintf(stderr, "OOM rebuilding the state\n"); exit(1); }
@@ -987,7 +987,7 @@ static int inkc_forward_seg(Model *m, InkChain *ch, float *xh, int S, int pos_ba
     ch->forwards++;
     return full ? 1 : 2;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("inkling", pos_base, S);   /* the device lost only when it said so (#2793) */
     free(xfin);
     vkc_device(0);
     inkc_recover(m, pos_base);

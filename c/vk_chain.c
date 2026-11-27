@@ -24,6 +24,7 @@
 #include <string.h>
 #include <time.h>
 #include "compat.h"
+#include "coli_event_log.h"   /* why the chain or the device stopped, kept in a file too (#2793) */
 
 /* Every device memory block goes through the backend's books (COLI_VK_DEVICE_CAP_MB,
  * coli_vk_mem_alloc): the chain's buffers count against the device's budget as its
@@ -209,10 +210,18 @@ void vkc_shutdown_all(void) {   /* both devices' contexts, the second first (at 
 int vkc_lost(void) { return KC.lost; }
 
 static void lose(const char *what, VkResult r) {
-    if (!KC.lost) fprintf(stderr, "[VK] chain: %s failed (%d): the device is lost\n", what, (int)r);
+    if (!KC.lost) coli_event("[VK] chain: %s failed (%d): the device is lost", what, (int)r);
     KC.lost = 1;
     coli_vk_mark_lost_dev(g_kd);
 }
+/* The last request the chain's memory refused (#2793: a frame could not be built and nothing said why): what was
+ * asked and how many bytes, for the line a chain prints when it stops (vkc_frame_failed) */
+static struct { char what[160]; size_t bytes; unsigned long long n; } g_kc_ref;
+static void kc_refused(const char *what, size_t bytes) {
+    snprintf(g_kc_ref.what, sizeof g_kc_ref.what, "%s", what);
+    g_kc_ref.bytes = bytes; g_kc_ref.n++;
+}
+static const char *kc_kind_name(int kind) { return kind == VKC_UP ? "host-written" : kind == VKC_DOWN ? "host-read" : "device"; }
 
 /* ---- blocks ---------------------------------------------------------------------- */
 #define VKC_BLOCK ((uint64_t)64 << 20)
@@ -267,7 +276,12 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
     if (!vkc_ready() || kind < 0 || kind > 2) return NULL;
     if (!bytes) bytes = 4;
     bytes = (bytes + 3) & ~(size_t)3;
-    if (KC.core.ssbo_range && bytes > KC.core.ssbo_range) return NULL;   /* one binding could not address it */
+    char why[160];
+    if (KC.core.ssbo_range && bytes > KC.core.ssbo_range) {   /* one binding could not address it */
+        snprintf(why, sizeof why, "a %s buffer past the device's %llu-byte binding range", kc_kind_name(kind), (unsigned long long)KC.core.ssbo_range);
+        kc_refused(why, bytes);
+        return NULL;
+    }
     VkcBuf *b = calloc(1, sizeof *b);
     if (!b) return NULL;
     b->kind = kind; b->bytes = bytes; b->d = g_kd;
@@ -277,7 +291,10 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,   /* vkc_moe_rows' dispatches */
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    if (vkCreateBuffer(KC.dev, &bi, NULL, &b->buf) != VK_SUCCESS) { free(b); return NULL; }
+    if (vkCreateBuffer(KC.dev, &bi, NULL, &b->buf) != VK_SUCCESS) {
+        snprintf(why, sizeof why, "a %s buffer (vkCreateBuffer)", kc_kind_name(kind)); kc_refused(why, bytes);
+        free(b); return NULL;
+    }
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(KC.dev, b->buf, &req);
     VkcPool *P = &KC.pool[kind];
@@ -285,6 +302,8 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
     if (!(req.memoryTypeBits & (1u << P->memtype)) ||
         (!vka_alloc(&P->p, req.size, align, &b->r) &&
          !(pool_grow(P, req.size + align) && vka_alloc(&P->p, req.size, align, &b->r)))) {
+        snprintf(why, sizeof why, "a %s buffer (memory type %u: the driver gave no block for it)", kc_kind_name(kind), P->memtype);
+        kc_refused(why, bytes);
         vkDestroyBuffer(KC.dev, b->buf, NULL); free(b); return NULL;
     }
     VkcBlock *bk = P->p.b[b->r.block].user;
@@ -856,6 +875,26 @@ int vkc_finish(void) {
     for (int i = 0; i < VKC_FRAMES; i++) if (!frame_wait(&KC.fr[i])) return 0;
     return !KC.lost;
 }
+/* A chain's frame failed and the chain turns itself off (its `lost:` exits). The device is lost only when it said
+ * so (a submission, a fence, a reset: lose() marked it then); a frame refused for want of memory leaves the device
+ * to the backend's per-matrix path and the expert tier, where every such frame had marked it lost and the CPU had
+ * taken everything until the process ended (#2793: "the device stopped answering", 300 s for a 12.7k prompt and
+ * 7 tok/s after). The line says which of the two, what the chain's memory refused last, at which position. */
+void vkc_frame_failed(const char *engine, int pos, int rows) {
+    const int dead = KC.lost || !vkc_finish();
+    if (dead) {
+        coli_event("[VK] %s chain: the device is lost at position %d (%d rows); the CPU runs from here on", engine, pos, rows);
+        return;
+    }
+    if (g_kc_ref.n)
+        coli_event("[VK] %s chain: a frame failed at position %d (%d rows) without a device error: %s of %.1f MiB was refused; "
+                   "the chain off, the device stays (the per-matrix path and the expert tier)",
+                   engine, pos, rows, g_kc_ref.what, g_kc_ref.bytes / 1048576.0);
+    else
+        coli_event("[VK] %s chain: a frame failed at position %d (%d rows) without a device error or a refused buffer; "
+                   "the chain off, the device stays (the per-matrix path and the expert tier)", engine, pos, rows);
+    g_kc_ref.n = 0;
+}
 
 static void barrier_now(VkCommandBuffer c, VkPipelineStageFlags dst_stage, VkAccessFlags dst) {
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1295,6 +1334,42 @@ static void zero_now(VkcBuf *b) {
     vkc_zero(b, 0, b->bytes / 4);
     if (!was_open) vkc_submit(1);
 }
+/* COLI_VK_CHAIN_STAGE_REFUSE=n (tests): the n-th staging buffer vkc_write asks for is refused, as a driver short of
+ * host-visible memory would, and COLI_VK_CHAIN_STAGE_REFUSE_N (1) of them in a row (2: the least's retry too, so the
+ * frames so far are done and their staging given back); COLI_VK_CHAIN_STAGE_REFUSE_ALL=1: every one from there on */
+static int stage_refused(size_t want) {
+    static long at = -2, all = -1, rn = 1, seen;
+    if (at == -2) {
+        const char *e = getenv("COLI_VK_CHAIN_STAGE_REFUSE"), *a = getenv("COLI_VK_CHAIN_STAGE_REFUSE_ALL"),
+                   *k = getenv("COLI_VK_CHAIN_STAGE_REFUSE_N");
+        at = e && *e ? atol(e) : -1; all = a && *a == '1'; rn = k && atol(k) > 0 ? atol(k) : 1;
+    }
+    if (at < 1) return 0;
+    ++seen;
+    if ((seen >= at && seen < at + rn) || (all && seen > at)) {
+        kc_refused("a host-written staging buffer (COLI_VK_CHAIN_STAGE_REFUSE)", want);
+        return 1;
+    }
+    return 0;
+}
+static VkcBuf *stage_buf(size_t want) { return stage_refused(want) ? NULL : vkc_buf(want, VKC_UP); }
+/* A frame's staging refused (#2793: right after the expert tier gave device memory back and the KV mirror grew,
+ * a long prompt chunk's doubled staging buffer was refused, the frame could not be built and the device was taken
+ * for lost): every frame so far submitted and waited for, their temporaries and staging buffers given back, and a
+ * new frame opened, as vkc_layer_recorded splits one every few layers. Not a frame that waits for the host's value
+ * (a hybrid step's goes off as it is). 1: the open frame is a new one. */
+static int stage_relieve(void) {
+    VkcFrame *f = open_frame();
+    if (!f || f->wait_h || f->sig_g || KC.lost) return 0;
+    if (!vkc_finish()) return 0;
+    for (int i = 0; i < VKC_FRAMES; i++) {
+        VkcFrame *g = &KC.fr[i];
+        frame_reclaim(g);
+        if (g->stage) { buf_release(g->stage); g->stage = NULL; }
+    }
+    KC.st.stage_relieved++;
+    return vkc_begin();
+}
 int vkc_write(VkcBuf *dst, size_t off, const void *src, size_t bytes) {
     VkcFrame *f = open_frame();
     if (!f || KC.lost) return 0;
@@ -1306,7 +1381,29 @@ int vkc_write(VkcBuf *dst, size_t off, const void *src, size_t bytes) {
         /* a new staging buffer; the old one stays alive until the frame comes back */
         size_t want = f->stage ? 2 * f->stage->bytes : VKC_STAGE0;
         while (want < bytes) want *= 2;
-        VkcBuf *n = vkc_buf(want, VKC_UP);
+        VkcBuf *n = stage_buf(want);
+        /* refused: the least that holds this write (not the doubled size), then the frames so far done and their
+         * staging given back, once more (the same copies in the same order: the bytes do not move) */
+        const size_t least = (bytes + 65535) & ~(size_t)65535;
+        if (!n && least < want) n = stage_buf(least);
+        if (!n) {
+            static int said;
+            if (said++ < 4)
+                fprintf(stderr, "[VK] chain: a staging buffer of %.1f MiB refused (%s); the frames so far done and their "
+                                "staging given back, once more\n", want / 1048576.0, g_kc_ref.what);
+        }
+        if (!n && stage_relieve()) {
+            f = open_frame();
+            n = stage_buf(want);
+            if (!n && least < want) n = stage_buf(least);
+            if (n) {   /* the new frame's first staging buffer */
+                f->stage = n;
+                memcpy(n->ptr, src, bytes);
+                f->stage_used = bytes;
+                KC.st.bytes_up += bytes;
+                return copy_bytes(dst, off * 4, n, 0, bytes);
+            }
+        }
         if (!n) return 0;
         if (f->stage) {
             if (f->ntmp == f->ctmp) {

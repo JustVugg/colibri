@@ -1426,7 +1426,7 @@ host_oom:   /* the host state half written: as a failed CPU forward leaves it, a
 lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(cs); free(wl); free(cos_); free(sin_);
     if (pool) coli_v4_expert_store_prefill_pool(experts, -1);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("deepseek_v4", start, n);   /* the device lost only when it said so (#2793) */
     *lost = 1;
     return 0;
 }
