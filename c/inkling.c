@@ -2501,13 +2501,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 int64_t srow = mr ? (int64_t)s*kvdim : 0;
                 /* mix the relative-bias bank for this (token, head): rl[dist] */
                 const float *rv = rr + (int64_t)s*H*c->d_rel + h*c->d_rel;
-                {   /* the distances the row reaches, the bank's rows outermost (each distance's sum in the same order) */
-                    const int ne = qpos - t0 + 1 < ext ? qpos - t0 + 1 : ext;
-                    for (int e = 0; e < ne; e++) rl[e] = 0.f;
-                    for (int d = 0; d < c->d_rel; d++) {
-                        const float w = rv[d], *pr = l->relp + (int64_t)d*ext;
-                        for (int e = 0; e < ne; e++) rl[e] += w * pr[e];
-                    }
+                /* dev's loop: run over the bank's rows first, the compiler fused it otherwise in this file */
+                for (int e = 0; e < ext; e++) {
+                    float acc = 0.f;
+                    for (int d = 0; d < c->d_rel; d++) acc += rv[d] * l->relp[(int64_t)d*ext + e];
+                    rl[e] = acc;
                 }
                 /* tau: log-length scaling on global layers (f32, per query pos) */
                 float tau = 1.f;

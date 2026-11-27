@@ -889,11 +889,18 @@ static void q36cc_room_from_tier(Q36CChain *ch, size_t need) {
         if (fr >= need || !qt_chain_give_back(need - fr, q36cc_tensor_addr)) return;
     }
 }
-/* the room the planned places past the chain's own take (q36_places_plan), for the tier's reserve */
-static size_t q36cc_places_bytes(Model *m) {
-    size_t b = 0, fr = 0, tot = 0;
-    if (g_q36_mux_slots > 1 && coli_kv_plan() && coli_cuda_mem_info(0, &fr, &tot)) q36_places_plan(m, q36cc_kves(), fr, &b);
+/* the room the planned places past the chain's own take (q36_places_plan), for the tier: sized from the device's
+ * free memory when the tier reads it (qt_reserve_fn; before the tier starts the backend has no device to ask) */
+static Model *g_q36cc_plan_model;
+static size_t q36cc_places_reserve(size_t free_bytes) {
+    size_t b = 0;
+    if (g_q36cc_plan_model && g_q36_mux_slots > 1 && coli_kv_plan())
+        q36_places_plan(g_q36cc_plan_model, q36cc_kves(), free_bytes, &b);
     return b;
+}
+static void q36cc_places_plan_at_tier(Model *m) {
+    g_q36cc_plan_model = m;
+    qt_reserve_fn(q36cc_places_reserve);
 }
 /* room for `bytes` more (and 512 MiB): the least recently used places' KV mirrors go first */
 static int q36cc_conv_room(Q36CChain *ch, Model *m, int keep, size_t bytes) {

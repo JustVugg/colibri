@@ -301,14 +301,12 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
                 float **Kc = mr ? mr[s].seq->K : m->K, **Vc = mr ? mr[s].seq->V : m->V;
                 const int64_t srow = mr ? (int64_t)s * kvdim : 0;
                 const float *rv = rr + (int64_t)s * H * dr + h * dr;
-                {   /* the bank over the distances the row reaches (0 .. its positions - 1), its rows outermost: each
-                     * distance's sum over the bank in the same order, vectorized over the distances */
-                    const int ne = qpos - t0 + 1 < ext ? qpos - t0 + 1 : ext;
-                    for (int e = 0; e < ne; e++) rl[e] = 0.f;
-                    for (int d = 0; d < dr; d++) {
-                        const float w = rv[d], *pr = l->relp + (int64_t)d * ext;
-                        for (int e = 0; e < ne; e++) rl[e] += w * pr[e];
-                    }
+                /* the bank's loop as dev's: in this file the compiler fuses it otherwise when it runs over the bank's rows
+                 * first (the engine's answers changed; a harness built apart gave the same bits) */
+                for (int e = 0; e < ext; e++) {
+                    float acc = 0.f;
+                    for (int d = 0; d < dr; d++) acc += rv[d] * l->relp[(int64_t)d * ext + e];
+                    rl[e] = acc;
                 }
                 float tau = 1.f;   /* global layers: log-length scaling of q and the relative states */
                 if (!local && c->log_floor > 0) {
