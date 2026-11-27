@@ -28,6 +28,12 @@ layout(constant_id = 2) const int SPLIT = 0;
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
 layout(std430, binding = 1) readonly buffer KB { float kc[]; };
 layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+// KV16: the ring's K and V float16, two a word (chain_relattn.comp's); the step's own rows stay float32
+layout(constant_id = 3) const bool KV16 = false;
+layout(std430, binding = 1) readonly buffer KBH { uint kch[]; };
+layout(std430, binding = 2) readonly buffer VBH { uint vch[]; };
+float kf(int i) { return KV16 ? unpackHalf2x16(kch[i >> 1])[i & 1] : kc[i]; }
+float vf(int i) { return KV16 ? unpackHalf2x16(vch[i >> 1])[i & 1] : vc[i]; }
 layout(std430, binding = 3) writeonly buffer OB { float o[]; };
 layout(std430, binding = 4) readonly buffer SB { float kvs[]; };
 layout(std430, binding = 5) readonly buffer RB { float r[]; };
@@ -58,11 +64,11 @@ shared float sm[PM], sl[PM], sn[PM], scr[PM];   // running max and sum, the tile
 
 int row_t0(int qpos) { return p.window > 0 ? max(0, qpos - p.window + 1) : 0; }
 float k_at(int t, int kvh, int d) {
-    return t < p.pos_base ? kc[p.k_off + (kvh * p.cap + t % p.cap) * p.hd + d]
+    return t < p.pos_base ? kf(p.k_off + (kvh * p.cap + t % p.cap) * p.hd + d)
                           : kvs[p.ks_off + (t - p.pos_base) * p.kv_row + kvh * p.hd + d];
 }
 float v_at(int t, int kvh, int d) {
-    return t < p.pos_base ? vc[p.v_off + (kvh * p.cap + t % p.cap) * p.hd + d]
+    return t < p.pos_base ? vf(p.v_off + (kvh * p.cap + t % p.cap) * p.hd + d)
                           : kvs[p.vs_off + (t - p.pos_base) * p.kv_row + kvh * p.hd + d];
 }
 

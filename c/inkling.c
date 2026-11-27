@@ -2482,32 +2482,31 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     int win = kv_ring_rows(c, li, m->max_t);
     float scale = 1.f / (float)hd;
     float *ctx = falloc((int64_t)S*qdim);
-    /* a (KV head, row) at a time with the KV head's `group` query heads: each K and V row read once for all
-     * of them (pairs of heads through dot_f32_lanes_x2, the same bits as dot_f32_lanes), the bias bank mixed
-     * over the distances the row reaches with the bank's rows outermost (each distance's sum in the same
-     * order). Each head's arithmetic is a head's alone, in its order. */
+    /* a (KV head, row) at a time with the KV head's `group` query heads one after the other, so the K and V rows
+     * one head reads are in the cache for the next: each head's arithmetic is the (head, row) loop's, word for word
+     * (a reordered form changed the compiler's fusions, and with them the bits) */
     #pragma omp parallel
     {
-        float *rl = malloc((size_t)group * ext * sizeof(float));
-        float *sc = malloc((size_t)group * m->max_t * sizeof(float));
+        float *rl = malloc(ext * sizeof(float));
+        float *sc = malloc((size_t)m->max_t * sizeof(float));
         #pragma omp for collapse(2) schedule(static)
         for (int g = 0; g < KV; g++) {
-            for (int s = 0; s < S; s++) {
+            for (int s = 0; s < S; s++) for (int hh = 0; hh < group; hh++) {
+                int h = g * group + hh;
                 int qpos = mr ? mr[s].pos : pos0 + s;
                 int sp0 = mr ? qpos : pos0;       /* the scratch's first position: the row's own in a multiplexed step */
                 int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
                 int tb = sp0 > t0 ? sp0 : t0;   /* first row served by the scratch */
-                int n = qpos - t0 + 1, ne = n < ext ? n : ext;   /* the distances 0 .. n - 1 */
                 float **Kc = mr ? mr[s].seq->K : m->K, **Vc = mr ? mr[s].seq->V : m->V;
                 int64_t srow = mr ? (int64_t)s*kvdim : 0;
                 /* mix the relative-bias bank for this (token, head): rl[dist] */
-                for (int hh = 0; hh < group; hh++) {
-                    const float *rv = rr + (int64_t)s*H*c->d_rel + (g*group + hh)*c->d_rel;
-                    float *rh = rl + (int64_t)hh*ext;
-                    for (int e = 0; e < ne; e++) rh[e] = 0.f;
+                const float *rv = rr + (int64_t)s*H*c->d_rel + h*c->d_rel;
+                {   /* the distances the row reaches, the bank's rows outermost (each distance's sum in the same order) */
+                    const int ne = qpos - t0 + 1 < ext ? qpos - t0 + 1 : ext;
+                    for (int e = 0; e < ne; e++) rl[e] = 0.f;
                     for (int d = 0; d < c->d_rel; d++) {
                         const float w = rv[d], *pr = l->relp + (int64_t)d*ext;
-                        for (int e = 0; e < ne; e++) rh[e] += w * pr[e];
+                        for (int e = 0; e < ne; e++) rl[e] += w * pr[e];
                     }
                 }
                 /* tau: log-length scaling on global layers (f32, per query pos) */
@@ -2516,36 +2515,27 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     double en = (double)(qpos + 1) / c->log_floor;
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
-                const float *qg = q + (int64_t)s*qdim + (int64_t)g*group*hd;
-                const float *Kh = Kc[li] + ((int64_t)g*win)*hd;
-                const float *Kb = k  + srow + (int64_t)g*hd;
+                const float *qv = q + (int64_t)s*qdim + h*hd;
+                const float *Kh = Kc[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Kb = k  + srow + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
                     const float *kv = t < tb ? Kh + (int64_t)(t % win)*hd
                                              : Kb + (int64_t)(t - sp0)*kvdim;
-                    int dist = qpos - t, hh = 0;
-                    for (; hh + 2 <= group; hh += 2) {
-                        float dt[2];
-                        dot_f32_lanes_x2(dt, qg + (int64_t)hh*hd, qg + (int64_t)(hh + 1)*hd, kv, hd);
-                        for (int u = 0; u < 2; u++)
-                            sc[(int64_t)(hh + u)*m->max_t + (t - t0)] = tau * (dt[u]*scale + (dist < ext ? rl[(int64_t)(hh + u)*ext + dist] : 0.f));
-                    }
-                    for (; hh < group; hh++)
-                        sc[(int64_t)hh*m->max_t + (t - t0)] = tau * (dot_f32_lanes(qg + (int64_t)hh*hd, kv, hd)*scale + (dist < ext ? rl[(int64_t)hh*ext + dist] : 0.f));
+                    float acc = dot_f32_lanes(qv, kv, hd);
+                    int dist = qpos - t;
+                    sc[t - t0] = tau * (acc*scale + (dist < ext ? rl[dist] : 0.f));
                 }
-                float *cg = ctx + (int64_t)s*qdim + (int64_t)g*group*hd;
-                for (int hh = 0; hh < group; hh++) {
-                    softmax_row(sc + (int64_t)hh*m->max_t, n);
-                    for (int d = 0; d < hd; d++) cg[(int64_t)hh*hd + d] = 0.f;
-                }
-                const float *Vh = Vc[li] + ((int64_t)g*win)*hd;
-                const float *Vb = vv + srow + (int64_t)g*hd;
+                int n = qpos - t0 + 1;
+                softmax_row(sc, n);
+                float *cx = ctx + (int64_t)s*qdim + h*hd;
+                for (int d = 0; d < hd; d++) cx[d] = 0.f;
+                const float *Vh = Vc[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Vb = vv + srow + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
                     const float *vrow = t < tb ? Vh + (int64_t)(t % win)*hd
                                                : Vb + (int64_t)(t - sp0)*kvdim;
-                    for (int hh = 0; hh < group; hh++) {
-                        float a = sc[(int64_t)hh*m->max_t + (t - t0)], *cx = cg + (int64_t)hh*hd;
-                        for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
-                    }
+                    float a = sc[t - t0];
+                    for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
                 }
             }
         }

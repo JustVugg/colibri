@@ -3576,19 +3576,42 @@ static VkPipeline kx_pipe(int k) {
 }
 /* chain_relattn_tile.comp (a prompt chunk's rows, vkc_relattn below): a pipeline per (G, ND), its
  * specialization constants, G = H / KVH from 1 to 4, ND 1 for hd <= 128 and 2 for hd <= 256 */
-static struct { VkShaderModule mod; VkPipeline pipe[4][2][2]; int tried, ptried[4][2][2]; } g_kt[2];
+static struct { VkShaderModule mod; VkPipeline pipe[4][2][2][2]; int tried, ptried[4][2][2][2]; VkPipeline rel16; int rel16_tried; } g_kt[2];
+static int g_relattn_kv16;   /* vkc_relattn_kv16: the rings' K and V float16 */
 #define KRT (g_kt[g_kd])
 #define RELATTN_TILE_SHARED ((4096 + 24 * 16 + 24 * 128 + 4 * 24) * 4)   /* the shader's shared arrays */
 static VkPipeline kt_pipe(int G, int nd, int split) {
+    const int h = g_relattn_kv16 ? 1 : 0;
     if (G < 1 || G > 4 || nd < 1 || nd > 2 || split < 0 || split > 1 || !vkc_ready()) return VK_NULL_HANDLE;
-    if (KRT.pipe[G - 1][nd - 1][split] || KRT.ptried[G - 1][nd - 1][split]) return KRT.pipe[G - 1][nd - 1][split];
-    KRT.ptried[G - 1][nd - 1][split] = 1;
+    if (KRT.pipe[G - 1][nd - 1][split][h] || KRT.ptried[G - 1][nd - 1][split][h]) return KRT.pipe[G - 1][nd - 1][split][h];
+    KRT.ptried[G - 1][nd - 1][split][h] = 1;
     if (!KRT.tried) { KRT.tried = 1; KRT.mod = load_module(KC.core.spv_path, "chain_relattn_tile.spv"); }
     if (!KRT.mod || kc_shared_limit() < RELATTN_TILE_SHARED) return VK_NULL_HANDLE;
-    int32_t v[3] = {G, nd, split};
-    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
-    VkSpecializationInfo si = {3, me, sizeof v, v};
-    return KRT.pipe[G - 1][nd - 1][split] = make_pipe(KRT.mod, &si);
+    int32_t v[4] = {G, nd, split, h};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
+    VkSpecializationInfo si = {4, me, sizeof v, v};
+    return KRT.pipe[G - 1][nd - 1][split][h] = make_pipe(KRT.mod, &si);
+}
+/* chain_relattn.comp itself: its float32 pipeline (kx_pipe), or KV16's */
+static VkPipeline rel_pipe(void) {
+    if (!g_relattn_kv16) return kx_pipe(1);
+    if (KRT.rel16 || KRT.rel16_tried || !kx_pipe(1)) return KRT.rel16;
+    KRT.rel16_tried = 1;
+    VkBool32 on = VK_TRUE;
+    VkSpecializationMapEntry me = {0, 0, sizeof on};
+    VkSpecializationInfo si = {1, &me, sizeof on, &on};
+    return KRT.rel16 = make_pipe(KX.mod[1], &si);
+}
+int vkc_relattn_kv16(int on) {
+    int was = g_relattn_kv16;
+    if (on >= 0) g_relattn_kv16 = on != 0;
+    return was;
+}
+int vkc_relattn_kv16_ready(void) {
+    int was = vkc_relattn_kv16(1);
+    VkPipeline p = rel_pipe();
+    vkc_relattn_kv16(was);
+    return p != VK_NULL_HANDLE && vkc_kvh_ready();
 }
 /* rb and jc for chain_relattn_tile.comp: rb rows a block (24 / G at most), jc V rows a pass, (jc + rb - 1) * hd
  * within its 4096 floats */
@@ -3604,8 +3627,9 @@ static void kx_shutdown(void) {
         if (KX.mod[k]) vkDestroyShaderModule(KC.dev, KX.mod[k], NULL);
     }
     memset(&KX, 0, sizeof KX);
-    for (int g = 0; g < 4; g++) for (int n = 0; n < 2; n++) for (int t = 0; t < 2; t++)
-        if (KRT.pipe[g][n][t]) vkDestroyPipeline(KC.dev, KRT.pipe[g][n][t], NULL);
+    for (int g = 0; g < 4; g++) for (int n = 0; n < 2; n++) for (int t = 0; t < 2; t++) for (int h = 0; h < 2; h++)
+        if (KRT.pipe[g][n][t][h]) vkDestroyPipeline(KC.dev, KRT.pipe[g][n][t][h], NULL);
+    if (KRT.rel16) vkDestroyPipeline(KC.dev, KRT.rel16, NULL);
     if (KRT.mod) vkDestroyShaderModule(KC.dev, KRT.mod, NULL);
     memset(&KRT, 0, sizeof KRT);
 }
@@ -3689,7 +3713,7 @@ int vkc_relattn_tile_dec(int on) {
 }
 int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                 const VkcRelAttn *p) {
-    VkPipeline pipe = kx_pipe(1);
+    VkPipeline pipe = rel_pipe();
     if (!pipe || p->hd > 256 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
     KC.kind = PK_ATTN;
     /* a decode step over many positions: its positions over workgroups, then their combine */

@@ -438,6 +438,11 @@ void vkc_relattn_part(VkcBuf *part);
  * for all of them, the arithmetic chain_relattn's mode 0's in its order (the same bits). rows >= 0 sets the
  * threshold (tests); returns the one before. */
 int  vkc_relattn_tile_rows(int rows);
+/* The rings vkc_relattn reads (kc, vc) in float16, two a word (offsets in halves): on >= 0 sets it for the calls
+ * after (the engine, at its chain's start), returns the one before. The step's own rows (kvs) stay float32;
+ * vkc_copy_regions_h puts them into such a ring. _ready: 1 when the device takes it. */
+int  vkc_relattn_kv16(int on);
+int  vkc_relattn_kv16_ready(void);
 /* COLI_VK_RELATTN_TILE_DEC (off): the split decode's partials on chain_relattn_tile.comp (a KV head's query
  * heads a workgroup, the same bits as mode 1); on >= 0 sets it (tests), returns the one before */
 int  vkc_relattn_tile_dec(int on);
