@@ -345,6 +345,102 @@ class UIProxyDisconnectTest(unittest.TestCase):
     def test_live_reader_observes_upstream_chunk_failure(self):
         self.held_response(chunked=True, abort=True)
 
+    def test_windows_connection_aborted_cancels_upstream_prefill(self):
+        """Windows reports aborted peer sockets as ConnectionAbortedError (WinError 10053),
+        a sibling of ConnectionResetError under ConnectionError. The disconnect monitor must
+        treat it as a client disconnect and shut down upstream."""
+        shut = threading.Event()
+
+        class FakeFrontend:
+            def getsockopt(self, *_args):
+                return 0
+
+            def recv(self, *_args):
+                raise ConnectionAbortedError(10053, "software in your host machine")
+
+        class FakeUpstream:
+            def shutdown(self, _how):
+                shut.set()
+
+        class FakeConn:
+            sock = FakeUpstream()
+
+            def close(self):
+                pass
+
+        handler = type("H", (), {"connection": FakeFrontend()})()
+        with patch.object(ui.responses_shim.select, "select", return_value=([handler.connection], [], [])):
+            with ui.responses_shim._cancel_on_disconnect(handler, FakeConn()) as disconnected:
+                self.assertTrue(shut.wait(1), "ConnectionAbortedError did not shut down upstream")
+                self.assertTrue(disconnected.is_set())
+        self.assert_monitors_finished()
+
+    def test_windows_connection_aborted_during_write_closes_cleanly(self):
+        """A ConnectionAbortedError (WinError 10053) on wfile write must close the frontend
+        connection cleanly instead of escaping _proxy uncaught."""
+        class Backend(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+            def log_message(self, *args):
+                pass
+
+        backend = self.server(Backend)
+        errors, finished, closed_flag = [], threading.Event(), []
+
+        class AbortingProxy(ui.Handler):
+            def _proxy(self, *args):
+                orig_write = self.wfile.write
+
+                def abort_on_end(data):
+                    if data == b"0\r\n\r\n":
+                        raise ConnectionAbortedError(10053, "aborted")
+                    return orig_write(data)
+
+                self.wfile.write = abort_on_end
+                try:
+                    return super()._proxy(*args)
+                except Exception as error:
+                    errors.append(error)
+                finally:
+                    closed_flag.append(self.close_connection)
+                    finished.set()
+
+            def log_message(self, *args):
+                pass
+
+        AbortingProxy.backend = urlsplit("http://127.0.0.1:%d" % backend.server_port)
+        server = self.server(AbortingProxy)
+        connection = self.connect(server, streaming=True)
+        try:
+            self.assertTrue(finished.wait(2))
+            self.assertEqual(errors, [])
+            self.assertEqual(closed_flag, [True])
+        finally:
+            connection.close()
+        self.assert_monitors_finished()
+
+    def test_api_and_ui_servers_refuse_double_bind_on_occupied_port(self):
+        """A second APIServer or _UIServer must fail immediately on an occupied port on
+        every OS (including Windows, where SO_REUSEADDR otherwise allows port hijacking)."""
+        first_api = gw.APIServer(("127.0.0.1", 0), None, "m1")
+        self.addCleanup(first_api.server_close)
+        with self.assertRaises(OSError):
+            second_api = gw.APIServer(("127.0.0.1", first_api.server_port), None, "m2")
+            second_api.server_close()
+
+        first_ui = ui._UIServer(("127.0.0.1", 0), ui.Handler)
+        self.addCleanup(first_ui.server_close)
+        with self.assertRaises(OSError):
+            second_ui = ui._UIServer(("127.0.0.1", first_ui.server_port), ui.Handler)
+            second_ui.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

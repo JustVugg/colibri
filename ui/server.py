@@ -17,7 +17,7 @@ with neither it answers 404 and the page says the feature is not available.
 Streams (chat in SSE) are passed through chunk by chunk. A confirmed client reset
 or failed response write closes upstream. A client that only closes its request
 write side can still read its response."""
-import argparse, ipaddress, json, os, sys, time, urllib.parse
+import argparse, ipaddress, json, os, socket, sys, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -214,7 +214,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except ConnectionError:
                 self.close_connection = True
             finally:
                 resp.close()
@@ -318,6 +318,18 @@ def _alive(pid):
     return os.path.exists("/proc/%d" % pid)
 
 
+class _UIServer(ThreadingHTTPServer):
+    daemon_threads = True
+    # On Windows SO_REUSEADDR lets a second process bind an already-listening port;
+    # SO_EXCLUSIVEADDRUSE prevents both exact-address and wildcard/loopback hijacking.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8790)
@@ -381,8 +393,7 @@ def main():
             Handler.models = models
         except Exception as e:   # noqa: BLE001 - a tree without colibri's setup modules: no Models page
             print("colibri UI: no Models page (%s: %s)" % (type(e).__name__, e), file=sys.stderr)
-    srv = ThreadingHTTPServer((a.host, a.port), Handler)
-    srv.daemon_threads = True
+    srv = _UIServer((a.host, a.port), Handler)
     print("colibri UI: http://%s:%d  (the gateway: %s)" % (a.host, a.port, a.backend), flush=True)
     try:
         srv.serve_forever()
