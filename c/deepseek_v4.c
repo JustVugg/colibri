@@ -2331,6 +2331,33 @@ static int v4_attn_batch_proj_on(void) {
     }
     return wanted;
 }
+/* V4_HOST_CLEANUP (opt-in, default 0): keep decode attention per-call scratch
+ * in grow-only static slots instead of calloc/malloc per token and skip the
+ * CPU input qdq when the GPU projections already produced qa and kv. */
+static int v4_host_cleanup_on(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("V4_HOST_CLEANUP");
+        wanted = env && *env && atoi(env) != 0;
+    }
+    return wanted;
+}
+/* Per-call scratch with one static slot each (V4_HOST_CLEANUP only). A slot is
+ * reallocated only when it must grow; its contents are never assumed zero. */
+enum { V4_ATTN_SLOTS = 20 };
+static void *v4_attn_slot_ptr[V4_ATTN_SLOTS];
+static size_t v4_attn_slot_cap[V4_ATTN_SLOTS];
+static void *v4_attn_slot_get(int slot, size_t bytes) {
+    if (!bytes) bytes = 1;
+    if (v4_attn_slot_cap[slot] < bytes) {
+        void *p = malloc(bytes);
+        if (!p) return NULL;
+        free(v4_attn_slot_ptr[slot]);
+        v4_attn_slot_ptr[slot] = p;
+        v4_attn_slot_cap[slot] = bytes;
+    }
+    return v4_attn_slot_ptr[slot];
+}
 
 static int attention_token_impl(float *output,
                                 ColiDeepSeekV4WindowAttentionState *state,
@@ -2360,20 +2387,36 @@ static int attention_token_impl(float *output,
         fp8_view(&wo_b, weights, "attn.wo_b"))
         return set_error(error, error_size, "missing native FP8 attention tensor");
 
-    float *qa = calloc((size_t)q_rank, sizeof(*qa));
-    float *q = calloc((size_t)heads * head_dim, sizeof(*q));
-    float *kv = calloc((size_t)head_dim, sizeof(*kv));
-    float *attended = calloc((size_t)heads * head_dim, sizeof(*attended));
-    float *oa = calloc((size_t)groups * o_rank, sizeof(*oa));
-    float *norm_weight = calloc((size_t)(q_rank > head_dim ? q_rank : head_dim),
-                                sizeof(*norm_weight));
-    float *cosines = calloc((size_t)rope_dim / 2, sizeof(*cosines));
-    float *sines = calloc((size_t)rope_dim / 2, sizeof(*sines));
+    int hc = v4_host_cleanup_on();
+    float *qa, *q, *kv, *attended, *oa, *norm_weight, *cosines, *sines;
+    if (hc) {
+        qa = v4_attn_slot_get(0, (size_t)q_rank * sizeof(*qa));
+        q = v4_attn_slot_get(1, (size_t)heads * head_dim * sizeof(*q));
+        kv = v4_attn_slot_get(2, (size_t)head_dim * sizeof(*kv));
+        attended = v4_attn_slot_get(3, (size_t)heads * head_dim * sizeof(*attended));
+        oa = v4_attn_slot_get(4, (size_t)groups * o_rank * sizeof(*oa));
+        norm_weight = v4_attn_slot_get(5, (size_t)(q_rank > head_dim ? q_rank : head_dim) *
+                                          sizeof(*norm_weight));
+        cosines = v4_attn_slot_get(6, (size_t)rope_dim / 2 * sizeof(*cosines));
+        sines = v4_attn_slot_get(7, (size_t)rope_dim / 2 * sizeof(*sines));
+    } else {
+        qa = calloc((size_t)q_rank, sizeof(*qa));
+        q = calloc((size_t)heads * head_dim, sizeof(*q));
+        kv = calloc((size_t)head_dim, sizeof(*kv));
+        attended = calloc((size_t)heads * head_dim, sizeof(*attended));
+        oa = calloc((size_t)groups * o_rank, sizeof(*oa));
+        norm_weight = calloc((size_t)(q_rank > head_dim ? q_rank : head_dim),
+                             sizeof(*norm_weight));
+        cosines = calloc((size_t)rope_dim / 2, sizeof(*cosines));
+        sines = calloc((size_t)rope_dim / 2, sizeof(*sines));
+    }
     int *compressed_indices = NULL;
     int compressed_selected = 0;
     if (!qa || !q || !kv || !attended || !oa || !norm_weight || !cosines || !sines) {
-        free(sines); free(cosines); free(norm_weight); free(oa);
-        free(attended); free(kv); free(q); free(qa);
+        if (!hc) {
+            free(sines); free(cosines); free(norm_weight); free(oa);
+            free(attended); free(kv); free(q); free(qa);
+        }
         return set_error(error, error_size, "out of memory in attention");
     }
 
@@ -2381,11 +2424,14 @@ static int attention_token_impl(float *output,
      * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
      * compute, GPU path invariato (riceve l'input raw come prima).
      * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
-    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
-    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
-    int result = (!input_act || !input_act_scales ||
-                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
-                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
+    float *input_act = hc ? v4_attn_slot_get(8, (size_t)wq_a.columns * sizeof(*input_act))
+                          : malloc((size_t)wq_a.columns * sizeof(*input_act));
+    uint8_t *input_act_scales = hc ? v4_attn_slot_get(9, (size_t)wq_a.columns / 128 + 1)
+                                   : malloc((size_t)wq_a.columns / 128 + 1);
+    int result = (!input_act || !input_act_scales) ? -1 : 0;
+    if (!result && !hc)
+        result = coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
+                                             (size_t)wq_a.columns, 128) ? -1 : 0;
     static int aprof = -1;
     struct timespec ap0, ap1;
     if (aprof < 0) aprof = getenv("DSV4_DECODE_PROF") != NULL;
@@ -2536,6 +2582,11 @@ static int attention_token_impl(float *output,
         }
     }
 #endif
+    /* The input qdq feeds only the per-call CPU fallback. With V4_HOST_CLEANUP
+     * it is skipped when the GPU already produced both qa and kv. */
+    if (!result && hc && (!qa_done || !kv_done))
+        result = coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
+                                             (size_t)wq_a.columns, 128) ? -1 : 0;
     if (!result && !qa_done) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     if (!fused_done) coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
@@ -2587,8 +2638,10 @@ static int attention_token_impl(float *output,
         if (!result && produced) state->compressed_count++;
         AP_MARK(g_v4_ap_comp_c);
         if (!result && state->indexer) {
-            compressed_indices = malloc((size_t)config->index_topk *
-                                        sizeof(*compressed_indices));
+            compressed_indices = hc ? v4_attn_slot_get(14, (size_t)config->index_topk *
+                                                           sizeof(*compressed_indices))
+                                    : malloc((size_t)config->index_topk *
+                                             sizeof(*compressed_indices));
             if (!compressed_indices) result = -1;
             else {
                 /* Same split as prefill (advance, then select_batch with a
@@ -2660,15 +2713,17 @@ static int attention_token_impl(float *output,
         coli_v4_rope_apply(kv_rope, 1, rope_dim, cosines, sines, 0);
         coli_bf16_round_array(kv_rope, (size_t)rope_dim);
         size_t nope = (size_t)(head_dim - rope_dim);
-        float *qdq = malloc(nope * sizeof(*qdq));
-        uint8_t *scales = malloc((nope + 63) / 64);
+        float *qdq = hc ? v4_attn_slot_get(12, nope * sizeof(*qdq))
+                        : malloc(nope * sizeof(*qdq));
+        uint8_t *scales = hc ? v4_attn_slot_get(13, (nope + 63) / 64)
+                             : malloc((nope + 63) / 64);
         if (!qdq || !scales || coli_fp8_activation_qdq_ref(qdq, scales, kv, nope, 64))
             result = -1;
         if (!result) {
             memcpy(kv, qdq, nope * sizeof(*kv));
             coli_bf16_round_array(kv, nope);
         }
-        free(scales); free(qdq);
+        if (!hc) { free(scales); free(qdq); }
     }
     }   /* !fused_done */
 
@@ -2961,10 +3016,12 @@ static int attention_token_impl(float *output,
     free(lf_out); free(lf_kv); free(lf_qa); free(lf_q); free(lf_sel);
 #endif
 
-    free(compressed_indices);
-    free(sines); free(cosines); free(norm_weight); free(oa);
-    free(attended); free(kv); free(q); free(qa);
-    free(input_act_scales); free(input_act);
+    if (!hc) {
+        free(compressed_indices);
+        free(sines); free(cosines); free(norm_weight); free(oa);
+        free(attended); free(kv); free(q); free(qa);
+        free(input_act_scales); free(input_act);
+    }
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -7236,19 +7293,61 @@ static int block_token_pipeline(float *output_hc,
         return set_error(error, error_size, "invalid block arguments");
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
-    float *residual = malloc(hd * sizeof(*residual));
-    float *state = malloc(hd * sizeof(*state));
-    float *reduced = malloc((size_t)d * sizeof(*reduced));
-    float *normalized = malloc((size_t)d * sizeof(*normalized));
-    float *branch = malloc((size_t)d * sizeof(*branch));
-    float *post = malloc((size_t)hc * sizeof(*post));
-    float *comb = malloc((size_t)hc * hc * sizeof(*comb));
-    if (!residual || !state || !reduced || !normalized || !branch ||
-        !post || !comb) {
-        free(comb); free(post); free(branch); free(normalized);
-        free(reduced); free(state); free(residual); return -1;
+    /* V4_DECODE_GPU_MHC=1 (opt-in, default off): the decode token's four mHC
+     * steps on the GPU with the same kernels the batched prefill uses (batch = 1).
+     * Each GPU post runs only right after a successful GPU pre on the same host
+     * pointers, so its residency tags always describe this layer's bytes; any
+     * failure falls back to the CPU step. */
+    static int gpu_mhc = -1;
+    if (gpu_mhc < 0) {
+        const char *setting = getenv("V4_DECODE_GPU_MHC");
+        gpu_mhc = setting && atoi(setting) != 0;
     }
-    memcpy(residual, input_hc, hd * sizeof(*residual));
+    /* V4_MHC_CHAIN=1 (opt-in, default off): inside target_token's layer loop
+     * the streams stay on the device between the four steps
+     * (coli_v4_gpu_mhc_chain_*): input_hc may be stale on the host (its bytes
+     * in a mirror), the GPU posts leave state and output_hc stale, and every
+     * CPU step flushes first. The block's buffers are static (the scope belongs
+     * to one thread) instead of seven mallocs per layer; residual, used only by
+     * the CPU posts, is copied when one of them runs. */
+    int chain = 0;
+    float *residual = NULL, *state = NULL, *reduced = NULL, *normalized = NULL;
+    float *branch = NULL, *post = NULL, *comb = NULL;
+#ifdef COLI_V4_GPU_TIER
+    if (coli_v4_gpu_mhc_chain_active()) {
+        static float *chain_buffer;
+        static size_t chain_floats;
+        size_t floats = 2 * hd + 3 * (size_t)d + (size_t)hc + (size_t)hc * hc;
+        if (chain_floats < floats) {
+            free(chain_buffer);
+            chain_buffer = malloc(floats * sizeof(*chain_buffer));
+            chain_floats = chain_buffer ? floats : 0;
+        }
+        chain = gpu_mhc && chain_buffer;
+        if (chain) {
+            residual = chain_buffer; state = residual + hd; reduced = state + hd;
+            normalized = reduced + d; branch = normalized + d; post = branch + d;
+            comb = post + hc;
+        } else if (coli_v4_gpu_mhc_chain_flush()) {   /* input_hc must be valid */
+            return set_error(error, error_size, "mHC chain: streams download failed");
+        }
+    }
+#endif
+    if (!chain) {
+        residual = malloc(hd * sizeof(*residual));
+        state = malloc(hd * sizeof(*state));
+        reduced = malloc((size_t)d * sizeof(*reduced));
+        normalized = malloc((size_t)d * sizeof(*normalized));
+        branch = malloc((size_t)d * sizeof(*branch));
+        post = malloc((size_t)hc * sizeof(*post));
+        comb = malloc((size_t)hc * hc * sizeof(*comb));
+        if (!residual || !state || !reduced || !normalized || !branch ||
+            !post || !comb) {
+            free(comb); free(post); free(branch); free(normalized);
+            free(reduced); free(state); free(residual); return -1;
+        }
+        memcpy(residual, input_hc, hd * sizeof(*residual));
+    }
     /* DSV4_DECODE_PROF=1: per-token stage totals across layers (printed at
      * layer 0 for the previous token). */
     static int dprof = -1;
@@ -7267,9 +7366,20 @@ static int block_token_pipeline(float *output_hc,
     const char *stage = "attention hyper-connection";
     if (error && error_size) error[0] = 0;
     int team = v4_hc_decode_team(experts);
-    int result = normalized_hc_pre_team(reduced, post, comb, normalized, input_hc,
-                                        weights, config, "attn", "attn_norm.weight",
-                                        team);
+    int gpu_pre = 0, chain_lost = 0;
+#ifdef COLI_V4_GPU_TIER
+    gpu_pre = gpu_mhc &&
+        (chain ? coli_v4_gpu_mhc_chain_pre(weights, 0, post, comb, normalized,
+                                           input_hc, hc, d)
+               : coli_v4_gpu_mhc_pre_norm_batch(weights, "attn", "attn_norm", post, comb,
+                                                normalized, input_hc, hc, d, 1)) == 0;
+    /* chain: the CPU pre reads input_hc, which may be stale */
+    if (chain && !gpu_pre) chain_lost = coli_v4_gpu_mhc_chain_flush() != 0;
+#endif
+    int result = gpu_pre ? 0 : chain_lost ? -1
+        : normalized_hc_pre_team(reduced, post, comb, normalized, input_hc,
+                                 weights, config, "attn", "attn_norm.weight",
+                                 team);
     DP_MARK(dp_hc);
     if (!result) stage = "attention";
     if (!result) result = attention
@@ -7279,28 +7389,76 @@ static int block_token_pipeline(float *output_hc,
                                       position, error, error_size);
     DP_MARK(dp_attn);
     if (!result) stage = "attention hyper-connection post";
-    if (!result) result = coli_v4_hc_post_team(state, branch, residual,
-                                               post, comb, hc, d, team);
-    if (!result) coli_bf16_round_array(state, hd);
-    if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    int gpu_post = 0;
+#ifdef COLI_V4_GPU_TIER
+    /* residual is a copy of input_hc: pass input_hc so the residual tag hits */
+    gpu_post = !result && gpu_pre &&
+        (chain ? coli_v4_gpu_mhc_chain_post(weights, 0, state, branch, input_hc,
+                                            post, comb, hc, d)
+               : coli_v4_gpu_mhc_post_batch(weights, state, branch, input_hc, post, comb,
+                                            hc, d, 1)) == 0;
+    /* chain: the CPU post reads residual, copied here from a valid input_hc */
+    if (chain && !result && !gpu_post) {
+        if (coli_v4_gpu_mhc_chain_flush()) result = -1;
+        else memcpy(residual, input_hc, hd * sizeof(*residual));
+    }
+#endif
+    if (!result && !gpu_post) result = coli_v4_hc_post_team(state, branch, residual,
+                                                            post, comb, hc, d, team);
+    /* chain + GPU post: state stays on the device (stale here); the kernel's
+     * output is bf16 already, so the rounding is the identity on it, and
+     * residual is copied only when a CPU post needs it */
+    if (!result && !(chain && gpu_post)) coli_bf16_round_array(state, hd);
+    if (!result && !(chain && gpu_post)) memcpy(residual, state, hd * sizeof(*residual));
     if (!result) stage = "FFN hyper-connection";
-    if (!result) result = normalized_hc_pre_team(reduced, post, comb, normalized, state,
-                                                 weights, config, "ffn",
-                                                 "ffn_norm.weight", team);
+    gpu_pre = 0;
+#ifdef COLI_V4_GPU_TIER
+    gpu_pre = !result && gpu_mhc &&
+        (chain ? coli_v4_gpu_mhc_chain_pre(weights, 1, post, comb, normalized,
+                                           state, hc, d)
+               : coli_v4_gpu_mhc_pre_norm_batch(weights, "ffn", "ffn_norm", post, comb,
+                                                normalized, state, hc, d, 1)) == 0;
+    /* chain: the CPU pre reads state, the CPU post residual = state */
+    if (chain && !result && !gpu_pre) {
+        if (coli_v4_gpu_mhc_chain_flush()) result = -1;
+        else memcpy(residual, state, hd * sizeof(*residual));
+    }
+#endif
+    if (!result && !gpu_pre) result = normalized_hc_pre_team(reduced, post, comb, normalized, state,
+                                                             weights, config, "ffn",
+                                                             "ffn_norm.weight", team);
     DP_MARK(dp_hc);
     if (!result) stage = "MoE";
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
     DP_MARK(dp_moe);
     if (!result) stage = "FFN hyper-connection post";
-    if (!result) result = coli_v4_hc_post_team(output_hc, branch, residual,
-                                               post, comb, hc, d, team);
-    if (!result) coli_bf16_round_array(output_hc, hd);
+    gpu_post = 0;
+#ifdef COLI_V4_GPU_TIER
+    /* residual now holds a copy of state: pass state so the residual tag hits */
+    gpu_post = !result && gpu_pre &&
+        (chain ? coli_v4_gpu_mhc_chain_post(weights, 1, output_hc, branch, state,
+                                            post, comb, hc, d)
+               : coli_v4_gpu_mhc_post_batch(weights, output_hc, branch, state, post, comb,
+                                            hc, d, 1)) == 0;
+    /* chain: the CPU post reads residual, a copy of a valid state */
+    if (chain && !result && !gpu_post) {
+        if (coli_v4_gpu_mhc_chain_flush()) result = -1;
+        else memcpy(residual, state, hd * sizeof(*residual));
+    }
+#endif
+    if (!result && !gpu_post) result = coli_v4_hc_post_team(output_hc, branch, residual,
+                                                            post, comb, hc, d, team);
+    /* chain + GPU post: output_hc stays on the device (stale until the next
+     * pre reads the mirror or a host reader materializes it) */
+    if (!result && !(chain && gpu_post)) coli_bf16_round_array(output_hc, hd);
     DP_MARK(dp_hc);
     if (dprof) dp_layers++;
 #undef DP_MARK
-    free(comb); free(post); free(branch); free(normalized);
-    free(reduced); free(state); free(residual);
+    if (!chain) {
+        free(comb); free(post); free(branch); free(normalized);
+        free(reduced); free(state); free(residual);
+    }
     if (!result) return 0;
     if (moe_reason()[0])
         return set_error(error, error_size, "block computation failed in MoE: %s",
@@ -13230,6 +13388,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
 }
 
 static void v4_upload_report(void);
+static void v4_mhc_chain_release(void);   /* V4_MHC_CHAIN pinned staging */
 void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
     if (engine && engine->gpu.enabled && coli_v4_hot_split_on())
         fprintf(stderr, "v4_gpu hot-split experts gpu=%llu cpu=%llu uploads=%llu mirrors=%d\n",
@@ -13243,6 +13402,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
      * banks. Callers outside generate() (oracle, teacher forcing, Segment
      * runs) never release them themselves. */
     coli_v4_gpu_moe_batch_release();
+    v4_mhc_chain_release();
     dsv4_cuda_proj_batch_release();
     for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
         if (!engine->gpu.layer_ready[layer]) continue;
@@ -13815,8 +13975,18 @@ int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
 
 int coli_v4_gpu_wo_decode(const ColiTensorView *a, const ColiTensorView *b,
                            float *output, const float *input, int groups) {
-    const char *enabled = getenv("DSV4_CUDA_WO_DECODE");
-    if ((enabled && !atoi(enabled)) || !a->gpu || !b->gpu) return -1;
+    /* V4_HOST_CLEANUP (opt-in): read DSV4_CUDA_WO_DECODE once instead of per call. */
+    static int hc_flag = -1, wo_disabled = 0, wo_read = 0;
+    if (hc_flag < 0) {
+        const char *h = getenv("V4_HOST_CLEANUP");
+        hc_flag = h && *h && atoi(h) != 0;
+    }
+    if (!hc_flag || !wo_read) {
+        const char *enabled = getenv("DSV4_CUDA_WO_DECODE");
+        wo_disabled = enabled && !atoi(enabled);
+        wo_read = hc_flag;
+    }
+    if (wo_disabled || !a->gpu || !b->gpu) return -1;
     return dsv4_cuda_wo_decode(a->gpu, b->gpu, groups, output, input) ? 0 : -1;
 }
 
@@ -16629,6 +16799,9 @@ int coli_v4_gpu_attention_wo_batch(
 /* Shared activation mirrors for the batched mHC offload. Grow-only, single
  * generation thread (same contract as the other prefill mirrors). */
 static void v4_gpu_mhc_tags_clear(void);
+static void v4_mhc_chain_evict(const Dsv4CudaActivation *act);
+static int v4_mhc_chain_guard(void);
+static int v4_mhc_chain_foreign(void);
 
 static Dsv4CudaActivation *v4_gpu_mhc_mirror(int slot, int device,
                                              long long elements) {
@@ -16636,10 +16809,13 @@ static Dsv4CudaActivation *v4_gpu_mhc_mirror(int slot, int device,
     static long long capacity[4];
     static int mirror_device = -1;
     if (slot < 0 || slot > 3) return NULL;
+    /* a scope is open on another thread: its mirrors and record are not ours */
+    if (v4_mhc_chain_foreign()) return NULL;
     if (mirror_device != device || capacity[slot] < elements)
         v4_gpu_mhc_tags_clear();    /* a freed activation address can recycle */
     if (mirror_device != device) {
         for (int i = 0; i < 4; i++) {
+            v4_mhc_chain_evict(mirrors[i]);   /* V4_MHC_CHAIN: stale host bytes first */
             if (mirrors[i]) dsv4_cuda_activation_free(mirrors[i]);
             mirrors[i] = NULL;
             capacity[i] = 0;
@@ -16647,6 +16823,7 @@ static Dsv4CudaActivation *v4_gpu_mhc_mirror(int slot, int device,
         mirror_device = device;
     }
     if (capacity[slot] < elements) {
+        v4_mhc_chain_evict(mirrors[slot]);
         if (mirrors[slot]) dsv4_cuda_activation_free(mirrors[slot]);
         mirrors[slot] = dsv4_cuda_activation_create(device, elements);
         capacity[slot] = mirrors[slot] ? elements : 0;
@@ -16685,6 +16862,7 @@ int coli_v4_gpu_mhc_pre_norm_batch(
     if (!coli_v4_gpu_attn_batch_wanted() || !weights || !branch || !norm_key ||
         !posts || !combs || !normalized || !inputs_hc ||
         hc != 4 || hidden != 4096 || batch < 1) return -1;
+    if (v4_mhc_chain_guard()) return -1;   /* V4_MHC_CHAIN: never clobber device-only streams */
     char key[64];
     snprintf(key, sizeof(key), "hc_%s_fn", branch);
     Dsv4CudaTensor *fn = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, key);
@@ -16731,6 +16909,7 @@ int coli_v4_gpu_mhc_post_batch(
     if (!coli_v4_gpu_attn_batch_wanted() || !weights || !outputs_hc ||
         !branch || !residual_hc || !posts || !combs ||
         hc != 4 || hidden != 4096 || batch < 1) return -1;
+    if (v4_mhc_chain_guard()) return -1;   /* V4_MHC_CHAIN: never clobber device-only streams */
     Dsv4CudaTensor *anchor =
         (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "hc_attn_fn");
     if (!anchor) return -1;
@@ -16767,7 +16946,579 @@ int coli_v4_gpu_mhc_post_batch(
     free(state_host);
     return good ? 0 : -1;
 }
-#endif /* COLI_V4_GPU_TIER && _WIN32 */
+
+/* ==== V4_MHC_CHAIN (opt-in, default off): the decode hc streams stay on the device
+ *
+ * The V4_DECODE_GPU_MHC decode path makes two pre and two post calls per layer,
+ * each a full host round trip: every pre uploads the 64 KiB of streams the
+ * previous post has just downloaded (the same bytes are still in a mirror),
+ * every post downloads its 64 KiB output and syncs, every pre downloads x and
+ * post/comb into pageable memory (each download blocks), looks up four tensors
+ * by name and mallocs. With the chain, inside target_token's layer loop (the
+ * scope, opened by coli_v4_gpu_mhc_chain_begin on the generation thread):
+ *  - a post enqueues upload(branch) + mhc_output_batch and returns: no download,
+ *    no sync. Its output stays in mirror slot 0 or 3 (ping-pong, so the output
+ *    never aliases the residual the kernel reads) and its host buffer is STALE
+ *    (v4_mhc_chain.host);
+ *  - the next pre whose input is that host buffer reads the mirror instead of
+ *    uploading, and downloads x and post/comb into pinned staging under one sync
+ *    (which also retires the post before it);
+ *  - host readers of a stale buffer call coli_v4_gpu_mhc_chain_materialize
+ *    (the DSpark tap), CPU fallbacks call coli_v4_gpu_mhc_chain_flush, and
+ *    coli_v4_gpu_mhc_chain_end makes the final streams valid on the host before
+ *    target_token returns (final_hidden, the head, prefix checkpoints,
+ *    MTP/DSpark, snapshots);
+ *  - the fn/scale/base/norm handles come from a (layer, site) slot-index cache
+ *    checked with one strcmp each, instead of snprintf + linear name scans.
+ * Same kernels in the same order on the same bytes (the GPU outputs are already
+ * bf16, so the host bf16 rounding the old path applies before re-uploading is
+ * the identity): bit-identical to the V4_DECODE_GPU_MHC path.
+ * V4_MHC_CHAIN_VERIFY=1 (implies the chain) also runs the old path on shadow
+ * mirrors (its own residual, fed by its own previous outputs) and byte-compares
+ * streams in/out, x, post and comb per call, the materialized streams and the
+ * cached handles; mismatches are counted and the first ones printed. */
+static int v4_mhc_chain_flag(const char *setting) {
+    return setting && atoi(setting) != 0;
+}
+
+/* Sub-switches of the chain for splitting its gain in an A/B (both default on,
+ * both bit-identical): V4_MHC_CHAIN_PINNED=0 keeps the x and post/comb staging
+ * pageable (each download blocks again), V4_MHC_CHAIN_HCACHE=0 looks the four
+ * tensors up by name on every pre as the old path does. */
+static int v4_mhc_chain_option(const char *setting, int *cache) {
+    if (*cache < 0) *cache = setting ? atoi(setting) != 0 : 1;
+    return *cache;
+}
+static int v4_mhc_chain_pinned_opt = -1, v4_mhc_chain_hcache_opt = -1;
+
+static int v4_mhc_chain_verify_wanted(void) {
+    static int wanted = -1;
+    if (wanted < 0) wanted = v4_mhc_chain_flag(getenv("V4_MHC_CHAIN_VERIFY"));
+    return wanted;
+}
+
+static int v4_mhc_chain_wanted(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        int chain = v4_mhc_chain_flag(getenv("V4_MHC_CHAIN")) ||
+                    v4_mhc_chain_verify_wanted();
+        /* the chain lives inside the V4_DECODE_GPU_MHC path only */
+        wanted = chain && v4_mhc_chain_flag(getenv("V4_DECODE_GPU_MHC")) &&
+                 coli_v4_gpu_attn_batch_wanted();
+        if (chain)
+            fprintf(stderr, "v4_mhc_chain %s verify=%d\n",
+                    wanted ? "on" : "off (needs V4_DECODE_GPU_MHC=1 and COLI_CUDA_ATTN_BATCH=1)",
+                    v4_mhc_chain_verify_wanted());
+    }
+    return wanted;
+}
+
+static struct {
+    const float *host;               /* host buffer whose bytes live in act; NULL: none */
+    const Dsv4CudaActivation *act;   /* the mirror holding them */
+    long long elements;
+    int stale;                       /* the host copy has not been downloaded */
+    int slot;                        /* act's ping-pong index: 0 = mirror 0, 1 = mirror 3 */
+    int cur;                         /* ping-pong index of the residual of the last
+                                      * successful chain pre, -1: no pre to post after */
+    int device;                      /* that pre's device */
+} v4_mhc_chain = {NULL, NULL, 0, 0, 0, -1, -1};
+static __thread int v4_mhc_chain_scope;     /* a scope is open on this thread */
+static int v4_mhc_chain_owner;              /* a scope is open on some thread */
+/* 1 when a scope is open on ANOTHER thread: the record, the mirrors and the
+ * tags belong to that thread's token, so this thread must not touch them.
+ * The owner flag is set before the owner's scope bit and cleared after it. */
+static int v4_mhc_chain_foreign(void) {
+    return __atomic_load_n(&v4_mhc_chain_owner, __ATOMIC_ACQUIRE) &&
+           !v4_mhc_chain_scope;
+}
+static float *v4_mhc_stage;                 /* x [4096] then post/comb [20] */
+static int v4_mhc_stage_pinned;
+static struct {
+    unsigned long long tokens, pre, post, resident, uploads, materialized, flushes;
+} v4_mhc_chain_stats;
+
+static struct {
+    int on, layer, site, messages, pre_valid;
+    unsigned long long pre, post, unverified, last_total;
+    unsigned long long mism_in, mism_x, mism_post, mism_comb, mism_out, mism_mat,
+                       mism_handles;
+    float *in, *x, *pc, *out, *tmp;  /* shadow residual, x, post+comb, output; readback */
+    const float *out_for;            /* the host buffer `out` stands for; NULL: none */
+} v4_mhc_verify;
+
+static void v4_mhc_chain_forget(void) {
+    v4_mhc_chain.host = NULL;
+    v4_mhc_chain.act = NULL;
+    v4_mhc_chain.elements = 0;
+    v4_mhc_chain.stale = 0;
+    v4_mhc_chain.cur = -1;
+}
+
+static void v4_mhc_verify_cmp(const char *kind, const float *chain,
+                              const float *shadow, long long n,
+                              unsigned long long *counter) {
+    if (!memcmp(chain, shadow, (size_t)n * sizeof(*chain))) return;
+    (*counter)++;
+    long long first = -1, differing = 0;
+    for (long long i = 0; i < n; i++)
+        if (memcmp(&chain[i], &shadow[i], sizeof(*chain))) {
+            if (first < 0) first = i;
+            differing++;
+        }
+    if (v4_mhc_verify.messages < 32 && first >= 0) {
+        uint32_t a, b;
+        memcpy(&a, &chain[first], sizeof(a));
+        memcpy(&b, &shadow[first], sizeof(b));
+        v4_mhc_verify.messages++;
+        fprintf(stderr, "v4_mhc_chain_verify MISMATCH layer=%d site=%s %s: %lld/%lld "
+                        "floats differ, first [%lld] chain=%08x old=%08x\n",
+                v4_mhc_verify.layer, v4_mhc_verify.site ? "ffn" : "attn", kind,
+                differing, n, first, (unsigned)a, (unsigned)b);
+    }
+}
+
+/* the pending host copy, then sync; the device copy stays valid */
+static int v4_mhc_chain_download(void) {
+    Dsv4CudaActivation *act = (Dsv4CudaActivation *)v4_mhc_chain.act;
+    int good = act && v4_mhc_chain.host &&
+        dsv4_cuda_activation_download((float *)v4_mhc_chain.host, act,
+                                      v4_mhc_chain.elements) &&
+        dsv4_cuda_activation_sync(act);
+    v4_mhc_chain_stats.materialized++;
+    if (!good) return -1;
+    v4_mhc_chain.stale = 0;
+    if (v4_mhc_verify.on && v4_mhc_verify.out_for == v4_mhc_chain.host &&
+        v4_mhc_chain.elements == 4LL * 4096)
+        v4_mhc_verify_cmp("materialized", v4_mhc_chain.host, v4_mhc_verify.out,
+                          v4_mhc_chain.elements, &v4_mhc_verify.mism_mat);
+    return 0;
+}
+
+int coli_v4_gpu_mhc_chain_materialize(const float *host) {
+    if (v4_mhc_chain_foreign()) return -1;   /* another thread's streams */
+    if (!host || host != v4_mhc_chain.host || !v4_mhc_chain.stale) return 0;
+    return v4_mhc_chain_download();
+}
+
+int coli_v4_gpu_mhc_chain_flush(void) {
+    if (v4_mhc_chain_foreign()) return -1;   /* another thread's streams: leave them */
+    int result = 0;
+    if (v4_mhc_chain.host) {
+        if (v4_mhc_chain.stale) result = v4_mhc_chain_download();
+        v4_mhc_chain_stats.flushes++;
+    }
+    v4_mhc_chain_forget();
+    /* the CPU computes the next step: the shadow cannot follow it */
+    v4_mhc_verify.out_for = NULL;
+    v4_mhc_verify.pre_valid = 0;
+    return result;
+}
+
+static void v4_mhc_chain_evict(const Dsv4CudaActivation *act) {
+    if (!act || v4_mhc_chain.act != act) return;
+    if (v4_mhc_chain.stale && v4_mhc_chain_download())
+        fprintf(stderr, "v4_mhc_chain: lost device-only streams of a reallocated mirror\n");
+    v4_mhc_chain_forget();
+}
+
+/* A batched mHC call on a thread that is not the scope's owner: refused (-1)
+ * without touching the record, the mirrors or the tags. */
+static int v4_mhc_chain_guard(void) {
+    if (v4_mhc_chain_foreign()) return -1;
+    if (v4_mhc_chain.host && v4_mhc_chain.stale && coli_v4_gpu_mhc_chain_flush())
+        fprintf(stderr, "v4_mhc_chain: flush before a batched mHC call failed\n");
+    return 0;
+}
+
+int coli_v4_gpu_mhc_chain_active(void) { return v4_mhc_chain_scope; }
+
+static int v4_mhc_verify_init(void) {
+    if (v4_mhc_verify.in) return 0;
+    size_t rh = (size_t)4 * 4096, xh = 4096;
+    float *in = malloc(rh * sizeof(*in)), *x = malloc(xh * sizeof(*x));
+    float *pc = malloc(20 * sizeof(*pc)), *out = malloc(rh * sizeof(*out));
+    float *tmp = malloc(rh * sizeof(*tmp));
+    if (!in || !x || !pc || !out || !tmp) {
+        free(in); free(x); free(pc); free(out); free(tmp);
+        fprintf(stderr, "v4_mhc_chain_verify: out of memory, verify off\n");
+        return -1;
+    }
+    v4_mhc_verify.in = in; v4_mhc_verify.x = x; v4_mhc_verify.pc = pc;
+    v4_mhc_verify.out = out; v4_mhc_verify.tmp = tmp;
+    return 0;
+}
+
+int coli_v4_gpu_mhc_chain_begin(void) {
+    if (!v4_mhc_chain_wanted() || v4_mhc_chain_scope) return 0;
+    if (__atomic_exchange_n(&v4_mhc_chain_owner, 1, __ATOMIC_ACQ_REL))
+        return 0;   /* another thread holds a scope: this forward stays unchained */
+    v4_mhc_chain_scope = 1;
+    v4_mhc_chain_forget();
+    v4_gpu_mhc_tags_clear();
+    v4_mhc_verify.on = v4_mhc_chain_verify_wanted() && !v4_mhc_verify_init();
+    v4_mhc_verify.out_for = NULL;
+    v4_mhc_verify.pre_valid = 0;
+    return 1;
+}
+
+int coli_v4_gpu_mhc_chain_end(void) {
+    if (!v4_mhc_chain_scope) return 0;
+    int result = 0;
+    if (v4_mhc_chain.host && v4_mhc_chain.stale) result = v4_mhc_chain_download();
+    v4_mhc_chain_forget();
+    v4_gpu_mhc_tags_clear();
+    v4_mhc_chain_scope = 0;
+    __atomic_store_n(&v4_mhc_chain_owner, 0, __ATOMIC_RELEASE);
+    unsigned long long tokens = ++v4_mhc_chain_stats.tokens;
+    if (tokens == 1 || tokens % 64 == 0)
+        fprintf(stderr, "v4_mhc_chain tokens=%llu pre=%llu post=%llu resident=%llu "
+                        "uploads=%llu materialized=%llu flushes=%llu pinned=%d\n",
+                tokens, v4_mhc_chain_stats.pre, v4_mhc_chain_stats.post,
+                v4_mhc_chain_stats.resident, v4_mhc_chain_stats.uploads,
+                v4_mhc_chain_stats.materialized, v4_mhc_chain_stats.flushes,
+                v4_mhc_stage_pinned);
+    if (v4_mhc_verify.on) {
+        unsigned long long total = v4_mhc_verify.mism_in + v4_mhc_verify.mism_x +
+            v4_mhc_verify.mism_post + v4_mhc_verify.mism_comb +
+            v4_mhc_verify.mism_out + v4_mhc_verify.mism_mat +
+            v4_mhc_verify.mism_handles;
+        if (tokens <= 2 || tokens % 32 == 0 || total != v4_mhc_verify.last_total)
+            fprintf(stderr, "v4_mhc_chain_verify tokens=%llu pre=%llu post=%llu "
+                            "unverified=%llu mismatches=%llu (streams_in=%llu x=%llu "
+                            "post=%llu comb=%llu streams_out=%llu materialized=%llu "
+                            "handles=%llu)\n",
+                    tokens, v4_mhc_verify.pre, v4_mhc_verify.post,
+                    v4_mhc_verify.unverified, total, v4_mhc_verify.mism_in,
+                    v4_mhc_verify.mism_x, v4_mhc_verify.mism_post,
+                    v4_mhc_verify.mism_comb, v4_mhc_verify.mism_out,
+                    v4_mhc_verify.mism_mat, v4_mhc_verify.mism_handles);
+        v4_mhc_verify.last_total = total;
+    }
+    return result;
+}
+
+/* Engine close: the pinned staging belongs to the backend's context. */
+static void v4_mhc_chain_release(void) {
+    if (v4_mhc_chain_scope || v4_mhc_chain_foreign()) return;
+    if (v4_mhc_stage) {
+        if (v4_mhc_stage_pinned) dsv4_cuda_host_free(v4_mhc_stage);
+        else free(v4_mhc_stage);
+    }
+    v4_mhc_stage = NULL;
+    v4_mhc_stage_pinned = 0;
+}
+
+static int v4_mhc_chain_stage(void) {
+    if (v4_mhc_stage) return 0;
+    size_t bytes = (size_t)(4096 + 32) * sizeof(float);
+    if (v4_mhc_chain_option(getenv("V4_MHC_CHAIN_PINNED"), &v4_mhc_chain_pinned_opt))
+        v4_mhc_stage = (float *)dsv4_cuda_host_alloc(bytes);
+    v4_mhc_stage_pinned = v4_mhc_stage != NULL;
+    if (!v4_mhc_stage) v4_mhc_stage = malloc(bytes);   /* older DLL: pageable */
+    if (!v4_mhc_stage) return -1;
+    fprintf(stderr, "v4_mhc_chain staging=%s handle_cache=%d\n",
+            v4_mhc_stage_pinned ? "pinned"
+            : v4_mhc_chain_pinned_opt ? "pageable (backend without dsv4_cuda_host_alloc)"
+                                      : "pageable (V4_MHC_CHAIN_PINNED=0)",
+            v4_mhc_chain_option(getenv("V4_MHC_CHAIN_HCACHE"), &v4_mhc_chain_hcache_opt));
+    return 0;
+}
+
+/* Handle cache: per (layer, site) the plan slots of fn/scale/base/norm, found
+ * with coli_v4_layer_gpu's lookup and revalidated by one strcmp of the slot's
+ * name; the handle itself is always read from weights->gpu. */
+enum { V4_MHC_HCACHE_LAYERS = 128, V4_MHC_HCACHE_NAME = 64 };
+static const char *const v4_mhc_keys[2][4] = {
+    {"hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm"},
+    {"hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "ffn_norm"},
+};
+static struct V4MhcHandleSlot {
+    int ok;
+    size_t count;
+    int idx[4];
+    char name[4][V4_MHC_HCACHE_NAME];
+} v4_mhc_hcache[V4_MHC_HCACHE_LAYERS][2];
+
+/* coli_v4_layer_gpu, returning the plan slot instead of the handle */
+static int v4_mhc_layer_gpu_index(const ColiDeepSeekV4LayerWeights *weights,
+                                  const char *suffix) {
+    char name[COLI_V4_MAX_TENSOR_NAME];
+    snprintf(name, sizeof(name), "layers.%d.%s.weight", weights->plan.layer, suffix);
+    for (size_t i = 0; i < weights->plan.tensor_count; i++)
+        if (strcmp(weights->plan.tensors[i].name, name) == 0) return (int)i;
+    snprintf(name, sizeof(name), "layers.%d.%s", weights->plan.layer, suffix);
+    for (size_t i = 0; i < weights->plan.tensor_count; i++)
+        if (strcmp(weights->plan.tensors[i].name, name) == 0) return (int)i;
+    return -1;
+}
+
+static int v4_mhc_handles(const ColiDeepSeekV4LayerWeights *weights, int site,
+                          Dsv4CudaTensor *t[4]) {
+    int layer = weights->plan.layer;
+    size_t count = weights->plan.tensor_count;
+    if (v4_mhc_chain_hcache_opt < 0)
+        v4_mhc_chain_option(getenv("V4_MHC_CHAIN_HCACHE"), &v4_mhc_chain_hcache_opt);
+    if (!v4_mhc_chain_hcache_opt) {
+        for (int k = 0; k < 4; k++)   /* the old path's lookups */
+            t[k] = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, v4_mhc_keys[site][k]);
+        return t[0] && t[1] && t[2] && t[3] ? 0 : -1;
+    }
+    struct V4MhcHandleSlot *slot = layer >= 0 && layer < V4_MHC_HCACHE_LAYERS
+        ? &v4_mhc_hcache[layer][site] : NULL;
+    int hit = slot && slot->ok && slot->count == count;
+    for (int k = 0; hit && k < 4; k++)
+        hit = slot->idx[k] >= 0 && (size_t)slot->idx[k] < count &&
+              strcmp(weights->plan.tensors[slot->idx[k]].name, slot->name[k]) == 0;
+    if (hit) {
+        for (int k = 0; k < 4; k++)
+            t[k] = (Dsv4CudaTensor *)weights->gpu[slot->idx[k]];
+    } else {
+        int fill = slot != NULL;
+        for (int k = 0; k < 4; k++) {
+            int i = v4_mhc_layer_gpu_index(weights, v4_mhc_keys[site][k]);
+            t[k] = i >= 0 ? (Dsv4CudaTensor *)weights->gpu[i] : NULL;
+            if (fill && (i < 0 || strlen(weights->plan.tensors[i].name) >= V4_MHC_HCACHE_NAME))
+                fill = 0;
+            if (fill) {
+                slot->idx[k] = i;
+                strcpy(slot->name[k], weights->plan.tensors[i].name);
+            }
+        }
+        if (slot) {
+            slot->ok = fill;
+            slot->count = count;
+        }
+    }
+    if (v4_mhc_verify.on)
+        for (int k = 0; k < 4; k++) {
+            Dsv4CudaTensor *reference =
+                (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, v4_mhc_keys[site][k]);
+            if (reference != t[k]) {
+                v4_mhc_verify.mism_handles++;
+                if (v4_mhc_verify.messages < 32) {
+                    v4_mhc_verify.messages++;
+                    fprintf(stderr, "v4_mhc_chain_verify MISMATCH layer=%d handle %s\n",
+                            layer, v4_mhc_keys[site][k]);
+                }
+                t[k] = reference;
+            }
+        }
+    return t[0] && t[1] && t[2] && t[3] ? 0 : -1;
+}
+
+/* Shadow mirrors for V4_MHC_CHAIN_VERIFY (the old path's own device state). */
+static Dsv4CudaActivation *v4_mhc_shadow(int slot, int device, long long elements) {
+    static Dsv4CudaActivation *mirrors[4];
+    static long long capacity[4];
+    static int shadow_device = -1;
+    if (slot < 0 || slot > 3) return NULL;
+    if (shadow_device != device) {
+        for (int i = 0; i < 4; i++) {
+            if (mirrors[i]) dsv4_cuda_activation_free(mirrors[i]);
+            mirrors[i] = NULL;
+            capacity[i] = 0;
+        }
+        shadow_device = device;
+    }
+    if (capacity[slot] < elements) {
+        if (mirrors[slot]) dsv4_cuda_activation_free(mirrors[slot]);
+        mirrors[slot] = dsv4_cuda_activation_create(device, elements);
+        capacity[slot] = mirrors[slot] ? elements : 0;
+    }
+    return mirrors[slot];
+}
+
+/* The old pre on the shadow: upload its own host residual, the same 4
+ * kernels, download post/comb and x; compare with the chain's results and the
+ * chain's device residual with the old path's host one. */
+static void v4_mhc_verify_pre(Dsv4CudaTensor *const t[4], int device,
+                              const float *inputs_hc, int resident,
+                              const Dsv4CudaActivation *residual,
+                              const float *posts, const float *combs,
+                              const float *normalized) {
+    const long long rh = 4LL * 4096, sh = 20, xh = 4096;
+    v4_mhc_verify.pre++;
+    v4_mhc_verify.pre_valid = 0;
+    const float *source = !resident ? inputs_hc
+        : v4_mhc_verify.out_for == inputs_hc ? v4_mhc_verify.out : NULL;
+    if (!source) { v4_mhc_verify.unverified++; return; }
+    memcpy(v4_mhc_verify.in, source, (size_t)rh * sizeof(float));
+    Dsv4CudaActivation *s0 = v4_mhc_shadow(0, device, rh);
+    Dsv4CudaActivation *s1 = v4_mhc_shadow(1, device, sh);
+    Dsv4CudaActivation *s2 = v4_mhc_shadow(2, device, xh);
+    int good = s0 && s1 && s2 &&
+        dsv4_cuda_activation_download(v4_mhc_verify.tmp, residual, rh) &&
+        dsv4_cuda_activation_upload(s0, v4_mhc_verify.in, rh) &&
+        dsv4_cuda_mhc_pre_norm_batch(s0, t[0], t[1], t[2], t[3], 1, 4096, s1, s2) &&
+        dsv4_cuda_activation_download(v4_mhc_verify.pc, s1, sh) &&
+        dsv4_cuda_activation_download(v4_mhc_verify.x, s2, xh) &&
+        dsv4_cuda_activation_sync(s2);
+    if (!good) { v4_mhc_verify.unverified++; return; }
+    v4_mhc_verify_cmp("streams_in", v4_mhc_verify.tmp, v4_mhc_verify.in, rh,
+                      &v4_mhc_verify.mism_in);
+    v4_mhc_verify_cmp("post", posts, v4_mhc_verify.pc, 4, &v4_mhc_verify.mism_post);
+    v4_mhc_verify_cmp("comb", combs, v4_mhc_verify.pc + 4, 16, &v4_mhc_verify.mism_comb);
+    v4_mhc_verify_cmp("x", normalized, v4_mhc_verify.x, xh, &v4_mhc_verify.mism_x);
+    v4_mhc_verify.pre_valid = 1;
+}
+
+/* The old post on the shadow (its residual and post/comb are still in shadow
+ * slots 0/1 from the shadow pre): download + the old path's host bf16 rounding,
+ * compared with the chain's output read back from its mirror. */
+static void v4_mhc_verify_post(int device, const float *outputs_hc,
+                               const float *branch, const Dsv4CudaActivation *out) {
+    const long long rh = 4LL * 4096, sh = 20, xh = 4096;
+    v4_mhc_verify.post++;
+    v4_mhc_verify.out_for = NULL;
+    if (!v4_mhc_verify.pre_valid) { v4_mhc_verify.unverified++; return; }
+    v4_mhc_verify.pre_valid = 0;
+    Dsv4CudaActivation *s0 = v4_mhc_shadow(0, device, rh);
+    Dsv4CudaActivation *s1 = v4_mhc_shadow(1, device, sh);
+    Dsv4CudaActivation *s2 = v4_mhc_shadow(2, device, xh);
+    Dsv4CudaActivation *s3 = v4_mhc_shadow(3, device, rh);
+    int good = s0 && s1 && s2 && s3 &&
+        dsv4_cuda_activation_upload(s2, branch, xh) &&
+        dsv4_cuda_mhc_post_batch(s2, s0, s1, 1, 4096, s3) &&
+        dsv4_cuda_activation_download(v4_mhc_verify.out, s3, rh) &&
+        dsv4_cuda_activation_download(v4_mhc_verify.tmp, out, rh) &&
+        dsv4_cuda_activation_sync(s3);
+    if (!good) { v4_mhc_verify.unverified++; return; }
+    coli_bf16_round_array(v4_mhc_verify.out, (size_t)rh);
+    v4_mhc_verify_cmp("streams_out", v4_mhc_verify.tmp, v4_mhc_verify.out, rh,
+                      &v4_mhc_verify.mism_out);
+    v4_mhc_verify.out_for = outputs_hc;
+}
+
+int coli_v4_gpu_mhc_chain_pre(
+    const ColiDeepSeekV4LayerWeights *weights, int site, float *posts,
+    float *combs, float *normalized, const float *inputs_hc, int hc, int hidden) {
+    v4_mhc_chain.cur = -1;
+    if (!v4_mhc_chain_scope || !coli_v4_gpu_attn_batch_wanted() || !weights ||
+        site < 0 || site > 1 || !posts || !combs || !normalized || !inputs_hc ||
+        hc != 4 || hidden != 4096)
+        return -1;
+    Dsv4CudaTensor *t[4];
+    if (v4_mhc_handles(weights, site, t)) return -1;
+    int device = dsv4_cuda_tensor_device(t[0]);
+    if (device < 0 || v4_mhc_chain_stage()) return -1;
+    const long long rh = (long long)hc * hidden, sh = hc + hc * hc, xh = hidden;
+    Dsv4CudaActivation *ping[2];
+    ping[0] = v4_gpu_mhc_mirror(0, device, rh);
+    ping[1] = v4_gpu_mhc_mirror(3, device, rh);
+    Dsv4CudaActivation *state = v4_gpu_mhc_mirror(1, device, sh);
+    Dsv4CudaActivation *input = v4_gpu_mhc_mirror(2, device, xh);
+    if (!ping[0] || !ping[1] || !state || !input) {
+        v4_gpu_mhc_tags_clear();
+        return -1;
+    }
+    int resident = v4_mhc_chain.host == inputs_hc && v4_mhc_chain.elements == rh &&
+        v4_mhc_chain.device == device && v4_mhc_chain.act &&
+        v4_mhc_chain.act == ping[v4_mhc_chain.slot];
+    int cur;
+    if (resident) {
+        cur = v4_mhc_chain.slot;
+        v4_mhc_chain_stats.resident++;
+    } else {
+        /* the host copy is the input: whatever is stale goes back to the host
+         * first (it may be inputs_hc itself, or sit in the slot overwritten here) */
+        if (v4_mhc_chain.host && v4_mhc_chain.stale && coli_v4_gpu_mhc_chain_flush()) {
+            v4_gpu_mhc_tags_clear();
+            return -1;
+        }
+        v4_mhc_chain_forget();
+        cur = 0;
+        if (!dsv4_cuda_activation_upload(ping[cur], inputs_hc, rh)) {
+            v4_gpu_mhc_tags_clear();
+            return -1;
+        }
+        v4_mhc_chain_stats.uploads++;
+    }
+    float *x_stage = v4_mhc_stage, *pc_stage = v4_mhc_stage + 4096;
+    int good = dsv4_cuda_mhc_pre_norm_batch(ping[cur], t[0], t[1], t[2], t[3], 1,
+                                            hidden, state, input) &&
+        dsv4_cuda_activation_download(pc_stage, state, sh) &&
+        dsv4_cuda_activation_download(x_stage, input, xh) &&
+        dsv4_cuda_activation_sync(input);
+    if (!good) {
+        v4_gpu_mhc_tags_clear();
+        return -1;
+    }
+    memcpy(posts, pc_stage, (size_t)hc * sizeof(*posts));
+    memcpy(combs, pc_stage + hc, (size_t)hc * hc * sizeof(*combs));
+    memcpy(normalized, x_stage, (size_t)xh * sizeof(*normalized));
+    v4_gpu_mhc_res_tag = (struct V4GpuMhcTag){ping[cur], inputs_hc, rh};
+    v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){state, posts, sh};
+    v4_mhc_chain.cur = cur;
+    v4_mhc_chain.device = device;
+    v4_mhc_chain_stats.pre++;
+    if (v4_mhc_verify.on) {
+        v4_mhc_verify.layer = weights->plan.layer;
+        v4_mhc_verify.site = site;
+        v4_mhc_verify_pre(t, device, inputs_hc, resident, ping[cur], posts, combs,
+                          normalized);
+    }
+    return 0;
+}
+
+int coli_v4_gpu_mhc_chain_post(
+    const ColiDeepSeekV4LayerWeights *weights, int site, float *outputs_hc,
+    const float *branch, const float *residual_hc, const float *posts,
+    const float *combs, int hc, int hidden) {
+    int cur = v4_mhc_chain.cur, device = v4_mhc_chain.device;
+    v4_mhc_chain.cur = -1;   /* one post per pre */
+    if (!v4_mhc_chain_scope || !coli_v4_gpu_attn_batch_wanted() || !weights ||
+        site < 0 || site > 1 || !outputs_hc || !branch || !residual_hc || !posts ||
+        !combs || cur < 0 || device < 0 || hc != 4 || hidden != 4096)
+        return -1;
+    const long long rh = (long long)hc * hidden, sh = hc + hc * hc, xh = hidden;
+    Dsv4CudaActivation *ping[2];
+    ping[0] = v4_gpu_mhc_mirror(0, device, rh);
+    ping[1] = v4_gpu_mhc_mirror(3, device, rh);
+    Dsv4CudaActivation *state = v4_gpu_mhc_mirror(1, device, sh);
+    Dsv4CudaActivation *x = v4_gpu_mhc_mirror(2, device, xh);
+    if (!ping[0] || !ping[1] || !state || !x) return -1;
+    Dsv4CudaActivation *residual = ping[cur], *out = ping[1 - cur];
+    int res_resident =
+        v4_gpu_mhc_tag_hit(&v4_gpu_mhc_res_tag, residual, residual_hc, rh);
+    int state_resident =
+        v4_gpu_mhc_tag_hit(&v4_gpu_mhc_state_tag, state, posts, sh);
+    if (!res_resident) {
+        /* the residual comes from the host: its copy must be valid first */
+        if (v4_mhc_chain.host && v4_mhc_chain.stale && coli_v4_gpu_mhc_chain_flush())
+            return -1;
+        if (!dsv4_cuda_activation_upload(residual, residual_hc, rh)) return -1;
+    }
+    if (!state_resident) {
+        static float state_host[20];   /* pageable: the upload stages it at once */
+        memcpy(state_host, posts, (size_t)hc * sizeof(*posts));
+        memcpy(state_host + hc, combs, (size_t)hc * hc * sizeof(*combs));
+        if (!dsv4_cuda_activation_upload(state, state_host, sh)) return -1;
+    }
+    /* `out` is overwritten here: it must not hold the only copy of anything */
+    if (v4_mhc_chain.act == out) {
+        if (v4_mhc_chain.stale && coli_v4_gpu_mhc_chain_flush()) return -1;
+        v4_mhc_chain_forget();
+    }
+    if (!dsv4_cuda_activation_upload(x, branch, xh) ||
+        !dsv4_cuda_mhc_post_batch(x, residual, state, 1, hidden, out))
+        return -1;
+    /* no download, no sync: outputs_hc is stale until materialized */
+    v4_mhc_chain.host = outputs_hc;
+    v4_mhc_chain.act = out;
+    v4_mhc_chain.elements = rh;
+    v4_mhc_chain.stale = 1;
+    v4_mhc_chain.slot = 1 - cur;
+    v4_mhc_chain.device = device;
+    v4_mhc_chain_stats.post++;
+    if (v4_mhc_verify.on) {
+        v4_mhc_verify.layer = weights->plan.layer;
+        v4_mhc_verify.site = site;
+        v4_mhc_verify_post(device, outputs_hc, branch, out);
+    }
+    return 0;
+}
+#endif /* COLI_V4_GPU_TIER */
 #endif /* COLI_V4_UNIT_GPU */
 
 #ifdef COLI_V4_UNIT_PROMPT
@@ -18626,18 +19377,55 @@ static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **ne
         else { first_layer = chained; state = *state_ptr; next = *next_ptr; }
     }
 #endif
+    /* V4_MHC_CHAIN=1 (opt-in): the layers' hc streams stay on the device from
+     * one mHC step to the next (block_token_pipeline). Inside this loop the
+     * host copy of `state` may be stale: its only host reader here, the
+     * DSpark tap, materializes it first, and the scope's end downloads the
+     * final streams before anything after this function reads them
+     * (final_hidden, the head, prefix checkpoints, snapshots, MTP/DSpark).
+     * `next` is the swap scratch: its host bytes are not kept up to date. */
+    int mhc_chain = 0;
+    (void)mhc_chain;
+#ifdef COLI_V4_GPU_TIER
+    mhc_chain = coli_v4_gpu_mhc_chain_begin();
+#define V4_MHC_CHAIN_END() (mhc_chain ? coli_v4_gpu_mhc_chain_end() : 0)
+#else
+#define V4_MHC_CHAIN_END() 0
+#endif
     for (int layer_id = first_layer; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
-                               error, error_size)) return -1;
+                               error, error_size)) {
+            V4_MHC_CHAIN_END();
+            return -1;
+        }
         int result = coli_v4_block_window_token_ref(
             next, attention[layer_id], &layer, config, experts,
             state, token, position, error, error_size);
         coli_v4_layer_free(engine, &layer);
-        if (result) return -1;
+        if (result) {
+            V4_MHC_CHAIN_END();
+            return -1;
+        }
         float *swap = state; state = next; next = swap;
+#ifdef COLI_V4_GPU_TIER
+        if (mhc_chain && coli_v4_full_dspark_wanted &&
+            layer_id >= config->num_hidden_layers - V4_MAINH_TARGETS &&
+            coli_v4_gpu_mhc_chain_materialize(state)) {
+            V4_MHC_CHAIN_END();
+            if (error && error_size)
+                snprintf(error, error_size, "mHC chain: streams download failed");
+            return -1;
+        }
+#endif
         v4_mainh_tap(config, layer_id, state, position);
     }
+    if (V4_MHC_CHAIN_END()) {
+        if (error && error_size)
+            snprintf(error, error_size, "mHC chain: streams download failed");
+        return -1;
+    }
+#undef V4_MHC_CHAIN_END
     *state_ptr = state;
     *next_ptr = next;
     return 0;

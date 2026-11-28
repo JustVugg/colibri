@@ -215,6 +215,8 @@ typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
 typedef int             (*fn_stream_drain)(int device);
+typedef void           *(*fn_host_alloc)(size_t bytes);
+typedef void            (*fn_host_free)(void *p);
 typedef int             (*fn_mirror_alloc)(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
                                            int Og, int Ig, int Od, int Id, int device);
 typedef int             (*fn_mirror_refill)(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
@@ -370,6 +372,8 @@ static struct {
     fn_indexer_score_batch indexer_score_batch;
     fn_proj_batch proj_batch;                       /* optional (V4_ATTN_BATCH_PROJ, older DLLs: 0) */
     fn_proj_batch_release proj_batch_release;       /* optional */
+    fn_host_alloc host_alloc;                       /* optional (V4_MHC_CHAIN pinned buffers) */
+    fn_host_free host_free;                         /* optional (V4_MHC_CHAIN pinned buffers) */
     fn_fp8_ref_matmul fp8_ref_matmul;
     /* optional, V4_LAYER_FUSED: a decode token's attention on the device */
     fn_indexer_resident indexer_resident;
@@ -688,6 +692,13 @@ static int dsv4_cuda_resolve(const char *dllname){
     if (!g_dsv4.proj_batch || !g_dsv4.proj_batch_release) {
         g_dsv4.proj_batch = NULL;
         g_dsv4.proj_batch_release = NULL;
+    }
+    /* optional: without them V4_MHC_CHAIN keeps pageable activation buffers */
+    g_dsv4.host_alloc = (fn_host_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_alloc");
+    g_dsv4.host_free = (fn_host_free)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_free");
+    if (!g_dsv4.host_alloc || !g_dsv4.host_free) {
+        g_dsv4.host_alloc = NULL;
+        g_dsv4.host_free = NULL;
     }
     _Pragma("GCC diagnostic pop")
     return 1;
@@ -1024,6 +1035,15 @@ int dsv4_cuda_proj_batch(int n, Dsv4CudaTensor *const *t, const int *rows,
 
 void dsv4_cuda_proj_batch_release(void){
     if(g_dsv4.available && g_dsv4.proj_batch_release) g_dsv4.proj_batch_release();
+}
+
+void *dsv4_cuda_host_alloc(size_t bytes){
+    if(!g_dsv4.available || !g_dsv4.host_alloc) return NULL;
+    return g_dsv4.host_alloc(bytes);
+}
+
+void dsv4_cuda_host_free(void *p){
+    if(g_dsv4.available && g_dsv4.host_free) g_dsv4.host_free(p);
 }
 
 int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
