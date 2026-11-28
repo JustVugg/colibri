@@ -1599,6 +1599,185 @@ static int test_expert_store_slab_shift(void) {
     return 0;
 }
 
+/* V4_UPLOAD_PIECES: an expert's direct read lands in pieces and each is
+ * reported as it lands. The fixture's experts are large enough for several
+ * pieces: three tensors of 64 x 2048 FP4 values (65,536 weight bytes and
+ * 4,096 scale bytes each). Expert 0 keeps its scales and weights apart in the
+ * file, the others are one contiguous record. Every payload byte depends on
+ * its place in the file. */
+enum { WIDE_SCALE = 4096, WIDE_WEIGHT = 65536, WIDE_RECORD = 3 * (WIDE_SCALE + WIDE_WEIGHT) };
+static unsigned char wide_byte(size_t payload_offset) {
+    return (unsigned char)(payload_offset * 131u + (payload_offset >> 8) * 17u + (payload_offset >> 16));
+}
+static size_t wide_scales_at(int expert) { return (size_t)expert * (WIDE_RECORD + 64u); }
+static size_t wide_weights_at(int expert) {
+    return wide_scales_at(expert) + 3u * WIDE_SCALE + (expert ? 0u : 64u);   /* expert 0: a gap */
+}
+static int write_wide_fixture(const char *path, int expert_count) {
+    static const char *matrix_names[3] = {"w1", "w2", "w3"};
+    size_t header_capacity = 256 + (size_t)expert_count * 1024;
+    size_t payload_size = (size_t)expert_count * (WIDE_RECORD + 64u);
+    char *header = malloc(header_capacity);
+    unsigned char *payload = malloc(payload_size);
+    if (!header || !payload) { free(header); free(payload); return -1; }
+    size_t used = (size_t)snprintf(header, header_capacity, "{");
+    for (int expert = 0; expert < expert_count; expert++)
+        for (int matrix = 0; matrix < 3; matrix++) {
+            size_t scale = wide_scales_at(expert) + (size_t)matrix * WIDE_SCALE;
+            size_t weight = wide_weights_at(expert) + (size_t)matrix * WIDE_WEIGHT;
+            int count = snprintf(
+                header + used, header_capacity - used,
+                "%s\"layers.0.ffn.experts.%d.%s.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[64,64],"
+                "\"data_offsets\":[%zu,%zu]},"
+                "\"layers.0.ffn.experts.%d.%s.weight\":{\"dtype\":\"I8\",\"shape\":[64,1024],"
+                "\"data_offsets\":[%zu,%zu]}",
+                used > 1 ? "," : "", expert, matrix_names[matrix], scale, scale + WIDE_SCALE,
+                expert, matrix_names[matrix], weight, weight + WIDE_WEIGHT);
+            if (count < 0 || (size_t)count >= header_capacity - used) {
+                free(header); free(payload); return -1;
+            }
+            used += (size_t)count;
+        }
+    header[used++] = '}';
+    header[used] = '\0';
+    for (size_t i = 0; i < payload_size; i++) payload[i] = wide_byte(i);
+    uint64_t header_length = used;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | COMPAT_O_BINARY, 0600);
+    if (fd < 0) { free(header); free(payload); return -1; }
+    int result = write_all(fd, &header_length, sizeof(header_length)) ||
+                 write_all(fd, header, (size_t)header_length) ||
+                 write_all(fd, payload, payload_size);
+    close(fd);
+    free(header); free(payload);
+    return result ? -1 : 0;
+}
+
+/* what the hook saw of the read in flight: how often each record byte was
+ * reported, and whether it was the file's */
+static unsigned char piece_seen[WIDE_RECORD];
+static int piece_calls, piece_bad, piece_expert;
+static void piece_collect(void *context, unsigned long long record_offset, size_t length,
+                          const unsigned char *bytes) {
+    (void)context;
+    piece_calls++;
+    if (record_offset + length > WIDE_RECORD) { piece_bad++; return; }
+    for (size_t i = 0; i < length; i++) {
+        size_t at = (size_t)record_offset + i;
+        size_t payload_offset = at < 3u * WIDE_SCALE
+            ? wide_scales_at(piece_expert) + at
+            : wide_weights_at(piece_expert) + (at - 3u * WIDE_SCALE);
+        if (bytes[i] != wide_byte(payload_offset)) piece_bad++;
+        if (piece_seen[at] < 255) piece_seen[at]++;
+    }
+}
+static int wide_expert_ok(const ColiExpertView *view, int expert) {
+    const ColiTensorView *tensors[3] = {&view->gate, &view->down, &view->up};
+    for (int matrix = 0; matrix < 3; matrix++) {
+        const unsigned char *data = tensors[matrix]->data;
+        const unsigned char *scales = tensors[matrix]->scales;
+        if (tensors[matrix]->data_bytes != WIDE_WEIGHT || tensors[matrix]->scale_bytes != WIDE_SCALE)
+            return 0;
+        for (size_t i = 0; i < WIDE_SCALE; i++)
+            if (scales[i] != wide_byte(wide_scales_at(expert) + (size_t)matrix * WIDE_SCALE + i))
+                return 0;
+        for (size_t i = 0; i < WIDE_WEIGHT; i++)
+            if (data[i] != wide_byte(wide_weights_at(expert) + (size_t)matrix * WIDE_WEIGHT + i))
+                return 0;
+    }
+    return 1;
+}
+
+static int test_expert_store_piece_reads(void) {
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    setenv("COLI_V4_PREWARM", "0", 1);
+    unsetenv("COLI_V4_DIRECT");
+    unsetenv("V4_SLAB_SHIFT");
+    /* pieces: 0 = off (nothing reported), 1 = the window once it is in, 4
+     * and 16 = that many per window;
+     * the last pass keeps 4 and turns the shift off (nothing reported) */
+    static const int passes[5][2] = {{0, 1}, {1, 1}, {4, 1}, {16, 1}, {4, 0}};
+    for (int pass = 0; pass < 5; pass++) {
+        int pieces = passes[pass][0], shifted = passes[pass][1];
+        char setting[8];
+        snprintf(setting, sizeof(setting), "%d", pieces);
+        if (pieces) setenv("V4_UPLOAD_PIECES", setting, 1); else unsetenv("V4_UPLOAD_PIECES");
+        if (shifted) unsetenv("V4_SLAB_SHIFT"); else setenv("V4_SLAB_SHIFT", "0", 1);
+        char directory[] = "colibri-v4-pieces-XXXXXX";
+        char path[256], error[256];
+        if (!mkdtemp(directory)) { perror("mkdtemp pieces"); return 1; }
+        snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+        if (write_wide_fixture(path, 3) != 0) { perror("write_wide_fixture"); rmdir(directory); return 1; }
+        ColiDeepSeekV4ExpertStoreOptions options = {
+            directory, 1, 3, (uint64_t)3 * WIDE_RECORD, -1, 0, 0, 0
+        };
+        ColiExpertStore *store = NULL;
+        if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof(error)) != 0) {
+            fprintf(stderr, "%s\n", error);
+            unlink(path); rmdir(directory);
+            return 1;
+        }
+        int failed = coli_v4_test_force_streaming_direct(store) != 0;
+        if (failed) fprintf(stderr, "piece reads: no streaming-direct fd\n");
+        coli_v4_test_piece_hook = piece_collect;
+        coli_v4_test_reset_direct_io_stats();
+        for (int expert = 0; expert < 3 && !failed; expert++) {
+            memset(piece_seen, 0, sizeof(piece_seen));
+            piece_calls = piece_bad = 0;
+            piece_expert = expert;
+            ColiExpertView view;
+            if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &view) != 0) {
+                fprintf(stderr, "piece reads: lookup of expert %d failed\n", expert);
+                failed = 1;
+                break;
+            }
+            if (!wide_expert_ok(&view, expert)) {
+                fprintf(stderr, "piece reads: expert %d differs (pieces=%d shift=%d)\n",
+                        expert, pieces, shifted);
+                failed = 1;
+            }
+            coli_expert_release(store, &view);
+            int reported = pieces > 0 && shifted;
+            size_t once = 0;
+            for (size_t i = 0; i < WIDE_RECORD; i++) once += piece_seen[i] == 1;
+            if (!failed && reported && (once != WIDE_RECORD || piece_bad || piece_calls < 1)) {
+                fprintf(stderr, "piece reads: expert %d, %d pieces: %zu of %d bytes reported once, "
+                                "%d wrong, %d calls\n", expert, pieces, once, (int)WIDE_RECORD,
+                        piece_bad, piece_calls);
+                failed = 1;
+            }
+            /* one window (and expert 0's scale run) for 1; else 4 pieces, or about 16 */
+            if (!failed && reported &&
+                (pieces == 1 ? piece_calls > 2 : piece_calls < (pieces == 16 ? 12 : 4))) {
+                fprintf(stderr, "piece reads: expert %d, %d pieces asked, %d calls\n",
+                        expert, pieces, piece_calls);
+                failed = 1;
+            }
+            if (!failed && !reported && piece_calls) {
+                fprintf(stderr, "piece reads: expert %d reported %d pieces with pieces=%d shift=%d\n",
+                        expert, piece_calls, pieces, shifted);
+                failed = 1;
+            }
+        }
+        coli_v4_test_piece_hook = NULL;
+        uint64_t reads = coli_v4_test_direct_reads();
+        uint64_t fallbacks = coli_v4_test_direct_fallbacks();
+        store->ops->destroy(store);
+        if (scratch_remove(directory, path)) return 1;
+        if (failed) return 1;
+        if (reads != 3 || fallbacks != 0) {
+            fprintf(stderr, "piece reads: direct reads=%llu fallbacks=%llu (pieces=%d)\n",
+                    (unsigned long long)reads, (unsigned long long)fallbacks, pieces);
+            return 1;
+        }
+    }
+    unsetenv("V4_UPLOAD_PIECES");
+    unsetenv("V4_SLAB_SHIFT");
+    puts("DeepSeek-V4 ExpertStore piece reads: ok");
+    return 0;
+}
+
 static int prewarm_resident(ColiExpertStore *store, int layers, int experts) {
     int resident = 0;
     for (int layer = 0; layer < layers; layer++)
@@ -2958,6 +3137,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_slab_shift() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_slab_shift\n");
+        return 1;
+    }
+    if (test_expert_store_piece_reads() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_piece_reads\n");
         return 1;
     }
     if (test_expert_store_prewarm() != 0) {

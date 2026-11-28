@@ -159,6 +159,14 @@ int dsv4_cuda_stream_drain(int device);
  * the compute stream after the copies enqueued so far; drain=1 waits for them
  * on the host. Returns 1 on success. */
 int dsv4_cuda_upload_fence(int device,int drain);
+/* V4_UPLOAD_PIECES: a piece of a two-run mirror's scale run (run 0) or weight
+ * run (run 1) at off, enqueued on the device's second stream; the tensors'
+ * places in the runs once every piece is in; a host region page-locked now,
+ * before anything reads into it. Each returns 1 on success. */
+int dsv4_cuda_mirror_copy(Dsv4CudaTensor *gate,int run,long long off,const uint8_t *src,long long len);
+int dsv4_cuda_mirror_point(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4CudaTensor *down,
+                           long long S,const long long *soff,long long Wb,const long long *woff);
+int dsv4_cuda_host_pin(const void *p,long long len);
 int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_pos,
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,
