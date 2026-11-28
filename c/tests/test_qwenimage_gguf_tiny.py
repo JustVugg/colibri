@@ -142,6 +142,16 @@ class QwenImageGgufTiny(unittest.TestCase):
         self.assertIn("matrices in the GGUF's blocks", err)
         self.assertEqual(f32.read_bytes(), native.read_bytes())
 
+    @unittest.skipUnless(sys.platform == "darwin", "requires Metal")
+    def test_metal_reads_gguf_blocks(self):
+        env = dict(COLI_IMG_ACT8="0", COLI_IMG_BITS="8", COLI_IMG_NATIVE="1")
+        gpu, log = self.image("gg", "metal_blocks", steps=2, COLI_IMG_METAL="1", **env)
+        if "needs a METAL=1 build" in log or "and a usable GPU" in log:
+            self.skipTest("requires a Metal build and device")
+        self.assertRegex(log, r"\([1-9]\d* from GGUF blocks\)")
+        cpu, _ = self.image("gg", "cpu_blocks", steps=2, COLI_IMG_METAL="0", **env)
+        self.assertGreater(psnr(cpu, gpu), 60.0)
+
     def test_int8_products_match_int8_rows(self):
         a, err = self.image("gg_te", "act8_native", COLI_IMG_ACT8="1")
         if "needs VNNI" in err:
