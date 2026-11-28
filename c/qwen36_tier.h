@@ -235,7 +235,11 @@ void qt_note_block(int layer, int eid,
              const float *gs, const float *us, const float *ds);
 void qt_fill_wait(void);   /* blocks until every enqueued upload is resident (not merely dequeued) */
 
-/* Direct-to-VRAM GGUF exact-arena wave warmstart (bypass RAM expert cache, single DMA per wave). */
+/* Direct-to-VRAM GGUF exact-arena wave warmstart (bypass RAM expert cache, single DMA per wave).
+ * max_slot is 0 when the warm start cannot run (one device, exact slots, every layer's rows a
+ * multiple of 4 bytes, a backend with coli_cuda_copy_async). A commit that fails (ok == 0, or the
+ * backend refuses the slot) returns the slot and leaves the expert planned with its reservation:
+ * the caller must still hand it to qt_note_planned. */
 int    qt_warm_gguf_ready(void);
 size_t qt_warm_gguf_max_slot(void);
 int    qt_warm_gguf_begin(int layer, int eid, int *dev_out, void **dev_ptr, size_t *ou_out, size_t *od_out,

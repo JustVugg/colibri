@@ -181,6 +181,9 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const
  * that predates them, and the tier keeps the host's step. */
 COLI_CUDA_DLLEXPORT int coli_cuda_host_register(void *p, size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_host_unregister(void *p);
+/* coli_cuda_copy_async: bytes from src to dst queued on the device's stream (a GGUF warm start's
+ * waves into the tier's arena); src must stay valid and unchanged until coli_cuda_pipe_sync(device)
+ * returns. Optional in the DLL loader: 0 from a backend that predates it. */
 COLI_CUDA_DLLEXPORT int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_planar_rows(int device, int D, int I);
 /* A GGUF's block formats (cuda_bd.cuh): fmt 100 + ggml type t, each row as the file stores

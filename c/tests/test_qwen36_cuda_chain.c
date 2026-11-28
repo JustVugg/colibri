@@ -1312,6 +1312,19 @@ int main(int argc, char **argv) {
             ck(q36_mc_init(&m3) && !g_q36_mc.pick_dev && g_q36_mc.outd->kind == CC_DOWN,
                "Q36_MTP_DUMP set when the head is set up: the logits buffer on the host, as before");
             unsetenv("Q36_MTP_DUMP");
+            /* a mixed container (convert_qwen36.py --down-bits): int4 gate/up, int8 down. Below the
+             * block formats the backend's MoE kernels read all three in one format: the head stays off */
+            uint8_t *q4 = calloc((size_t)D * INTER / 2, 1); float *sg = calloc(INTER * (D / 64), sizeof(float));
+            for (int e = 0; e < E; e++) {
+                p->eg[e].q4 = p->eu[e].q4 = q4; p->eg[e].sg = p->eu[e].sg = sg; p->eg[e].ng = p->eu[e].ng = D / 64;
+            }
+            memset(&g_q36_mc, 0, sizeof g_q36_mc);
+            ck(!q36_mc_init(&m3) && !g_q36_mc.on, "int4 gate/up with an int8 down: the head stays off the card");
+            for (int e = 0; e < E; e++) {
+                p->eg[e].q4 = p->eu[e].q4 = NULL; p->eg[e].sg = p->eu[e].sg = NULL; p->eg[e].ng = p->eu[e].ng = 0;
+            }
+            free(q4); free(sg);
+            memset(&g_q36_mc, 0, sizeof g_q36_mc);
         }
         if (hc == 3) {   /* the device's copy of the list (read straight from the fake's buffer) */
             q36_mtp_vocab_step(7);   /* an id outside the list: appended at its tail */

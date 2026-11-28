@@ -4317,7 +4317,7 @@ static void q38_tier_warm(Model *m,int hist) {
                     }
                     if(got!=cnt){
                         for(int k=0;k<got;k++)qt_warm_gguf_commit(l,pe[w0+k],aslot[k],0);
-                        ok_all=0; start_i=w0; break;
+                        ok_all=0; break;
                     }
                     const gguf_tensor *tg=lt[l][0],*tu=lt[l][1],*td=lt[l][2];
                     int64_t ebg=leb[l][0],ebu=leb[l][1],ebd=leb[l][2];
@@ -4339,8 +4339,9 @@ static void q38_tier_warm(Model *m,int hist) {
                         prev_valid=0;
                         if(!sy){
                             for(int k=0;k<cnt;k++)qt_warm_gguf_commit(l,pe[w0+k],aslot[k],0);
-                            ok_all=0; start_i=w0; break;
+                            ok_all=0; break;
                         }
+                        if(ok_all)start_i=w0;   /* the previous wave is in: the CPU loop starts past it */
                     }
                     int contig=1;
                     for(int k=1;k<cnt&&contig;k++)
@@ -4362,11 +4363,11 @@ static void q38_tier_warm(Model *m,int hist) {
                             if(!qt_warm_gguf_commit(l,pe[w0+k],aslot[k],up_ok))ok_all=0;
                             else if(up_ok)done_n++;
                         }
-                        if(!up_ok){ ok_all=0; start_i=w0; break; }
+                        if(!up_ok){ ok_all=0; break; }
+                        if(ok_all)start_i=w1;
                     }
                     (void)async_ok;
                     w0=w1;
-                    start_i=w0;
                 }
                 if(prev_valid){
                     int sy=coli_cuda_pipe_sync(prev_dev);

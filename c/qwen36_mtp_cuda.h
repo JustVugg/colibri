@@ -34,8 +34,8 @@ static int q36_mc_res(CcBuf **b, size_t floats, int kind) { return cc_reserve(b,
 static ColiCudaTensor *q36_mc_expert(int dev, const QW *w, int *fmt) {
     ColiCudaTensor *t = NULL;
     if (w->gq) {
-        int bf = qdw_gq_fmt(w);
-        if (bf >= 100 && cc_moe_block_type(bf - 100) && (w->gs == 1.0f || w->gs == 0.0f) &&
+        int bf = qdw_gq_fmt(w);   /* an interleaved (R16) type's base: w->gq holds other rows, refused */
+        if (bf >= 100 && w->gq_type == bf - 100 && cc_moe_block_type(bf - 100) && w->gs == 1.0f &&
             coli_cuda_tensor_upload(&t, w->gq, NULL, bf, w->I, w->O, dev)) {
             *fmt = bf;
             return t;
@@ -303,8 +303,10 @@ static int q36_mc_init(Model *m) {
             for (int j = 0; ok && j < 3; j++) {
                 int f = 0;
                 ColiCudaTensor *t = q36_mc_expert(dev, qw[j], &f);
+                /* down may differ from gate/up only between block formats: below 100 the backend's
+                 * MoE kernels read all three in gate/up's format (CcMoe.fmt_d) */
                 if (j < 2) { ok = t && (!g->fmt || f == g->fmt); g->fmt = f; }
-                else       { ok = t && (!g->fmt_d || f == g->fmt_d); g->fmt_d = f; }
+                else       { ok = t && (!g->fmt_d || f == g->fmt_d) && (f == g->fmt || (f >= 100 && g->fmt >= 100)); g->fmt_d = f; }
                 g->ex[(size_t)3 * x + j] = t;
             }
             ok = ok && cc_tensor_dev(g->ex[3 * x], &tab[x].g, &tab[x].gs, NULL) && cc_tensor_dev(g->ex[3 * x + 1], &tab[x].u, &tab[x].us, NULL) &&

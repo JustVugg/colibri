@@ -2252,6 +2252,11 @@ int qt_warm_gguf_ready(void){
 }
 size_t qt_warm_gguf_max_slot(void){
     if(!qt_warm_gguf_ready()) return 0;
+    /* The engines call this once before a warm start (0: no warm start). A backend whose
+     * coli_cuda_copy_async is missing (a 0-byte copy fails) predates tensor_upload_at's
+     * weights == NULL wrap as well, and every commit would fail. */
+    static const char probe;
+    if(!coli_cuda_copy_async(G.dev[0], G_arena[0], &probe, 0)) return 0;
     size_t mx = 0;
     for(int l = 0; l < G.nl; l++){
         if(G.off && G.off[l]) continue;
