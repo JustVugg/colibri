@@ -649,6 +649,7 @@ CUDA_OBJ  = backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o
 # inkling's bf16 dense matrices (backend_cuda_ink.o), and the expert tier Inkling-2's
 # experts run on (cu_tier.o over the backend)
 INK_CUDA_OBJ = backend_cuda_ink.o $(CUDA_OBJ)
+NEMO_CUDA_OBJ = backend_cuda_nemotron.o
 ifeq ($(COLI_ANS),1)
 ifeq ($(strip $(DIETGPU_ROOT)),)
 $(error DIETGPU_ROOT is required when COLI_ANS=1)
@@ -2281,6 +2282,20 @@ inkling: inkling$(EXE)
 endif
 inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o inkling$(EXE) $(LDFLAGS)
+
+ifneq ($(EXE),)
+.PHONY: nemotron
+nemotron: nemotron$(EXE)
+endif
+backend_cuda_nemotron.o: backend_cuda_nemotron.cu backend_cuda_nemotron.h .build-config
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_nemotron.cu -o $@
+
+nemotron$(EXE): nemotron.c nemotron_vision.h nemotron_cuda_chain.h backend_cuda_nemotron.h $(NEMO_CUDA_OBJ) .build-config
+	$(CC) $(CFLAGS) nemotron.c $(NEMO_CUDA_OBJ) -o nemotron$(EXE) $(LDFLAGS)
+
+.PHONY: nemotron-tiny-check
+nemotron-tiny-check: nemotron$(EXE)
+	$(PYTHON) tests/test_nemotron_oracle.py ./nemotron$(EXE)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
 # kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But
@@ -3999,7 +4014,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) gliner_decide$(EXE) \
+install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) nemotron$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) gliner_decide$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -4008,6 +4023,7 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 glm53$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm53$(EXE)
 	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
+	$(INSTALL) -m 755 nemotron$(EXE) $(DESTDIR)$(LIBEXECDIR)/nemotron$(EXE)
 	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)

@@ -1068,6 +1068,52 @@ def _individual_expert_inventory(pattern):
     return inventory
 
 
+_NEMOTRON_EXPERT = re.compile(
+    r"^(?:language_model\.)?backbone\.layers\.(\d+)\.mixer\.experts\.(\d+)\."
+    r"(?:up_proj|down_proj)\.(?:weight|weight_scale|weight_scale_2|input_scale)$"
+)
+
+
+def _nemotron_geometry(config, context, _model_dir=None):
+    hidden = _required_int(config, "hidden_size", "nemotron_h")
+    block_types = config.get("layers_block_type")
+    if isinstance(block_types, list) and block_types:
+        n_attn = sum(1 for t in block_types if t in ("attention", "full_attention"))
+        n_mamba = sum(1 for t in block_types if t in ("mamba", "linear_attention"))
+        n_moe = sum(1 for t in block_types if t == "moe")
+    else:
+        pat = config.get("hybrid_override_pattern", "")
+        n_attn = pat.count("*")
+        n_mamba = pat.count("M")
+        n_moe = pat.count("E")
+    kv_heads = config.get("num_key_value_heads", 2)
+    head_dim = config.get("head_dim", 128)
+    m_heads = config.get("mamba_num_heads", 128)
+    m_hd = config.get("mamba_head_dim", 64)
+    ssm_n = config.get("ssm_state_size", 128)
+    n_groups = config.get("n_groups", 8)
+    conv_k = config.get("conv_kernel", 4)
+    conv_dim = m_heads * m_hd + 2 * n_groups * ssm_n
+    n_experts = config.get("n_routed_experts", 0)
+    kv_bytes = n_attn * 2 * context * kv_heads * head_dim * 4
+    mamba_bytes = n_mamba * (conv_dim * conv_k + m_heads * m_hd * ssm_n) * 4
+    workspace = max(hidden * 64 * 4, 64 * 1024 * 1024)
+    return PlannerGeometry(
+        context_state_bytes=kv_bytes,
+        fixed_state_bytes=mamba_bytes,
+        workspace_bytes=workspace,
+        configured_experts=n_moe * n_experts,
+        dense=(n_moe == 0 or n_experts == 0),
+    )
+
+
+def _nemotron_expert_inventory(name, size, _config, _dtype=None):
+    match = _NEMOTRON_EXPERT.match(name)
+    if match is None:
+        return ()
+    return ((int(match.group(1)), int(match.group(2)), size),)
+
+
 def _dsv41_expert_inventory(name, size, config, _dtype=None):
     """Routed experts, the backbone's and the DSpark head's alike.
 
@@ -1942,6 +1988,41 @@ FAMILIES = (
         tokenizer_file="tokenizer.json",
         checkpoint_files=("config.json", "encoder_config/config.json"),
     ),
+    FamilyDescriptor(
+        id="nemotron_h",
+        model_types=("nemotron_h", "nemotron_h_omni"),
+        display_name="Nemotron-3.5 Super VL",
+        display_scale="120B",
+        reference_experts=512,
+        display_variants=(
+            DisplayVariant((("model_type", "nemotron_h_omni"), ("hidden_size", 4096),
+                            ("n_routed_experts", 512)),
+                           "Nemotron-3.5 Super VL", "120B",
+                           model_id="nemotron-3.5-super-vl-120b"),
+            DisplayVariant((("hidden_size", 4096), ("n_routed_experts", 512)),
+                           "Nemotron-3 Super", "120B",
+                           model_id="nemotron-3-super-120b"),
+        ),
+        engine_artifact="nemotron",
+        engine_aliases=(),
+        engine_group="nemotron",
+        internal_arch="nemotron_h",
+        build_target="nemotron",
+        process_names=("nemotron",),
+        default_model_id="nemotron-3.5-super-vl-120b",
+        cli_adapter="nemotron_h",
+        gateway_adapter="nemotron_h",
+        planner_id="nemotron_h",
+        planner_geometry=_nemotron_geometry,
+        planner_unsupported_reason="",
+        supports_accelerator=True,
+        expert_inventory=_nemotron_expert_inventory,
+        config_section="llm_config",
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 64, "CTX"),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
+        has_gateway_adapter=False,
+        has_cli_adapter=False,
+    ),
 )
 
 
@@ -2174,6 +2255,10 @@ def resolve_model(model_dir):
         family_config = config.get("text_config", config)
         if not isinstance(family_config, dict):
             raise FamilyConfigError(f"{family.id}: text_config is not an object")
+    elif family.config_section == "llm_config":
+        family_config = config.get("llm_config", config)
+        if not isinstance(family_config, dict):
+            raise FamilyConfigError(f"{family.id}: llm_config is not an object")
     head = ""
     for candidate in DECISION_HEADS:
         present = [name for name in candidate.files if (model / name).is_file()]

@@ -23,7 +23,7 @@ famille de modèles, aucun GPU requis.
 Treize moteurs fonctionnent aujourd'hui. Dix sont pour les modèles de langage :
 **GLM-5.2/5.3** (qui fait aussi tourner **Mistral-Large-4**), **GLM-5.3-Flash**,
 **Inkling**, **Kimi K3** (et K3.1 Pro), **DeepSeek V4 Flash**, **DeepSeek V4.1
-Flash**, **MiMo-V2.6 Flash** (et Pro), **Qwen3.8-Flash-Next**, **Qwen3.6** (qui
+Flash**, **MiMo-V2.6 Flash**, **Nemotron-3.5 Super VL** (et Pro), **Qwen3.8-Flash-Next**, **Qwen3.6** (qui
 fait aussi tourner Qwen3-Coder, le Qwen3.8-27B dense, **Flint**, **Muse Spark
 Open** et **LFM3-VL**) et **OLMoE**. Un dessine des images : **Qwen-Image-2.1**.
 Deux répondent à des décisions : **Laya** et **GLiNER2.5-Decide**, avec un

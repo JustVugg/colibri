@@ -22,7 +22,7 @@ necessidade de GPU.
 
 Treze motores rodam hoje. Dez são para modelos de linguagem: **GLM-5.2/5.3** (que
 também roda o **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3** (e K3.1 Pro),
-**DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (e Pro),
+**DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash**, **Nemotron-3.5 Super VL** (e Pro),
 **Qwen3.8-Flash-Next**, **Qwen3.6** (que também roda o Qwen3-Coder, o denso
 Qwen3.8-27B, o **Flint**, o **Muse Spark Open** e o **LFM3-VL**) e **OLMoE**. Um
 desenha figuras: **Qwen-Image-2.1**. Dois respondem decisões: **Laya** e

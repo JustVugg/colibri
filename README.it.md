@@ -22,7 +22,7 @@ necessaria.
 
 Oggi girano tredici motori. Dieci sono per modelli linguistici: **GLM-5.2/5.3** (che
 esegue anche **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3** (e K3.1 Pro),
-**DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (e Pro),
+**DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash**, **Nemotron-3.5 Super VL** (e Pro),
 **Qwen3.8-Flash-Next**, **Qwen3.6** (che esegue anche Qwen3-Coder, il denso
 Qwen3.8-27B, **Flint**, **Muse Spark Open** e **LFM3-VL**) e **OLMoE**. Uno disegna
 immagini: **Qwen-Image-2.1**. Due prendono decisioni: **Laya** e
