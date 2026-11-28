@@ -400,7 +400,7 @@ Qwen3.8-Flash-Next, Qwen3.6 con i modelli che esegue, OLMoE e i motori di
 decisione (Laya, GLiNER2.5-Decide). Su Windows il motore CUDA è
 una DLL separata ([windows.md](docs/windows.md)), e ogni release la porta già
 compilata: `colibri-<versione>-windows-x86_64-cuda.zip` contiene `coli_cuda.dll`
-(schede con compute capability 8.0 o superiore) e i motori colibri, glm53, qwen36,
+(schede con compute capability 7.5 o superiore) e i motori colibri, glm53, qwen36,
 qwen38, kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya e gliner_decide che la caricano, con le DLL CUDA di DeepSeek V4. Estrailo sopra
 l'archivio principale e l'installazione sceglie CUDA.
 
