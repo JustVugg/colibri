@@ -15,7 +15,8 @@
  *     two GEMVs and the elementwise product;
  *   - the tensor cores' integer steps (bd_mmg_launch, sm_80 on) of 1 to 8 rows, each row the bits
  *     of the GEMV's same row alone; again with x's quantization kept (g_bd_x_same), and after
- *     another x at the same address without it.
+ *     another x at the same address without it, and after a matmul wrote x (its quantization
+ *     dropped, the chain's word or not).
  * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows. Build from c/:
  *   gcc -O2 -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
  *   nvcc -O2 -std=c++17 -arch=native tests/test_cuda_bd.cu tests/cuda_bd_ref.o -o tests/test_cuda_bd */
@@ -23,7 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <ctime>
+#include <chrono>
 #include <cuda_runtime.h>
 #include "../backend_cuda.cu"
 
@@ -40,7 +41,7 @@ const char *ref_name(int t);
 static int fails;
 static unsigned long long g_rng = 0x9e3779b97f4a7c15ull;
 static unsigned rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17; return (unsigned)(g_rng >> 11); }
-static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static double now(void) { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 /* sane scale fields in a random block (test_vk_chain.c's bd_fix, with the float-form types) */
 static void bd_fix(int t, uint8_t *b) {
@@ -648,7 +649,7 @@ static void bench_moe(int tg, int td, int S, int K, int E, int D, int I, int rep
 
 /* bd_mmg_launch of type t at I inputs, O rows (16 outputs a block, a part one; the GEMV's 8, 16 or 32
  * classes): every row count's rows the bits of the GEMV's rows alone */
-static int g_mmq;
+static int g_mmq, g_mmq_glu;
 static void check_mmq(int t, int I, int O) {
     const int SM = 8, Ss[] = {1, 2, 3, 4, 5, 6, 7, 8};
     long rb = ref_row_bytes(t, I);
@@ -714,6 +715,36 @@ static void check_mmq(int t, int I, int O) {
         if (!okl || memcmp(got, two, (size_t)4 * O * 4)) { printf("FAIL %s [%d x %d]: the word with another row count, other bits\n", ref_name(t), O, I); fails++; ok = 0; }
     }
     if (ok) g_mmq++;
+    /* a SwiGLU's gate and up of 3 to 8 rows in one pass on the tensor cores (bd_mmg_glu_launch, what
+     * coli_cuda_tensor_glu_async takes where bd_mmq_takes): the bits of the two row sets and
+     * CC_EW_SWIGLU's product, where the launch takes the shape */
+    if (ok && (t == 8 || t == 12 || t == 13 || t == 14) && I % 256 == 0 && bd_lpr(I) >= 8 && bd_lpr_for(t, I, O) >= 8) {
+        uint8_t *wu = (uint8_t *)calloc((size_t)O, (size_t)rw * 4);
+        for (int o = 0; o < O; o++) {
+            uint8_t *r = wu + (size_t)o * rw * 4;
+            for (long i = 0; i < rb; i++) r[i] = (uint8_t)rnd();
+            for (long k = 0; k + bb <= rb; k += bb) bd_fix(t, r + k);
+        }
+        bd_u32 *ud; float *gd, *vd;
+        cudaMalloc(&ud, (size_t)O * rw * 4); cudaMalloc(&gd, (size_t)SM * O * 4); cudaMalloc(&vd, (size_t)SM * O * 4);
+        cudaMemcpy(ud, wu, (size_t)O * rw * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(xd, x, (size_t)SM * I * 4, cudaMemcpyHostToDevice);
+        for (int S = 3; S <= SM && ok; S++) {
+            cudaMemset(yd, 0, (size_t)SM * O * 4);
+            int okg = bd_mmg_launch(gd, xd, wd, fmt, I, O, rw, S, 0, g_tab) && bd_mmg_launch(vd, xd, ud, fmt, I, O, rw, S, 0, g_tab);
+            if (okg) swiglu_ref_k<<<(S * O + 255) / 256, 256>>>(gd, gd, vd, S * O);
+            okg = okg && bd_mmg_glu_launch(yd, xd, wd, ud, fmt, I, O, rw, S, 0, g_tab) && cudaDeviceSynchronize() == cudaSuccess;
+            cudaMemcpy(one, gd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
+            if (!okg || memcmp(got, one, (size_t)S * O * 4)) {
+                printf("FAIL %s [%d x %d]: the gate and up of %d rows in one pass on the tensor cores differ (%s)\n", ref_name(t), O, I, S,
+                       cudaGetErrorString(cudaGetLastError()));
+                fails++; ok = 0;
+            }
+        }
+        if (ok) g_mmq_glu++;
+        free(wu); cudaFree(ud); cudaFree(gd); cudaFree(vd);
+    }
 out:
     cudaFree(wd); cudaFree(xd); cudaFree(yd);
     free(w); free(x); free(x2); free(one); free(two); free(got);
@@ -758,6 +789,48 @@ static void check_xq_forget(void) {
     free(w); free(x); free(x2); free(want); free(got);
 }
 
+/* a matmul's output is an input's address: the backend's quantization of that address goes when it
+ * writes there. A (6 rows, the tensor cores) quantizes y; a matmul writes y (the chain's word 2, a new
+ * input); B (float rows, quantizing nothing) reads y, so the chain's own record of y is fresh; A with
+ * the chain's word 1: y's new contents' bits, not the codes of y before the write */
+static void check_xq_out(void) {
+    const int t = 12, I = 2048, OB = 16, S = 6;
+    long rb = ref_row_bytes(t, I);
+    int bb = ref_block_bytes(t);
+    uint8_t *w = (uint8_t *)malloc((size_t)I * rb);
+    for (size_t i = 0; i < (size_t)I * rb; i++) w[i] = (uint8_t)rnd();
+    for (size_t k = 0; k + bb <= (size_t)I * rb; k += bb) bd_fix(t, w + k);
+    float *x = (float *)malloc((size_t)S * I * 4), *x2 = (float *)malloc((size_t)S * I * 4);
+    float *want = (float *)malloc((size_t)S * I * 4), *got = (float *)malloc((size_t)S * I * 4);
+    for (int i = 0; i < S * I; i++) { x[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f; x2[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f; }
+    ColiCudaTensor *ta = NULL, *tb = NULL;   /* ta square: its output is the next one's input */
+    float *xd, *yd, *ya, *yb;
+    cudaMalloc(&xd, (size_t)S * I * 4); cudaMalloc(&yd, (size_t)S * I * 4); cudaMalloc(&ya, (size_t)S * I * 4); cudaMalloc(&yb, (size_t)S * OB * 4);
+    float *wf = (float *)malloc((size_t)OB * I * 4);
+    for (int i = 0; i < OB * I; i++) wf[i] = ((int)(rnd() % 2001) - 1000) * 1e-3f;
+    int ok = coli_cuda_tensor_upload(&ta, w, NULL, 100 + t, I, I, 0) && coli_cuda_tensor_upload(&tb, wf, NULL, 0, I, OB, 0);
+    free(wf);
+    cudaMemcpy(xd, x, (size_t)S * I * 4, cudaMemcpyHostToDevice);
+    ok = ok && coli_cuda_tensor_gemm_async(ta, yd, xd, S, NULL);   /* y = A x */
+    ok = ok && coli_cuda_tensor_gemm_async(ta, ya, yd, S, NULL);   /* y quantized */
+    cudaMemcpy(xd, x2, (size_t)S * I * 4, cudaMemcpyHostToDevice);
+    coli_cuda_bd_x_same(2);
+    ok = ok && coli_cuda_tensor_gemm_async(ta, yd, xd, S, NULL);   /* y = A x2, written by the backend */
+    ok = ok && coli_cuda_tensor_gemm_async(tb, yb, yd, S, NULL);   /* read, nothing quantized */
+    coli_cuda_bd_x_same(1);
+    ok = ok && coli_cuda_tensor_gemm_async(ta, ya, yd, S, NULL) && cudaDeviceSynchronize() == cudaSuccess;
+    cudaMemcpy(got, ya, (size_t)S * I * 4, cudaMemcpyDeviceToHost);
+    coli_cuda_bd_x_same(0);
+    ok = ok && coli_cuda_tensor_gemm_async(ta, ya, yd, S, NULL) && cudaDeviceSynchronize() == cudaSuccess;
+    cudaMemcpy(want, ya, (size_t)S * I * 4, cudaMemcpyDeviceToHost);
+    if (!ok || memcmp(got, want, (size_t)S * I * 4)) { printf("FAIL a matmul's output read with the chain's word: a stale quantization of it\n"); fails++; }
+    else printf("mmq: a matmul's output drops the backend's quantization of its address\n");
+    if (ta) coli_cuda_tensor_free(ta);
+    if (tb) coli_cuda_tensor_free(tb);
+    cudaFree(xd); cudaFree(yd); cudaFree(ya); cudaFree(yb);
+    free(w); free(x); free(x2); free(want); free(got);
+}
+
 int main(void) {
     int devs[1] = {0};
     if (!coli_cuda_init(devs, 1)) { printf("SKIP: no CUDA device\n"); return 0; }
@@ -775,8 +848,8 @@ int main(void) {
     /* BENCH_MOE="tg:td:S,...": a prompt chunk's routed experts of Qwen3.8's shape (10 of 512 a row,
      * 2560 x 640) through the f16 tiles, timed */
     if (getenv("BENCH_MOE")) {
-        char *spec = strdup(getenv("BENCH_MOE")), *save = NULL;
-        for (char *tok = strtok_r(spec, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *spec = strdup(getenv("BENCH_MOE"));
+        for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
             int tg = 0, td = 0, S = 0;
             if (sscanf(tok, "%d:%d:%d", &tg, &td, &S) == 3) bench_moe(tg, td, S, 10, 512, 2560, 640, 10);
         }
@@ -786,9 +859,9 @@ int main(void) {
     }
     /* BENCH_ONLY="t:I:O,...": time those (and check them) only, e.g. LFM3's decode matrices */
     if (getenv("BENCH_ONLY")) {
-        char *spec = strdup(getenv("BENCH_ONLY")), *save = NULL;
+        char *spec = strdup(getenv("BENCH_ONLY"));
         printf("BENCH (rows of x: 1 to BENCH_ROWS)\n");
-        for (char *tok = strtok_r(spec, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
             int t = 0, I = 0, O = 0;
             if (sscanf(tok, "%d:%d:%d", &t, &I, &O) == 3) check(t, I, O, 1);
         }
@@ -824,9 +897,11 @@ int main(void) {
         if (major >= 8) {
             /* the GEMV's 16, 32, 32 and 8 classes (1, 4, 4 and 1 warps a block), part tiles of 16 outputs */
             const int mshape[][2] = {{2048, 300}, {5120, 1000}, {17408, 40}, {1024, 8200}};
-            for (int t : {8, 12, 13, 14, 20, 23, 10, 11, 16, 17, 18, 19, 21, 22}) for (auto &sh : mshape) check_mmq(t, sh[0], sh[1]);
+            for (int t : {8, 12, 13, 14, 20, 23, 10, 11, 16, 17, 18, 19, 29, 21, 22}) for (auto &sh : mshape) check_mmq(t, sh[0], sh[1]);
             printf("mmq: %d types and shapes, 1 to 8 rows on the tensor cores, each the bits of the GEMV's row alone\n", g_mmq);
+            printf("mmq glu: %d types and shapes, gate and up of 3 to 8 rows in one pass, the bits of the two and the SwiGLU\n", g_mmq_glu);
             check_xq_forget();
+            check_xq_out();
         } else printf("mmq: SKIP (compute capability %d, the tensor cores' integer steps need 8)\n", major);
     }
     if (bench) {

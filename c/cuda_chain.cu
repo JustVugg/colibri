@@ -3,7 +3,10 @@
  * Buffers, frames and the chain's kernels. Each kernel is the arithmetic of the
  * shader of the same name in shaders/chain_*.comp, ported line for line (the sums in
  * the same order, the same sentinels), so the two chains give the same bits for the
- * same bits in and tests/test_vk_chain.c's references hold here too. The matmul is
+ * same bits in and tests/test_vk_chain.c's references hold here too. Not so for the
+ * attention decode (blocks of 32 positions, four threads a position) and the one-warp
+ * router (cc_route_warp_k: a softmax over the picked K at norm_eps 0), which keep the
+ * references' picks and their values to rounding, not their bits. The matmul is
  * the backend's own GEMV / GEMM kernel (coli_cuda_tensor_gemm_async) on the chain's
  * stream.
  *
@@ -1230,7 +1233,7 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
         for (int e = tid; e < BC * HD / 4; e += NT) {   /* K and V of keys k0 .. k0 + BC - 1, zero past nt */
             int kl = e / (HD / 4), d = (e - kl * (HD / 4)) * 4, key = k0 + kl;
             if constexpr (sizeof(KT) == 2) {
-                uint2 kv = make_uint2(0u, 0u), vv = kv;
+                [[maybe_unused]] uint2 kv = make_uint2(0u, 0u), vv = kv;   /* one is unread in the write and read passes */
                 if (key < nt) {
                     size_t at = (size_t)(g * p.cap + (ring ? key % ring : key)) * HD + d;
                     if constexpr (pass != CC_F2_READ_QK) kv = *reinterpret_cast<const uint2 *>(kc + p.k_off + at);
@@ -1239,7 +1242,7 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
                 if constexpr (pass != CC_F2_READ_QK) *reinterpret_cast<uint2 *>(sK + kl * LD + d) = kv;
                 if constexpr (pass != CC_F2_WRITE_QK) *reinterpret_cast<uint2 *>(sV + kl * LD + d) = vv;
             } else {
-                float4 kv = make_float4(0.f, 0.f, 0.f, 0.f), vv = kv;
+                [[maybe_unused]] float4 kv = make_float4(0.f, 0.f, 0.f, 0.f), vv = kv;
                 if (key < nt) {
                     size_t at = (size_t)(g * p.cap + (ring ? key % ring : key)) * HD + d;
                     if constexpr (pass != CC_F2_READ_QK) kv = cc_kv4(kc, p.k_off + at);
@@ -2224,11 +2227,18 @@ static int cc_dnrec_sm_launch(dim3 g, cudaStream_t st, const float *a, const flo
                               const float *pr, float *yy, float *sn, const CcDnRec &p) {
     constexpr int KR = CC_DNREC_SM_KR(KD);
     const size_t sm = (size_t)(KD - KR) * 128 * sizeof(float);
-    static int raised = -1;   /* past 48 KiB the kernel asks for it, once */
-    if (raised < 0)
-        raised = sm <= 48 * 1024 ||
-                 cudaFuncSetAttribute(cc_dnrec_sm_k<KD, KR>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess;
-    if (!raised) { (void)cudaGetLastError(); return 0; }
+    static unsigned tried, raised;   /* past 48 KiB the kernel asks for it, once a device (the attribute is a context's) */
+    if (sm > 48 * 1024) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || dev > 31) { (void)cudaGetLastError(); return 0; }
+        if (!(tried >> dev & 1u)) {
+            tried |= 1u << dev;
+            if (cudaFuncSetAttribute(cc_dnrec_sm_k<KD, KR>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess)
+                raised |= 1u << dev;
+            else (void)cudaGetLastError();
+        }
+        if (!(raised >> dev & 1u)) return 0;
+    }
     coli_launch(cc_dnrec_sm_k<KD, KR>, g, 128, sm, st, a, b, zz, s, pr, yy, sn, p);
     return 1;
 }
@@ -2334,7 +2344,7 @@ __global__ static void __launch_bounds__(32) cc_dnrec_vsplit_k(const float *__re
             if constexpr (SN) {
                 if (do_snap_n)
                     dst_sn = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s] + (size_t)h * KD * p.VD;
-            } else { (void)do_snap_n; (void)dst_sn; }
+            }
             float o = 0.f;
             #pragma unroll
             for (int k = 0; k < KR; k++) {
@@ -2343,7 +2353,7 @@ __global__ static void __launch_bounds__(32) cc_dnrec_vsplit_k(const float *__re
                 if (!is_last) colr[k] = c_;
                 o += qn[k] * c_;
                 if (do_snap) snap[nb + (size_t)k * p.VD + v] = c_;
-                if constexpr (SN) { if (do_snap_n) dst_sn[(size_t)k * p.VD + v] = c_; }
+                if (do_snap_n) dst_sn[(size_t)k * p.VD + v] = c_;   /* do_snap_n is false without SN */
                 if (is_last) st[sb + (size_t)k * p.VD + v] = c_;
             }
             #pragma unroll 4
@@ -2353,7 +2363,7 @@ __global__ static void __launch_bounds__(32) cc_dnrec_vsplit_k(const float *__re
                 if (!is_last) cs[(k - KR) * 32] = c_;
                 o += qn[k] * c_;
                 if (do_snap) snap[nb + (size_t)k * p.VD + v] = c_;
-                if constexpr (SN) { if (do_snap_n) dst_sn[(size_t)k * p.VD + v] = c_; }
+                if (do_snap_n) dst_sn[(size_t)k * p.VD + v] = c_;   /* do_snap_n is false without SN */
                 if (is_last) st[sb + (size_t)k * p.VD + v] = c_;
             }
             y[(size_t)p.y_off + (size_t)s * p.y_row + (size_t)h * p.VD + v] = o;
@@ -5292,14 +5302,14 @@ static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, 
     if (p->snap_n > 0 && c->down_seq != c->down_joined && !cc_join_down(c)) return 0;
     if (cc_uses_feature(c, Q36_DNCONV) && p->order != 2 && p->snap_n == 0)
         return cc_dnconv_tiled(in, w, ring, out, snap, p);
-    if (p->CK == 4 && p->order != 2) {
+    if (!c->device_profile && p->CK == 4 && p->order != 2) {   /* a profile without Q36_DNCONV keeps the kernels below */
         if (p->S <= 16 && p->snap_n == 0) {
             const unsigned g = grid1((size_t)p->CD, 64);
             if (p->order == 0) coli_launch(cc_dnconv_ck4_k<false, 0>, g, 64, 0, c->stream, fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p);
             else               coli_launch(cc_dnconv_ck4_k<false, 1>, g, 64, 0, c->stream, fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p);
             return launched(c, "dnconv");
         }
-        if (p->S > 16 && p->S < 65536 * 32 && p->snap_n == 0 && c->major >= 8 && in != out &&
+        if (p->S > 16 && p->S <= 65535 * 32 && p->snap_n == 0 && c->major >= 8 && in != out &&
             ((p->CD | p->in_off | p->in_row | p->out_off | p->out_row | p->w_off) & 3) == 0 &&
             (((uintptr_t)in->d | (uintptr_t)out->d | (uintptr_t)w->d) & 15) == 0) {
             dim3 g(grid1((size_t)(p->CD / 4), 128), grid1((size_t)p->S, 32));
@@ -5534,7 +5544,7 @@ static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *
     }
     if (p->n_group <= 1 && p->E <= 512) {
         const char *e = getenv("COLI_CUDA_ROUTE_FAST");
-        if (!(e && *e == '0')) {
+        if (e ? *e != '0' : !c->device_profile || (c->kernel_mask & Q36_EXPERT_ROUTE)) {   /* a profile: its mask, as above */
             const int wpb = p->S < 8 ? p->S : 8;
             const unsigned g = (unsigned)((p->S + 7) / 8), b = (unsigned)(wpb * 32);
             if (p->E <= 64)       coli_launch(cc_route_warp_k<2>,  g, b, 0, c->stream, fp(l), fp(bias), (int *)fpw(ids), fpw(w), *p);
@@ -6334,6 +6344,7 @@ static void *cc_graph_end(int *broke) {
 static int cc_graph_launch(void *g) {
     CcCtx *c = live();
     if (!c || !g || c->capturing) return 0;
+    coli_cuda_qx_invalidate(c->device, nullptr, 0);   /* a replay rewrites the buffers and the quantized-x scratch */
     cc_bd_cache_clear();
     return cc_ok(c, cudaGraphLaunch((cudaGraphExec_t)g, c->stream), "graph launch");
 }

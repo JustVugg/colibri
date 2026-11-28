@@ -9,7 +9,8 @@
  *   attn      causal GQA with the output gate over a cache at an offset, a prefill of
  *             several rows after earlier ones, a selection list
  *   dnconv    both orders, the ring carried across calls, the snapshot row; LFM3's (order 2)
- *   dnrec     KD 8 and 128, silu and sigmoid gates, the state carried, the snapshot
+ *   dnrec     KD 8, 64, 128 and 256, silu and sigmoid gates, the state carried, the snapshot
+ *   route     softmax, sigmoid and sqrt(softplus) pickers, groups, biases; norm_eps 0 as the engines pass it
  *   ew        every element-wise op
  *   lost      a failed launch (COLI_GPU_FAIL_AFTER) marks the device lost to the chain
  * Needs a device: run by hand (make cuda-chain-check CUDA=1); gpu-compile builds it. */
@@ -1344,10 +1345,11 @@ int main(void) {
         T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(sb);
     }
     printf("dnrec\n");
-    /* four rows (cc_dnrec_k) and 37 (the prompt's kernels: cc_dnrec_rows_k for KD 8, cc_dnrec_split_k
-     * for 64 and 128; blocks of rows past the first, the last part full, the snapshot inside one) */
-    for (int it = 0; it < 6; it++) {
-        const int KD = it % 3 == 1 ? 128 : it % 3 == 2 ? 64 : 8, S = it < 3 ? 4 : 37, snap_at = S == 4 ? 1 : 20;
+    /* four rows (cc_dnrec_k; cc_dnrec_sm_k for KD 128 and 256 on sm_80 on, 256's past 48 KiB of shared
+     * memory) and 37 (the prompt's kernels: cc_dnrec_rows_k for KD 8 and 256, cc_dnrec_split_k for 64
+     * and 128; blocks of rows past the first, the last part full, the snapshot inside one) */
+    for (int it = 0; it < 8; it++) {
+        const int KD = it >= 6 ? 256 : it % 3 == 1 ? 128 : it % 3 == 2 ? 64 : 8, S = it < 3 || it == 6 ? 4 : 37, snap_at = S == 4 ? 1 : 20;
         const int VH = 4, KH = 2, VD = KD == 8 ? 16 : 128, Ktot = KH * KD, CD = 2 * Ktot + VH * VD, vd = VH * VD;
         std::vector<float> cv = rnd((size_t)S * CD, 61), ab = rnd((size_t)S * 2 * VH, 62), z = rnd((size_t)S * (CD + vd), 63), st = rnd((size_t)VH * KD * VD, 64, 0.1f);
         std::vector<float> prm(2 * VH + VD); unsigned s = 65; for (int h = 0; h < VH; h++) { prm[h] = -1.f + 0.5f * frand(&s); prm[VH + h] = 0.2f * frand(&s); } for (int v = 0; v < VD; v++) prm[2 * VH + v] = 1.f + 0.2f * frand(&s);
@@ -1509,8 +1511,11 @@ int main(void) {
             {2, 256, 32, 0, 0, 0, 0, 0, 1.f, 1.f, "softmax, top 32 of 256, not normalized"},
             {2, 200, 6, 0, 2, 0, 0, 1, 1.3f, 1.f, "softmax, the bias in the logit, a temperature, 200 experts"},
         };
-        for (auto &cs : cases) {
-            CcRoute p = {cs.S, cs.E, cs.K, cs.kind, 5, cs.E + 3, 2, cs.has_bias, 1, cs.K + 2, 3, cs.K + 1, cs.n_group, cs.topk_group, cs.norm, cs.temp, cs.scale, 1e-20f};
+        /* norm_eps 0 too, as the engines pass it: a softmax's normalized weights then come from the K picked
+         * logits alone (cc_route_warp_k), the same ids and weights */
+        for (float eps : {1e-20f, 0.f}) for (auto &cs : cases) {
+            if (eps == 0.f && !(cs.kind == 0 && cs.has_bias != 1 && cs.norm == 1)) continue;
+            CcRoute p = {cs.S, cs.E, cs.K, cs.kind, 5, cs.E + 3, 2, cs.has_bias, 1, cs.K + 2, 3, cs.K + 1, cs.n_group, cs.topk_group, cs.norm, cs.temp, cs.scale, eps};
             std::vector<float> l = rnd((size_t)5 + cs.S * (cs.E + 3), 101 + cs.E, 4.f), b = rnd(cs.E + 2, 202, 0.5f);
             std::vector<int> rid((size_t)1 + cs.S * (cs.K + 2), -7); std::vector<float> rw((size_t)3 + cs.S * (cs.K + 1), -7.f);
             ref_route(l.data(), b.data(), rid.data(), rw.data(), &p);
@@ -1530,7 +1535,9 @@ int main(void) {
                     if (a != b) printf("  (row %d slot %d: device %d, CPU %d, scores %.9g %.9g)\n", s, k, a, b, a >= 0 && a < cs.E ? l[5 + s * (cs.E + 3) + a] : 0.f, b >= 0 ? l[5 + s * (cs.E + 3) + b] : 0.f);
                 }
             }
-            ck(ok && same && wd < 1e-6, cs.what);
+            char what[128];
+            snprintf(what, sizeof what, "%s%s", cs.what, eps == 0.f ? ", norm_eps 0" : "");
+            ck(ok && same && wd < 1e-6, what);
             T->free(lb); T->free(bb); T->free(ib); T->free(wb);
         }
     }

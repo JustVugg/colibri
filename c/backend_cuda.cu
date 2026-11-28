@@ -5119,7 +5119,10 @@ static void hcm_half_shutdown(int device) {
         g_hcm_hc[i].st = nullptr; g_hcm_hc[i].dev = -1;
     }
 }
+/* A matmul's output range: the f16 copies of it go, and so do the quantized x slots (bd_xq) of
+ * it, or a later reader the chain calls x_same would get the old quantization */
 static void hcm_half_invalidate_range(int device, const void *ptr, size_t nbytes) {
+    if (ptr && nbytes) bd_xq_invalidate_range(ptr, nbytes);
     std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
     for (int i = 0; i < g_hcm_hc_n; i++) {
         if (device >= 0 && g_hcm_hc[i].dev != device) continue;
@@ -5149,6 +5152,7 @@ static void hcm_half_forget_stream(cudaStream_t st, const float *keep_glu_for) {
     }
 }
 static void hcm_half_clear_glu_and_invalidate_out(int device, cudaStream_t st, const void *y_dev, size_t ybytes) {
+    if (y_dev && ybytes) bd_xq_invalidate_range(y_dev, ybytes);
     std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
     const uintptr_t y0 = (uintptr_t)y_dev, y1 = y0 + ybytes;
     for (int i = 0; i < g_hcm_hc_n; i++) {
@@ -5245,6 +5249,7 @@ static __half *hcm_half_reserve_glu_out(int dev, const float *y, int S, int O, c
     if (O % 4 != 0) return nullptr;
     const size_t bytes = (size_t)S * O * sizeof(__half);
     if (bytes == 0 || bytes > HCM_HALF_MAX_BYTES) return nullptr;
+    bd_xq_invalidate_range(y, (size_t)S * O * sizeof(float));
     std::lock_guard<std::mutex> lk(g_hcm_hc_mu);
     const int idx = hcm_hc_find_or_add(st, dev);
     if (idx < 0) return nullptr;
@@ -5299,9 +5304,9 @@ static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, cons
 }
 #else
 static void hcm_half_shutdown(int) {}
-static void hcm_half_invalidate_range(int, const void *, size_t) {}
+static void hcm_half_invalidate_range(int, const void *ptr, size_t nbytes) { if (ptr && nbytes) bd_xq_invalidate_range(ptr, nbytes); }
 static void hcm_half_forget_stream(cudaStream_t, const float *) {}
-static void hcm_half_clear_glu_and_invalidate_out(int, cudaStream_t, const void *, size_t) {}
+static void hcm_half_clear_glu_and_invalidate_out(int, cudaStream_t, const void *y, size_t n) { if (y && n) bd_xq_invalidate_range(y, n); }
 #endif
 /* hcm_dense_k for a block tensor's S rows: the inputs in f16 (persistent per-stream HcmHalfCache) and
  * split K's partial sums. COLI_CUDA_HCM_TILE and COLI_CUDA_HCM_SPLIT (2 ..) force a tile and a split K.
