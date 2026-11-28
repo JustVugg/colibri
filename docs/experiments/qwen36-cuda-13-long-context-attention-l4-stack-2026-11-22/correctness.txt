@@ -1,0 +1,29 @@
+NVIDIA L4 vs dev, full CUDA stack
+
+These measurements compare the historical full stack with dev on the same physical GPU.
+FP32 reference: dev at 05245ef45048b837fee5ed7b5b1ab2e59161fb80.
+Every workload compared the full 248,320-value FP32 output after prefill and each generation step.
+All three retained repetitions of both builds matched the saved dev reference.
+The columns below list the per-run vector count and two hashes from the measurement log.
+
+workload_id | vectors per run | logits fingerprint | token fingerprint | NLL | top-1
+1 | 129 | 58597411337179d4 | a7164b3cd0654951 | 2.81901 | 0.492
+2 | 129 | a699413c086b66c8 | bc09903f9a4069bc | 2.88573 | 0.461
+3 | 129 | 58597411337179d4 | a7164b3cd0654951 | 2.81901 | 0.492
+4 | 129 | a699413c086b66c8 | bc09903f9a4069bc | 2.88573 | 0.461
+5 | 129 | 7e3b3547a30ba7b7 | d6661a686430b1fa | 2.41373 | 0.484
+6 | 129 | 60daf01145db39db | 45601e6c456735d4 | 1.52531 | 0.602
+7 | 129 | a0edef03da04b7b5 | e54687bacc388530 | 2.42010 | 0.484
+8 | 129 | f13531074b0da9db | e3656e007bca1e82 | 2.26869 | 0.492
+9 | 58 | cee314a080b4d7af | a9232a16bd227f2d | 1.75267 | 0.737
+10 | 33 | 3602c302dc965351 | 7d6e0f6d44b5cecc | 0.02470 | 1.000
+11 | 88 | 8d62337e690c90a1 | 159540b062b93762 | 1.10625 | 0.724
+12 | 45 | 24f0e00b63a4e83f | 23d625e741190180 | 0.22478 | 0.932
+13 | 55 | 07186047db46868b | 24b73c35bded487b | 1.09471 | 0.796
+14 | 25 | 025d0485fcc8de5d | 331c8c8593842500 | 0.29756 | 0.875
+15 | 468 | 69ec1e9880d5c25c | c005de8ea3c4e76e | 0.84355 | 0.760
+16 | 187 | 89abcc13bb9bfa32 | 1ac06551ca8a243e | 0.88944 | 0.731
+
+Independent PPL check: 512-token prompt, 128 continuation vectors; 31,784,960 FP32 values per engine.
+Dev and trial NLL: 2.8802031624062088. Dev and trial PPL: 17.817892737882865.
+Official CUDA test command: make -C c cuda-test CUDA_ARCH=native. Exit code: 0.

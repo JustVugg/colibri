@@ -67,6 +67,7 @@ __device__ __forceinline__ unsigned ccd_wscan(unsigned v, unsigned *cnt, int tid
 
 /* ---- mHC ------------------------------------------------------------------------------ */
 __global__ void __launch_bounds__(256) ccd_mhc_split_k(const float *x, const float *mx, float *hp, const float *prm, CcMhc p) {
+    COLI_PDL_WAIT();
     __shared__ float red[256];
     __shared__ float ms[96];
     const int s = blockIdx.x, tid = threadIdx.x, H = p.H, HD = H * p.D, nm = (2 + H) * H;
@@ -111,6 +112,7 @@ __global__ void __launch_bounds__(256) ccd_mhc_split_k(const float *x, const flo
     }
 }
 __global__ void ccd_mhc_ew_k(int mode, const float *x, const float *mx, const float *hp, float *y, CcMhc p) {
+    COLI_PDL_WAIT();
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (mode == CC_SWIGLU_CLAMP) {
         if (i >= p.n) return;
@@ -163,6 +165,7 @@ __device__ __forceinline__ float ccd_kv(const float *win, const float *cmp, int 
 /* a (head, row) a block: chain_dsv4.comp's mode 0 */
 __global__ void __launch_bounds__(256) ccd_attn_k(const float *q, const float *win, const float *cmp, const int *list,
                                                   const float *prm, float *out, CcDsAttn p) {
+    COLI_PDL_WAIT();
     extern __shared__ float sm[];   /* hd queries, then cnt scores */
     __shared__ float red[256];
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x;
@@ -219,6 +222,7 @@ __global__ void __launch_bounds__(256) ccd_attn_k(const float *q, const float *w
  * listed rows, in chunks of 32 floats */
 __global__ void __launch_bounds__(256) ccd_pa_scores_k(const float *q, const float *win, const float *cmp, const int *list,
                                                        float *scr, CcDsAttn p) {
+    COLI_PDL_WAIT();
     __shared__ float sq[64 * 32];
     __shared__ float sk[64 * 33];
     __shared__ int se[64];
@@ -261,6 +265,7 @@ __global__ void __launch_bounds__(256) ccd_pa_scores_k(const float *q, const flo
 }
 /* the weights in place and each (row, head)'s denominator in list order */
 __global__ void __launch_bounds__(256) ccd_pa_weights_k(const int *list, const float *prm, float *scr, float *den, CcDsAttn p) {
+    COLI_PDL_WAIT();
     __shared__ float red[256];
     __shared__ float sw[3072];
     const int s = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, H = p.H, n = p.cnt;
@@ -287,6 +292,7 @@ __global__ void __launch_bounds__(256) ccd_pa_weights_k(const int *list, const f
 /* the output: 64 heads by 64 dims a block, the entries in list order on tiles of 32 */
 __global__ void __launch_bounds__(256) ccd_pa_out_k(const float *win, const float *cmp, const int *list, const float *scr,
                                                     const float *den, float *out, CcDsAttn p) {
+    COLI_PDL_WAIT();
     __shared__ float sk[32 * 65];
     __shared__ float sw[64 * 33];
     __shared__ int se[32];
@@ -366,6 +372,7 @@ static int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm,
 
 /* ---- RoPE on interleaved pairs ---------------------------------------------------------- */
 __global__ void ccd_rope_k(float *x, const float *cs, CcDsRope p) {
+    COLI_PDL_WAIT();
     const long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     const int half_ = p.rd / 2;
     if (t >= (long long)p.nseg * half_) return;
@@ -392,6 +399,7 @@ static int cc_ds_rope(CcBuf *x, CcBuf *cs, const CcDsRope *p) {
 /* ---- the compressor's rolling group (one block, the rows in order) --------------------- */
 __global__ void __launch_bounds__(256) ccd_compress_k(const float *kv, const float *sc, float *ring, const float *ape, float *out,
                                                       CcDsComp p) {
+    COLI_PDL_WAIT();
     const int tid = threadIdx.x, R = p.ratio, P = p.P, D = p.D, ov = p.overlap;
     const int rows = ov ? 2 * R : R, ro = p.ring_off, so = ro + rows * P;
     for (int s = 0; s < p.S; s++) {
@@ -443,6 +451,7 @@ static int cc_ds_compress(CcBuf *kv, CcBuf *sc, CcBuf *ring, CcBuf *prm, CcBuf *
 /* ---- the indexer's scores: a thread a (column, head), the heads joined in their order --- */
 __global__ void __launch_bounds__(256) ccd_score_k(const float *iq, const float *hw, const float *keys, const unsigned char *mask, float *scs,
                                                    CcDsScore p) {
+    COLI_PDL_WAIT();
     extern __shared__ float sm[];   /* the queries (IH*ID when they fit), then IH weights */
     __shared__ float red[256];
     const int s = blockIdx.y, tid = threadIdx.x, IH = p.IH, ID = p.ID, width = p.width;
@@ -490,6 +499,7 @@ static int cc_ds_score(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *mask, CcBuf *sc
 
 /* ---- the candidate blocks ------------------------------------------------------------------ */
 __global__ void __launch_bounds__(256) ccd_cand_k(const float *scs, unsigned char *mask, CcDsCand p) {
+    COLI_PDL_WAIT();
     __shared__ float bm[4096];
     __shared__ float red[256];
     __shared__ unsigned cnt[256];
@@ -545,6 +555,7 @@ static int cc_ds_cand(CcBuf *sc, CcBuf *mask, const CcDsCand *p) {
 
 /* ---- the top-k: the keep-th largest key bit by bit, then the columns in order ---------- */
 __global__ void __launch_bounds__(256) ccd_topk_k(const float *scs, int *list, CcDsTopk p) {
+    COLI_PDL_WAIT();
     __shared__ unsigned cnt[256];
     extern __shared__ float rank[];   /* order 1: the selected columns */
     const int s = blockIdx.x, tid = threadIdx.x;
@@ -605,6 +616,7 @@ static int cc_ds_topk(CcBuf *sc, CcBuf *list, const CcDsTopk *p) {
 
 /* ---- the engram gate ------------------------------------------------------------------------ */
 __global__ void __launch_bounds__(256) ccd_engram_k(const float *kv, const float *prm, float *x, CcDsEngram p) {
+    COLI_PDL_WAIT();
     __shared__ float sm[768];
     const int cs = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, H = p.H, D = p.D;
     if (s >= p.S || cs >= H) return;

@@ -829,8 +829,10 @@ static void test_sconv(int C, int CK) {
  * before pos_base through a ring of cap rows (t % cap, the latest such t < pos_base)
  * and the step's own rows in a scratch, k at ks, v at vs, kvd floats a row. */
 /* sink (Inkling-2): a logit per (row, head) after the tau rows, in the softmax's denominator only */
-static void test_relattn_s(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink) {
-    int H = 4, KVH = 2, kvd = KVH * hd, T = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8, soff = toff + S + 3;
+/* H, KVH: the heads; every case runs on chain_relattn_tile.comp (H / KVH <= 4) and on mode 0, the
+ * two the same bits */
+static void test_relattn_h(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink, int H, int KVH) {
+    int kvd = KVH * hd, T = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8, soff = toff + S + 3;
     float *q = fvec((size_t)S * H * hd, 1.f), *kt = fvec((size_t)T * kvd, 1.f), *vt = fvec((size_t)T * kvd, 1.f);
     float *r = fvec((size_t)S * H * dr, 0.5f), *relp = fvec((size_t)dr * ext, 0.5f), *tau = malloc(S * sizeof *tau);
     float *snk = fvec((size_t)S * H, 3.f);
@@ -877,14 +879,100 @@ static void test_relattn_s(int S, int pos_base, int window, int cap, int hd, int
     VkcBuf *pb = up(pbuf, poff + (size_t)dr * ext), *tb = up(tbuf, nt), *ob = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN);
     VkcRelAttn p = {S, H, KVH, hd, pos_base, cap, window, ext, dr, 0, H * hd, 0, H * hd, koff, koff, (int)ks, (int)vs, kvd,
                     roff, H * dr, poff, toff, scale, sink, sink ? soff : 0};
+    size_t no = (size_t)S * H * hd;
+    float *tile = malloc(no * sizeof *tile);
+    const int was = vkc_relattn_tile_rows(1);
+    VkcStats st0; vkc_stats(&st0);
     vkc_begin(); int ok = vkc_relattn(qb, kb, vb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
-    double e = relerr((float *)vkc_ptr(ob), ref, (size_t)S * H * hd, 1e-3);
-    CHECK(ok && e < 2e-5, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d: err %.2e", S, pos_base, window, cap, hd, dr, ext, sink, e);
+    VkcStats st1; vkc_stats(&st1);
+    const int tiled = st1.relattn_tile > st0.relattn_tile;
+    memcpy(tile, vkc_ptr(ob), no * sizeof *tile);
+    vkc_relattn_tile_rows(0);
+    vkc_begin(); ok = ok && vkc_relattn(qb, kb, vb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+    vkc_relattn_tile_rows(was);
+    double e = relerr((float *)vkc_ptr(ob), ref, no, 1e-3), et = relerr(tile, ref, no, 1e-3);
+    size_t diff = 0;
+    for (size_t i = 0; i < no; i++) diff += memcmp(tile + i, (float *)vkc_ptr(ob) + i, 4) != 0;
+    CHECK(ok && e < 2e-5 && et < 2e-5 && (H / KVH > 4 || (tiled && !diff)),
+          "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d heads %d/%d: err %.2e, tiles %.2e (%s), %zu of %zu differ",
+          S, pos_base, window, cap, hd, dr, ext, sink, H, KVH, e, et, tiled ? "ran" : "did not run", diff, no);
+    free(tile);
+    /* the ring in float16 (vkc_relattn_kv16): mode 0 and the tiles the same bits again, the values within the halves'
+     * rounding of the reference */
+    if (vkc_relattn_kv16_ready() && hd % 2 == 0 && koff % 2 == 0) {
+        uint16_t *kh = calloc(nr, sizeof *kh), *vh = calloc(nr, sizeof *vh);
+        kv16_pack(kh, kr, (int64_t)nr); kv16_pack(vh, vr, (int64_t)nr);
+        VkcBuf *khb = vkc_buf((nr + 1) / 2 * 4, VKC_UP), *vhb = vkc_buf((nr + 1) / 2 * 4, VKC_UP);
+        memcpy(vkc_ptr(khb), kh, nr * 2); memcpy(vkc_ptr(vhb), vh, nr * 2);
+        float *t16 = malloc(no * sizeof *t16);
+        const int w16 = vkc_relattn_kv16(1), wt = vkc_relattn_tile_rows(1);
+        vkc_begin(); int ok16 = vkc_relattn(qb, khb, vhb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+        memcpy(t16, vkc_ptr(ob), no * sizeof *t16);
+        vkc_relattn_tile_rows(0);
+        vkc_begin(); ok16 = ok16 && vkc_relattn(qb, khb, vhb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+        vkc_relattn_tile_rows(wt); vkc_relattn_kv16(w16);
+        double e16 = relerr((float *)vkc_ptr(ob), ref, no, 1e-3), et16 = relerr(t16, ref, no, 1e-3);
+        size_t d16 = 0;
+        for (size_t i = 0; i < no; i++) d16 += memcmp(t16 + i, (float *)vkc_ptr(ob) + i, 4) != 0;
+        CHECK(ok16 && e16 < 4e-3 && et16 < 4e-3 && (H / KVH > 4 || !d16),
+              "relattn KV16 S %d pos %d window %d hd %d heads %d/%d: err %.2e, tiles %.2e, %zu of %zu differ",
+              S, pos_base, window, hd, H, KVH, e16, et16, d16, no);
+        free(t16); free(kh); free(vh); vkc_free(khb); vkc_free(vhb);
+    }
+    /* a decode-sized step over more than a tile: the split (mode 1's partials, mode 2's join) on
+     * chain_relattn_tile.comp's SPLIT and on mode 1, the same bits */
+    int nmax = pos_base + S;
+    if (window > 0 && nmax > window) nmax = window;
+    const int nc = (nmax + 127) / 128;
+    if (S <= 8 && nc >= 2 && H / KVH <= 4) {
+        VkcBuf *part = vkc_buf((size_t)S * H * nc * (hd + 2) * 4, VKC_DEV);
+        float *dec = malloc(no * sizeof *dec);
+        vkc_relattn_part(part);
+        const int wd = vkc_relattn_tile_dec(1);
+        VkcStats d0; vkc_stats(&d0);
+        vkc_begin(); int okd = vkc_relattn(qb, kb, vb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+        VkcStats d1; vkc_stats(&d1);
+        memcpy(dec, vkc_ptr(ob), no * sizeof *dec);
+        vkc_relattn_tile_dec(0);
+        vkc_begin(); okd = okd && vkc_relattn(qb, kb, vb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
+        vkc_relattn_tile_dec(wd);
+        vkc_relattn_part(NULL);
+        double es = relerr((float *)vkc_ptr(ob), ref, no, 1e-3), ed = relerr(dec, ref, no, 1e-3);
+        size_t dd = 0;
+        for (size_t i = 0; i < no; i++) dd += memcmp(dec + i, (float *)vkc_ptr(ob) + i, 4) != 0;
+        CHECK(okd && es < 2e-5 && ed < 2e-5 && d1.relattn_tile > d0.relattn_tile && !dd,
+              "relattn split S %d pos %d window %d hd %d heads %d/%d, %d tiles: err %.2e, on the KV heads %.2e (%s), %zu of %zu differ",
+              S, pos_base, window, hd, H, KVH, nc, es, ed, d1.relattn_tile > d0.relattn_tile ? "ran" : "did not run", dd, no);
+        free(dec); vkc_free(part);
+    }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(rb); vkc_free(pb); vkc_free(tb); vkc_free(ob);
     free(q); free(kt); free(vt); free(r); free(relp); free(tau); free(snk); free(ref); free(kr); free(vr); free(scr); free(rbuf); free(pbuf); free(tbuf);
 }
+static void test_relattn_s(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink) {
+    test_relattn_h(S, pos_base, window, cap, hd, dr, ext, sink, 4, 2);
+}
 static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext) {
     test_relattn_s(S, pos_base, window, cap, hd, dr, ext, 0);
+}
+/* chain_relattn_tile.comp's blocks: Inkling-2-Mini's heads (24 over 8, a block of 8 rows), one, two and four
+ * heads a KV head, rows that end a block short, a window that slides inside a block and a wrapped ring */
+static void test_relattn_tiles(void) {
+    const unsigned saved = rng;   /* the later cases' inputs as before these */
+    test_relattn_h(37, 0, 0, 64, 128, 16, 64, 1, 24, 8);          /* a first chunk, global */
+    test_relattn_h(70, 1100, 1024, 1024, 128, 16, 1024, 1, 6, 2);  /* Inkling-2-Mini's window over a full ring */
+    test_relattn_h(45, 200, 64, 64, 128, 16, 64, 0, 3, 1);         /* t0 sliding by one a row, a wrapped ring */
+    test_relattn_h(29, 5, 0, 64, 24, 4, 16, 1, 2, 2);              /* one head a KV head, odd dims, past ext */
+    test_relattn_h(30, 300, 0, 400, 32, 8, 100, 0, 8, 4);          /* two heads a KV head */
+    test_relattn_h(19, 140, 100, 100, 64, 16, 100, 1, 8, 2);       /* four */
+    test_relattn_h(17, 40, 0, 64, 256, 64, 32, 1, 3, 1);           /* the largest head and bank */
+    test_relattn_h(9, 600, 0, 700, 128, 16, 512, 1, 24, 8);        /* a decode-sized step over five tiles */
+    /* the split decode on the KV heads: one row and a verify's rows, a window over a wrapped ring, four heads a KV
+     * head (two blocks of rows), the largest head */
+    test_relattn_h(1, 1500, 0, 1501, 128, 16, 1024, 1, 24, 8);
+    test_relattn_h(4, 2000, 1024, 1024, 128, 16, 1024, 1, 24, 8);
+    test_relattn_h(8, 700, 0, 708, 64, 8, 64, 0, 8, 2);
+    test_relattn_h(3, 300, 0, 303, 256, 64, 32, 1, 3, 1);
+    rng = saved;
 }
 /* Inkling-2's residual mix (inkling2.h's ink2_attn_res): nb block states and the stream, each
  * RMS-normalised without a weight, mixed by softmax((q . n_e) / sqrt(D)) */
@@ -973,6 +1061,7 @@ static void test_inkling2(void) {
     test_relattn_s(1, 40, 16, 16, 32, 4, 16, 1);        /* decode over a wrapped ring */
     test_relattn_s(130, 3, 0, 200, 24, 4, 200, 1);      /* two tiles, and sliced rows keep their sinks */
     test_relattn_s(3, 513, 512, 512, 128, 16, 512, 1);  /* Inkling-2-Small's window, hd 128 */
+    test_relattn_tiles();
     test_ink2_mix(1, 64, 0); test_ink2_mix(3, 4608, 8); test_ink2_mix(2, 300, 15);
     test_ink2_clip(3, 4, 128, 1, 2.f); test_ink2_clip(2, 2, 16, 0, 0.5f); test_ink2_clip(1, 48, 300, 1, 22.6f);
     test_ink2_dconv(2, 16, 4, 3, 1); test_ink2_dconv(8, 128, 4, 1, 1); test_ink2_dconv(1, 8, 9, 5, 4); test_ink2_dconv(3, 4, 1, 2, 2);
@@ -3280,7 +3369,7 @@ static void bench_gemv(void) {
         for (size_t i = 0; i < (size_t)O * (I / 64 + 1); i++) sc[i] = 0.01f;
         for (int j = 0; j < nm; j++) coli_vk_tensor_ensure(&t[j], w, sc, fmt, I, O, gs);
         const char *se = getenv("COLI_VK_BENCH_S"); int S = se && *se ? atoi(se) : 1;
-        if (S < 1 || S > 4) S = 1;
+        if (S < 1 || S > 32) S = 1;
         vkc_gemm_rows(S > 1 ? 0 : -1);
         float *x = fvec((size_t)I * S, 1.f);
         VkcBuf *xb = up(x, (size_t)I * S), *yb = vkc_buf((size_t)O * 4 * nm * S, VKC_DEV);
@@ -3320,15 +3409,17 @@ static void test_verify_rows(int fmt, int I, int O) {
     for (size_t i = 0; i < (size_t)O * (I / 64 + 1); i++) sc[i] = 0.005f + (rnd() % 100) / 10000.f;
     ColiVkTensor *t = NULL;
     if (!coli_vk_tensor_ensure(&t, w, sc, fmt, I, O, fmt == 4 ? 64 : 0)) { CHECK(0, "verify rows fmt %d: upload", fmt); free(w); free(sc); return; }
-    float *x = fvec((size_t)4 * I, 1.f), *one = malloc((size_t)4 * O * 4);
-    VkcBuf *xb = up(x, (size_t)4 * I), *yb = vkc_buf((size_t)4 * O * 4, VKC_DOWN);
+    float *x = fvec((size_t)8 * I, 1.f), *one = malloc((size_t)8 * O * 4);
+    VkcBuf *xb = up(x, (size_t)8 * I), *yb = vkc_buf((size_t)8 * O * 4, VKC_DOWN);
     vkc_gemm_rows(0);
     int ok = 1;
-    for (int s = 0; s < 4 && ok; s++) {   /* each row alone: a decode step's */
+    for (int s = 0; s < 8 && ok; s++) {   /* each row alone: a decode step's */
         ok = vkc_begin() && vkc_matmul(t, xb, (size_t)s * I, yb, (size_t)s * O, 1) && vkc_submit(1);
         memcpy(one + (size_t)s * O, (float *)vkc_ptr(yb) + (size_t)s * O, (size_t)O * 4);
     }
-    for (int S = 2; S <= 4 && ok; S++) {
+    int ss[] = {2, 3, 4, 5, 6, 8};
+    for (int k = 0; k < 6 && ok; k++) {
+        int S = ss[k];
         ok = vkc_begin() && vkc_matmul(t, xb, 0, yb, 0, S) && vkc_submit(1);
         int same = ok && !memcmp(vkc_ptr(yb), one, (size_t)S * O * 4) && !bad(one, (size_t)S * O);
         CHECK(same, "verify rows fmt %d I %d O %d: the %d rows have a decode step's bits", fmt, I, O, S);
@@ -4788,8 +4879,11 @@ int main(int argc, char **argv) {
         test_kpool(1, 2, 4, 16, 2, 4, 0); test_kpool(2, 30, 16, 16, 2, 6, 1);
         {   /* many pools: their scores on a grid first (the random stream kept); the pooled keys are
              * softmax means made on the device, so a run with many pools can meet a near tie that
-             * a software device's exp settles otherwise than the CPU's */
+             * a software device's exp settles otherwise than the CPU's. Its own seed, the state the
+             * stream had here when Lavapipe agreed: #3099's verify rows drew more numbers before it and
+             * moved it onto such a tie */
             unsigned rng_was = rng;
+            rng = 3897331057u;
             test_kpool(2, 1000, 4, 32, 4, 128, 1);
             rng = rng_was;
         }

@@ -127,6 +127,23 @@ class MemoryParsing(unittest.TestCase):
         self.assertEqual(mem["total"], 26673356 * 1024)
         self.assertEqual(mem["available"], 23465316 * 1024)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc/meminfo")
+    def test_a_container_limit_bounds_the_total(self):
+        # 16 GiB of a 256 GB host: the model choice is sized by the total
+        meminfo = "MemTotal: 263860000 kB\nMemAvailable: 250000000 kB\n"
+        limit, left = 16 * 2**30, 16 * 2**30 - 300 * 2**20
+        for confined, total, available in ((limit, limit, left), (None, 263860000 * 1024, 250000000 * 1024)):
+            with self.subTest(confined=confined), \
+                    mock.patch("builtins.open", mock.mock_open(read_data=meminfo)), \
+                    mock.patch("resource_plan.memory_limit", return_value=confined), \
+                    mock.patch("resource_plan.memory_available",
+                               return_value=left if confined else 250000000 * 1024):
+                self.assertEqual(setup_hw.detect_memory(), {"total": total, "available": available})
+        with mock.patch("builtins.open", mock.mock_open(read_data=meminfo)), \
+                mock.patch("resource_plan.memory_limit", side_effect=ValueError("malformed cgroup")), \
+                mock.patch("resource_plan.memory_available", return_value=None):
+            self.assertEqual(setup_hw.detect_memory()["total"], 263860000 * 1024)   # as before
+
     def test_meminfo_without_available_is_unknown_not_zero(self):
         mem = setup_hw.memory_from_meminfo("MemTotal: 1000 kB\n")
         self.assertEqual(mem["total"], 1000 * 1024)

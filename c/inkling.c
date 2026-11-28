@@ -98,6 +98,16 @@ static int g_ink_dho = 0;       /* COLI_VK_DENSE_HOST: the dense matrices on the
  * device; L = 0 while there is none (the chain off, or one that declines as before). */
 static VkcFit g_inkc_fit;
 #endif
+/* INK2_MTP's drafter on the Vulkan chain (inkling2_mtp.h): the chain stays on with the drafter;
+ * INK2_MTP_CHAIN=0 turns the chains off for the CPU's drafter instead */
+static int g_ink2mc = 0;
+static int ink2mc_wanted(void) {
+#ifdef COLI_VULKAN
+    const char *e = getenv("INK2_MTP_CHAIN"); return !(e && *e == '0');
+#else
+    return 0;
+#endif
+}
 /* The routed-expert tier on either device (xtier.h): Vulkan's (vk_tier.h), or CUDA's
  * (cu_tier.h, the same tier over the CUDA backend) once ink_cu_tier_start chose it. A build
  * without one of them has its stubs, so XT(...) is always defined. */
@@ -284,13 +294,9 @@ typedef struct {
 } Model;
 
 /* ---------- utility ---------- */
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
-#endif
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static double now_s(void) { return compat_now_s(); }
+static double rss_gb(void) { return compat_rss_gb(); }
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 static float siluf(float x) { return x / (1.f + expf(-x)); }
 /* A routed expert's activation over its gate and up rows (g <- act(g, u)): SwiGLU, or on
@@ -1120,13 +1126,38 @@ static const char *embed_norm_name(shards *S) {
     return NULL;
 }
 
-static float *load_t(Model *m, const char *name) {
+/* `want` is the element count the forward pass indexes with (config dims): a short tensor used to
+ * be read past its end at inference, so it is refused here, as qwen36's load_t_n and olmoe's load_t do
+ * (#1824). want < 0: no count to check against (load_t). */
+static float *load_tn(Model *m, const char *name, int64_t want) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (want >= 0 && n < want) {   /* fewer than the forward pass reads: past the end; more were read as their prefix before */
+        fprintf(stderr, "%s: %lld elements, config implies %lld -- refusing\n", name, (long long)n, (long long)want);
+        exit(1);
+    }
     float *p = falloc(n);
+    st_tensor *t = st_find(&m->S, name);
+    if (st_is_ggml(t->dtype)) {   /* a GGUF's small tensor in a block type (AtomicChat's Inkling-2-Mini
+                                   * files hold attn_sink_proj and the conv projections in Q8_0): its rows dequantized */
+        const int type = st_ggml_type(t->dtype);
+        const int64_t cols = t->shape[t->rank - 1], rows = n / cols, rb = gq_row_bytes(type, cols);
+        if (rb < 0 || t->nbytes != rb * rows) {
+            fprintf(stderr, "%s: not %lld rows of %lld in ggml type %s, refusing\n",
+                    name, (long long)rows, (long long)cols, gq_type_name(type)); exit(1); }
+        uint8_t *raw = malloc((size_t)t->nbytes);
+        if (!raw) { fprintf(stderr, "OOM reading %s\n", name); exit(1); }
+        st_pread_full(t->fd, raw, t->nbytes, t->off, name);
+        for (int64_t r = 0; r < rows; r++)
+            if (gq_dequant_row(type, raw + r * rb, p + r * cols, cols)) {
+                fprintf(stderr, "%s: cannot read %s rows\n", name, gq_type_name(type)); exit(1); }
+        free(raw);
+        return p;
+    }
     st_read_f32(&m->S, name, p, 0);
     return p;
 }
+static float *load_t(Model *m, const char *name) { return load_tn(m, name, -1); }
 static float load_scalar(Model *m, const char *name, float dflt) {
     if (!st_has(&m->S, name)) return dflt;
     /* SEC: `v` is four bytes on the stack, and st_read_f32 writes as many as
@@ -1600,11 +1631,15 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
          * COLI_METAL=1: not measured on a Mac yet, so off unless asked */
         const char *im = getenv("INK2_METAL");
         if (!(im && *im == '1')) setenv("COLI_METAL", "0", 1);
-        /* INK2_MTP: the drafter reads the layers' streams on the host, and its verify rolls the
-         * state back, which the dense chains keep a copy of on the device: they stay off */
+        /* INK2_MTP: the CPU's drafter reads the layers' streams on the host, and its verify rolls the
+         * state back, which the dense chains keep a copy of on the device: they stay off, but the
+         * Vulkan chain, which runs the drafter itself (inkling2_mtp.h; INK2_MTP_CHAIN=0: off too) */
         if (ink2m_wanted()) {
-            setenv("COLI_VK_CHAIN", "0", 1); unsetenv("COLI_CUDA_CHAIN");
-            fprintf(stderr, "[inkling2] INK2_MTP: the dense chains off (the drafter reads the layers on the host)\n");
+            setenv("COLI_CUDA_CHAIN", "0", 1);   /* on by default for the Mini now: unset no longer keeps it off */
+            if (!ink2mc_wanted()) {
+                setenv("COLI_VK_CHAIN", "0", 1);
+                fprintf(stderr, "[inkling2] INK2_MTP: the dense chains off (the drafter reads the layers on the host)\n");
+            }
         }
 #if !defined(COLI_CUDA) && !defined(COLI_VULKAN)
         fprintf(stderr, "[inkling2] Inkling-2 runs on the CPU in this build\n");
@@ -1691,10 +1726,10 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 #endif
     if (load_boundaries && m->c.v2) {
         m->embed      = load_w(m, "model.llm.embed.weight", 0);
-        m->embed_norm = st_has(&m->S, "model.llm.embed_norm.weight") ? load_t(m, "model.llm.embed_norm.weight") : NULL;
-        m->final_norm = load_t(m, "model.llm.norm.weight");
+        m->embed_norm = st_has(&m->S, "model.llm.embed_norm.weight") ? load_tn(m, "model.llm.embed_norm.weight", m->c.hidden) : NULL;
+        m->final_norm = load_tn(m, "model.llm.norm.weight", m->c.hidden);
         m->lm_head    = load_w(m, "model.llm.unembed.weight", 1);
-        m->x2_out_query = load_t(m, "model.llm.attn_res.output_query");
+        m->x2_out_query = load_tn(m, "model.llm.attn_res.output_query", m->c.hidden);
         char mq[96] = "";
         if (m->c.loop_p > 1) snprintf(mq, sizeof mq, "model.llm.layers.%d.loop_msg_query", m->c.loop_s);
         if (m->c.loop_p > 1 && st_has(&m->S, mq)) {
@@ -1709,7 +1744,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
                             (long long)st_numel(&m->S, mq), (long long)D);
                     exit(1);
                 }
-                float *t = load_t(m, mq);
+                float *t = load_tn(m, mq, 4 * D);
                 memcpy(m->x2_loopq + (int64_t)j * 4 * D, t, 4 * D * sizeof(float));
                 free(t);
             }
@@ -1720,7 +1755,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
                 fprintf(stderr, "inkling2: the loop's message queries are not 2 x %d x %lld values\n", nl, (long long)D);
                 exit(1);
             }
-            float *q = load_t(m, qn), *kv = load_t(m, kvn);
+            float *q = load_tn(m, qn, 2 * nl * D), *kv = load_tn(m, kvn, 2 * nl * D);
             m->x2_loopq = falloc((int64_t)nl * 4 * D);
             for (int j = 0; j < nl; j++) {
                 float *o = m->x2_loopq + (int64_t)j * 4 * D;
@@ -1732,10 +1767,11 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         }
         m->vis = ink2_vision_load(m, snap);
         if (ink2m_wanted()) m->mtp = ink2m_load(m, snap);
+        g_ink2mc = m->mtp && ink2mc_wanted();
     } else if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
-        { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }
-        m->final_norm = load_t(m, "model.norm.weight");
+        { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_tn(m, en, m->c.hidden) : NULL; }
+        m->final_norm = load_tn(m, "model.norm.weight", m->c.hidden);
         m->lm_head    = load_w(m, "lm_head.weight", 1);
     }
     /* Inkling's audio "tower" is one embedding table + one RMSNorm. The int4
@@ -1759,7 +1795,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             exit(1);
         }
         m->audio_enc  = load_w(m, "model.audio.encoder.weight", 0);
-        m->audio_norm = load_t(m, "model.audio.final_norm.weight");
+        m->audio_norm = load_tn(m, "model.audio.final_norm.weight", m->c.hidden);
         fprintf(stderr, "[audio] DMel encoder loaded (%d bins x %d levels -> D=%d)\n",
                 c->mel_bins, c->mel_vocab, D);
     }
@@ -1771,25 +1807,26 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         Layer *l = &m->L[i];
         if (c->v2) ink2_load_layer(m, i, nm, sizeof(nm));
         else {
-        #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
+        #define LD(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_tn(m,nm,want)
+        const int64_t hd = L_HD(c,i), kvd = (int64_t)L_KV(c,i) * hd;
         #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm,1)
-        LD(in_ln,  "input_layernorm.weight");
-        LD(post_ln,"post_attention_layernorm.weight");
+        LD(in_ln,  "input_layernorm.weight", D);
+        LD(post_ln,"post_attention_layernorm.weight", D);
         LDW(q, "self_attn.q_proj.weight"); LDW(k, "self_attn.k_proj.weight");
         LDW(v, "self_attn.v_proj.weight"); LDW(r, "self_attn.r_proj.weight");
         LDW(o, "self_attn.o_proj.weight");
-        LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
-        LD(relp, "self_attn.rel_logits_proj.proj");
-        LD(k_cw, "self_attn.k_sconv.conv1d.weight");
-        LD(v_cw, "self_attn.v_sconv.conv1d.weight");
-        LD(a_cw, "attn_sconv.conv1d.weight");
-        LD(m_cw, "mlp_sconv.conv1d.weight");
+        LD(qn,"self_attn.q_norm.weight", hd); LD(kn,"self_attn.k_norm.weight", hd);
+        LD(relp, "self_attn.rel_logits_proj.proj", (int64_t)c->d_rel * L_EXT(c,i));
+        LD(k_cw, "self_attn.k_sconv.conv1d.weight", kvd * K);
+        LD(v_cw, "self_attn.v_sconv.conv1d.weight", kvd * K);
+        LD(a_cw, "attn_sconv.conv1d.weight", (int64_t)D * K);
+        LD(m_cw, "mlp_sconv.conv1d.weight", (int64_t)D * K);
         if (!c->sparse[i]) {
             LDW(dg, "mlp.gate_proj.weight"); LDW(du, "mlp.up_proj.weight"); LDW(dd, "mlp.down_proj.weight");
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.global_scale",i); l->dgs = load_scalar(m,nm,1.f);
         } else {
-            LD(router, "mlp.gate.weight");
-            LD(rbias,  "mlp.gate.e_score_correction_bias");
+            LD(router, "mlp.gate.weight", (int64_t)(c->n_experts + c->n_shared) * D);
+            LD(rbias,  "mlp.gate.e_score_correction_bias", c->n_experts);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.global_scale",i); l->rgs = load_scalar(m,nm,1.f);
             LDW(sh_g, "mlp.shared_experts.gate_proj");
             LDW(sh_u, "mlp.shared_experts.up_proj");
@@ -2445,13 +2482,17 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     int win = kv_ring_rows(c, li, m->max_t);
     float scale = 1.f / (float)hd;
     float *ctx = falloc((int64_t)S*qdim);
+    /* a (KV head, row) at a time with the KV head's `group` query heads one after the other, so the K and V rows
+     * one head reads are in the cache for the next: each head's arithmetic is the (head, row) loop's, word for word
+     * (a reordered form changed the compiler's fusions, and with them the bits) */
     #pragma omp parallel
     {
         float *rl = malloc(ext * sizeof(float));
         float *sc = malloc((size_t)m->max_t * sizeof(float));
         #pragma omp for collapse(2) schedule(static)
-        for (int h = 0; h < H; h++) {
-            for (int s = 0; s < S; s++) {
+        for (int g = 0; g < KV; g++) {
+            for (int s = 0; s < S; s++) for (int hh = 0; hh < group; hh++) {
+                int h = g * group + hh;
                 int qpos = mr ? mr[s].pos : pos0 + s;
                 int sp0 = mr ? qpos : pos0;       /* the scratch's first position: the row's own in a multiplexed step */
                 int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
@@ -2460,6 +2501,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 int64_t srow = mr ? (int64_t)s*kvdim : 0;
                 /* mix the relative-bias bank for this (token, head): rl[dist] */
                 const float *rv = rr + (int64_t)s*H*c->d_rel + h*c->d_rel;
+                /* dev's loop: run over the bank's rows first, the compiler fused it otherwise in this file */
                 for (int e = 0; e < ext; e++) {
                     float acc = 0.f;
                     for (int d = 0; d < c->d_rel; d++) acc += rv[d] * l->relp[(int64_t)d*ext + e];
@@ -2601,6 +2643,10 @@ static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
     free(bg); free(bh);
 }
 
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
+/* the positions the plan (coli_kv_plan.h) holds the KV caches at from the first request (0: grown as requests
+ * ask, as before), set where the device's mirrors at the whole served context fit (ink2c_plan_bytes, ink2cc) */
+static int g_ink_kv_plan_t;
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* ---- the routed-expert tier (vk_tier.c on Vulkan; on CUDA, cu_tier.c: XT) ------
  * With the tier on, one MoE layer runs per block of rows: the block's resident
@@ -3670,6 +3716,7 @@ static int64_t ink_cs_cells(Cfg *c, int bank, int layer);
 #endif
 #ifdef COLI_CUDA
 #include "cuda_chain.h"
+#include "kv16.h"            /* kv16_pack: the float16 mirrors (COLI_CUDA_KV16) */
 #include "inkling2_cuchain.h"   /* COLI_CUDA_CHAIN: Inkling-2's on a CUDA device */
 #endif
 
@@ -3744,6 +3791,9 @@ static InkPinState *ink_pin_state_save(Model *m, InkPinState *reuse){
             }
         }
     }
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     for (int j = 0; j < 4; j++)
         for (int i = 0; i < c->n_state; i++)
             memcpy(st->cs[j][i], m->cs[j][i],
@@ -3903,10 +3953,16 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
 
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
 static void ink_seq_swap(Model *m, InkSeq *q) {
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     float **K = m->K, **V = m->V; int len = m->kv_len; kv_prefix p = m->kvp;
     m->K = q->K; m->V = q->V; m->kv_len = q->kv_len; m->kvp = q->kvp;
     q->K = K; q->V = V; q->kv_len = len; q->kvp = p;
     for (int j = 0; j < 4; j++) { float **cs = m->cs[j]; m->cs[j] = q->cs[j]; q->cs[j] = cs; }
+#ifdef COLI_CUDA
+    ink2cc_host_wrote(m, 0);
+#endif
 }
 /* A conversation's state of its own, the shape the Model's has at its max_t. */
 static void ink_seq_alloc(Model *m, InkSeq *q) {
@@ -4192,23 +4248,8 @@ static int pi_desc(const void *a, const void *b) {
     float d = ((const PI*)b)->p - ((const PI*)a)->p;
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
- * (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V) {
-    static int dump = -1;
-    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
-    if (!dump) return;
-    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
-    for (int t = 0; t < V; t++) {
-        const float x = lo[t];
-        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
-    }
-    fprintf(stderr, "[LOGITS]");
-    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
-    fprintf(stderr, "\n");
-}
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
-    serve_logit_dump(logit, n);
+    coli_logit_dump(logit, n);
     int best = 0;
     for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
     if (temp <= 0.f) return best;
@@ -4312,12 +4353,6 @@ static void ink_image_attach(SReq *q) {
     g_ink_img.pix = NULL;
 }
 
-static int stdin_readable(void) {
-    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
-     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
-    return coli_stdin_readable();
-}
-
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
  * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
 static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
@@ -4407,7 +4442,7 @@ typedef struct { double t0, f0, e0, s0, a0; uint64_t h0, m0; } InkReqClock;
  * (prompt_break.h), with the reader its decode loop uses. The multiplexed loop owns its
  * command stream and reads it between steps. */
 static int ink_prompt_poll(ColiPromptBreak *b) {
-    while (!b->control && !b->eof && stdin_readable()) {
+    while (!b->control && !b->eof && coli_stdin_readable()) {
         int r = serve_read_cmd(stdin, stdout, b->id);
         if (r < 0) b->eof = 1;   /* as the decode loop: it stops at its next read */
         else if (r > 0) b->control = 1;
@@ -4439,6 +4474,9 @@ static ColiParkPart *ink_park_parts(Model *m, int *n_out) {
 static void ink_park(Model *m, int np, int max_tok) {
     int n = m->K && g_ink_mux_slots == 1 ? coli_park_rows_for(&g_ink_park, &m->kvp, m->kv_len, np, max_tok, 16) : 0, k = 0;
     if (!n) return;
+#ifdef COLI_CUDA
+    ink2cc_sync_cs(m);
+#endif
     ColiParkPart *p = ink_park_parts(m, &k);
     if (p) coli_park_save(&g_ink_park, &m->kvp, m->kv_len, p, k, n);
     free(p);
@@ -4606,6 +4644,9 @@ static int ink_ps_marks(const Tok *T, const int *ids, int np, int from, int *mar
 
 static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out, float **logit_out,
                            InkReqClock *clk, int lone) {
+#ifdef COLI_VULKAN
+    if (m->c.v2) ink2c_retry(m);   /* a chain that stopped with the device alive comes back (vkc_chain_retry) */
+#endif
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
@@ -4678,7 +4719,15 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
      *     so ids alone cannot tell two different clips apart
      * Either the reused positions are token-identical or nothing is reused;
      * the emitted tokens are unchanged in both cases. */
-    kv_alloc(m, np + q->max_tok + 8);
+    {   /* planned (g_ink_kv_plan_t): the whole context at once, where the RAM holds it (coli_kv_plan_host) */
+        int want = np + q->max_tok + 8;
+        if (g_ink_kv_plan_t > want) {
+            double b = 0;
+            for (int i = 0; i < m->c.n_state; i++) b += 2.0 * L_KV(&m->c, i) * L_HD(&m->c, i) * 4.0 * kv_ring_rows(&m->c, i, g_ink_kv_plan_t);
+            if (coli_kv_plan_host(b * (g_ink_mux_slots > 1 ? g_ink_mux_slots : 1), compat_mem_available_gb() * 1e9)) want = g_ink_kv_plan_t;
+        }
+        kv_alloc(m, want);
+    }
     /* naud>0 taints this turn before the comparison, not after: a request that
      * brings its own audio must not match a text-only state either. */
     if (media) kv_prefix_taint(&m->kvp);
@@ -4831,7 +4880,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
                 int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
                 coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
                 gen++; len++;
-                while (stdin_readable()) {
+                while (coli_stdin_readable()) {
                     int r = serve_read_cmd(stdin, stdout, q->id);
                     if (r < 0) { free(ids); return -1; }
                     if (r > 0) { cancelled = 1; limited = 0; }
@@ -4856,7 +4905,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
         if (q->logprobs > 0) coli_serve_write_data_lp(stdout,q->id,buf,(size_t)nb,lptail);
         else coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
         gen++; len++;
-        while (stdin_readable()) {
+        while (coli_stdin_readable()) {
             int r = serve_read_cmd(stdin, stdout, q->id);
             if (r < 0) { free(ids); return -1; }
             if (r > 0) { cancelled = 1; limited = 0; }
@@ -5056,7 +5105,7 @@ static void serve_mux(Model *m, Tok *T) {
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
         /* idle: wait for a command; decoding: take one only when one is there */
-        if (!input_eof && (!active || stdin_readable())) {
+        if (!input_eof && (!active || coli_stdin_readable())) {
             ColiServeCommand command;
             ColiServeReadResult result = coli_serve_read_command(stdin, &inkling_wire, &command);
             if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) input_eof = 1;
@@ -5148,6 +5197,9 @@ static void serve_loop(Model *m, Tok *T) {
     serve_tiers_emap(m);
     if (g_ink_mux_slots > 1) { serve_mux(m, T); coli_ps_report(&g_ink_ps); return; }
     for (;;) {
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("inkling");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) { coli_ps_report(&g_ink_ps); return; }   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
@@ -5160,11 +5212,7 @@ static void serve_loop(Model *m, Tok *T) {
 
 /* ---------- ref_inkling.json harness ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { *n_out = 0; return NULL; }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 0, 0, INT_MIN);
 }
 
 #ifndef INKLING_NO_MAIN
@@ -5969,8 +6017,8 @@ static int inkling_edge_engine_open(
     }
     model->embed = load_w(model, "model.embed_tokens.weight", 0);
     const char *embed_norm = embed_norm_name(&model->S);
-    model->embed_norm = embed_norm ? load_t(model, embed_norm) : NULL;
-    model->final_norm = load_t(model, "model.norm.weight");
+    model->embed_norm = embed_norm ? load_tn(model, embed_norm, model->c.hidden) : NULL;
+    model->final_norm = load_tn(model, "model.norm.weight", model->c.hidden);
     model->lm_head = load_w(model, "lm_head.weight", 1);
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",

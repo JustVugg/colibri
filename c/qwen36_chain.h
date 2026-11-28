@@ -72,6 +72,7 @@
  * verify snapshots); every loop over layers here runs over the N. A device lost
  * mid-forward rebuilds the N layers' recurrent state from the prefix record: the CPU's
  * layers have not run that forward yet, so theirs is already the host's. */
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 #include "vk_dmoe.h"
@@ -145,7 +146,6 @@ static int g_q36c_fit2_on;
 static Q36Chain *q36c_of(Model *m, int d) { return (Q36Chain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *q36c_name(const Q36Chain *ch) { return ch && ch->d ? "qwen36 dev2" : "qwen36"; }
 /* COLI_VK_CHAIN_DEV2=0: the second device keeps routed experts only */
-static int q36c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 static void q36c_fatal(const char *what) {
     fprintf(stderr, "[VK] qwen36 chain: %s -- stopping (COLI_VK_CHAIN=0 keeps the state on the CPU)\n", what);
@@ -156,11 +156,13 @@ static void q36c_fatal(const char *what) {
  * positions the prefix record names (a prefill on the CPU), and leave the chain off.
  * A partial chain rebuilds its N layers only: the CPU's layers hold their state on the
  * host already, at `upto` (a forward the device was lost in has not reached them). */
+static int g_q36c_mode;   /* the chain's mode before a stop (q36c_retry brings it back) */
 static void q36c_recover(Model *m, int upto) {
     Q36Chain *ch = (Q36Chain *)m->vkchain, *ch2 = (Q36Chain *)m->vkchain2;
     Cfg *c = &m->c; int D = c->hidden;
     int nd = ch && ch->ok ? ch->n : c->n_layers;
     if (ch && ch->ok && ch2 && ch2->ok) nd += ch2->n;   /* the second device's layers ran in that forward too */
+    if (g_vk_chain) g_q36c_mode = g_vk_chain;
     g_vk_chain = 0;
     for (int d = 0; d < 2; d++) {
         Q36Chain *x = q36c_of(m, d);
@@ -174,8 +176,8 @@ static void q36c_recover(Model *m, int upto) {
     if (upto <= 0) return;
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         q36c_fatal("the device was lost with a recurrent state its token ids do not describe (an image)");
-    fprintf(stderr, "[VK] qwen36 chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on\n", upto);
+    fprintf(stderr, "[VK] qwen36 chain: %s; rebuilding the state of %d positions on the host's path, "
+                    "which runs from here on\n", vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", upto);
     int *ids = malloc((size_t)upto * sizeof(int));
     float *x = falloc((int64_t)upto * D);
     if (!ids) { fprintf(stderr, "OOM rebuilding the state\n"); exit(1); }
@@ -538,7 +540,7 @@ static void q36c_start(Model *m) {
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n, with that device's free memory (the tier there sizes itself after the placement) */
     int n2 = 0;
-    if (n > 0 && n < L && q36c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+    if (n > 0 && n < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
         vkc_device(1);
         size_t fixed2 = vkc_fit_buf((size_t)D * sizeof(float)) + vkc_fit_buf(4);
         g_q36c_fitsum = &fixed2;
@@ -731,7 +733,9 @@ static size_t q36c_late_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
     if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
     int R = q36_ring_for(c, ctx), hi = g_q36c_fit_on ? g_q36c_fit.n : c->n_layers;
-    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0, half = vkc_dev_avail() / 2;   /* as float32 (q36cc_mirror_at) */
+    /* as float32 (q36cc_mirror_at), or float16 where the mirrors will be (q36c_kvh_want) */
+    size_t es = q36c_kvh_want() ? 2 : sizeof(float);
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * es, kv = 0, half = vkc_dev_avail() / 2;
     for (int i = 0; i < hi && i < c->n_layers; i++)
         if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
     return kv > half ? half : kv;
@@ -763,7 +767,7 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
      * card's room a short conversation decoded at 61-71 tok/s against 75-91 before it (#2733). One
      * device, the chain's whole stack (the tier's room is the primary's). */
     size_t owed = 0;
-    if (ch->cap > 0 && ch->d == 0 && !q36c_of(m, 1) && ch->cap > 2 * (need > Q36C_KV_START ? need : Q36C_KV_START)) {
+    if (!coli_kv_plan() && ch->cap > 0 && ch->d == 0 && !q36c_of(m, 1) && ch->cap > 2 * (need > Q36C_KV_START ? need : Q36C_KV_START)) {
         for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             if (!c->is_attn[i]) continue;
             owed += vkc_bytes(ch->kc[i]) + vkc_bytes(ch->vc[i]);
@@ -778,6 +782,8 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
         if (ch->host_cap == m->kv_cap) return 1;
         /* the host's capacity moved: a sliding layer may have turned from its first rows into a
          * ring (q36c_ring), the rest keep theirs */
+    } else if (coli_kv_plan() && top >= need) {
+        cap = top;   /* planned: the whole context at the first forward, whole or split, never grown (coli_kv_plan.h) */
     } else {
         cap = need + (need / 8 > 1024 ? need / 8 : 1024);
         if (cap < Q36C_CONV_ROWS) cap = Q36C_CONV_ROWS;
@@ -1002,6 +1008,12 @@ static void q36c_conv_free(Model *m, Q36cConv *v) {
 /* A place's mirrors start at Q36C_CONV_ROWS rows and double as its conversation grows
  * (q36c_conv_grow): a conversation takes the device memory its length needs, not the
  * context's. A sliding layer's ring keeps its rows. */
+/* the room the planned places past the chain's own take (q36_places_plan), for the expert tier */
+static size_t q36c_places_bytes(Model *m) {
+    size_t b = 0;
+    if (g_q36_mux_slots > 1 && coli_kv_plan()) q36_places_plan(m, sizeof(float), vkc_dev_avail(), &b);
+    return b;
+}
 static size_t q36c_conv_kv_bytes(Model *m, Q36Chain *ch, int cap) {
     Cfg *c = &m->c; size_t b = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++)
@@ -1032,7 +1044,7 @@ static int q36c_conv_room(Q36Chain *ch, Model *m, int keep, size_t bytes) {
             if (j == keep || v->used == ch->conv_clock || !v->cap || j == ch->conv_cur) continue;
             if (k < 0 || v->used < ch->conv[k].used) k = j;
         }
-        if (k < 0) {
+        if (k < 0 || coli_kv_plan()) {   /* planned: another place's mirrors stay its own */
             const size_t av = q36c_conv_avail();
             return vkt_give_back(bytes + margin - av) > 0 && q36c_conv_avail() >= bytes + margin;
         }
@@ -1053,7 +1065,7 @@ static int q36c_conv_grow(Q36Chain *ch, Model *m, int k, int need) {
     Cfg *c = &m->c; int KV = c->kv_heads, kvd = c->k_head_dim;
     int cap = v->cap ? 2 * v->cap : Q36C_CONV_ROWS;
     if (cap < need) cap = (need + 1023) / 1024 * 1024;
-    if (cap > m->kv_cap) cap = m->kv_cap;
+    if (cap > m->kv_cap || coli_kv_plan()) cap = m->kv_cap;   /* planned: the whole context at once */
     if (cap < need) return 0;
     size_t more = q36c_conv_kv_bytes(m, ch, cap) - q36c_conv_kv_bytes(m, ch, v->cap);
     if (!q36c_conv_room(ch, m, k, more)) return 0;
@@ -1078,7 +1090,7 @@ static int q36c_conv_grow(Q36Chain *ch, Model *m, int k, int need) {
 static void q36c_conv_shrink(Q36Chain *ch, Model *m, int k, int need) {
     Q36cConv *v = &ch->conv[k];
     const int keep = need > Q36C_CONV_ROWS ? need : Q36C_CONV_ROWS;
-    if (!v->cap || v->cap <= 2 * keep) return;
+    if (!v->cap || v->cap <= 2 * keep || coli_kv_plan()) return;   /* planned: a place keeps its context */
     Cfg *c = &m->c;
     size_t freed = 0, again = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) {
@@ -1096,11 +1108,12 @@ static int q36c_conv_new(Q36Chain *ch, Model *m) {
     const char *e = getenv("COLI_VK_CHAIN_MUX");   /* places beside the chain's own, as colibri's */
     int most = e && *e ? 1 + atoi(e) : g_q36_mux_slots;
     if (most > g_q36_mux_slots) most = g_q36_mux_slots;
+    if (g_q36_places_plan > 0 && most > g_q36_places_plan) most = g_q36_places_plan;
     if (ch->conv_full || ch->nconv >= most) return -1;
     size_t nr = q36_rec_cells(c) * sizeof(float);
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float), dn = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) if (!c->is_attn[i]) dn += nr + nc;
-    int cap0 = m->kv_cap < Q36C_CONV_ROWS ? m->kv_cap : Q36C_CONV_ROWS;
+    int cap0 = m->kv_cap < Q36C_CONV_ROWS || coli_kv_plan() ? m->kv_cap : Q36C_CONV_ROWS;
     size_t need = dn + q36c_conv_kv_bytes(m, ch, cap0), avail = vkc_dev_avail();
     Q36cConv v = {.slot = -1, .dn_where = Q36C_HOST};
     int ok = need + ((size_t)512 << 20) <= avail;
@@ -1133,8 +1146,11 @@ static int q36c_conv_get(Q36Chain *ch, Model *m, int slot, int evict) {
     for (int j = 0; j < ch->nconv && k < 0; j++) if (ch->conv[j].slot < 0) k = j;
     if (k < 0) k = q36c_conv_new(ch, m);
     if (k < 0 && evict) {
-        for (int j = 0; j < ch->nconv; j++)
+        for (int j = 0; j < ch->nconv; j++) {
+            const int s = ch->conv[j].slot;
+            if (g_q36_mux_busy && s >= 0 && s < g_q36_mux_slots && g_q36_mux_busy[s]) continue;   /* a running conversation's */
             if (ch->conv[j].used != ch->conv_clock && (k < 0 || ch->conv[j].used < ch->conv[k].used)) k = j;
+        }
         if (k < 0) return -1;
         if (k == ch->conv_cur) q36c_conv_save(ch);
         if (!q36c_conv_down(ch, m, &ch->conv[k])) return -1;
@@ -1245,6 +1261,19 @@ static void q36c_mux_leave(Model *m) {
 }
 /* slot is held now (-1: none, a decode step's turn): its place, or nothing on the device
  * counts as its own */
+/* KV_SLOTS: can slot's conversation start now with its state on the device? Its own place, a free one, one more
+ * (opened now), or the place of a conversation whose request is not running (g_q36_mux_busy; its state goes to the
+ * host when the place is taken). Without places (a second device, a partial chain, the split) every conversation
+ * goes through the host anyway: 1. */
+static int q36c_mux_room(Model *m, int slot) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (!ch || !ch->conv || !q36c_pool_ok(ch, m)) return 1;
+    for (int k = 0; k < ch->nconv; k++) {
+        const int s = ch->conv[k].slot;
+        if (s == slot || s < 0 || s >= g_q36_mux_slots || !g_q36_mux_busy || !g_q36_mux_busy[s]) return 1;
+    }
+    return q36c_conv_new(ch, m) >= 0;
+}
 static void q36c_mux_enter(Model *m, int slot) {
     Q36Chain *ch = q36c_of(m, 0);
     if (ch && !ch->conv && ch->pool_closed) q36c_pool_reopen(m, slot);
@@ -1957,7 +1986,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     vkc_gemm_rows(-1);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("qwen36", pos_base, S);   /* the device lost only when it said so (#2793) */
     vkc_device(0);
     if (!ch->mx_rows) q36c_recover(m, pos_base);   /* the held conversation (none in a multiplexed step) */
     g_vk_chain = 0; ch->failed = 1;
@@ -1966,6 +1995,18 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
     return 0;
 }
 
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. q36c_recover left the state on the host, so the mirrors' rows and the DeltaNet state go up from it at the
+ * next forward, as at a first; one device, one conversation (the places and a second device stay on the host). */
+static void q36c_retry(Model *m) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || q36c_of(m, 1) || ch->conv || !vkc_chain_retry("qwen36")) return;
+    Cfg *c = &m->c;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++)
+        if (c->is_attn[i]) { ch->kv_valid[i] = 0; if (ch->ks.on) vkc_kv_lower(&ch->ks, ch->attn_ord[i], 0); }
+    ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+    ch->failed = 0; g_vk_chain = g_q36c_mode ? g_q36c_mode : 1;
+}
 /* One decode step of several conversations in the chain (serve_mux, KV_SLOTS > 1): row s is
  * the token whose embedding is xh's row s, at rows[s].pos of rows[s].seq, every conversation
  * parked. The matrices and the routed experts run once over the S rows, each row's

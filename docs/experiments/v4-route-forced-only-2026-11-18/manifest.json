@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "hypothesis": "The three hash layers take their six experts per token from the token table, and the router then reads only those six experts' gate scores, yet it computed all 256 gate dot products per token on the CPU (about 10 ms per 128-token prompt chunk, against about 0.5 ms on the GPU-routed layers). Computing only the forced experts' dot products, each the same serial loop, removes that time and leaves every weight the same bits.",
+  "commit": "a4165e910b95f9934b500756376fdaca10218175",
+  "model": "DeepSeek-V4-Flash-0731 architecture, abliterated weights (same shapes), safetensors, native FP8/FP4",
+  "command": "make -C c -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 DEEPGEMM=1 CUDA_HOME=/usr/local/cuda-13.3 ARCH=native; deepseek_v4 <model> --prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16 with the environment in config, the arms alternated four times; tok_s = the prompt's 3,278 tokens / time_to_first_token from the engine's timing line (prompt throughput)",
+  "prompt_hash": "3def6f25ca23ac992efe343ea4eec2c4a71ffe48dc66a95c93de91014b6923da",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X, 12 cores / 24 threads",
+    "ram": "94 GiB (--memory-gb 16 for these runs)",
+    "storage": "Samsung 990 PRO 4TB + 980 PRO 2TB NVMe in one LVM volume, ext4, direct aligned reads",
+    "os": "Ubuntu 26.04.1, Linux 7.0.0-43, gcc 15.2.0, CUDA 13.3, driver 595.91.07, RTX 5080 16 GB"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "V4_ROUTE_FORCED_ONLY"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "DSV4_CUDA_PIN_CAP_GB": "16",
+      "V4_LAYER_FUSED": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_IDX_FAST": "1",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_PREFIX_CKPT": "0",
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native, one binary for both arms",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "V4_ROUTE_FORCED_ONLY": "0"
+    },
+    "samples": {
+      "tok_s": [
+        77.59,
+        77.34,
+        77.54,
+        76.94
+      ]
+    },
+    "median_tok_s": 77.44,
+    "quality": {
+      "method": "stdout md5 (without the TUNE line) identical across all runs of both arms",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-route-forced-only-2026-11-18/cli_runs.txt",
+      "sha256": "2253531436c5c5a03fde4de136970aefd684d6141a1bc0a8d58f12e99ff00499"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "DSV4_CUDA_PIN_CAP_GB": "16",
+      "V4_LAYER_FUSED": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_IDX_FAST": "1",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_PREFIX_CKPT": "0",
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native, one binary for both arms",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "V4_ROUTE_FORCED_ONLY": "1"
+    },
+    "samples": {
+      "tok_s": [
+        78.14,
+        78.23,
+        78.45,
+        78.18
+      ]
+    },
+    "median_tok_s": 78.205,
+    "quality": {
+      "method": "stdout md5 identical to the baseline's; V4_ROUTE_FORCED_ONLY=2 compared the forced-only and the full routing bit for bit on every hash-layer routing of one run (0 mismatches)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-route-forced-only-2026-11-18/cli_runs.txt",
+      "sha256": "2253531436c5c5a03fde4de136970aefd684d6141a1bc0a8d58f12e99ff00499"
+    }
+  },
+  "outcome": "improvement"
+}

@@ -27,8 +27,9 @@ jobs:
     # more engines' GGUF code: the builds now use every core (make test runs the C and
     # Python suites one after the other, so only the compiling is parallel).
     # 2026-11-11: 30.0 minutes on #2750, then cancelled at 35 twice on #2759, which adds
-    # a GGUF MTP suite. 50.
-    timeout-minutes: 50
+    # a GGUF MTP suite. 50. 2026-11-25: 44 minutes on #3069, then cancelled at 50 on #3077
+    # in its last Python suites. 75.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - name: make check
@@ -264,7 +265,9 @@ jobs:
     # off inside the Python suite with no test failed, and showed as red.
     # 2026-10-24 it took 24 minutes, and on the next run the suite printed
     # OK at 25:00, the moment the job was cut off: 35 leaves the room again.
-    timeout-minutes: 35
+    # 2026-11-24 it took 31 minutes on #3042, and #3065 and #3066 were cut off at 35
+    # inside the Python suite, nothing failed: 50.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - name: install libomp

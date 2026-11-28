@@ -44,8 +44,8 @@ extern "C" {
  * same arrangement colibri.c uses for metal_fused_fmt_ok.
  *
  * NOT a statement about which formats the CUDA BACKEND supports: quant_matmul
- * has its own explicit branches for fmt=6 (E8/IQ3) and fmt=7 (MXFP4) that
- * never route through weight_at (and its own fmt=8 branch for the dense path
+ * has its own explicit branches for fmt=6 (E8/IQ3), fmt=7 (MXFP4) and fmt=9 (bf16:
+ * not admitted here, it rides coli_cuda_matmul's own branch) that never route through weight_at (and its own fmt=8 branch for the dense path
  * -- weight_at's fmt=8 branch serves the absorb kernels, which share the same
  * c_e4m3 LUT). This predicate is scoped to weight_at's own dispatch, which is
  * what the absorb and grouped-expert kernels decode through.
@@ -206,8 +206,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tens
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
- * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=grouped int4.
+ * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=grouped int4,
+ * plus 9=bf16, which this backend decodes in a device branch of its own: a
+ * checkpoint whose dense side (attention projections, gated residual, shared
+ * expert, router, lm_head) is bf16 end to end carries no scales at all, and
+ * bf16 -> f32 is the identity on the top 16 bits.
  * gs is the group size for fmt=4 (0 for all other formats).
+ * Formats 0, 6 and 9 are scale-free: pass scales = NULL for them.
  * The first successful call uploads W and its scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
@@ -221,6 +226,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul_mxfp4(float *y, const float *x,
                                                const unsigned char *e8s,
                                                int S, int I, int O);
 
+/* coli_cuda_tensor_upload of a block-format matrix (fmt >= 100) a range of rows at a time, so
+ * the rows can pass through a bounded staging buffer: rows [row0, row0 + n) from n of the file's
+ * rows at weights. With *tensor NULL, row0 is 0 and the tensor's O rows are allocated first;
+ * later calls fill the tensor that call made. 0 on failure (the caller frees the tensor).
+ * tensor == NULL is the probe: 1 from a backend that has it. Optional in the DLL loader. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_rows(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O,
+                                                     int device, int row0, int n);
 /* Streaming Kimi expert: down(SiTU(gate(x), up(x))). Weights are MXFP4
  * host buffers; intermediate activations remain on device. No weight cache.
  * Returns 0 on failure; callers must accumulate y only after success. */
@@ -321,6 +333,12 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update(ColiCudaTensor *tensor,
 /* ---- resident-pipeline primitives (Inc.0): device-pointer entry points ---- */
 COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
 COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
+/* Ledger (ledger_map.h; no effect without LEDGER_OUT): what the engine calls its next
+ * allocations on this thread -- kind "weight", "cache" or "buffer", a NULL name for the
+ * backend's own -- and the end of a decode step (writes the map, opens and closes
+ * COLI_LEDGER_WINDOW=<skip>:<take>). */
+COLI_CUDA_DLLEXPORT void coli_cuda_ledger_label(const char *kind,const char *name);
+COLI_CUDA_DLLEXPORT void coli_cuda_ledger_step(void);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);

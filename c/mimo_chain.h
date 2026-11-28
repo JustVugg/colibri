@@ -101,7 +101,6 @@ static VkcFit g_mc_fit2;
 static int g_mc_fit2_on;
 static MimoChain *mc_of(Model *m, int d) { return (MimoChain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *mc_name(const MimoChain *ch) { return ch && ch->d ? "mimo dev2" : "mimo"; }
-static int mc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 
 /* the geometry of layer li's attention */
@@ -632,13 +631,15 @@ static int mc_forward(Model *m, float *h, int S, int pos_base, float *logits, in
     if (ch2) ch2->forwards++;
     return S;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(at->d); }
+    (void)at;   /* the chain that failed is the current device's (vkc_frame_failed reads it) */
+    vkc_frame_failed("mimo", pos_base, S);   /* the device lost only when it said so (#2793) */
     vkc_device(0);
     g_vk_chain = 0;
     ch->failed = 1;
     if (ch2) ch2->failed = 1;
-    fprintf(stderr, "[VK] mimo chain: the device was lost at position %d; the host's caches hold every "
-                    "position before it, and the CPU runs from there on\n", pos_base + done);
+    fprintf(stderr, "[VK] mimo chain: %s at position %d; the host's caches hold every "
+                    "position before it, and the host's path runs from there on\n",
+            vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", pos_base + done);
     return done;
 }
 

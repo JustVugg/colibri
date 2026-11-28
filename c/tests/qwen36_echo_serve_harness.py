@@ -114,7 +114,7 @@ def main():
         print(__doc__)
         return 2
     fixture = Path(sys.argv[1])
-    engine_path = Path(__file__).resolve().parent.parent / "qwen36"
+    engine_path = Path(__file__).resolve().parent.parent / ("qwen36.exe" if sys.platform == "win32" else "qwen36")
     if not engine_path.exists():
         print(f"FAIL: {engine_path} is not built (make -C c qwen36)")
         return 1

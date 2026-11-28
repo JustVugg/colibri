@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -1500,6 +1501,13 @@ def last_turn_speed(profile):
     return round(tokens / wall, 2) if wall > 0 and tokens else None
 
 
+# The servers this process started in the background, by port: until one writes its
+# pidfile (a slow start can take longer than start_server's wait), its state is
+# "loading", so a second start in the same process (MCP's start, which a lock
+# serializes) does not launch another server beside it.
+_BACKGROUND_STARTS = {}
+
+
 def server_status(cfg):
     port, host = int(cfg["port"]), cfg.get("host", DEFAULT_HOST)
     pid = None
@@ -1508,6 +1516,9 @@ def server_status(cfg):
             pid = int(handle.read().split()[0])
     except (OSError, ValueError, IndexError):
         pid = None
+    started = _BACKGROUND_STARTS.get(port)
+    if pid is None and started is not None and started.poll() is None:
+        pid = started.pid
     alive = _pid_alive(pid)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
     code, health = _get_json(f"http://{shown}:{port}/health", require_colibri=True)
@@ -1599,6 +1610,7 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
         kwargs["start_new_session"] = True
     process = spawn_detached(cmd, **kwargs)
     handle.close()
+    _BACKGROUND_STARTS[int(cfg["port"])] = process
     deadline = time.time() + wait
     while time.time() < deadline and process.poll() is None:
         time.sleep(0.25)
@@ -1850,6 +1862,9 @@ def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True, ext
     whole in extra_dirs (a model split across drives) are neither counted as missing
     nor fetched again."""
     token = setup_download.hf_token()
+    # said before the first request, so a network that does not answer is not a blank
+    # screen (#2970)
+    ui.say(f"  listing the files on {urllib.parse.urlsplit(setup_download.endpoint()).hostname}")
     files = setup_download.list_repo_files(entry.repo, entry.revision, include=entry.include,
                                            exclude=entry.exclude, token=token)
     if not files:
@@ -1904,7 +1919,8 @@ def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True, ext
 
     write_state("download", model=entry.id, done=have, total=total, model_dir=model_dir)
     setup_download.download_repo(entry.repo, entry.revision, model_dir, files, token=token,
-                                 progress=progress, curl=curl, verify=verify, extra_dirs=extra_dirs)
+                                 progress=progress, curl=curl, verify=verify, extra_dirs=extra_dirs,
+                                 notify=lambda text: ui.say(f"  {text}"))
     ui.progress(f"  [{'#' * 24}] 100.0%  {human_size(total)}  done", force=True)
     ui.say("")
     return total
@@ -2148,6 +2164,9 @@ def config_ready(cfg):
 
 
 def cmd_setup(a, ui=None):
+    if a.port is not None and not 1 <= a.port <= 65535:
+        raise SetupError("port must be from 1 to 65535; "
+                         "rerun `coli setup --port PORT`")
     interactive = sys.stdin.isatty() and not a.yes and not a.json
     ui = ui or UI(interactive, quiet=a.json)
     ui.say("colibri setup\n")
@@ -2342,13 +2361,14 @@ def cmd_setup(a, ui=None):
 
 
 def machine_fit(hw, root):
-    """The machine as model_fit's estimates read it: setup_hw's report, the RAM's bandwidth
-    measured now (about two seconds), the cards' from the CUDA driver, the disk under `root`."""
+    """The machine as model_fit's estimates read it: setup_hw's report, the RAM's bandwidth and the
+    cores' vector work measured now (about three seconds), the cards' from the CUDA driver, the
+    disk under `root`."""
     import model_fit
     probe = setup_hw._probe_cuda_child() if (hw.get("gpu") or {}).get("nvidia") else None
     return model_fit.machine_from_hw(
         hw, model_fit.measure_ram_bandwidth(avail_bytes=(hw.get("memory") or {}).get("available")),
-        model_fit.disk_kind(root), (probe or {}).get("devices"))
+        model_fit.disk_kind(root), (probe or {}).get("devices"), model_fit.measure_cpu_gbs())
 
 
 def _recommend_for(hw, explicit_dir, requested="auto", tc=None, fit=None):

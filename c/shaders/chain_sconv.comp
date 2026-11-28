@@ -10,6 +10,8 @@
 //   mode 1: x[i] = x[i] * fc, i < n       (the dense MLP's global scale)
 //   mode 2: x[i] = x[i] / fc, i < n       (the logits' width multiplier)
 // x[x_off + s*x_row + c]; w[w_off + c*CK + k]; ring[ring_off + c*(CK-1) + k], oldest first.
+//   mode 0 with n > 0 (an MTP verify, inkling2_mtp.h): the ring after each row s also into
+//     ring[ring_off + (s+1)*n + c*(CK-1) + k], so a rejected draft's rows roll back by a copy.
 // Limits: CK <= 9.
 layout(local_size_x = 64) in;
 
@@ -47,6 +49,7 @@ void main() {
         x[xi] = acc + cur;
         for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
         for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
+        if (p.n > 0) for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + (s + 1) * p.n + c * nh + k] = hist[k];
     }
     for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
 }

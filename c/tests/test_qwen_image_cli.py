@@ -247,6 +247,27 @@ class CommandsTest(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("multiple of 32", refused.stderr + refused.stdout)
 
+    @unittest.skipUnless(importlib.util.find_spec("PIL"), "image editing requires Pillow")
+    def test_run_with_one_reference_checks_capability_and_forwards_pixels(self):
+        reference = Path(self.tmp.name) / "source.png"
+        output = Path(self.tmp.name) / "result.png"
+        args = ["run", "--model", self.model, "--image", str(reference), "--size", "256x256",
+                "--steps", "2", "--seed", "1", "--out", str(output), "change the fur color"]
+        reference.write_bytes(image_engine.encode_png(2, 2, b"\x01\x00\x00\xff" * 4, 4))
+        refused = run_coli(args, self.env)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("does not support reference-image edits", refused.stderr)
+        self.assertFalse(output.exists())
+        env = dict(self.env, QWENIMAGE_STUB_EDITS="1")
+        passed = run_coli(args, env)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertEqual(image_engine.decode_png(output.read_bytes())[:2], (256, 256))
+        first = output.read_bytes()
+        reference.write_bytes(image_engine.encode_png(2, 2, b"\x02\x00\x00\xff" * 4, 4))
+        passed = run_coli(args, env)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertNotEqual(output.read_bytes(), first)
+
     def test_chat_private_mode(self):
         script = "/size 256x256\n/steps 2\n/seed 7\n/bogus\na lighthouse at dusk\n/size\n:q\n"
         result = run_coli(["chat", "--model", self.model, "--no-attach"], self.env,

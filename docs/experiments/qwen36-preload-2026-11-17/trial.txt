@@ -1,0 +1,307 @@
+# bae0e3c1, Q36_PRELOAD=1, the timed requests sent once the loaders are done
+
+## run 1: dev + preload commit, Q36_PRELOAD=1, after the load
+env: {"COLI_TIMERS": "1", "Q36_PRELOAD": "1"}
+fresh tok/s: [9.139, 9.602, 9.92]  first token s: [1.85, 1.76, 1.69]
+warm  tok/s: [9.842, 9.863, 10.08]  first token s: [1.8, 1.74, 1.66]
+sha256 of the six replies' text: 9ec0f3c7a6ffae4888f65424209f872fb43178efcb3d64132ef3cb1d007d58eb
+### replies
+"The sky appears blue due to a phenomenon called Rayleigh scattering. As sunlight reaches Earth's atmosphere, it collides with gas molecules and other small particles. These particles scatter shorter wavelengths of light, such as blue and violet, much more effectively than longer wavelengths like red and yellow. Although violet light is scattered even more than blue, our eyes are more sensitive to blue light, and some violet light is absorbed by the upper atmosphere, resulting in the sky appearing predominantly blue to human observers"
+"The history of the bicycle began in 1817 with the invention of the \"running machine\" by German Baron Karl von Drais, a wooden device that required riders to push along the ground with their feet. This early design evolved significantly in the 1860s with the addition of pedals directly to the front wheel, creating the \"velocipede\" or \"boneshaker,\" which featured iron tires and a rigid frame. The most transformative leap occurred"
+"A refrigerator operates on the principle of heat transfer using a refrigerant cycle. Inside the unit, a compressor pressurizes a special gas, which then flows through coils on the back or bottom, releasing heat into the surrounding room as it cools and condenses into a liquid. This liquid passes through an expansion valve into the evaporator coils inside the fridge, where it rapidly expands and evaporates back into a gas, absorbing heat from the interior air in the process. A fan"
+### server log
+[gateway] 131072 tokens of context (5.4 GB of conversation state of 61.5 GB); --ctx sets it
+[env] COLI_POLICY is not read by qwen36 (it belongs to colibri) -- it will have no effect
+[OMP] qwen36: hot-thread tuning, re-exec once (COLI_NO_OMP_TUNE=1 to skip)
+[env] COLI_POLICY is not read by qwen36 (it belongs to colibri) -- it will have no effect
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=131072 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /mnt/devel/colibri-models/qwen36-35b/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.5s | RSS after load: 2.93 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] preload: filling the expert cache in the background (4 threads, Q36_PRELOAD=0 to skip)
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[gateway] input modalities: text (the engine loaded no vision tower; a picture gets a 400)
+OpenAI-compatible API listening on http://127.0.0.1:8011/v1
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[qwen36] preload: 10240 experts loaded in 54.4 s, RSS 18.81 GB
+[qwen36] KV cache: float16, 0.02 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[PREFIX] store: up to 4096 MiB of the prompts read, kept by content for any later request (blocks of 256 tokens; COLI_PREFIX_STORE=0 off)
+[qwen36 spec gate] turn 1: T(1) 107.1 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 1: 1.00 tokens/forward (7 forwards per 7 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 62 ms/token (last 32)
+[timers] window: moe 58 ms/token (last 32)
+[timers] window: moe 58 ms/token (last 32)
+[qwen36 spec gate] turn 2: T(1) 105.1 ms, rows 2:2.31, rho 0.88, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 2: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 4 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 54 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[qwen36 spec gate] turn 3: T(1) 101.7 ms, rows 2:2.20, rho 0.97, acceptance by position 0.25 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 3: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/2 drafts in 2 verifies) | gate on, 6 declined, 2 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 52 ms/token (last 32)
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[qwen36 spec gate] turn 4: T(1) 100.6 ms, rows 2:1.82, rho 0.66, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 4: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 3 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 54 ms/token (last 32)
+[timers] window: moe 53 ms/token (last 32)
+[qwen36 spec gate] turn 5: T(1) 104.4 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 5: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 1 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 54 ms/token (last 32)
+[timers] window: moe 54 ms/token (last 32)
+[timers] window: moe 54 ms/token (last 32)
+[qwen36 spec gate] turn 6: T(1) 106.7 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 6: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 1 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 53 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[qwen36 spec gate] turn 7: T(1) 98.6 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 7: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 3 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[qwen36 spec gate] turn 8: T(1) 98.4 ms, rows 2:2.13, rho 0.81, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 8: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 3 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[qwen36 spec gate] turn 9: T(1) 101.2 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 9: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 3 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[qwen36 spec gate] turn 10: T(1) 100.0 ms, rows 2:2.07, rho 0.74, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 10: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 4 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[qwen36 spec gate] turn 11: T(1) 101.6 ms, rows 2:1.79, rho 0.77, acceptance by position 0.25 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 11: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/2 drafts in 2 verifies) | gate on, 6 declined, 2 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[qwen36 spec gate] turn 12: T(1) 103.6 ms, rows 2:1.81, rho 0.73, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 12: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 3 declined, 1 probes
+
+## run 2: dev + preload commit, Q36_PRELOAD=1, after the load
+env: {"COLI_TIMERS": "1", "Q36_PRELOAD": "1"}
+fresh tok/s: [9.229, 9.909, 9.945]  first token s: [1.81, 1.75, 1.77]
+warm  tok/s: [10.289, 10.048, 10.111]  first token s: [1.99, 1.83, 1.7]
+sha256 of the six replies' text: 9ec0f3c7a6ffae4888f65424209f872fb43178efcb3d64132ef3cb1d007d58eb
+### replies
+"The sky appears blue due to a phenomenon called Rayleigh scattering. As sunlight reaches Earth's atmosphere, it collides with gas molecules and other small particles. These particles scatter shorter wavelengths of light, such as blue and violet, much more effectively than longer wavelengths like red and yellow. Although violet light is scattered even more than blue, our eyes are more sensitive to blue light, and some violet light is absorbed by the upper atmosphere, resulting in the sky appearing predominantly blue to human observers"
+"The history of the bicycle began in 1817 with the invention of the \"running machine\" by German Baron Karl von Drais, a wooden device that required riders to push along the ground with their feet. This early design evolved significantly in the 1860s with the addition of pedals directly to the front wheel, creating the \"velocipede\" or \"boneshaker,\" which featured iron tires and a rigid frame. The most transformative leap occurred"
+"A refrigerator operates on the principle of heat transfer using a refrigerant cycle. Inside the unit, a compressor pressurizes a special gas, which then flows through coils on the back or bottom, releasing heat into the surrounding room as it cools and condenses into a liquid. This liquid passes through an expansion valve into the evaporator coils inside the fridge, where it rapidly expands and evaporates back into a gas, absorbing heat from the interior air in the process. A fan"
+### server log
+[gateway] 131072 tokens of context (5.4 GB of conversation state of 61.5 GB); --ctx sets it
+[env] COLI_POLICY is not read by qwen36 (it belongs to colibri) -- it will have no effect
+[OMP] qwen36: hot-thread tuning, re-exec once (COLI_NO_OMP_TUNE=1 to skip)
+[env] COLI_POLICY is not read by qwen36 (it belongs to colibri) -- it will have no effect
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=131072 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /mnt/devel/colibri-models/qwen36-35b/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.3s | RSS after load: 2.93 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] preload: filling the expert cache in the background (4 threads, Q36_PRELOAD=0 to skip)
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[gateway] input modalities: text (the engine loaded no vision tower; a picture gets a 400)
+OpenAI-compatible API listening on http://127.0.0.1:8011/v1
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[qwen36] preload: 10240 experts loaded in 53.5 s, RSS 18.81 GB
+[qwen36] KV cache: float16, 0.02 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[PREFIX] store: up to 4096 MiB of the prompts read, kept by content for any later request (blocks of 256 tokens; COLI_PREFIX_STORE=0 off)
+[qwen36 spec gate] turn 1: T(1) 114.0 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 1: 1.00 tokens/forward (7 forwards per 7 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 63 ms/token (last 32)
+[timers] window: moe 59 ms/token (last 32)
+[timers] window: moe 56 ms/token (last 32)
+[qwen36 spec gate] turn 2: T(1) 107.2 ms, rows 2:2.16, rho 0.86, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 2: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 4 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 54 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[qwen36 spec gate] turn 3: T(1) 98.2 ms, rows 2:1.87, rho 0.73, acceptance by position 0.25 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 3: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/2 drafts in 2 verifies) | gate on, 6 declined, 2 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[qwen36 spec gate] turn 4: T(1) 98.2 ms, rows 2:2.69, rho 1.07, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 4: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 3 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 55 ms/token (last 32)
+[timers] window: moe 53 ms/token (last 32)
+[qwen36 spec gate] turn 5: T(1) 102.4 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 5: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 1 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 52 ms/token (last 32)
+[timers] window: moe 55 ms/token (last 32)
+[timers] window: moe 53 ms/token (last 32)
+[qwen36 spec gate] turn 6: T(1) 100.4 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 6: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 1 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 53 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[qwen36 spec gate] turn 7: T(1) 100.3 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 7: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 3 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 50 ms/token (last 32)
+[qwen36 spec gate] turn 8: T(1) 103.7 ms, rows 2:2.05, rho 0.78, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 8: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 3 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[qwen36 spec gate] turn 9: T(1) 96.7 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 9: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 3 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 50 ms/token (last 32)
+[qwen36 spec gate] turn 10: T(1) 98.1 ms, rows 2:1.94, rho 0.76, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 10: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 4 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 49 ms/token (last 32)
+[timers] window: moe 48 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[qwen36 spec gate] turn 11: T(1) 105.2 ms, rows 2:1.70, rho 0.72, acceptance by position 0.25 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 11: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/2 drafts in 2 verifies) | gate on, 6 declined, 2 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[qwen36 spec gate] turn 12: T(1) 101.4 ms, rows 2:1.80, rho 0.65, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 12: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 3 declined, 1 probes
+
+## run 3: dev + preload commit, Q36_PRELOAD=1, after the load
+env: {"COLI_TIMERS": "1", "Q36_PRELOAD": "1"}
+fresh tok/s: [9.194, 9.876, 9.823]  first token s: [1.84, 1.74, 1.65]
+warm  tok/s: [10.248, 10.024, 10.218]  first token s: [1.77, 1.75, 1.77]
+sha256 of the six replies' text: 9ec0f3c7a6ffae4888f65424209f872fb43178efcb3d64132ef3cb1d007d58eb
+### replies
+"The sky appears blue due to a phenomenon called Rayleigh scattering. As sunlight reaches Earth's atmosphere, it collides with gas molecules and other small particles. These particles scatter shorter wavelengths of light, such as blue and violet, much more effectively than longer wavelengths like red and yellow. Although violet light is scattered even more than blue, our eyes are more sensitive to blue light, and some violet light is absorbed by the upper atmosphere, resulting in the sky appearing predominantly blue to human observers"
+"The history of the bicycle began in 1817 with the invention of the \"running machine\" by German Baron Karl von Drais, a wooden device that required riders to push along the ground with their feet. This early design evolved significantly in the 1860s with the addition of pedals directly to the front wheel, creating the \"velocipede\" or \"boneshaker,\" which featured iron tires and a rigid frame. The most transformative leap occurred"
+"A refrigerator operates on the principle of heat transfer using a refrigerant cycle. Inside the unit, a compressor pressurizes a special gas, which then flows through coils on the back or bottom, releasing heat into the surrounding room as it cools and condenses into a liquid. This liquid passes through an expansion valve into the evaporator coils inside the fridge, where it rapidly expands and evaporates back into a gas, absorbing heat from the interior air in the process. A fan"
+### server log
+[gateway] 131072 tokens of context (5.4 GB of conversation state of 61.5 GB); --ctx sets it
+[env] COLI_POLICY is not read by qwen36 (it belongs to colibri) -- it will have no effect
+[OMP] qwen36: hot-thread tuning, re-exec once (COLI_NO_OMP_TUNE=1 to skip)
+[env] COLI_POLICY is not read by qwen36 (it belongs to colibri) -- it will have no effect
+== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=131072 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from /mnt/devel/colibri-models/qwen36-35b/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 10.3s | RSS after load: 2.93 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] preload: filling the expert cache in the background (4 threads, Q36_PRELOAD=0 to skip)
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[gateway] input modalities: text (the engine loaded no vision tower; a picture gets a 400)
+OpenAI-compatible API listening on http://127.0.0.1:8011/v1
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[qwen36] preload: 10240 experts loaded in 53.0 s, RSS 18.81 GB
+[qwen36] KV cache: float16, 0.02 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[PREFIX] store: up to 4096 MiB of the prompts read, kept by content for any later request (blocks of 256 tokens; COLI_PREFIX_STORE=0 off)
+[qwen36 spec gate] turn 1: T(1) 109.3 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 1: 1.00 tokens/forward (7 forwards per 7 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 62 ms/token (last 32)
+[timers] window: moe 57 ms/token (last 32)
+[timers] window: moe 58 ms/token (last 32)
+[qwen36 spec gate] turn 2: T(1) 102.7 ms, rows 2:2.41, rho 0.88, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 2: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 4 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 53 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[timers] window: moe 50 ms/token (last 32)
+[qwen36 spec gate] turn 3: T(1) 96.6 ms, rows 2:2.04, rho 0.79, acceptance by position 0.25 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 3: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/2 drafts in 2 verifies) | gate on, 6 declined, 2 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[qwen36 spec gate] turn 4: T(1) 100.5 ms, rows 2:2.94, rho 1.15, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 4: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 3 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 53 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[qwen36 spec gate] turn 5: T(1) 106.4 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 5: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 1 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 55 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[timers] window: moe 53 ms/token (last 32)
+[qwen36 spec gate] turn 6: T(1) 101.1 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 6: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 1 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 52 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[timers] window: moe 52 ms/token (last 32)
+[qwen36 spec gate] turn 7: T(1) 98.0 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 7: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 3 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[qwen36 spec gate] turn 8: T(1) 101.2 ms, rows 2:1.97, rho 0.73, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 8: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 3 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 52 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[qwen36 spec gate] turn 9: T(1) 99.6 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 9: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 3 declined, 0 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 51 ms/token (last 32)
+[timers] window: moe 50 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[qwen36 spec gate] turn 10: T(1) 103.0 ms, rows 2:1.78, rho 0.73, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 10: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 4 declined, 1 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 49 ms/token (last 32)
+[timers] window: moe 49 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[qwen36 spec gate] turn 11: T(1) 96.8 ms, rows 2:1.98, rho 0.82, acceptance by position 0.25 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 11: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/2 drafts in 2 verifies) | gate on, 6 declined, 2 probes
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[timers] window: moe 48 ms/token (last 32)
+[timers] window: moe 48 ms/token (last 32)
+[timers] window: moe 51 ms/token (last 32)
+[qwen36 spec gate] turn 12: T(1) 95.4 ms, rows 2:1.96, rho 0.71, acceptance by position 0.33 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 12: 1.00 tokens/forward (95 forwards per 95 tokens) | acceptance 0.0% (0/1 drafts in 1 verifies) | gate on, 3 declined, 1 probes

@@ -149,7 +149,6 @@ static VkcFit g_olc_fit2;
 static int g_olc_fit2_on;
 static OlmChain *olc_of(Model *m, int d) { return (OlmChain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *olc_name(const OlmChain *ch) { return ch && ch->d ? "olmoe dev2" : "olmoe"; }
-static int olc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 static size_t olm_dho_layer(Model *m, int i);   /* olmoe.c: layer i's host copies given back */
 
 static int olc_geometry_ok(const Cfg *c) {
@@ -329,7 +328,7 @@ static void olc_fit_start(Model *m) {
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n, with that device's free memory (the tier there sizes itself after the placement) */
     int n2 = 0;
-    if (n > 0 && n < L && olc_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+    if (n > 0 && n < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
         vkc_device(1);
         n2 = vkc_fit("olmoe dev2", L - n, per + n, mat + n, fixed, tail, &g_olc_fit2);
         if (n2 > 0 && !vkc_init()) {
@@ -866,7 +865,7 @@ static int olc_forward_seg(Model *m, OlmChain *ch, const int *ids, float *xh, in
     *rows_only = part;
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("olmoe", pos_base, S);   /* the device lost only when it said so (#2793) */
     free(xfin);
     vkc_device(0);
     olc_lost(m, pos_base);

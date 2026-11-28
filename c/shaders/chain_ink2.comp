@@ -23,7 +23,8 @@
 //   y    = (sum_lag u_lag * tap + u_0) / fc,   fc = sqrt(2K + 1)
 // where u_0 is the row's input and u_lag the input lag rows before it (the state's K-1
 // inputs, ring[y_off + c*(K-1) + j] oldest first, then the step's rows); the state keeps the
-// last K-1 inputs. One thread per channel. K <= 9.
+// last K-1 inputs. One thread per channel. K <= 9. SNAP > 0 (an MTP verify): the state after
+// each row s also at ring[y_off + (s+1)*SNAP + c*(K-1) + j].
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -58,6 +59,7 @@ layout(push_constant) uniform P { int v[32]; } p;
 #define C_      p.v[2]
 #define K_      p.v[3]
 #define HD_     p.v[10]
+#define SNAP    p.v[12]
 #define FC      intBitsToFloat(p.v[11])
 
 shared float rms[256];
@@ -155,6 +157,7 @@ void dconv() {
         xv[xi] = (acc + cur) / FC;
         [[unroll]] for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
         [[unroll]] for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
+        if (SNAP > 0) [[unroll]] for (int k = 0; k < 8; k++) if (k < nh) yv[Y_OFF + (s + 1) * SNAP + c * nh + k] = hist[k];
     }
     [[unroll]] for (int k = 0; k < 8; k++) if (k < nh) yv[Y_OFF + c * nh + k] = hist[k];
 }

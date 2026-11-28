@@ -203,6 +203,12 @@ class MakefilePlatformTests(unittest.TestCase):
         self.assertIn("-DCOLI_DSV4_NO_TC", out)
         self.assertNotIn("-lcublasLt", out)
 
+    def test_dsv4_dll_refuses_no_tc_with_dsv4_tc(self):
+        # NO_TC=1 used to lose silently to DSV4_TC=1 and still link cuBLASLt.
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            self._dry_run("cuda-dsv4-dll", "x86_64-w64-mingw32", NO_TC=1, DSV4_TC=1)
+        self.assertIn("NO_TC=1 means DSV4_TC=0", caught.exception.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

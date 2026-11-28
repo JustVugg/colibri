@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "hypothesis": "On an 8 GB card behind PCIe 4.0 x8 most routed experts miss VRAM and an upload costs more than computing the expert on the CPU, so the GPU tier decodes slower than the CPU alone. Computing the experts already mirrored in VRAM on the GPU while the CPU computes the others at the same time, and uploading at most one expert per layer by use count, makes decode faster than both the GPU tier and the CPU.",
+  "commit": "80cd7c7f67dfd1f768b255d21c26fc28094142b8",
+  "model": "DeepSeek-V4-Flash architecture, REAP-pruned to 132 experts x 43 layers (79 GB), safetensors, native FP8/FP4",
+  "command": "make -C c -j16 deepseek-v4 HIP=1 HIP_ARCH=gfx1102 ROCM_HOME=/usr (hipcc's default 32-lane waves); deepseek_v4 <model> 'Count from 1 to 300, separated by single spaces.' --max-tokens 200 with the environment in config (--vram 5 as CUDA_EXPERT_GB=5); the arms alternate (trial, baseline, CPU reference) three times on one binary; tok_s = (generated - 1) / after_first from the engine's `timing` line (decode throughput); cpu_reference_runs.txt is the same binary with COLI_CUDA=0",
+  "prompt_hash": "a90836cb1e5f23f0ac423a0f9ef504126710ea8b4d5d329c2fc3f2ef8c551a66",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 7945HX, 16 cores / 32 threads, AVX-512",
+    "ram": "62 GB DDR5 (auto memory budget, about 57 GiB available)",
+    "storage": "Apacer AS2280Q4U 4TB NVMe (PCIe 4.0 x4), ext4, direct aligned reads",
+    "os": "Gentoo Linux 7.3.5, gcc 16.2.1, ROCm/HIP 7.16.0 (clang 23.1.5), AMD Radeon RX 7600M XT 8 GB (gfx1102, PCIe 4.0 x8; also the display GPU, desktop running)"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "V4_HOT_SPLIT"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102",
+      "V4_HOT_SPLIT": "0",
+      "args": "'Count from 1 to 300, separated by single spaces.' --max-tokens 200",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "5",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0"
+    },
+    "samples": {
+      "tok_s": [
+        1.6635,
+        1.6657,
+        1.658
+      ]
+    },
+    "median_tok_s": 1.6635,
+    "quality": {
+      "method": "the answer is exactly '1 2 3 ... 100' (checked number by number) and the same text (md5 of stdout) in every run of both arms",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-hot-split-2026-11-19/baseline_runs.txt",
+      "sha256": "6ba5db69008a23b082b87a90d01047aaee8b2b3600273cf8d9593e2eeeeef845"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102",
+      "V4_HOT_SPLIT": "1",
+      "args": "'Count from 1 to 300, separated by single spaces.' --max-tokens 200",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "5",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0"
+    },
+    "samples": {
+      "tok_s": [
+        3.4062,
+        3.4138,
+        3.3955
+      ]
+    },
+    "median_tok_s": 3.4062,
+    "quality": {
+      "method": "the answer is exactly '1 2 3 ... 100' (checked number by number) and the same text (md5 of stdout) in every run of both arms",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-hot-split-2026-11-19/trial_runs.txt",
+      "sha256": "919ac7721d2e5ba88af19b56b7ca951322ebad8c63396ab1336740a4aee2280d"
+    }
+  },
+  "outcome": "improvement"
+}

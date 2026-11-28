@@ -71,6 +71,7 @@
  * neither): the second device's is read back first, so a read that fails leaves the
  * primary's untouched; the primary's record of input rows rebuilds both. Losing either
  * device turns both off. */
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
@@ -114,6 +115,7 @@ static int g_g53c_fitted;
 static size_t g_g53c_lazy;                    /* what the chain allocates at its first forward: one chunk's
                                                * scratch and the N layers' MLA caches at their first size */
 static size_t *g_g53c_mir;                    /* each layer's MLA caches at their first size */
+static size_t g_g53c_mir_sum;                 /* the placed layers' (coli_kv_plan: the tier keeps them free) */
 /* the second device's chain (layers g_g53c_fit.n..), its fit; g_g53c_dev: the device
  * g53c_tensor uploads a new matrix to */
 static G53Chain *g_g53c2;
@@ -121,7 +123,6 @@ static VkcFit g_g53c_fit2;
 static int g_g53c_fit2_on, g_g53c_dev;
 static G53Chain *g53c_of(int d) { return d ? g_g53c2 : g_g53c; }
 static const char *g53c_name(const G53Chain *ch) { return ch && ch->d ? "glm53 dev2" : "glm53"; }
-static int g53c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 /* A GGUF matrix's device format: its blocks as the file has them (100 + the ggml type; the
  * CPU's rows interleaved by 16 go back to the file's), where the backend has a block form
@@ -323,7 +324,9 @@ static void g53c_fit_plan(GModel *m) {
     size_t *lb = calloc(L ? L : 1, sizeof(size_t)), *mb = calloc(L ? L : 1, sizeof(size_t));
     size_t *mir = calloc(L ? L : 1, sizeof(size_t));
     if (!lb || !mb || !mir) { free(lb); free(mb); free(mir); return; }
-    const int cap0 = 256;   /* g53c_mirror's first size */
+    /* g53c_mirror's first size: 256, or planned (coli_kv_plan.h) a serve slot's whole context, its latent rows at
+     * most 32768 positions (past them the split keeps a window on the device; the index keys stay whole) */
+    const int ctx0 = coli_kv_plan() ? g53_slot_ctx_env() : 256, cap0 = ctx0 < 32768 ? ctx0 : 32768;
     for (int i = 0; i < L; i++) {
         lb[i] = 2 * vkc_fit_tensor(10, HD, nm, 0);
         mb[i] = 2 * coli_vk_tensor_payload(10, HD, nm, 0);
@@ -335,8 +338,8 @@ static void g53c_fit_plan(GModel *m) {
         }
         lb[i] += g53c_arena_floats(c, i) * sizeof(float);
         if (c->is_full[i])
-            mir[i] = vkc_fit_buf((size_t)cap0 * c->kv_lora * sizeof(float)) + 2 * vkc_fit_buf((size_t)cap0 * ID * sizeof(float)) +
-                     vkc_fit_buf((size_t)(cap0 / c->index_kpool + 1) * ID * sizeof(float));
+            mir[i] = vkc_fit_buf((size_t)cap0 * c->kv_lora * sizeof(float)) + 2 * vkc_fit_buf((size_t)ctx0 * ID * sizeof(float)) +
+                     vkc_fit_buf((size_t)(ctx0 / c->index_kpool + 1) * ID * sizeof(float));
         else
             lb[i] += vkc_fit_buf((size_t)3 * P * c->conv_k * sizeof(float)) +
                      vkc_fit_buf((size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float));
@@ -366,7 +369,7 @@ static void g53c_fit_plan(GModel *m) {
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n0 (the head stays on the host), with that device's free memory, its pipelines up now */
     int n0 = g_g53c_fit.n;
-    if (vkc_fit_partial(&g_g53c_fit) && n0 > 0 && n0 < L && g53c_dev2_wanted() && getenv("COLI_VK_DEV2") &&
+    if (vkc_fit_partial(&g_g53c_fit) && n0 > 0 && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
         coli_vk_dev2_open_env()) {
         vkc_device(1);
         int n2 = vkc_fit("glm53 dev2", L - n0, lb + n0, mb + n0, fixed, 0, &g_g53c_fit2);
@@ -580,6 +583,7 @@ static int g53c_mirror(G53Chain *ch, const GModel *m, int need, int limit, int r
     const Cfg *c = &m->c; int lo = ch->lo, hi = lo + ch->n, ID = c->index_hd, pool = c->index_kpool;   /* the device's layers */
     if (ch->cap >= need) return 1;
     int cap = 256; while (cap < need) cap *= 2;
+    if (coli_kv_plan()) cap = limit;   /* planned: the slot's whole context at the first, never grown (coli_kv_plan.h) */
     if (cap > limit) cap = limit;
     if (cap < need) return 0;
     size_t row = (size_t)c->kv_lora * sizeof(float);
@@ -720,8 +724,20 @@ static int g53c_mla(G53Chain *ch, const GModel *m, const GSession *s, const GLay
  * the CPU from the recorded input rows of [rec_base, start), from the host's copy at
  * rec_base. The second device's is read back first (g53c_sync_host): dev2 without dev0
  * does not happen. */
+static int g_g53c_mode;   /* the chain's mode before a stop (g53c_retry brings it back) */
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. g53c_recover gave the state to the host and the device no owner: the next forward takes the session as
+ * any new owner, its rows and state up from the host. One device. */
+static void g53c_retry(void) {
+    G53Chain *ch = g_g53c;
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || g_g53c2 || !vkc_chain_retry("glm53")) return;
+    ch->owner = NULL; ch->where = G53C_HOST;
+    for (int i = 0; i < ch->lo + ch->n; i++) ch->kv_valid[i] = ch->pool_valid[i] = 0;
+    ch->failed = 0; g_vk_chain = g_g53c_mode ? g_g53c_mode : 1;
+}
 static void g53c_recover(GModel *m, GSession *s, int start, int dev0, int dev2, const G53Chain *who) {
     G53Chain *ch = g_g53c, *ch2 = g_g53c2;
+    if (g_vk_chain) g_g53c_mode = g_vk_chain;
     g_vk_chain = 0;
     if (!ch) return;
     int had = ch->owner == s && (dev0 || dev2);
@@ -732,7 +748,7 @@ static void g53c_recover(GModel *m, GSession *s, int start, int dev0, int dev2, 
     }
     const char *nm = g53c_name(who);
     if (!had) {
-        fprintf(stderr, "[VK] %s chain: the device was lost; the host's state is current, the CPU runs from here on\n", nm);
+        fprintf(stderr, "[VK] %s chain: %s; the host's state is current, the host's path runs from here on\n", nm, vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays");
         return;
     }
     const Cfg *c = &m->c; int H = c->hc_mult, D = c->hidden;
@@ -742,8 +758,8 @@ static void g53c_recover(GModel *m, GSession *s, int start, int dev0, int dev2, 
         exit(1);
     }
     int n = start - ch->rec_base;
-    fprintf(stderr, "[VK] %s chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on\n", nm, n);
+    fprintf(stderr, "[VK] %s chain: %s; rebuilding the state of %d positions on the host's path, "
+                    "which runs from here on\n", nm, vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", n);
     /* the devices' layers only: a partial chain's CPU layers ran every position already */
     if (n <= 0) return;
     float *xs = malloc((size_t)n * H * D * sizeof(float)), *xn = malloc((size_t)n * H * D * sizeof(float));
@@ -860,7 +876,7 @@ static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams
     return ch->n;
 lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(outs);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("glm53", start, n);   /* the device lost only when it said so (#2793) */
     *lost = 1;
     return 0;
 }
@@ -1010,6 +1026,7 @@ static void g53c_start(GModel *m) {
     }
     g_g53_partial = vkc_fit_partial(&g_g53c_fit);
     for (int i = 0; i < g_g53c_fit.n; i++) g_g53c_lazy += g_g53c_mir[i];   /* for the tier (glm53_vk_tier_start) */
+    for (int i = 0; i < g_g53c_fit.n; i++) g_g53c_mir_sum += g_g53c_mir[i];   /* a whole chain's mirrors, planned (g53_tier_dense_bytes) */
     vkc_fit_placed("glm53", &g_g53c_fit);
     g53_dho_finish(m, g_g53c_fit.n, g_g53c_fit.tail, g_g53_partial);
 }

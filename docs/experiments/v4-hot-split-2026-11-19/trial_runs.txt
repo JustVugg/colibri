@@ -1,0 +1,44 @@
+== T32_1 vram=5 [V4_HOT_SPLIT=1] rc=0 abort=0 wall=70s kfd_peak=5045MiB over=-75MiB card_delta=5035MiB generated=200 time_to_first_token=7.602s after_first=58.423s reads=3379 md5=ccbc8dfc avail=56G
+   tok_s=(generated-1)/after_first=199/58.423=3.4062
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=57.57GiB dense=resident(6.23GiB) target_slots=84 target_cache=44.97GiB head=resident-bf16 projected=57.08GiB
+   [DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+   v4_gpu place device=0 budget=5120MiB dense=ram
+   v4_gpu hot-split mirrors=302
+   v4_gpu tier=dense-matvec device=0
+   v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=28525 hits=25146 misses=3379 hit_rate=88.154 bytes=45175013376 target_only=1
+   timing time_to_first_token=7.602s after_first=58.423s
+   v4_gpu hot-split experts gpu=24536 cpu=23518 uploads=475 mirrors=302
+   v4_direct reads=3379 flock_reads=0 fallbacks=0 payload_bytes=43229380608
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 
+
+== T32_2 vram=5 [V4_HOT_SPLIT=1] rc=0 abort=0 wall=69s kfd_peak=5045MiB over=-75MiB card_delta=5073MiB generated=200 time_to_first_token=7.486s after_first=58.293s reads=3376 md5=ccbc8dfc avail=56G
+   tok_s=(generated-1)/after_first=199/58.293=3.4138
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=57.40GiB dense=resident(6.23GiB) target_slots=84 target_cache=44.97GiB head=resident-bf16 projected=57.08GiB
+   [DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+   v4_gpu place device=0 budget=5120MiB dense=ram
+   v4_gpu hot-split mirrors=302
+   v4_gpu tier=dense-matvec device=0
+   v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=28525 hits=25149 misses=3376 hit_rate=88.165 bytes=45134905344 target_only=1
+   timing time_to_first_token=7.486s after_first=58.293s
+   v4_gpu hot-split experts gpu=24536 cpu=23518 uploads=475 mirrors=302
+   v4_direct reads=3376 flock_reads=0 fallbacks=0 payload_bytes=43190059008
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 
+
+== T32_3 vram=5 [V4_HOT_SPLIT=1] rc=0 abort=0 wall=69s kfd_peak=5045MiB over=-75MiB card_delta=5071MiB generated=200 time_to_first_token=7.441s after_first=58.607s reads=3388 md5=ccbc8dfc avail=55G
+   tok_s=(generated-1)/after_first=199/58.607=3.3955
+   answer_md5=230822aca97b2bafa95ed612b2a63314 count_exact=True sequence=1..100
+   ram_tiers available=56.91GiB dense=resident(6.23GiB) target_slots=83 target_cache=44.44GiB head=resident-bf16 projected=56.54GiB
+   [DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+   v4_gpu place device=0 budget=5120MiB dense=ram
+   v4_gpu hot-split mirrors=302
+   v4_gpu tier=dense-matvec device=0
+   v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+   v4_tokens prompt=17 generated=200 total=217 expert_requests=28525 hits=25137 misses=3388 hit_rate=88.123 bytes=45295337472 target_only=1
+   timing time_to_first_token=7.441s after_first=58.607s
+   v4_gpu hot-split experts gpu=24536 cpu=23518 uploads=475 mirrors=302
+   v4_direct reads=3388 flock_reads=0 fallbacks=0 payload_bytes=43344986112
+   answer: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 

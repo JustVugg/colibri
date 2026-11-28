@@ -16,9 +16,10 @@ The constants (GPU_EFF, CPU_EFF, FAMILY) are fitted to decode speeds measured on
 (CALIBRATION, tests/test_model_fit.py holds the estimates to them). The machine: setup_hw's
 report (RAM, cards, CPU, disk), the RAM's read bandwidth measured here (a process a core, each
 scanning its own buffer with the C library's memchr: within 3% of numpy's sums on three
-machines), a card's bandwidth from the CUDA driver (memory clock x bus width) or from its name,
-and the disk's kind (NVMe, SSD, HDD). Standard library only: the setup runs before anything
-else is installed.
+machines), the same scan over a buffer each process keeps in its L2 (the vector work the cores
+do together: where it is short, the CPU and not the RAM sets a decode's pace, CPU_PACE_GBS), a
+card's bandwidth from the CUDA driver (memory clock x bus width) or from its name, and the disk's
+kind (NVMe, SSD, HDD). Standard library only: the setup runs before anything else is installed.
 """
 import json
 import os
@@ -36,6 +37,13 @@ GPU_EFF = {"cuda": 0.72, "vulkan": 0.62}
 #: The CPU's share of the RAM's measured bandwidth in a decode (Qwen3.6 int4 on ds: 19.8 tok/s
 #: from 2.5 GB a token at 61.8 GB/s)
 CPU_EFF = 0.8
+#: The cores' vector work (memchr over a buffer each process keeps in its L2, every logical CPU at
+#: once, measure_cpu_gbs) below which the CPU, not the RAM, sets a decode's pace on the CPU: its
+#: time grows by CPU_PACE_GBS over the measure. D (i5-13500) reads 977-1024 GB/s and ds (Ryzen 7
+#: PRO 8700GE) 912, both paced by their RAM. An i7-1355U laptop under WSL reads 288-304 with RAM
+#: as fast as D's (35 GB/s), and Inkling-2-Mini UD-IQ2_XXS decodes there at 2.5-3.1 tok/s against
+#: 8.4 on D: the estimate from the RAM alone said 11.1.
+CPU_PACE_GBS = 900.0
 #: An integrated GPU reads the same RAM: what it changes is the compute. Measured on a Radeon 780M
 #: against its Ryzen 7 PRO 8700GE (docs/vulkan.md): decode on the GPU over decode on the CPU, for
 #: that GPU only (another integrated one is estimated as its CPU).
@@ -157,12 +165,26 @@ def measure_ram_bandwidth(cpus=None, avail_bytes=None, mb=128, seconds=0.6, runs
     procs = cpus
     if avail_bytes:
         procs = max(1, min(cpus, int(avail_bytes * 0.25 // (mb << 20))))
+    return _scan_gbs(mb << 20, procs, seconds, runs)
+
+
+def measure_cpu_gbs(cpus=None, kib=192, seconds=0.6, runs=2):
+    """The cores' vector work in GB/s, the best of `runs`: the RAM probe's memchr over `kib` KiB
+    a process, a buffer its L2 keeps, every logical CPU at once. It counts what a decode on the
+    CPU needs past the RAM: the cores, their vector width, the clock the power limit leaves (see
+    CPU_PACE_GBS). None if it cannot run."""
+    return _scan_gbs(kib << 10, cpus or os.cpu_count() or 2, seconds, runs)
+
+
+def _scan_gbs(nbytes, procs, seconds, runs):
+    """`procs` processes, each scanning its own `nbytes` with memchr for `seconds`, started
+    together: the bytes they read a second in GB/s, the best of `runs`; None if none ran."""
     best = None
     for _ in range(runs):
         children = []
         try:
             for _ in range(procs):
-                children.append(subprocess.Popen([sys.executable, "-c", _CHILD, str(mb << 20), str(seconds)],
+                children.append(subprocess.Popen([sys.executable, "-c", _CHILD, str(nbytes), str(seconds)],
                                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True))
             for c in children:
                 if (c.stdout.readline() or "").strip() != "ready":
@@ -184,6 +206,26 @@ def measure_ram_bandwidth(cpus=None, avail_bytes=None, mb=128, seconds=0.6, runs
 
 # ---------------------------------------------------------------- the disk
 
+def _block_kind(d):
+    """One block device's kind, from its sysfs folder."""
+    if os.path.basename(d).startswith("nvme"):
+        return "nvme"
+    try:
+        with open(os.path.join(d, "queue", "rotational")) as f:
+            rot = f.read().strip() == "1"
+    except OSError:
+        return None
+    if not rot:
+        return "ssd"
+    try:
+        with open(os.path.join(d, "device", "model")) as f:
+            model = f.read().strip()
+    except OSError:
+        model = ""
+    # Hyper-V's virtual disk reads rotational whatever holds it: WSL2's own disk on an NVMe drive
+    return None if model == "Virtual Disk" else "hdd"
+
+
 def _linux_disk_kind(path):
     try:
         st = os.stat(path)
@@ -200,15 +242,7 @@ def _linux_disk_kind(path):
         for s in os.listdir(slaves):
             m = os.path.realpath(os.path.join(slaves, s))
             members.append(m if os.path.exists(os.path.join(m, "queue")) else os.path.dirname(m))
-    kinds = []
-    for d in members or [disk]:
-        name = os.path.basename(d)
-        try:
-            with open(os.path.join(d, "queue", "rotational")) as f:
-                rot = f.read().strip() == "1"
-        except OSError:
-            rot = None
-        kinds.append("nvme" if name.startswith("nvme") else "hdd" if rot else "ssd" if rot is False else None)
+    kinds = [_block_kind(d) for d in members or [disk]]
     for k in ("hdd", "ssd", None, "nvme"):   # the slowest member sets the pace
         if k in kinds:
             return k
@@ -234,7 +268,8 @@ def _windows_disk_kind(path):
 
 
 def disk_kind(path):
-    """nvme, ssd, hdd or None (unknown: a network share, WSL's view of a Windows drive)."""
+    """nvme, ssd, hdd or None (unknown: a network share, WSL's view of a Windows drive or its
+    own virtual disk)."""
     path = path or "."
     while path and not os.path.exists(path):
         parent = os.path.dirname(path)
@@ -250,9 +285,10 @@ def disk_kind(path):
 
 # ---------------------------------------------------------------- the machine
 
-def machine_from_hw(hw, ram_gbs=None, disk=None, cuda_devices=None):
-    """setup_hw's report as what the estimates read: RAM (bytes), its bandwidth (GB/s), the cards
-    (discrete ones with their memory and bandwidth, an integrated one), the disk's kind."""
+def machine_from_hw(hw, ram_gbs=None, disk=None, cuda_devices=None, cpu_gbs=None):
+    """setup_hw's report as what the estimates read: RAM (bytes), its bandwidth (GB/s), the cores'
+    vector work (GB/s, measure_cpu_gbs), the cards (discrete ones with their memory and bandwidth,
+    an integrated one), the disk's kind."""
     mem = hw.get("memory") or {}
     cards = []
     by_slot = {}
@@ -274,7 +310,7 @@ def machine_from_hw(hw, ram_gbs=None, disk=None, cuda_devices=None):
     elif vk and vk.get("type") == "integrated":
         integrated = re.sub(r"^Microsoft Direct3D12 \((.+)\)$", r"\1", vk.get("name") or "")
     return {"ram": mem.get("total") or 0, "ram_avail": mem.get("available") or 0,
-            "ram_gbs": ram_gbs, "cards": cards, "integrated": integrated,
+            "ram_gbs": ram_gbs, "cpu_gbs": cpu_gbs, "cards": cards, "integrated": integrated,
             "disk": disk, "disk_gbs": DISK_GBS.get(disk, DISK_GBS[None]),
             "cpu": (hw.get("cpu") or {}).get("name"),
             "cores": (hw.get("cpu") or {}).get("physical_cores") or (hw.get("cpu") or {}).get("logical_cores")}
@@ -309,6 +345,13 @@ def _hit(fraction):
     return 1.0 if fraction >= 1 else max(0.0, fraction) ** 0.5
 
 
+def cpu_slowdown(machine):
+    """How much longer the CPU's share of a decode takes than the RAM's bandwidth says: 1 where the
+    cores' vector work reaches CPU_PACE_GBS or was not measured, its shortfall below that."""
+    gbs = machine.get("cpu_gbs")
+    return max(1.0, CPU_PACE_GBS / gbs) if gbs else 1.0
+
+
 def estimate(entry, machine, backend):
     """How `entry` runs on `machine` with `backend` (cuda, vulkan or cpu): {"tier", "tok_s",
     "where"} (gpu, hybrid, ram or ssd; decode tokens a second), or {"tier": None, "why"} when it
@@ -320,8 +363,9 @@ def estimate(entry, machine, backend):
     ram = max(0.0, machine["ram"] * RAM_SHARE - RAM_KEEP)
     ram_gbs = (machine.get("ram_gbs") or DEFAULT_RAM_GBS) * GB
     disk_gbs = (machine.get("disk_gbs") or DISK_GBS[None]) * GB
-    cpu_bw = ram_gbs * CPU_EFF
-    cpu_fixed = g["layers"] * fam["cpu_ms"] / 1000
+    slow = cpu_slowdown(machine)
+    cpu_bw = ram_gbs * CPU_EFF / slow
+    cpu_fixed = g["layers"] * fam["cpu_ms"] / 1000 * slow
     total = g["resident"] + g["experts"]
     cards = [c for c in machine.get("cards") or [] if c.get("vram")]
     if backend in ("cuda", "vulkan") and cards:
@@ -391,6 +435,8 @@ def pick(rows):
 def describe(machine):
     """The machine as the menu's header says it."""
     parts = ["RAM %.0f GB%s" % (machine["ram"] / GB, " at %.0f GB/s" % machine["ram_gbs"] if machine.get("ram_gbs") else "")]
+    if cpu_slowdown(machine) > 1:
+        parts.append("a CPU that computes %.1fx slower than its RAM reads" % cpu_slowdown(machine))
     for c in machine.get("cards") or []:
         parts.append("%s %.0f GB%s" % (c["name"], c["vram"] / GB, " at %.0f GB/s" % c["gbs"] if c.get("gbs") else ""))
     if machine.get("integrated"):
@@ -405,5 +451,5 @@ if __name__ == "__main__":   # `python3 model_fit.py`: this machine as the setup
     hw = setup_hw.detect(os.path.expanduser("~"))
     probe = setup_hw._probe_cuda_child() if hw.get("nvidia") else None
     m = machine_from_hw(hw, measure_ram_bandwidth(avail_bytes=(hw.get("memory") or {}).get("available")),
-                        disk_kind(os.path.expanduser("~")), (probe or {}).get("devices"))
+                        disk_kind(os.path.expanduser("~")), (probe or {}).get("devices"), measure_cpu_gbs())
     print(json.dumps(m, indent=1, default=str))

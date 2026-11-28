@@ -1,0 +1,10 @@
+dev r1: probe found in 0.0 s | tier  151 ms after the probe line: budget 11.36 GiB, 2982 experts
+fix r1: probe found in 0.2 s | tier  154 ms after the probe line: budget 12.36 GiB, 3072 experts
+dev r2: probe found in 0.0 s | tier  154 ms after the probe line: budget 11.36 GiB, 2982 experts
+fix r2: probe found in 0.2 s | tier  166 ms after the probe line: budget 12.36 GiB, 3072 experts
+dev r3: probe found in 0.0 s | tier  157 ms after the probe line: budget 11.36 GiB, 2982 experts
+fix r3: probe found in 0.2 s | tier  185 ms after the probe line: budget 12.36 GiB, 3072 experts
+dev r4: probe found in 0.0 s | tier  154 ms after the probe line: budget 11.36 GiB, 2982 experts
+fix r4: probe found in 0.2 s | tier  195 ms after the probe line: budget 12.36 GiB, 3072 experts
+dev r5: probe found in 0.0 s | tier  172 ms after the probe line: budget 12.36 GiB, 3072 experts
+fix r5: probe found in 0.2 s | tier  163 ms after the probe line: budget 12.36 GiB, 3072 experts

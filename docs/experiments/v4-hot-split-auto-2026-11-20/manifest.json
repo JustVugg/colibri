@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "hypothesis": "Below 10 GiB of --vram the HIP placement keeps the shared experts in RAM, the condition V4_HOT_SPLIT needs. Turning the split on there by itself (V4_HOT_SPLIT unset) makes decode faster than the plain GPU tier at every --vram the 8 GB card takes, with the same text.",
+  "commit": "65fac3eed9a2061c25217d65dc7bb659cb3bbb03",
+  "model": "DeepSeek-V4-Flash architecture, REAP-pruned to 132 experts x 43 layers (79 GB), safetensors, native FP8/FP4",
+  "command": "make -C c -j16 deepseek-v4 HIP=1 HIP_ARCH=gfx1102 ROCM_HOME=/usr (hipcc's default 32-lane waves); deepseek_v4 <model> 'Count from 1 to 300, separated by single spaces.' --max-tokens 200 with the environment in config (--vram N as CUDA_EXPERT_GB=N); one binary; the arms alternate (trial, baseline) three times at --vram 4, then at 6; tok_s = (generated - 1) / after_first from the engine's `timing` line (decode throughput). Also on that binary: vram5_trial (one run), vram6_* (three runs per arm), vram7_trial (three runs; the plain tier does not fit beside the desktop at --vram 7: it peaks about 180 MiB above --vram), cpu_reference (COLI_CUDA=0, three runs)",
+  "prompt_hash": "a90836cb1e5f23f0ac423a0f9ef504126710ea8b4d5d329c2fc3f2ef8c551a66",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 7945HX, 16 cores / 32 threads, AVX-512",
+    "ram": "62 GB DDR5 (auto memory budget, about 54 GiB available)",
+    "storage": "Apacer AS2280Q4U 4TB NVMe (PCIe 4.0 x4), ext4, direct aligned reads",
+    "os": "Gentoo Linux 7.3.5, gcc 16.2.1, ROCm/HIP 7.16.0 (clang 23.1.5), AMD Radeon RX 7600M XT 8 GB (gfx1102, PCIe 4.0 x8; also the display GPU, desktop running)"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "V4_HOT_SPLIT"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102",
+      "V4_HOT_SPLIT": "0",
+      "args": "'Count from 1 to 300, separated by single spaces.' --max-tokens 200",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "4",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0"
+    },
+    "samples": {
+      "tok_s": [
+        1.5126,
+        1.5,
+        1.5153
+      ]
+    },
+    "median_tok_s": 1.5126,
+    "quality": {
+      "method": "the answer is exactly '1 2 3 ... 100' (checked number by number) and the same text (md5 of stdout) in every run of both arms",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-hot-split-auto-2026-11-20/baseline_runs.txt",
+      "sha256": "46ebb43c0e86efb6d685de5c378f4d3a8ee60a1842a5104765b5246c861e2328"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102",
+      "V4_HOT_SPLIT": "unset (on by itself: dense in RAM below 10 GiB)",
+      "args": "'Count from 1 to 300, separated by single spaces.' --max-tokens 200",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "4",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0"
+    },
+    "samples": {
+      "tok_s": [
+        3.3521,
+        3.3636,
+        3.292
+      ]
+    },
+    "median_tok_s": 3.3521,
+    "quality": {
+      "method": "the answer is exactly '1 2 3 ... 100' (checked number by number) and the same text (md5 of stdout) in every run of both arms",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-hot-split-auto-2026-11-20/trial_runs.txt",
+      "sha256": "989dfe0cb2ab5dad103841dc13e048e56c2b0dcc1a7fd57c489270456ad83c60"
+    }
+  },
+  "outcome": "improvement"
+}

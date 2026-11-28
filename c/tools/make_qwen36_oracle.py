@@ -129,7 +129,14 @@ def main():
     except Exception:
         pass
 
-    payload = {"prompt_ids": prompt_ids, "full_ids": full_ids,
+    # teacher forcing (make_glm_oracle.py's tf_pred): one forward over the whole
+    # sequence, no cache, the argmax at every position -- what `TF=1` on the engine
+    # compares with, position by position, the prompt's included.
+    with torch.no_grad():
+        tf_pred = model(out_ids, use_cache=False).logits[0].argmax(-1).tolist()
+    print(f"tf_pred     : {tf_pred}")
+
+    payload = {"prompt_ids": prompt_ids, "full_ids": full_ids, "tf_pred": tf_pred,
                "mode": args.mode, "model": mdir}
     Path(args.out).write_text(json.dumps(payload, indent=2))
     print(f"\nSaved reference to {args.out}")

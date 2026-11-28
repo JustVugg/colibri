@@ -258,6 +258,7 @@ int  vkt_wanted(void);
 /* 1 = the tier is on. heat: [layers][experts] routing counts, or NULL. */
 int  vkt_init(const VktConfig *cfg, uint32_t *const *heat);
 int  vkt_ready(void);
+int  vkt_lost(void);   /* the device stopped answering under the tier (issue): it is off for the process */
 void vkt_shutdown(void);
 int  vkt_plan(int *layers, int *eids, int max);
 /* The warm start's line ("[VK] tier <engine>: warm start, N experts in Xs (...)"): what

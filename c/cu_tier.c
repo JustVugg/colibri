@@ -127,6 +127,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_ram_first cut_ram_first
 #define vkt_ram_gave cut_ram_gave
 #define vkt_ready cut_ready
+#define vkt_lost cut_lost
 #define vkt_report cut_report
 #define vkt_resident cut_resident
 #define vkt_score cut_score

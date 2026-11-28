@@ -1,4 +1,5 @@
 #include "backend_cuda_dsv4.h"
+#include "ledger_map.h"   /* LEDGER_OUT: the memory map and the window Ledger reads */
 #include <chrono>
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #include "backend_gpu_compat.h"
@@ -138,6 +139,25 @@ static int attn_device_on(void){static int on=-1;if(on<0){const char*e=getenv("V
 __constant__ float e8_table[256];
 __global__ void set_decode_state(int*state,int token,int position){if(!threadIdx.x){state[0]=token;state[1]=position;}}
 __device__ float e8(uint8_t b){return e8_table[b];}
+/* e8()'s values from the exponent bits: no serialized __constant__ reads when a warp's lanes need different scales */
+__device__ __forceinline__ float v4f_e8f(unsigned b){ return b? __uint_as_float(b<<23) : __uint_as_float(0x00400000u); }
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+template<class T> __device__ __forceinline__ T dsv4_ldcs(const T* p){return *p;}
+template<class T> __device__ __forceinline__ T dsv4_ldcg(const T* p){return *p;}
+#else
+template<class T> __device__ __forceinline__ T dsv4_ldcs(const T* p){return __ldcs(p);}
+template<class T> __device__ __forceinline__ T dsv4_ldcg(const T* p){return __ldcg(p);}
+#endif
+/* Exact warp-level reduction tree matching the 256-thread shared-memory tree (128, 64, ..., 1):
+ * lane l holds partials j = 8l..8l+7; steps 128..8 shuffle across lanes, 4..1 fold in-lane. */
+__device__ __forceinline__ float v4f_tree(float p[8]){
+    #pragma unroll
+    for(int k=16;k;k>>=1){
+        #pragma unroll
+        for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__shfl_down_sync(0xffffffffu,p[r],k));}
+    p[0]=__fadd_rn(p[0],p[4]);p[1]=__fadd_rn(p[1],p[5]);p[2]=__fadd_rn(p[2],p[6]);p[3]=__fadd_rn(p[3],p[7]);
+    p[0]=__fadd_rn(p[0],p[2]);p[1]=__fadd_rn(p[1],p[3]);
+    return __fadd_rn(p[0],p[1]);}
 __device__ __forceinline__ float e4m3_exact(unsigned b){
     unsigned sg=b>>7,e=(b>>3)&15u,m=b&7u;float v;
     if(e==0)v=(float)m*0.001953125f;
@@ -325,13 +345,62 @@ static void launch_bf16_one(const __nv_bfloat16*w,const float*x,float*y,int O,in
     }else mm_bf16_batch<<<dim3(O,1),256,0,st>>>(w,x,y,O,I,1);
 }
 template<int R> __global__ void mv_fp4_grouped(const MvDesc *desc,int count,int O,int I){
-    int matrix=blockIdx.y,base=blockIdx.x*R;if(matrix>=count)return;MvDesc d=desc[matrix];float sum[R]={};
-    for(int i=threadIdx.x;i<I;i+=blockDim.x){
+    int matrix=blockIdx.y,base=blockIdx.x*R;if(matrix>=count)return;MvDesc d=desc[matrix];
+    /* one buffer, as big as xs[4096] + s[R][256]: x for the warp path; else the block's
+     * staged rows (nibbles, then scales), then the reduction tree */
+    __shared__ __align__(16) uint8_t sm[16384+R*1024];
+    __shared__ float lut[16];
+    if(threadIdx.x<16){const float t[16]={0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6};lut[threadIdx.x]=t[threadIdx.x];}
+    if((I&255)==0&&I<=4096&&!((size_t)d.x&15)&&!((size_t)d.w&3)){
+        float*xs=(float*)sm;
+        for(int i=threadIdx.x*4;i<I;i+=256*4)*(float4*)(xs+i)=dsv4_ldcg((const float4*)(d.x+i));
+        __syncthreads();
+        int wid=threadIdx.x>>5,lane=threadIdx.x&31,o=base+wid;
+        if(wid>=R||o>=O)return;
+        const uint8_t* wrow=d.w+((long long)o*I>>1);
+        const uint8_t* srow=d.scale+(long long)o*(I/32);
+        float p[8]={0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+        #pragma unroll 4
+        for(int m=0;m<I;m+=256){
+            int i=m+8*lane;
+            unsigned u=dsv4_ldcs((const unsigned*)(wrow+(i>>1)));
+            float sc=v4f_e8f(__ldg(srow+(i>>5)));
+            const float4* xp=(const float4*)(xs+i);
+            float4 xa=xp[0],xb=xp[1];
+            const float xv[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
+            #pragma unroll
+            for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__fmul_rn(__fmul_rn(xv[r],lut[(u>>(4*r))&15]),sc));
+        }
+        float acc=v4f_tree(p);
+        if(!lane)d.y[o]=acc;
+        return;
+    }
+    /* I > 4096 (e.g. H=5120, 7168): stage the block's rows with 16-byte loads; same terms in
+     * the same order as the per-element loop below (lut holds f4's values), so bit-identical */
+    const int rows=O-base<R?O-base:R;
+    const bool staged=(I&31)==0&&R*(I/2)+R*(I/32)<=(int)sizeof sm&&!((size_t)d.w&15);
+    const uint8_t*ws=sm,*ss=sm+R*(I/2);
+    if(staged){
+        const uint4*wsrc=(const uint4*)(d.w+((long long)base*I>>1));
+        for(int i=threadIdx.x;i<rows*(I/2)/16;i+=blockDim.x)((uint4*)sm)[i]=dsv4_ldcs(wsrc+i);
+        const uint8_t*ssrc=d.scale+(long long)base*(I/32);
+        for(int i=threadIdx.x;i<rows*(I/32);i+=blockDim.x)sm[R*(I/2)+i]=__ldg(ssrc+i);
+    }
+    __syncthreads();
+    float sum[R]={};
+    if(staged)for(int i=threadIdx.x;i<I;i+=blockDim.x){
+        float xv=d.x[i];
+        #pragma unroll
+        for(int r=0;r<R;r++){int o=base+r;if(o<O){uint8_t p=ws[(r*I+i)>>1],q=(i&1)?p>>4:p&15;
+            sum[r]+=xv*lut[q]*v4f_e8f(ss[r*(I/32)+i/32]);}}
+    }
+    else for(int i=threadIdx.x;i<I;i+=blockDim.x){
         #pragma unroll
         for(int r=0;r<R;r++){int o=base+r;if(o<O){uint8_t p=d.w[((long long)o*I+i)>>1],q=(i&1)?p>>4:p&15;
             sum[r]+=d.x[i]*f4(q)*e8(d.scale[(long long)o*(I/32)+i/32]);}}
     }
-    __shared__ float s[R][256];
+    __syncthreads(); /* the tree reuses sm */
+    float (*s)[256]=(float(*)[256])sm;
     #pragma unroll
     for(int r=0;r<R;r++)s[r][threadIdx.x]=sum[r];__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n){
@@ -682,7 +751,7 @@ __global__ void dg_swiglu_quant_rows(const __nv_bfloat16*in,uint8_t*q,int*sfa,fl
     for(int phase=0;phase<2;phase++){int group=phase*8+warp,base=group*128;float value[4],mx=0;
         #pragma unroll
         for(int j=0;j<4;j++){int k=base+lane+j*32;float gate=fminf(__bfloat162float(in[(long long)row*4096+k]),limit),up=fmaxf(-limit,fminf(__bfloat162float(in[(long long)row*4096+2048+k]),limit));value[j]=__bfloat162float(__float2bfloat16((gate/(1.f+expf(-gate)))*up));mx=fmaxf(mx,fabsf(value[j]));}
-        for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));uint8_t c=dg_scale_code(mx),cc=__shfl_sync(0xffffffff,c,0);float scale=dg_scale_value(cc);if(!lane)code[group]=cc;
+        for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));uint8_t c=dg_scale_code(mx),cc=__shfl_sync(0xffffffff,c,0,32);float scale=dg_scale_value(cc);if(!lane)code[group]=cc;
         #pragma unroll
         for(int j=0;j<4;j++){int k=base+lane+j*32;q[(long long)row*2048+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,value[j]/scale)),__NV_SATFINITE,__NV_E4M3);}}
     __syncthreads();if(threadIdx.x<4){int g=threadIdx.x*4;sfa[(long long)threadIdx.x*rows+row]=(int)((uint32_t)code[g]|((uint32_t)code[g+1]<<8)|((uint32_t)code[g+2]<<16)|((uint32_t)code[g+3]<<24));}}
@@ -1130,6 +1199,7 @@ extern "C" int dsv4_cuda_kv_ring_append(int device,int layer,const float*rows,
     if(!g_kv_ring[layer]){
         if(!alloc_ok(cudaMalloc((void**)&g_kv_ring[layer],(size_t)window*dim*4),"kv ring allocation"))return 0;
         g_kv_ring_rows[layer]=window;
+        coli_ledger::add(g_kv_ring[layer],(size_t)window*dim*4,"cache","layers."+std::to_string(layer)+".kv_ring",{window,dim},"float32");
     }
     int done=0;
     while(done<count){
@@ -1160,6 +1230,7 @@ extern "C" int dsv4_cuda_kv_comp_append(int device,int layer,const float*rows,
                                cudaMemcpyDeviceToDevice,c->stream),"kv comp grow copy")){cudaFree(grown);return 0;}
         if(g_kv_comp[layer]){cudaStreamSynchronize(c->stream);cudaFree(g_kv_comp[layer]);}
         g_kv_comp[layer]=grown;g_kv_comp_cap[layer]=cap;
+        coli_ledger::add(grown,(size_t)cap*dim*4,"cache","layers."+std::to_string(layer)+".kv_compressed",{cap,dim},"float32");
     }
     return ok(cudaMemcpyAsync(g_kv_comp[layer]+(size_t)start_idx*dim,rows,
                               (size_t)count*dim*4,cudaMemcpyHostToDevice,c->stream),"kv comp append");
@@ -2324,7 +2395,7 @@ __global__ void __launch_bounds__(32) fp8_ref_rows8_warp_kernel(float*y,const ui
         float sc=scl[c>>7];
         #pragma unroll 8
         for(int i=0;i<32;i++){
-            unsigned lo=__shfl_sync(0xffffffffu,cur.x,i),hi=__shfl_sync(0xffffffffu,cur.y,i);
+            unsigned lo=__shfl_sync(0xffffffffu,cur.x,i,32),hi=__shfl_sync(0xffffffffu,cur.y,i,32);
             unsigned word=r<4?lo:hi;unsigned b=(word>>((r&3)*8))&255u;
             float v=e4m3_exact(b);
             sum=__fadd_rn(sum,__fmul_rn(__fmul_rn(x[c+i],v),sc));
@@ -2446,6 +2517,10 @@ extern "C" int dsv4_cuda_indexer_resident(int device,int layer,const uint8_t*w,c
         if(g_idx_s[layer])cudaFree(g_idx_s[layer]);
         if(g_idx_hw[layer])cudaFree(g_idx_hw[layer]);
         g_idx_w[layer]=NULL;g_idx_s[layer]=NULL;g_idx_hw[layer]=NULL;return 0;}
+    if(coli_ledger::on()){const std::string n="layers."+std::to_string(layer)+".indexer";
+        coli_ledger::add(g_idx_w[layer],wb,"weight",n+".wq_b.weight",{rows,cols},"float8_e4m3fn");
+        coli_ledger::add(g_idx_s[layer],sb,"weight",n+".wq_b.scale",{},"float32");
+        coli_ledger::add(g_idx_hw[layer],hb,"weight",n+".weights_proj.weight",{heads,hidden},"bfloat16");}
     g_idx_w_src[layer]=w;g_idx_rows[layer]=rows;g_idx_cols[layer]=cols;g_idx_packed[layer]=packed_rows8;
     g_idx_heads[layer]=heads;g_idx_hidden[layer]=hidden;g_idx_dev[layer]=device;
     return 1;
@@ -2472,6 +2547,7 @@ extern "C" int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long lo
             cudaFree(grown);return 0;}
         if(g_idx_keys[layer]){cudaStreamSynchronize(c->stream);cudaFree(g_idx_keys[layer]);}
         g_idx_keys[layer]=grown;g_idx_keys_cap[layer]=cap;
+        coli_ledger::add(grown,(size_t)cap*dim*4,"cache","layers."+std::to_string(layer)+".indexer.keys",{cap,dim},"float32");
         if(g_idx_keys_t[layer]){cudaFree(g_idx_keys_t[layer]);g_idx_keys_t[layer]=nullptr;}}
     int have=g_idx_keys_n[layer];
     if(count>have){
@@ -2481,9 +2557,10 @@ extern "C" int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long lo
         /* DSV4_IDX_COAL: the [dim][cap] copy, the whole prefix again (an
          * append is a few rows; the copy is a few hundred KB) */
         if(idx_coal_on()){
-            if(!g_idx_keys_t[layer]&&
-               !alloc_ok(cudaMalloc((void**)&g_idx_keys_t[layer],(size_t)g_idx_keys_cap[layer]*dim*4),"indexer key transpose"))
-                g_idx_keys_t[layer]=nullptr;
+            if(!g_idx_keys_t[layer]){
+                if(!alloc_ok(cudaMalloc((void**)&g_idx_keys_t[layer],(size_t)g_idx_keys_cap[layer]*dim*4),"indexer key transpose"))
+                    g_idx_keys_t[layer]=nullptr;
+                else coli_ledger::add(g_idx_keys_t[layer],(size_t)g_idx_keys_cap[layer]*dim*4,"cache","layers."+std::to_string(layer)+".indexer.keys_transposed",{dim,g_idx_keys_cap[layer]},"float32");}
             if(g_idx_keys_t[layer]){transpose_f32(g_idx_keys_t[layer],g_idx_keys[layer],count,dim,g_idx_keys_cap[layer],c->stream);g_idx_keys_t_n[layer]=count;}
         }}
     else if(idx_coal_on()&&g_idx_keys_t[layer]&&g_idx_keys_t_n[layer]<count){
@@ -2988,7 +3065,7 @@ __global__ void __launch_bounds__(256) head_dot_warp_kernel(float*scores,const _
         #pragma unroll
         for(int j=0;j<32;j++){
             #pragma unroll
-            for(int k=0;k<8;k++){float v=__shfl_sync(0xffffffffu,p[k],j);sum=__fadd_rn(sum,v);}
+            for(int k=0;k<8;k++){float v=__shfl_sync(0xffffffffu,p[k],j,32);sum=__fadd_rn(sum,v);}
         }
         cur=nxt;
     }
@@ -3040,6 +3117,7 @@ static int lf_comp_reserve(Dev*c,int layer,int have,int need,int dim){
        !ok(cudaMemcpyAsync(grown,g_kv_comp[layer],(size_t)have*dim*4,cudaMemcpyDeviceToDevice,c->stream),"kv comp grow copy")){cudaFree(grown);return 0;}
     if(g_kv_comp[layer]){cudaStreamSynchronize(c->stream);cudaFree(g_kv_comp[layer]);}
     g_kv_comp[layer]=grown;g_kv_comp_cap[layer]=cap;
+    coli_ledger::add(grown,(size_t)cap*dim*4,"cache","layers."+std::to_string(layer)+".kv_compressed",{cap,dim},"float32");
     return 1;
 }
 static int lf_keys_reserve(Dev*c,int layer,int need,int dim){
@@ -3053,6 +3131,7 @@ static int lf_keys_reserve(Dev*c,int layer,int need,int dim){
        !ok(cudaMemcpyAsync(grown,g_idx_keys[layer],(size_t)have*dim*4,cudaMemcpyDeviceToDevice,c->stream),"indexer key grow copy")){cudaFree(grown);return 0;}
     if(g_idx_keys[layer]){cudaStreamSynchronize(c->stream);cudaFree(g_idx_keys[layer]);}
     g_idx_keys[layer]=grown;g_idx_keys_cap[layer]=cap;
+    coli_ledger::add(grown,(size_t)cap*dim*4,"cache","layers."+std::to_string(layer)+".indexer.keys",{cap,dim},"float32");
     if(g_idx_keys_t[layer]){cudaFree(g_idx_keys_t[layer]);g_idx_keys_t[layer]=nullptr;g_idx_keys_t_n[layer]=0;}
     return 1;
 }
@@ -3133,7 +3212,9 @@ extern "C" int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs*a){
             g_cs_kv[k][layer]=g_cs_sc[k][layer]=nullptr;g_cs_cap[k][layer]=0;
             if(!alloc_ok(cudaMalloc((void**)&g_cs_kv[k][layer],nb),"compressor state mirror")||
                !alloc_ok(cudaMalloc((void**)&g_cs_sc[k][layer],nb),"compressor score mirror"))return 0;
-            g_cs_cap[k][layer]=nb;resync=1;}
+            g_cs_cap[k][layer]=nb;resync=1;
+            coli_ledger::add(g_cs_kv[k][layer],nb,"cache","layers."+std::to_string(layer)+".compressor."+std::to_string(k)+".kv_state",{a->cs_rows[k],a->cs_proj[k]},"float32");
+            coli_ledger::add(g_cs_sc[k][layer],nb,"cache","layers."+std::to_string(layer)+".compressor."+std::to_string(k)+".score_state",{a->cs_rows[k],a->cs_proj[k]},"float32");}
         if(g_cs_apecap[k][layer]<ab){if(g_cs_ape[k][layer])cudaFree(g_cs_ape[k][layer]);g_cs_ape[k][layer]=nullptr;g_cs_apecap[k][layer]=0;
             if(!alloc_ok(cudaMalloc((void**)&g_cs_ape[k][layer],ab),"compressor ape mirror"))return 0;g_cs_apecap[k][layer]=ab;resync=1;}
         if(g_cs_normcap[k][layer]<wb_){if(g_cs_norm[k][layer])cudaFree(g_cs_norm[k][layer]);g_cs_norm[k][layer]=nullptr;g_cs_normcap[k][layer]=0;
@@ -3738,6 +3819,14 @@ extern "C" int dsv4_cuda_activation_device(const Dsv4CudaActivation*a){return a?
 extern "C" int dsv4_cuda_decode_state_set(int device,int token,int position){Dev*c=ctx(device);if(!c||token<0||position<0||!ok(cudaSetDevice(device),"select decode state device"))return 0;set_decode_state<<<1,1,0,c->stream>>>(c->decode_state,token,position);return ok(cudaGetLastError(),"decode state update");}
 extern "C" void dsv4_cuda_profiler_start(void){cudaProfilerStart();}
 extern "C" void dsv4_cuda_profiler_stop(void){for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);cudaStreamSynchronize(g[i].stream);}cudaProfilerStop();}
+/* Ledger (ledger_map.h): the engine's name for its next allocations on this thread, and
+ * the end of a decode step (writes the map, opens and closes COLI_LEDGER_WINDOW). */
+extern "C" void dsv4_cuda_ledger_label(const char*kind,const char*name){coli_ledger::set_label(kind,name);}
+extern "C" void dsv4_cuda_ledger_step(void){
+    const int edge=coli_ledger::step("dsv4");if(!edge)return;
+    for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);cudaDeviceSynchronize();}
+    (void)(edge>0?cudaProfilerStart():cudaProfilerStop());
+    fprintf(stderr,"[LEDGER] window %s after decode step %lld\n",edge>0?"opened":"closed",coli_ledger::map().steps);}
 extern "C" int dsv4_cuda_graph_begin(int device){Dev*c=ctx(device);return c&&ok(cudaSetDevice(device),"select graph device")&&ok(cudaStreamBeginCapture(c->stream,cudaStreamCaptureModeThreadLocal),"begin graph capture");}
 extern "C" Dsv4CudaGraph *dsv4_cuda_graph_end(int device){Dev*c=ctx(device);if(!c||!ok(cudaSetDevice(device),"select graph device"))return nullptr;Dsv4CudaGraph*g=(Dsv4CudaGraph*)calloc(1,sizeof(*g));if(!g)return nullptr;g->device=device;if(!ok(cudaStreamEndCapture(c->stream,&g->graph),"end graph capture")||!ok(cudaGraphInstantiate(&g->exec,g->graph,0),"instantiate graph")){dsv4_cuda_graph_free(g);return nullptr;}return g;}
 extern "C" int dsv4_cuda_graph_end_pair(int primary,int peer,Dsv4CudaGraph **pg,Dsv4CudaGraph **qg){
@@ -3765,6 +3854,14 @@ static bool host_pin_straddled(const void*p,size_t len);
 static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what){
     if(host_pin_straddled(src,n))host_pinned(src,n);   /* one registration under the whole source */
     return ok(cudaMemcpyAsync(dst,src,n,cudaMemcpyHostToDevice,c->stream),what)&&ok(cudaStreamSynchronize(c->stream),what);}
+static const char*ledger_dtype(int fmt){return fmt==4?"float4_e2m1fn":fmt>=8&&fmt<=11?"float8_e4m3fn":fmt==12||fmt==16?"bfloat16":fmt==32?"float32":"uint8";}
+/* a tensor's weights (wb bytes) and scales (sb) in the Ledger map, under the engine's label
+ * or tensor.<n> */
+static void ledger_tensor(const Dsv4CudaTensor*t,size_t wb,size_t sb){
+    if(!coli_ledger::on())return;const std::string kind=coli_ledger::kind("weight"),n=coli_ledger::name("tensor");
+    coli_ledger::add(t->w,wb,kind,n+".weight",{t->O,t->I},ledger_dtype(t->fmt));
+    if(t->scale)coli_ledger::add(t->scale,sb,kind,n+".scale",{},"uint8");
+    if(t->dg_scale)coli_ledger::add(t->dg_scale,(size_t)t->bytes-wb-sb,kind,n+".deepgemm_scale",{},"int32");}
 static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,size_t sb,int O,int I,int d,int fmt){if(*pt)return 1;Dev *c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select upload device"))return 0;Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));t->O=O;t->I=I;t->device=d;t->fmt=fmt;t->bytes=wb+sb;
     if(!alloc_ok(cudaMalloc(&t->w,wb),"weight allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_w=1;if(!h2d(c,t->w,w,wb,"weight upload")){dsv4_cuda_tensor_free(t);return 0;}
     if(sb){if(!alloc_ok(cudaMalloc(&t->scale,sb),"scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_scale=1;if(!h2d(c,t->scale,sc,sb,"scale upload")){dsv4_cuda_tensor_free(t);return 0;}}
@@ -3778,6 +3875,7 @@ static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,
         else dg_pack_dense_scale<<<(O*(I/128/4)+255)/256,256,0,c->stream>>>(t->dg_scale,t->scale,O,I/128);
         if(!ok(cudaGetLastError(),"dense DeepGEMM scale packing")){dsv4_cuda_tensor_free(t);return 0;}t->bytes+=db;}
 #endif
+    ledger_tensor(t,wb,sb);
     *pt=t;return 1;}
 extern "C" int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){return upload(t,w,(size_t)O*I,s,(size_t)((O+127)/128)*((I+127)/128),O,I,d,8);}
 extern "C" int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **t,const uint8_t*w,const float*s,int O,int I,int packed,int d){
@@ -3831,7 +3929,12 @@ extern "C" int dsv4_cuda_mirror_alloc(Dsv4CudaTensor**g,Dsv4CudaTensor**u,Dsv4Cu
     for(int k=0;k<3;k++){t[k]=(Dsv4CudaTensor*)calloc(1,sizeof(Dsv4CudaTensor));if(!t[k]){for(int j=0;j<k;j++)free(t[j]);cudaFree(wblock);cudaFree(sblock);return 0;}
         t[k]->device=dev;t[k]->fmt=4;t[k]->O=k<2?Og:Od;t[k]->I=k<2?Ig:Id;
         t[k]->scale=(uint8_t*)sblock+(k<2?k*sg:2*sg);t[k]->w=(uint8_t*)wblock+(k<2?k*wg:2*wg);}   /* provisional: a refill points them */
-    t[0]->block=wblock;t[0]->block2=sblock;t[0]->blockcap=Wb;t[0]->block2cap=S;t[0]->bytes=Wb+S;*g=t[0];*u=t[1];*d=t[2];return 1;}
+    t[0]->block=wblock;t[0]->block2=sblock;t[0]->blockcap=Wb;t[0]->block2cap=S;t[0]->bytes=Wb+S;*g=t[0];*u=t[1];*d=t[2];
+    if(coli_ledger::on()){   /* a slot: the expert it holds changes with each refill */
+        const std::string kind=coli_ledger::kind("weight"),n=coli_ledger::name("mirror");
+        coli_ledger::add(wblock,(size_t)Wb,kind,n+".weights",{Wb},"float4_e2m1fn");
+        coli_ledger::add(sblock,(size_t)S,kind,n+".scales",{S},"uint8");}
+    return 1;}
 /* sc: the host scale run (S bytes), w: the host weight run (Wb bytes);
  * soff/woff: where gate, up and down start in each. The weights start on a
  * 16-byte boundary, as they do in their own allocations. sync as in
@@ -3843,9 +3946,11 @@ extern "C" int dsv4_cuda_mirror_refill(Dsv4CudaTensor*g,Dsv4CudaTensor*u,Dsv4Cud
         if(soff[k]<0||soff[k]+sb>S||woff[k]<0||woff[k]+wb>Wb||(woff[k]&15))return 0;}
     Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror refill device"))return 0;
     if(host_pinned(w,(size_t)Wb))host_pinned(sc,(size_t)S);
-    if(!ok(cudaMemcpyAsync(g->block,w,(size_t)Wb,cudaMemcpyHostToDevice,c->stream),"mirror weights upload")||
-       !ok(cudaMemcpyAsync(g->block2,sc,(size_t)S,cudaMemcpyHostToDevice,c->stream),"mirror scales upload"))return 0;
-    if(sync&&!ok(cudaStreamSynchronize(c->stream),"mirror refill drain"))return 0;
+    cudaStream_t cs=sync>=2?c->aux:c->stream;   /* 2 and 3: the uploader thread's, as in dsv4_cuda_tensor_refill_fp4 */
+    if(!ok(cudaMemcpyAsync(g->block,w,(size_t)Wb,cudaMemcpyHostToDevice,cs),"mirror weights upload")||
+       !ok(cudaMemcpyAsync(g->block2,sc,(size_t)S,cudaMemcpyHostToDevice,cs),"mirror scales upload"))return 0;
+    if(sync==3)upload_submit(c);
+    else if(sync&&!ok(cudaStreamSynchronize(cs),"mirror refill drain"))return 0;
     for(int k=0;k<3;k++){t[k]->scale=(uint8_t*)g->block2+soff[k];t[k]->w=(uint8_t*)g->block+woff[k];}
     return 1;}
 /* V4_MIRROR_BLOCK_VERIFY: a run of a block mirror (0 the scales, 1 the
@@ -3874,6 +3979,7 @@ extern "C" int dsv4_cuda_upload_compressor(Dsv4CudaTensor **pt,const uint16_t *w
     /* upload() uses the default stream; packing runs on a nonblocking stream. */
     if(!ok(cudaStreamSynchronize(nullptr),"compressor source upload sync")||
        !ok(cudaMalloc(&t->bf16_cache,bytes),"compressor packed allocation")){dsv4_cuda_tensor_free(t);return 0;}
+    coli_ledger::add(t->bf16_cache,bytes,coli_ledger::kind("weight"),coli_ledger::name("tensor")+".packed",{O,I},"bfloat16");
     pack_bf16_rows32<<<((long long)O*I+255)/256,256,0,c->stream>>>((uint16_t*)t->bf16_cache,(const uint16_t*)t->w,O,I);
     if(!ok(cudaGetLastError(),"compressor packing launch")||!ok(cudaStreamSynchronize(c->stream),"compressor packing sync")){dsv4_cuda_tensor_free(t);return 0;}
     const char *verify=getenv("DSV4_IDX_VERIFY");
@@ -3910,6 +4016,7 @@ extern "C" int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **pt,const uint16_t *w
     int drained=ok(cudaStreamSynchronize(c->stream),"head packing sync");
     if(stage)cudaFree(stage);
     if(!good||!drained){dsv4_cuda_tensor_free(t);return 0;}
+    coli_ledger::add(t->w,(size_t)O*I*2,coli_ledger::kind("weight"),coli_ledger::name("lm_head")+".weight",{O,I},"bfloat16");
     *pt=t;return 1;
 }
 __global__ void head_scores_exact(const __nv_bfloat16 *w,const float *x,float *out,int O,int I){
@@ -4081,6 +4188,13 @@ extern "C" Dsv4CudaKvCache *dsv4_cuda_kv_create(int device, int window, int dim,
                 !h2d(c, k->comp_sin, csin, rb, "compress RoPE sin upload")))) {
         dsv4_cuda_kv_free(k);
         return nullptr;
+    }
+    if (coli_ledger::on()) {
+        const std::string n = coli_ledger::name("kv");
+        coli_ledger::add(k->kv, kb, "cache", n + ".window", {window, dim}, "float32");
+        coli_ledger::add(k->compressed, cb, "cache", n + ".compressed", {k->max_compressed, dim}, "float32");
+        coli_ledger::add(k->comp_value, pb, "cache", n + ".compress_value", {2 * window, dim}, "float32");
+        coli_ledger::add(k->comp_score, pb, "cache", n + ".compress_score", {2 * window, dim}, "float32");
     }
     fill_value<<<(pb / 4 + 255) / 256, 256, 0, c->stream>>>(k->comp_score, pb / 4, -INFINITY);
     if (!ok(cudaGetLastError(), "compress score clear")) {
@@ -4631,7 +4745,6 @@ __device__ __forceinline__ void v4f_bar_sync(V4FBar* b,unsigned n){
 __device__ __forceinline__ float v4f_bfr(float v){ return __bfloat162float(__float2bfloat16(v)); }
 __device__ __forceinline__ float v4f_act_fn(float g,float u,float w,float limit){ float gg=fminf(v4f_bfr(g),limit); float uu=fmaxf(-limit,fminf(v4f_bfr(u),limit));
     return v4f_bfr(w*(gg/(1.f+expf(-gg)))*uu); }
-__device__ __forceinline__ float v4f_e8f(unsigned b){ return b? __uint_as_float(b<<23) : __uint_as_float(0x00400000u); }
 /* A warp's row dot in the order of the launch sequence's 256-thread matvecs
  * (mv_fp4_grouped for the routed experts, mv<8> for the shared one): partial j sums
  * i = j, j+256, ... in order, then the shared-memory tree s[j] += s[j+n] for
@@ -4639,14 +4752,6 @@ __device__ __forceinline__ float v4f_e8f(unsigned b){ return b? __uint_as_float(
  * the eight contiguous weights m + 8l .. m + 8l + 7 with one vector load. The tree's
  * steps 128..8 pair the same register of lanes l and l + n/8 (shuffles), 4, 2, 1 pair
  * registers inside lane 0. Every output gets the same operands in the same order. */
-__device__ __forceinline__ float v4f_tree(float p[8]){
-    #pragma unroll
-    for(int k=16;k;k>>=1){
-        #pragma unroll
-        for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__shfl_down_sync(0xffffffffu,p[r],k));}
-    p[0]=__fadd_rn(p[0],p[4]);p[1]=__fadd_rn(p[1],p[5]);p[2]=__fadd_rn(p[2],p[6]);p[3]=__fadd_rn(p[3],p[7]);
-    p[0]=__fadd_rn(p[0],p[2]);p[1]=__fadd_rn(p[1],p[3]);
-    return __fadd_rn(p[0],p[1]);}
 /* The decodes give the same values as e4m3() and e8_table: the hardware e4m3
  * conversion is exact, and the scale is 2^(b-127) (2^-127 for b = 0) from its bits. */
 __device__ __forceinline__ float v4f_e4m3(unsigned b){
@@ -5020,6 +5125,12 @@ extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int H,int I
         (void)cudaGetLastError();
         dsv4_cuda_expert_set_free(set);return nullptr;
     }
+    if(coli_ledger::on()){
+        const std::string kind=coli_ledger::kind("weight"),n=coli_ledger::name("expert_bank");
+        coli_ledger::add(set->bank_fc1,fc1_w,kind,n+".fc1.weight",{count,2*I,H/2},"float4_e2m1fn");
+        coli_ledger::add(set->bank_fc1_scale,fc1_s,kind,n+".fc1.scale",{},"uint8");
+        coli_ledger::add(set->bank_fc2,fc2_w,kind,n+".fc2.weight",{count,H,I/2},"float4_e2m1fn");
+        coli_ledger::add(set->bank_fc2_scale,fc2_s,kind,n+".fc2.scale",{},"uint8");}
     return set;
 }
 /* ---- transparent host pinning for expert uploads ----

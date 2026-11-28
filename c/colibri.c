@@ -862,6 +862,16 @@ static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x,
 }
 #endif
 #ifdef COLI_CUDA
+/* Ledger (ledger_map.h; inert without LEDGER_OUT): one generated token, and the name of
+ * the device buffers the next uploads allocate (NULL: the backend's own) */
+static void ledger_token(void){ coli_cuda_ledger_step(); }
+static void ledger_expert(int layer,int eid){
+    char n[64]; snprintf(n,sizeof n,"layers.%d.experts.%d",layer,eid); coli_cuda_ledger_label("weight",n);
+}
+#else
+static void ledger_token(void){}
+#endif
+#ifdef COLI_CUDA
 static int qt_cuda_upload(QT *t){
     if(t->fmt==QT_GGML) return 0;   /* a GGUF matrix: ggml_quants.h on the CPU */
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
@@ -1158,11 +1168,7 @@ static void cluster_stat_suffix(const ProfBase *b, double dt, int ntok){
            g, g>t?g-t:0.0, t, (double)tx/1e3/n, (double)rx/1e3/n);
 }
 
-static float *falloc(int64_t n){
-    /* guardia anti-wrap (report PR #25): n assurdo da file modello ostili non deve
-     * diventare una malloc piccola. Niente calloc: il memset nel percorso caldo costa. */
-    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld is out of range\n",(long long)n); exit(1); }
-    float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
+static inline float *falloc(int64_t n){ return coli_falloc(n); }
 
 /* Come falloc, per i buffer non-float del percorso caldo. moe() e' la funzione piu'
  * chiamata del motore e girare al soffitto di RAM e' la premessa del progetto: e'
@@ -2679,8 +2685,14 @@ static QT qt_kvb_gguf(Model *m, const char *prefix, int H, int nope, int V, int 
     free(kraw); free(vraw);
     return t;   /* no vk_name: no tensor to read it back from, so it keeps its host copy */
 }
-static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
+/* `want` is the element count the forward pass indexes with (config dims): a shorter tensor
+ * used to load into a buffer of its own size and be read past its end at inference, so it is
+ * refused here, as qwen36's load_t_n and olmoe's load_t do (#1824). want < 0: no count to check
+ * against (a tensor whose use is not pinned to a config dim here). */
+static float *ld(Model *m, const char *name, int64_t want){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0) st_die_missing(&m->S,name);
+    if(want>=0 && n<want){ /* fewer than the forward pass reads: past the end; more were read as their prefix before */ fprintf(stderr,"%s: %lld elements, config implies %lld -- refusing\n",
+                                    name,(long long)n,(long long)want); exit(1); }
     float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
     st_read_f32(&m->S,name,p,0); return p;
 }
@@ -2865,7 +2877,7 @@ static void ml4_rope_table(Model *m){
     }
     float ff[128]; int has_ff=0;
     if(st_has(&m->S,"model.rotary_emb.freq_factors") && st_numel(&m->S,"model.rotary_emb.freq_factors")==half){
-        float *f=ld(m,"model.rotary_emb.freq_factors"); memcpy(ff,f,half*sizeof(float)); has_ff=1; }
+        float *f=ld(m,"model.rotary_emb.freq_factors",half); memcpy(ff,f,half*sizeof(float)); has_ff=1; }
     for(int j=0;j<half;j++){
         float pos=powf((float)base,(float)(2*j)/(float)dim);
         double inv=1.0/pos;
@@ -2902,7 +2914,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
         if(m->embed.cud_dense){ m->embed.cud_dense=0; g_cud_dense_bytes-=(size_t)qt_bytes(&m->embed); }
 #endif
         m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
-        m->final_norm = ld(m,"model.norm.weight");
+        m->final_norm = ld(m,"model.norm.weight",D);
     }
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
@@ -2952,24 +2964,24 @@ static void model_init_range(Model *m, const char *snap, int cap,
                     && (i < c->n_layers - g_trunk_resident);
         l->trunk_mmap = mmap_ok;
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
-        l->in_ln=ld(m,P("input_layernorm.weight"));
-        l->post_ln=ld(m,P("post_attention_layernorm.weight"));
+        l->in_ln=ld(m,P("input_layernorm.weight"),D);
+        l->post_ln=ld(m,P("post_attention_layernorm.weight"),D);
         l->rope = c->ml4 && !c->rope_on[i] ? 0 : c->qk_rope;   /* a NoPE layer: its whole key unrotated */
         l->nope = c->qk_head - l->rope;
         if(c->ml4){   /* Mistral-Large-4: the query straight from the input (in q_b), kv_a on a KV source only */
             l->q_b = qt_load_ex(m,P("self_attn.q_proj.weight"), H*c->qk_head, D, dbits,mmap_ok);
             if(c->kv_src[i]==i){
                 l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+l->rope, D, dbits,mmap_ok);
-                l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
+                l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"),c->kv_lora);
             }
-            l->ssm_s = ld(m,P("self_attn.softmax_scaling.scale"));
-            l->ssm_b = ld(m,P("self_attn.softmax_scaling.bias"));
+            l->ssm_s = ld(m,P("self_attn.softmax_scaling.scale"),-1);
+            l->ssm_b = ld(m,P("self_attn.softmax_scaling.bias"),-1);
         } else {
         l->q_a   = qt_load_ex(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits,mmap_ok);
-        l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
+        l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"),c->q_lora);
         l->q_b   = qt_load_ex(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits,mmap_ok);
         l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits,mmap_ok);
-        l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
+        l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"),c->kv_lora);
         }
         if(st_has(&m->S,P("self_attn.kv_b_proj.weight")))
             l->kv_b  = qt_load_ex(m,P("self_attn.kv_b_proj.weight"), H*(l->nope+c->v_head), c->kv_lora, dbits,mmap_ok);
@@ -2993,8 +3005,8 @@ static void model_init_range(Model *m, const char *snap, int cap,
             if(!l->up_proj.mmap_view)   qt_planarize(&l->up_proj);
             if(!l->down_proj.mmap_view) qt_planarize(&l->down_proj);
         } else {
-            l->router=ld(m,P("mlp.gate.weight"));
-            l->router_bias=c->softmax_router ? NULL : ld(m,P("mlp.gate.e_score_correction_bias"));   /* softmax: no bias */
+            l->router=ld(m,P("mlp.gate.weight"),(int64_t)c->n_experts*D);
+            l->router_bias=c->softmax_router ? NULL : ld(m,P("mlp.gate.e_score_correction_bias"),c->n_experts);   /* softmax: no bias */
             int sI=c->moe_inter*c->n_shared;
             l->sh_gate = qt_load_ex(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits,mmap_ok);
             l->sh_up   = qt_load_ex(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits,mmap_ok);
@@ -3043,28 +3055,28 @@ static void model_init_range(Model *m, const char *snap, int cap,
         if(m->has_mtp){
             int i=c->n_layers; Layer *l=&m->mtpL;
             #define PM(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
-            l->in_ln=ld(m,PM("input_layernorm.weight"));
-            l->post_ln=ld(m,PM("post_attention_layernorm.weight"));
+            l->in_ln=ld(m,PM("input_layernorm.weight"),D);
+            l->post_ln=ld(m,PM("post_attention_layernorm.weight"),D);
             l->q_a   = qt_load(m,PM("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
-            l->q_a_ln= ld(m,PM("self_attn.q_a_layernorm.weight"));
+            l->q_a_ln= ld(m,PM("self_attn.q_a_layernorm.weight"),c->q_lora);
             l->q_b   = qt_load(m,PM("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
             l->kv_a  = qt_load(m,PM("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
-            l->kv_a_ln= ld(m,PM("self_attn.kv_a_layernorm.weight"));
+            l->kv_a_ln= ld(m,PM("self_attn.kv_a_layernorm.weight"),c->kv_lora);
             if(st_has(&m->S,PM("self_attn.kv_b_proj.weight")))
                 l->kv_b  = qt_load(m,PM("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
             else { char pre[64]; snprintf(pre,sizeof pre,"model.layers.%d.",i);   /* a GGUF's k_b / v_b */
                 l->kv_b = qt_kvb_gguf(m,pre,H,c->qk_nope,c->v_head,c->kv_lora); }
             l->o     = qt_load(m,PM("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
             l->sparse=1;
-            l->router=ld(m,PM("mlp.gate.weight"));
-            l->router_bias=ld(m,PM("mlp.gate.e_score_correction_bias"));
+            l->router=ld(m,PM("mlp.gate.weight"),(int64_t)c->n_experts*D);
+            l->router_bias=ld(m,PM("mlp.gate.e_score_correction_bias"),c->n_experts);
             int sI=c->moe_inter*c->n_shared;
             l->sh_gate = qt_load(m,PM("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
             l->sh_up   = qt_load(m,PM("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
             l->sh_down = qt_load(m,PM("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
             m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, dbits);
-            m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
-            m->mtp_norm=ld(m,PM("shared_head.norm.weight"));
+            m->enorm=ld(m,PM("enorm.weight"),D); m->hnorm=ld(m,PM("hnorm.weight"),D);
+            m->mtp_norm=ld(m,PM("shared_head.norm.weight"),D);
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
@@ -3110,13 +3122,13 @@ static void model_init_range(Model *m, const char *snap, int cap,
                 if(!c->idx_type[i]) continue;
                 #define PI(s) (snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.indexer." s,i),nm)
                 if(c->ml4){   /* Mistral-Large-4: the indexer's query from the input's LayerNorm, its own SSMax */
-                    m->ix_qnw[i]=ld(m,PI("q_input_norm.weight")); m->ix_qnb[i]=ld(m,PI("q_input_norm.bias"));
-                    m->ix_ssm_s[i]=ld(m,PI("softmax_scaling.scale")); m->ix_ssm_b[i]=ld(m,PI("softmax_scaling.bias"));
+                    m->ix_qnw[i]=ld(m,PI("q_input_norm.weight"),-1); m->ix_qnb[i]=ld(m,PI("q_input_norm.bias"),-1);
+                    m->ix_ssm_s[i]=ld(m,PI("softmax_scaling.scale"),-1); m->ix_ssm_b[i]=ld(m,PI("softmax_scaling.bias"),-1);
                 }
                 m->ix_wq[i]=qt_load(m,PI("wq_b.weight"), c->index_nh*c->index_hd, c->ml4 ? D : c->q_lora, dbits);
                 m->ix_wk[i]=qt_load(m,PI("wk.weight"), c->index_hd, D, dbits);
                 m->ix_wp[i]=qt_load(m,PI("weights_proj.weight"), c->index_nh, D, dbits);
-                m->ix_knw[i]=ld(m,PI("k_norm.weight")); m->ix_knb[i]=ld(m,PI("k_norm.bias"));
+                m->ix_knw[i]=ld(m,PI("k_norm.weight"),c->index_hd); m->ix_knb[i]=ld(m,PI("k_norm.bias"),c->index_hd);
                 #undef PI
             }
             fprintf(stderr,"[DSA] indexer active: top-%d sparse attention beyond %d context tokens\n",
@@ -5095,8 +5107,11 @@ static int kv_dev_sync(Model *m, Layer *l, int layer, int upto){
     Cfg *c=&m->c; int kvl=c->kv_lora, R=c->qk_rope, dev=l->kv_b.cuda_device;
     if(upto>m->max_t) return 0;
     if(!m->kv_dev_L[layer]){
+        char n[64]; snprintf(n,sizeof n,"layers.%d.kv.latent",layer); coli_cuda_ledger_label("cache",n);
         m->kv_dev_L[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*kvl*4);
+        snprintf(n,sizeof n,"layers.%d.kv.rope",layer); coli_cuda_ledger_label("cache",n);
         m->kv_dev_R[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*R*4);
+        coli_cuda_ledger_label(NULL,NULL);
         m->kv_dev_valid[layer]=0;
         if(!m->kv_dev_L[layer]||!m->kv_dev_R[layer]) return 0;
     }
@@ -8734,9 +8749,15 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     layers_forward_rows_range(m,x,S,pos_base,NULL,NULL,layer_begin,layer_end);
 }
 
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
     KVState *k=m->kv;
+    {   /* planned (coli_kv_plan.h): a serve's whole context (CTX) at the first, where the RAM holds it (float32 rows
+         * counted: an upper bound for the int8 and float16 caches) */
+        int top=getenv("CTX")?atoi(getenv("CTX")):4096;
+        if(max_t<top && coli_kv_plan_host((double)top*(c->n_layers+1)*(c->kv_lora+c->qk_rope+c->index_hd)*4.0,compat_mem_available_gb()*1e9)) max_t=top;
+    }
 #ifdef COLI_CUDA
     if(m->kv_dev_L) for(int i=0;i<c->n_layers+1;i++){    /* dimensioni cambiate: ombra da rifare */
         if(m->kv_dev_L[i]){ coli_cuda_pipe_free(m->L[i<c->n_layers?i:0].kv_b.cuda_device,m->kv_dev_L[i]); m->kv_dev_L[i]=NULL; }
@@ -9327,7 +9348,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1;
         if((eos>=0 && next==eos) || is_stop(next)){ free(logit); logit=NULL; break; }
-        emit(next,logit,ud); free(logit); logit=NULL; all[kv]=next; emitted++; m->n_emit++;
+        emit(next,logit,ud); free(logit); logit=NULL; all[kv]=next; emitted++; m->n_emit++; ledger_token();
         gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
         /* One-shot generation does not need logits or KV for the last token.
          * Stateful callers do: their kv_out becomes chat history, feeds MORE,
@@ -9427,7 +9448,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                    accept = (rndu() < g_pbuf[draft[k]]); }
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
-            emit(draft[k],lo+(int64_t)k*V,ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
+            emit(draft[k],lo+(int64_t)k*V,ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++; ledger_token();
             gr_feed(&g_grd,draft[k]); k++;
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
@@ -11123,7 +11144,10 @@ static void repin_pass_limit(Model *m,int limit){
         const char *tier="RAM";
 #ifdef COLI_CUDA
         if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
-            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+            ledger_expert(cd[b].l,cd[b].eid);
+            int up=qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d);
+            coli_cuda_ledger_label(NULL,NULL);
+            if(up){
                 int64_t now_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
@@ -11867,7 +11891,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     int next=pick_tok(logit,m->c.vocab,-1);
     if(r->maximum<=0){ free(logit); r->length_limited=1; mux_done(m,sc,r); return 1; }   /* no room at all */
     if(next==eos || is_stop(next)){ free(logit); mux_done(m,sc,r); return 1; }
-    r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
+    r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++; ledger_token();
     if(grd[sub.slot].on){ grammar_reset(&grd[sub.slot]); gr_feed(&grd[sub.slot],next); }
     mux_data(T,r->id,next,logit,m->c.vocab,r->logprobs);
     free(logit);
@@ -12006,7 +12030,7 @@ static void run_serve_mux(Model *m, const char *snap){
                     int next=pick_tok(lo+(int64_t)j*m->c.vocab,m->c.vocab,-1);
                     sc->len++;                       /* seq[j] joins the committed history */
                     if(next==eos || is_stop(next)){ mux_done(m,sc,r); done=1; break; }
-                    r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+                    r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++; ledger_token();
                     if(gd->on) gr_feed(gd,next);
                     mux_data(&T,r->id,next,lo+(int64_t)j*m->c.vocab,m->c.vocab,r->logprobs);
                     if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); done=1; break; }
@@ -12030,7 +12054,7 @@ static void run_serve_mux(Model *m, const char *snap){
             sc->len++; g_temp=r->temp; g_nuc=r->top_p;
             int next=pick_tok(lo+(int64_t)s*m->c.vocab,m->c.vocab,-1);
             if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
-            r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+            r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++; ledger_token();
             if(grd[i].on) gr_feed(&grd[i],next);   /* walker stays in sync when not drafting */
             mux_data(&T,r->id,next,lo+(int64_t)s*m->c.vocab,m->c.vocab,r->logprobs);
             if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
@@ -13252,12 +13276,14 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                     tried[best]=1;
                     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
                     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+                    ledger_expert(li,s->eid);
                     int uploaded=
 #ifdef COLI_ANS
                         compress ? (qt_cuda_upload_compressed(&s->g)&&qt_cuda_upload_compressed(&s->u)&&
                                     qt_cuda_upload_compressed(&s->d)) :
 #endif
                         (qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d));
+                    coli_cuda_ledger_label(NULL,NULL);
 #ifdef COLI_ANS
                     if(compress&&!uploaded){
                         fprintf(stderr,"[ANS] sidecar load failed; refusing partial VRAM placement\n");
@@ -15825,7 +15851,7 @@ static int glm_edge_engine_open(
                            model->c.vocab, model->c.hidden, io_bits);
     model->lm_head = qt_load(model, "lm_head.weight",
                              model->c.vocab, model->c.hidden, io_bits);
-    model->final_norm = ld(model, "model.norm.weight");
+    model->final_norm = ld(model, "model.norm.weight", model->c.hidden);
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              options->model_dir);

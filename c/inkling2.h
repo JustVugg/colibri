@@ -283,13 +283,17 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
     const int win = kv_ring_rows(c, li, m->max_t);
     const float scale = (float)(1.0 / sqrt((double)hd));
     float *ctx = falloc((int64_t)S * qdim);
+    /* a (KV head, row) at a time with the KV head's `group` query heads one after the other, so the K and V rows
+     * one head reads are in the cache for the next: each head's arithmetic is the (head, row) loop's, word for word
+     * (a reordered form changed the compiler's fusions, and with them the bits) */
     #pragma omp parallel
     {
         float *rl = malloc((size_t)ext * sizeof(float));
         float *sc = malloc((size_t)m->max_t * sizeof(float));
         #pragma omp for collapse(2) schedule(static)
-        for (int h = 0; h < H; h++) {
-            for (int s = 0; s < S; s++) {
+        for (int g = 0; g < KV; g++) {
+            for (int s = 0; s < S; s++) for (int hh = 0; hh < group; hh++) {
+                const int h = g * group + hh;
                 const int qpos = mr ? mr[s].pos : pos0 + s;
                 const int sp0 = mr ? qpos : pos0;
                 const int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
@@ -297,6 +301,8 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
                 float **Kc = mr ? mr[s].seq->K : m->K, **Vc = mr ? mr[s].seq->V : m->V;
                 const int64_t srow = mr ? (int64_t)s * kvdim : 0;
                 const float *rv = rr + (int64_t)s * H * dr + h * dr;
+                /* the bank's loop as dev's: in this file the compiler fuses it otherwise when it runs over the bank's rows
+                 * first (the engine's answers changed; a harness built apart gave the same bits) */
                 for (int e = 0; e < ext; e++) {
                     float acc = 0.f;
                     for (int d = 0; d < dr; d++) acc += rv[d] * l->relp[(int64_t)d * ext + e];

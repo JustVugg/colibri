@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "hypothesis": "The selected full CUDA stack changes prompt throughput on NVIDIA RTX PRO 4000 Blackwell at 16,384 tokens while preserving dev logits.",
+  "commit": "05245ef45048b837fee5ed7b5b1ab2e59161fb80",
+  "commit_role": "Dev reference at the start of the measured campaign.",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64@c619aa594ad1e70af82168fb6b4878427896e21c",
+  "command": "COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=10 OMP_DISPLAY_AFFINITY=TRUE OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A /usr/bin/time -v ./qwen36-bench --model \"$MODEL_DIR\" --steps steps.tsv --text promessi_sposi.txt --lengths 2048,4096,8192,16384 --gen 128 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "gpu": "NVIDIA RTX PRO 4000 Blackwell",
+    "vram_mib": 24467,
+    "cuda_arch": "sm_120",
+    "cpu": "AMD EPYC 7352 24-Core Processor",
+    "threads": 10,
+    "ram": "28.9 GiB available to the workload",
+    "storage": "Model directory on overlay. Visible host disks: KINGSTON SKC6002 sata 238.5G, Samsung SSD 990 PRO 4TB nvme 3.6T",
+    "os": "Linux 6.8.0-149-generic x86_64, CUDA 12.9.86, NVIDIA driver 595.112.07"
+  },
+  "metric": "Prefill tok/s at 16,384 tokens, the fourth row of the 2,048 to 16,384 sequence.",
+  "warmup_runs": 1,
+  "warmup_policy": "One excluded warm-up per build and workload group.",
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "engine_build": "dev (source 05245ef45048b837fee5ed7b5b1ab2e59161fb80, compiled c/ tree 34355d8f798ffb5fdf6c1330d14f592cb5909205)"
+    },
+    "samples": {
+      "tok_s": [
+        4117.65,
+        4156.02,
+        4161.24
+      ],
+      "steady_decode_tok_s": [
+        133.653,
+        133.782,
+        133.138
+      ]
+    },
+    "median_tok_s": 4156.02,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-16-rtx-pro-4000-2026-11-22/correctness.txt",
+      "sha256": "d3adfbd82ec4f35ff88961252dafc113fb27be02015a319dfd0c1f334e66ce6e"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-16-rtx-pro-4000-2026-11-22/base.md",
+      "sha256": "51e8ede8a9454ef5dd07cb1a902717868656fed39a905e31e2e73052a914391d"
+    }
+  },
+  "trial": {
+    "config": {
+      "engine_build": "full stack (source da49a1611a76bfdf840b07cd326c31c4733c0e18, compiled c/ tree e7cb67d79e678045d4f9aaeb9fa9f745e1d5443b)"
+    },
+    "samples": {
+      "tok_s": [
+        6886.68,
+        6887.94,
+        6531.74
+      ],
+      "steady_decode_tok_s": [
+        136.193,
+        136.013,
+        135.973
+      ]
+    },
+    "median_tok_s": 6886.68,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-16-rtx-pro-4000-2026-11-22/correctness.txt",
+      "sha256": "d3adfbd82ec4f35ff88961252dafc113fb27be02015a319dfd0c1f334e66ce6e"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-16-rtx-pro-4000-2026-11-22/base.md",
+      "sha256": "51e8ede8a9454ef5dd07cb1a902717868656fed39a905e31e2e73052a914391d"
+    }
+  },
+  "outcome": "improvement",
+  "change_pct": 65.73404362827895,
+  "change_method": "Median of three paired percentage changes"
+}

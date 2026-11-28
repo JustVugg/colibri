@@ -37,6 +37,12 @@ layout(local_size_x = 128) in;
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
 layout(std430, binding = 1) readonly buffer KB { float kc[]; };
 layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+// KV16: the ring's K and V float16, two a word (vk_chain.c, vkc_relattn_kv16); the step's own rows stay float32
+layout(constant_id = 0) const bool KV16 = false;
+layout(std430, binding = 1) readonly buffer KBH { uint kch[]; };
+layout(std430, binding = 2) readonly buffer VBH { uint vch[]; };
+float kf(int i) { return KV16 ? unpackHalf2x16(kch[i >> 1])[i & 1] : kc[i]; }
+float vf(int i) { return KV16 ? unpackHalf2x16(vch[i >> 1])[i & 1] : vc[i]; }
 layout(std430, binding = 3) writeonly buffer OB { float o[]; };
 layout(std430, binding = 4) readonly buffer SB { float kvs[]; };
 layout(std430, binding = 5) readonly buffer RB { float r[]; };
@@ -103,7 +109,7 @@ void main() {
             int kb = t < p.pos_base ? p.k_off + (kvh * p.cap + t % p.cap) * p.hd
                                     : p.ks_off + (t - p.pos_base) * p.kv_row + kvh * p.hd;
             float a = 0.0;
-            if (t < p.pos_base) for (int d = 0; d < p.hd; d++) a += qs[d] * kc[kb + d];
+            if (t < p.pos_base) for (int d = 0; d < p.hd; d++) a += qs[d] * kf(kb + d);
             else                for (int d = 0; d < p.hd; d++) a += qs[d] * kvs[kb + d];
             int dist = qpos - t;
             float bias = 0.0;
@@ -137,8 +143,8 @@ void main() {
             float w = pe[j];
             if (t < p.pos_base) {
                 int vb = p.v_off + (kvh * p.cap + t % p.cap) * p.hd;
-                if (d0 < p.hd) acc0 += w * vc[vb + d0];
-                if (d1 < p.hd) acc1 += w * vc[vb + d1];
+                if (d0 < p.hd) acc0 += w * vf(vb + d0);
+                if (d1 < p.hd) acc1 += w * vf(vb + d1);
             } else {
                 int vb = p.vs_off + (t - p.pos_base) * p.kv_row + kvh * p.hd;
                 if (d0 < p.hd) acc0 += w * kvs[vb + d0];

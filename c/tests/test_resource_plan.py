@@ -1793,6 +1793,7 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(env["COLI_GPUS"], "1")
         # the plan's team: the physical cores, a hybrid CPU's performance cores
         self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["team_threads"]))
+        self.assertEqual(env["COLI_OMP_TEAM_AUTO"], "1")   # ours, so the engine's team probe may lower it
         self.assertLessEqual(plan["cpu"]["team_threads"], plan["cpu"]["physical_cores"])
         # The plan must NOT set OMP_PROC_BIND / OMP_PLACES on any platform:
         # the engine's own hot-thread tuning owns affinity (it prefers
@@ -1813,6 +1814,7 @@ memInfo.free:                     23.50 GB (97%)
         explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
                                                         "OMP_PROC_BIND": "close"})
         self.assertEqual(explicit_threads["OMP_NUM_THREADS"], "7")
+        self.assertNotIn("COLI_OMP_TEAM_AUTO", explicit_threads)   # the user's: left alone
         self.assertEqual(explicit_threads["OMP_PROC_BIND"], "close")
 
         if sys.platform.startswith("linux"):
@@ -2743,17 +2745,34 @@ class VulkanPartialChainGlm53Test(unittest.TestCase):
         want = {"32": ([773352, 728408, 576744, 728408, 576744, 728408], 65792),
                 "8": ([234472, 312408, 184296, 312408, 184296, 312408], 16896),
                 "4": ([153832, 250456, 126184, 250456, 126184, 250456], 9216)}
+        # those numbers are the engine's 256-row first mirror: COLI_KV_PLAN=0 (the plan's case below)
         for bits, (layers, tail) in want.items():
             with self.subTest(bits=bits):
-                env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": bits}
+                env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": bits, "COLI_KV_PLAN": "0"}
                 fit = vk_chain_fit(self.info, "glm53", env, device)
                 self.assertEqual(fit["layers"], layers)
                 self.assertEqual(fit["fixed"] - vk_fit_pools(0), 4847872)
                 self.assertEqual((fit["n"], fit["tail"]), (6, True))
         small = vk_chain_fit(self.info, "glm53", {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": "4",
-                                                  "COLI_VK_CHAIN_ROWS": "7", "GLM53_MAXT": "300"}, device)
+                                                  "COLI_VK_CHAIN_ROWS": "7", "GLM53_MAXT": "300", "COLI_KV_PLAN": "0"}, device)
         self.assertEqual(small["fixed"] - vk_fit_pools(0), 155904)
         self.assertEqual(small["layers"], want["4"][0])
+        # planned (COLI_KV_PLAN, the default): an MLA layer's mirror at the serve slot's context (GLM53_MAXT, 8192),
+        # its latent rows at most 32768, as glm53_chain.h's g53c_fit_plan counts it; every other byte the same
+        from resource_plan import vk_buf_bytes
+        kvl, ID, pool = 64, 32, 2
+
+        def mirror(ctx):
+            return (vk_buf_bytes(min(ctx, 32768) * kvl * 4) + 2 * vk_buf_bytes(ctx * ID * 4) +
+                    vk_buf_bytes((ctx // pool + 1) * ID * 4))
+        for maxt in (None, "300", "40000"):
+            with self.subTest(planned=maxt):
+                env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": "32"}
+                if maxt:
+                    env["GLM53_MAXT"] = maxt
+                more = mirror(int(maxt or 8192)) - mirror(256)
+                fit = vk_chain_fit(self.info, "glm53", env, device)
+                self.assertEqual(fit["layers"], [x + more if i % 2 else x for i, x in enumerate(want["32"][0])])
 
     def test_device_only_credits_the_layers_on_the_device(self):
         from resource_plan import _glm53_dense_tensors, _vk_layer_index, _vk_released_tensor_bytes, vk_chain_fit
@@ -3370,6 +3389,32 @@ class PhysicalCpuCountTest(unittest.TestCase):
         with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
              mock.patch.object(sys, "platform", "darwin"):
             self.assertEqual(physical_cpu_count(), 6)
+
+    def test_apple_tiers_are_picked_by_name(self):
+        # #2938, an M5 Pro: Super and Performance, no efficiency tier; the last-tier rule gave 6
+        m5_pro = {"hw.nperflevels": 2, "hw.perflevel0.logicalcpu": 6, "hw.perflevel0.name": "Super",
+                  "hw.perflevel1.logicalcpu": 12, "hw.perflevel1.name": "Performance",
+                  "hw.physicalcpu": 18}
+        m1_max = {"hw.nperflevels": 2, "hw.perflevel0.logicalcpu": 8, "hw.perflevel0.name": "Performance",
+                  "hw.perflevel1.logicalcpu": 2, "hw.perflevel1.name": "Efficiency", "hw.physicalcpu": 10}
+        for values, want in ((m5_pro, 18), (m1_max, 8)):
+            with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
+                 mock.patch.object(sys, "platform", "darwin"):
+                self.assertEqual(physical_cpu_count(), want)
+
+    def test_apple_team_rule_matches_omp_tune(self):
+        # the cases tests/test_omp_tune.c holds coli_apple_team to
+        from resource_plan import apple_team
+        cases = [([(8, "Performance"), (2, "Efficiency")], 8),
+                 ([(2, "Super"), (4, "Performance"), (6, "Efficiency")], 6),
+                 ([(6, "Super"), (12, "Performance")], 18),
+                 ([(6, None), (12, None)], 6),
+                 ([(2, "Super"), (4, None), (6, "Efficiency")], 6),
+                 ([(8, None)], 8),
+                 ([(4, "Efficiency")], 4)]
+        for tiers, want in cases:
+            with self.subTest(tiers=tiers):
+                self.assertEqual(apple_team(tiers), want)
 
     def test_apple_one_tier_is_every_core_and_older_macos_reads_perflevel0(self):
         one = {"hw.nperflevels": 1, "hw.perflevel0.logicalcpu": 8, "hw.physicalcpu": 8}

@@ -31,6 +31,7 @@
  * CPU's layers. */
 #ifndef GLM53_CUCHAIN_H
 #define GLM53_CUCHAIN_H
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "cuda_chain.h"
 
 #define G53U_HOST 0
@@ -349,6 +350,7 @@ static int g53u_mirror(G53U *ch, const GModel *m, int need, int limit) {
     const Cfg *c = &m->c; const int L = c->n_layers, ID = c->index_hd, pool = c->index_kpool;
     if (ch->cap >= need) return 1;
     int cap = 256; while (cap < need) cap *= 2;
+    if (coli_kv_plan()) cap = limit;   /* planned: the slot's whole context at the first, never grown (coli_kv_plan.h) */
     if (cap > limit) cap = limit;
     if (cap < need) return 0;
     for (int i = 0; i < L; i++) {

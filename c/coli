@@ -466,13 +466,20 @@ def require_model(model, file="tokenizer.json", engine=None, target="", build="c
 def need_model(model, engine=None):
     # Directory/file checks come FIRST: resolving the family reads config.json,
     # and a missing model dir must say "model not found", not "unsupported model".
-    # An image pipeline keeps its tokenizer in processor/, not at the root.
+    # An image pipeline keeps its tokenizer with the processor, which a GGUF
+    # import may keep in a separate checkpoint.
     require_model(model, file=None)
     tokenizer = "tokenizer.json"
     if is_image_model(model) or is_decision_model(model):
         # a decision checkpoint keeps it in tokenizer/ (Laya)
-        try: tokenizer = resolve_model(model).descriptor.tokenizer_file
-        except (FamilyConfigError, UnknownFamilyError): pass   # engine_for says why, below
+        try:
+            resolved = resolve_model(model)
+            tokenizer = resolved.descriptor.tokenizer_file
+            if resolved.descriptor.modality == "image":
+                from image_engine import image_tokenizer_path
+                tokenizer = image_tokenizer_path(resolved.model_dir, resolved.config)
+        except (FamilyConfigError, UnknownFamilyError):
+            pass   # engine_for says why, below
     require_model(model, file=tokenizer)
     engine = engine or engine_for(model)
     target = resolve_model(model).descriptor.build_target
@@ -506,6 +513,8 @@ def apply_measured_profile(env, profile, explicit_env, explicit_cap):
     """Apply scheduling/resource results while preserving CLI precedence."""
     from autotune import apply_profile
     result=apply_profile(env,profile,explicit_env)
+    if "OMP_NUM_THREADS" in profile.get("winner",{}).get("env",{}) and "OMP_NUM_THREADS" not in explicit_env:
+        result.pop("COLI_OMP_TEAM_AUTO",None)   # a measured team is not the default the engine may probe
     # This is a launcher-private bridge for engines whose cache capacity is an
     # argv value rather than an environment variable. It must never leak from a
     # parent shell or override an explicit --cap.
@@ -588,8 +597,8 @@ def env_for_engine(a, arch, plan=None):
     # setdefault, so an explicit OMP_NUM_THREADS still wins.
     if not env.get("COLI_NO_OMP_TUNE"):
         if arch != "deepseek_v4":
-            from resource_plan import team_cpu_count
-            env.setdefault("OMP_NUM_THREADS", str(team_cpu_count()))
+            from resource_plan import default_omp_team, team_cpu_count
+            default_omp_team(env, team_cpu_count())
         else:
             env.setdefault("OMP_WAIT_POLICY", "active")
             env.setdefault("GOMP_SPINCOUNT", "200000")
@@ -750,6 +759,7 @@ def env_for_engine(a, arch, plan=None):
             # measured profile (V4 only, below) or the user explicitly chooses
             # a team.
             env.pop("OMP_NUM_THREADS",None)
+            env.pop("COLI_OMP_TEAM_AUTO",None)
         if not getattr(a, "no_tune_profile", False):
             from autotune import load_profile
             profile=load_profile(plan,a.model,engine_for(a.model))
@@ -1039,8 +1049,8 @@ def env_for(a):
     # setdefault, so an explicit OMP_NUM_THREADS still wins, and the whole
     # thing stays behind COLI_NO_OMP_TUNE like the rest of the OMP tuning.
     if not e.get("COLI_NO_OMP_TUNE"):
-        from resource_plan import team_cpu_count
-        e.setdefault("OMP_NUM_THREADS", str(team_cpu_count()))
+        from resource_plan import default_omp_team, team_cpu_count
+        default_omp_team(e, team_cpu_count())
     if sys.platform == "win32":
         # COLI_NO_OMP_TUNE spegne SOLO il blocco OMP (stesso perimetro del
         # self-exec di glm.c; presence-based come nel motore: impostarla a
@@ -1110,7 +1120,12 @@ def env_for(a):
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
+        # COLI_NO_OMP_TUNE promises no automatic team: the launcher set none
+        # above, so the plan sets none either, as in env_for_engine.
+        plan_must_not_choose_omp=("OMP_NUM_THREADS" not in e
+                                  and e.get("COLI_NO_OMP_TUNE"))
         e=environment_for_plan(plan,e,has_cuda)
+        if plan_must_not_choose_omp: e.pop("OMP_NUM_THREADS",None)
         if not getattr(a, "no_tune_profile", False):
             from autotune import load_profile
             profile=load_profile(plan,a.model,GLM)
@@ -1174,7 +1189,11 @@ def env_for(a):
                     try:
                         plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy,
                                         kv_slots=requested_kv_slots(a,e))
-                        e.update(environment_for_plan(plan,e,cuda_enabled=True))
+                        planned=environment_for_plan(plan,e,cuda_enabled=True)
+                        # no automatic team under COLI_NO_OMP_TUNE, as with --auto-tier
+                        if "OMP_NUM_THREADS" not in e and e.get("COLI_NO_OMP_TUNE"):
+                            planned.pop("OMP_NUM_THREADS",None)
+                        e.update(planned)
                         vt=plan["tiers"]["vram"]
                         # #1409: the dense trunk is read on every token; leaving
                         # it on the CPU next to a 30 GB expert tier is the
@@ -1304,6 +1323,8 @@ class MDStream:
             line,self.cur=self.cur.split("\n",1)
             self._line(line)
         st=self.cur.lstrip()             # riga parziale: possibile fence? aspetta il newline
+        if self.printed==0 and (not st or st in ("-", "*")):
+            return                        # indentation or a list marker may still follow
         if st and (st.startswith("```") or (len(st)<3 and "```".startswith(st))):
             return
         if st.startswith("#") and self.printed==0:
@@ -1866,6 +1887,8 @@ def run_via_gateway(a, family, engine, prompt):
 def cmd_run(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
+    if getattr(a, "image", None) and family.modality != "image":
+        sys.exit("--image requires a model that supports reference-image editing")
     arch=family.id
     engine=engine_for(a.model)
     need_model(a.model,engine)
@@ -2155,6 +2178,21 @@ def server_arch(base, api_key=None, timeout=1.5):
     except Exception:
         return None
 
+def sse_data(lines):
+    """Join an SSE event's data fields before decoding its JSON payload."""
+    data=[]
+    for raw in lines:
+        line=raw.decode("utf-8","replace").rstrip("\r\n")
+        if not line:
+            if data:
+                yield "\n".join(data)
+                data=[]
+            continue
+        field, _, value=line.partition(":")
+        if field=="data":
+            data.append(value[1:] if value.startswith(" ") else value)
+
+
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
 
@@ -2265,16 +2303,18 @@ def chat_attached(a, base, model_id):
         print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
         md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False; think_open=False
-        exact_tokens=None; finish=None
+        exact_tokens=None; finish=None; stream_done=False; stream_error=None
         try:
             with urllib.request.urlopen(req) as r:
-                for raw in r:
-                    line=raw.decode("utf-8","replace").strip()
-                    if not line.startswith("data: "): continue
-                    data=line[6:]
-                    if data=="[DONE]": break
+                for data in sse_data(r):
+                    if data=="[DONE]":
+                        stream_done=True; break
                     try: ev=json.loads(data)
                     except ValueError: continue
+                    if ev.get("error"):
+                        error=ev["error"]
+                        stream_error=error.get("message", "generation failed") if isinstance(error,dict) else str(error)
+                        break
                     usage=ev.get("usage")
                     if isinstance(usage,dict) and isinstance(usage.get("completion_tokens"),int):
                         exact_tokens=usage["completion_tokens"]
@@ -2291,9 +2331,7 @@ def chat_attached(a, base, model_id):
                         if ch.get("finish_reason"): finish=ch["finish_reason"]
                         d=ch.get("delta",{})
                         rtxt=d.get("reasoning_content")
-                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")=="0":
-                            continue              # thinking nascosto: lo spinner resta a girare
-                        if rtxt:
+                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")!="0":
                             # Thinking arrives as its own delta field, and this loop
                             # used to drop it on the floor: `coli run` streamed the
                             # model's reasoning while `coli chat` silently hid it
@@ -2307,7 +2345,7 @@ def chat_attached(a, base, model_id):
                                 think_open=True
                                 sys.stdout.write(f"  {C.dgray}┌ thinking{C.r}\n  {C.dgray}│{C.r} ")
                             sys.stdout.write(C.dim+rtxt.replace("\n","\n  "+C.dgray+"│"+C.r+" "+C.dim)+C.r)
-                            sys.stdout.flush(); continue
+                            sys.stdout.flush()
                         txt=d.get("content")
                         if not txt: continue          # ping/ruolo: non è testo
                         if think_open:
@@ -2338,6 +2376,10 @@ def chat_attached(a, base, model_id):
             think_open=False                      # risposta solo-reasoning): chiudi il riquadro
             sys.stdout.write(f"{C.r}\n  {C.dgray}\u2514\u2500{C.r}\n")
         md.close(); sp.stop()
+        if stream_error:
+            print(f"  {C.yel}[the server ended the response: {stream_error}]{C.r}")
+        elif not interrupted and not stream_done and finish is None:
+            print(f"  {C.yel}[stream closed before the response finished]{C.r}")
         if reply: msgs.append({"role":"assistant","content":"".join(reply)})
         else: msgs.pop()                              # turno vuoto: non sporcare la history
         el=time.time()-t0
@@ -2601,9 +2643,15 @@ def read_document(path, base=None, note=None):
 
 def is_local_base(base):
     """A server address on this machine (loopback names and addresses)."""
+    import ipaddress
     from urllib.parse import urlparse
     host = (urlparse(base).hostname or "").lower()
-    return host in ("localhost", "::1") or host.startswith("127.")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def chat_preload(a, base=None):
@@ -2662,13 +2710,14 @@ class LocalImageBackend:
         self.info = self.engine.info
 
     def generate(self, prompt, width, height, steps, seed, want_preview, on_progress,
-                 on_preview, on_interrupt):
+                 on_preview, on_interrupt, *, reference=None):
         from image_engine import encode_png
         def preview(meta, pixels):
             on_preview(meta.get("width"), meta.get("height"), meta.get("channels", 3), pixels)
         result = self.engine.generate(prompt, width, height, steps, seed, preview=want_preview,
                                       on_progress=on_progress, on_preview=preview,
-                                      interruptible=True, on_interrupt=on_interrupt)
+                                      interruptible=True, on_interrupt=on_interrupt,
+                                      reference=reference)
         result["png"] = encode_png(result["width"], result["height"], result["rgba"], 4)
         return result
 
@@ -2915,7 +2964,8 @@ def image_settings(a, info):
         if problem: sys.exit(f"{C.yel}--seed: {problem}{C.r}")
     return {"width": width, "height": height, "steps": steps, "seed": seed}
 
-def generate_image(backend, prompt, settings, protocol, out=None, stream=None, last=None):
+def generate_image(backend, prompt, settings, protocol, out=None, stream=None, last=None,
+                   *, reference=None):
     """One image: progress, the picture drawn in the terminal, the PNG on disk.
     Returns the saved path, or None when it was cancelled or failed (said).
     `last`, when given, is filled with the PNG and where it went, for /save."""
@@ -2928,10 +2978,11 @@ def generate_image(backend, prompt, settings, protocol, out=None, stream=None, l
     progress = ImageProgress(stream, seed, settings["steps"], previews, protocol)
     progress.start()
     t0 = time.time()
+    options = {"reference": reference} if reference is not None else {}
     try:
         result = backend.generate(prompt, settings["width"], settings["height"],
                                   settings["steps"], seed, previews, progress.progress,
-                                  progress.preview, progress.interrupted)
+                                  progress.preview, progress.interrupted, **options)
     except ImageCancelled:
         progress.stop()
         print(f"  {C.yel}■ cancelled{C.r}\n", file=stream)
@@ -3112,14 +3163,33 @@ def run_image(a, family, engine, prompt):
     """coli run on an image model: one picture, written to --out (or the
     images folder), drawn inline when stdout is a terminal."""
     import term_image
+    from image_engine import (ImageRequestError, MAX_FRAME_BYTES, prepare_edit_reference,
+                              supports_image_edits)
+    inputs = getattr(a, "image", None) or []
+    reference = None
+    if inputs:
+        if len(inputs) != 1:
+            sys.exit("--image accepts one reference image")
+        try:
+            if not os.path.isfile(inputs[0]):
+                raise OSError("expected a regular file")
+            with open(inputs[0], "rb") as handle:
+                data = handle.read(MAX_FRAME_BYTES + 1)
+            if len(data) > MAX_FRAME_BYTES:
+                raise ImageRequestError("The reference image file exceeds 64 MiB.", "image")
+            reference = prepare_edit_reference(data)
+        except (OSError, ImageRequestError) as error:
+            sys.exit(f"--image: {error}")
     backend = start_local_image_backend(a, family, engine)
     try:
+        if reference is not None and not supports_image_edits(backend.info):
+            sys.exit("--image: the image engine does not support reference-image edits")
         settings = image_settings(a, backend.info)
         interactive = sys.stdout.isatty()
         protocol = term_image.detect(query=interactive and sys.stdin.isatty())[0] if interactive else "none"
         stream = sys.stdout if interactive else sys.stderr
         path = generate_image(backend, prompt, settings, protocol, out=getattr(a, "out", None),
-                              stream=stream)
+                              stream=stream, reference=reference)
         if path and not interactive:
             print(path)                            # the one line a script wants
         return 0 if path else 1
@@ -4334,6 +4404,8 @@ def main():
                  ("--seed",dict(type=int,default=None,help="image seed (image models; default: random)")))
     for flag,kw in image_flags: pr.add_argument(flag,**kw)
     pr.add_argument("--out",default=None,help="PNG path for an image model (default: the images folder)")
+    pr.add_argument("--image", action="append", metavar="PATH",
+                    help="one local PNG, JPEG, or WebP reference for an edit-capable image model")
     pc=sub.add_parser("chat", parents=[common])
     for flag,kw in image_flags: pc.add_argument(flag,**kw)
     pc.add_argument("--attach", nargs="?", const="http://127.0.0.1:8000", default=None,

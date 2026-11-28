@@ -25,6 +25,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include "coli_event_log.h"   /* the tier's stops kept in a file too (#2793) */
 #include "compat.h"
 #include <errno.h>
 #include "vk_tier.h"
@@ -201,6 +202,7 @@ static struct {
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
     int st_ok, st_slots, st_n, st_per, st_half, st_rows_env, gemm_rows, st_par;
+    int st_half_cap;                      /* sub-batch rows a refused scratch left (0: none refused) */
     VStage *st;
     double bw_up, cpu_row_ms;             /* measured: bytes per ms into a slot; CPU ms per (row, expert) */
     int big, big_fail, big_n, big_taken, said_fwd;
@@ -218,6 +220,7 @@ static struct {
      * place by the GEMMs; bpool[e] marks them in the step */
     int pool_copy; uint8_t *bpool;
     unsigned long long pc_experts; double pc_bytes;
+    int lost;                     /* the device stopped answering (issue): vkt_lost */
 } T;
 
 /* "2.31 GiB", "35.0 MiB", "9.5 KiB": the budget lines read on a 24 GB card and a tiny fixture alike */
@@ -1396,9 +1399,22 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     if (ndev || nst) {
         size_t ram = (size_t)(compat_mem_available_gb() * 1e9);
         half = coli_vk_xb_sub_fit(half, E + 1, ram ? ram / 2 : SIZE_MAX);
-        if (half < 1 || !coli_vk_xb_sub_reserve(half, E + 1)) {
+        if (T.st_half_cap && half > T.st_half_cap) half = T.st_half_cap;
+        /* The fit reads the driver's budget, which can show room an allocation is then refused: on a Windows
+         * desktop's RTX PRO 4500 (Qwen3.8 Q4_K_M, 2.2.0) every prompt step's 290 MiB of scratch was, and the whole
+         * step went to the CPU while the batch still held the scratch of the step before. Fewer rows a sub-batch
+         * instead, down to what the scratch already holds: the step's experts stay on the device. */
+        const int want = half;
+        while (half >= 1 && !coli_vk_xb_sub_reserve(half, E + 1)) half /= 2;
+        if (half < 1) {
             fprintf(stderr, VKT_TAG " tier %s: no scratch for a step of %d rows, its experts stay on the CPU\n", T.engine, S);
             return 0;
+        }
+        if (half < want) {
+            if (!T.st_half_cap)
+                fprintf(stderr, VKT_TAG " tier %s: a prompt step's scratch for sub-batches of %d rows was refused; "
+                        "sub-batches of %d rows from here on, on the device\n", T.engine, want, half);
+            T.st_half_cap = half;
         }
     }
     if ((size_t)n * H > T.csy) {
@@ -1553,7 +1569,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         T.big = 0;
         if (T.sy_step) { coli_vk_xb_step_end(); T.sy_step = NULL; }
         if (T.big_fail) {
-            fprintf(stderr, VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
+            coli_event(VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops", T.engine);
             T.on = 0;
         }
         return 0;
@@ -1602,7 +1618,7 @@ static int join_big(const float **rows) {
                 : hn && T.hy_of[i] >= 0 ? T.hy_out + (size_t)T.hy_of[i] * T.c.hidden : NULL;
     for (int i = 0; T.st && i < T.st_n; i++) if (T.st[i].state == SS_BUSY) { T.st[i].state = SS_FREE; T.st[i].pending = 0; }
     if (!ok) {
-        fprintf(stderr, VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
+        coli_event(VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops", T.engine);
         T.on = 0;
         return 0;
     }
@@ -2513,7 +2529,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
     if (!coli_vk_xb_ready()) {
-        if (T.on) { fprintf(stderr, VKT_TAG " tier %s: the device stopped answering, the experts stay on the CPU\n", T.engine); T.on = 0; }
+        if (T.on) { coli_event(VKT_TAG " tier %s: the device stopped answering, the experts stay on the CPU", T.engine); T.on = 0; T.lost = 1; }
         return 0;
     }
     if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
@@ -2718,7 +2734,7 @@ int vkt_join(const float **rows) {
         rows[i] = !(ok && ok1 && hok) ? NULL : T.map[i] >= 0 ? T.by[T.map[i]]
                 : hn && T.hy_of[i] >= 0 ? T.hy_out + (size_t)T.hy_of[i] * T.c.hidden : NULL;
     if (!ok) {
-        fprintf(stderr, VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
+        coli_event(VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops", T.engine);
         T.on = 0;
         return 0;
     }
@@ -2764,6 +2780,7 @@ int vkt_resident(int layer, int eid) {
            slot(layer, eid)->state == VS_RESIDENT;
 }
 int vkt_ready(void) { return T.on; }
+int vkt_lost(void) { return T.lost; }
 
 /* ---- budget ---------------------------------------------------------------------- */
 static size_t mem_available(void) { return (size_t)(compat_mem_available_gb() * 1e9); }
@@ -3121,7 +3138,8 @@ size_t vkt_give_back(size_t bytes) {
     const int nb = coli_vk_tier_pool_blocks(NULL, 0);
     if (nb <= 0) return 0;
     uint64_t *bb = calloc((size_t)nb, sizeof *bb); double *hp = calloc((size_t)nb, 2 * sizeof *hp); uint8_t *pick = calloc((size_t)nb, 1);
-    if (!bb || !hp || !pick) { free(bb); free(hp); free(pick); return 0; }
+    int *left = calloc((size_t)nb, sizeof *left);   /* the experts that left each block */
+    if (!bb || !hp || !pick || !left) { free(bb); free(hp); free(pick); free(left); return 0; }
     coli_vk_tier_pool_blocks(bb, nb);
     const size_t n = (size_t)T.c.layers * T.c.experts;
     for (int k = 0; k < nb; k++) { hp[2 * k] = 0; hp[2 * k + 1] = k; }
@@ -3162,6 +3180,7 @@ size_t vkt_give_back(size_t bytes) {
         }
         T.evictions++;
         note_change((int)i);
+        for (int j = 0; j < m; j++) if (blk[j] >= 0 && blk[j] < nb && pick[blk[j]]) { left[blk[j]]++; break; }
     }
     free(hp);
     const int drop = T.dmax[0] - (T.dres[0] + T.dque[0]);
@@ -3172,8 +3191,22 @@ size_t vkt_give_back(size_t bytes) {
     const uint64_t base = st.limit ? st.limit : st.total;
     coli_vk_tier_pool_limit(base > got + 4096 ? (size_t)(base - got) : 4096);   /* releases the emptied blocks */
     uint64_t *now = calloc((size_t)nb, sizeof *now), gave = 0;
-    if (now) { coli_vk_tier_pool_blocks(now, nb); for (int k = 0; k < nb; k++) if (pick[k] && !now[k]) gave += bb[k]; }
-    free(now); free(pick); free(bb);
+    int stay = 0;
+    if (now) { coli_vk_tier_pool_blocks(now, nb); for (int k = 0; k < nb; k++) if (pick[k]) { if (!now[k]) gave += bb[k]; else stay += left[k]; } }
+    else for (int k = 0; k < nb; k++) stay += left[k];
+    free(now); free(pick); free(bb); free(left);
+    /* A picked block that did not empty (the streaming slots are in it: the pool's, and in no
+     * expert's place) is still the tier's. Its bytes go back under the limit and its experts'
+     * places back to the tier; they are neither given nor owed. Before, the limit kept the cut
+     * for every block picked and vkt_take_back gave back only what was released, so each such
+     * give-back cost the tier that block and its places for the rest of the process. */
+    if (gave < got) coli_vk_tier_pool_limit(base > gave + 4096 ? (size_t)(base - gave) : 4096);
+    if (stay > drop) stay = drop > 0 ? drop : 0;
+    if (stay > 0) {
+        pthread_mutex_lock(&T.mx);
+        T.dmax[0] += stay; T.max_resident += stay; T.gb_owed -= stay;
+        pthread_mutex_unlock(&T.mx);
+    }
     T.budget = T.budget > gave ? T.budget - (size_t)gave : 0;
     T.gb_owed_bytes += (size_t)gave;
     coli_vk_pool_stats(1, &st);

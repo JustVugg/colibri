@@ -5,6 +5,70 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`coli setup` no longer promises a slow laptop CPU the speed of its RAM.** It estimated a decode on
+  the CPU from the RAM's bandwidth alone, so an i7-1355U laptop (RAM as fast as a desktop's, a third of
+  its compute) was offered Inkling-2-Mini at 11 tok/s where it decodes at 3. The setup now also
+  measures how much the cores compute (under a second) and slows the estimate where they are short.
+- **Vulkan: a long prompt's steps stay on the GPU when the driver refuses their scratch.** On a
+  Windows desktop (an RTX PRO 4500 with Qwen3.8) the driver refused memory its budget showed free,
+  and every prompt step's experts went to the CPU: a long prompt three times slower. The step now
+  takes sub-batches of fewer rows on the GPU. Without Resizable BAR, Inkling-2's long prompts no
+  longer print `vkAllocateMemory failed: -2` at every step: one line says what happened.
+- **`coli doctor` recognises a Metal engine.** A `METAL=1` build links Metal.framework rather than
+  loading a GPU runtime, and macOS has no `ldd`, so doctor found no GPU runtime and reported "GPU
+  detected but the engine is CPU-only" for a qwen36 that ran its Metal graph (an M5 Air and an M2
+  mini). It now reads the messages `backend_metal.o` compiles into every Metal engine, and the
+  switch that engine reads at run time: qwen36's Metal graph is on unless `COLI_METAL=0`; colibri,
+  GLM-5.3 and Inkling need `COLI_METAL=1` (an Inkling-2 model also `INK2_METAL=1` and a CUDA or
+  Vulkan build), Kimi K3 `K3_METAL=1`; qwen36 and Kimi K3 stay on the CPU with `KV_SLOTS` above 1.
+  When Metal is on the GPU check
+  passes ("Metal engine on the Apple GPU") and the plan shows the Apple GPU as unified memory with
+  no VRAM budget; when it is off it warns and names the variable; a Metal build on a Mac with no
+  Metal GPU found says so. (#2921)
+
+### New
+
+- **qwen36: teacher forcing (`TF=1`), colibri's for this engine.** On a `.json` reference the
+  engine feeds `full_ids` through the model as a prompt, 256 rows at a time, reads every row's
+  logits out and compares each position's argmax with the reference's `tf_pred`, the prompt's
+  positions included, which the greedy oracle never looks at: the prefill path checked apart
+  from the decode. A mismatch is named and exits 1 (`ORACLE_TF_MAX_MISMATCHES` allows some),
+  `DEBUG_LOGITS=1` prints a mismatched position's top five logits and top1-top2 gap, `DUMP`
+  takes one row a position. `tools/make_qwen36_tiny.py --emit-ref` and
+  `tools/make_qwen36_oracle.py` write `tf_pred` (one cache-free forward, the argmax at every
+  position), `c/ref_qwen36.json` carries it, and `make -C c qwen36-tf-check` is the gate on the
+  generated fixture (CI): 21/21 positions, one dump row a position, a wrong entry fails.
+
+- **`COLI_MAX_BODY` sets the gateway's request-body cap** (default 4 MiB, as before), for requests
+  with several base64 images. **`COLI_BODY_LINGER_S`** (default off) lets a client that is still
+  uploading a body over the cap read the 400 instead of a connection reset.
+- **`DSV4_CUDA_REQUIRE=1` makes DeepSeek V4 exit when its GPU tier does not start** (missing
+  backend DLL or CUDA runtime, init failure, unsupported device), with the cause on stderr,
+  instead of running the whole model on the CPU at a fraction of the speed. Default off.
+### Changed
+
+- **qwen36, qwen38: `DUMP` writes every sampled row, `SNAP` falls back to `COLI_MODEL`.** `DUMP=<path>` used
+  to keep the last token's logits only; it now appends every row a token is sampled from, raw f32,
+  vocab floats a row, as colibri.c's `dump_logits` does, so a comparison sees the whole path, not
+  its end (the CI gates that `cmp` two runs' dumps compare the same rows as before, there are
+  just more of them). Both engines take the model directory from `COLI_MODEL` when `SNAP` is
+  unset, as colibri.c does.
+- **qwen38: a RAM expert cache smaller than a decode step's distinct experts no longer turns
+  off the grouped decode and the CUDA chain's in-frame experts.** `q38_moe_decode_grouped`
+  takes the distinct experts in waves of at most the cache's slots (each wave loaded, computed
+  and noted to the tier before the next recycles its slots), so `q38cc_dm_able` needs one slot
+  a layer instead of `Q38CC_DM_ROWS` x top-k. With the cache large enough it is one wave, as
+  before; the arithmetic per assignment is unchanged.
+- **qwen36 with a GGUF on the CUDA tier no longer holds the placed dense matrices in RAM.** The
+  loader read every matrix into RAM before the tier placed a byte, and kept each placed one
+  beside its VRAM copy: Qwen3.8-27B Q4_K_M with its trunk on a 32 GB card passed 19 GB of RAM, and
+  a 32 GB PC with 22 GB free ran out of memory during the load (now about 8 GB). Now each matrix the tier takes goes from the file
+  to the device through one staging buffer (`Q36_GGUF_STAGE_KB`, 64 MiB), and is read back from
+  the file only if the CPU ever needs it. New optional backend export:
+  `coli_cuda_tensor_upload_rows`.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

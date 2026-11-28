@@ -134,8 +134,10 @@ def session(engine, snap, extra, chain):
 def pairs(p, err, turns, nslots):
     """CHAIN_SERVE_PAIRS=1: the turns go nslots at a time, one a slot, written together, so
     the engine prefills them one after the other and decodes their rows in the same steps
-    (several conversations in one forward). The frames come in the engine's order, which
-    the CPU's session and the chain's share."""
+    (several conversations in one forward). The frames come in the engine's order; with
+    fewer places than slots on the chain a request waits for one (COLI_VK_CHAIN_MUX), so
+    the requests' frames interleave otherwise than the CPU's: main compares each request's
+    own frames, in order."""
     turns = [t for t in turns if t is not None]
     out = []
     for k in range(0, len(turns), nslots):
@@ -214,6 +216,10 @@ def main():
     expect = os.environ.get("CHAIN_SERVE_EXPECT")
     if expect and not re.search(expect, err):
         sys.exit(f"FAIL: the chain session's stderr has no {expect!r}\n" + err[-3000:])
+    if os.environ.get("CHAIN_SERVE_PAIRS") == "1":   # each request's frames in order, the requests in id order
+        def by_id(frames):
+            return [f for rid in sorted({f.split(b" ")[1] for f in frames}) for f in frames if f.split(b" ")[1] == rid]
+        cpu, dev = by_id(cpu), by_id(dev)
     if len(cpu) != len(dev) or not all(close(a, b) for a, b in zip(cpu, dev)):
         for a, b in zip(cpu, dev):
             if not close(a, b):

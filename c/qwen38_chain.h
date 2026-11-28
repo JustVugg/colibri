@@ -100,6 +100,7 @@ typedef struct {
     VkcDmoe dm_mtp;                   /* the head's routed experts in the frame (its layer whole in the tier) */
     unsigned long long mtp_rows;      /* the head's rows run here */
     unsigned long long pc_took, pc_staged;   /* prompts whose host pool experts the CPU computed, and those staged (q38c_pc_take) */
+    int kvh;                                   /* the K/V mirrors in float16 (q38c_kvh_want; whole mirrors only) */
 } Q38Chain;
 /* the MTP head's layer on the device beside the full chain (q38c_mtp_rows); Q38_MTP_CHAIN=0:
  * on the CPU, as before */
@@ -110,7 +111,6 @@ static int q38c_attn_at(const Cfg *c, int i) { return i >= c->layers || c->is_at
 /* the primary device's chain (d 0) or the second device's (d 1, after it) */
 static Q38Chain *q38c_of(Model *m, int d) { return (Q38Chain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *q38c_name(const Q38Chain *ch) { return ch && ch->d ? "qwen38 dev2" : "qwen38"; }
-static int q38c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 static int g_vk_chain = 0;
 static void q38c_fatal(const char *what) {
@@ -200,6 +200,13 @@ static int q38c_chunk_rows(Q38Chain *ch, Model *m) {
          + ((size_t)c->experts + 3 * (size_t)c->shared_inter + c->hidden + 1) * sizeof(float);
     return vkc_chunk_rows(q38c_name(ch), row);
 }
+/* COLI_VK_KV16 (on): whole K/V mirrors in float16 where the rows are float16's already (q38_kv16: rounded where they
+ * are made), so the same values and the same bits (vkc_attn_h) in half the memory; the split reads float32 */
+static int q38c_kvh_want(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_KV16"); on = !(e && *e == '0'); }
+    return on && q38_kv16() && vkc_kvh_ready();
+}
 /* What the chain allocates at its first forward, after the tier has filled the device:
  * the KV mirror whole at the context's capacity (at most a quarter of the device's free
  * memory, past which vkc_kv_plan splits it anyway) and a prompt chunk of 512 rows. The
@@ -213,7 +220,8 @@ static size_t q38c_late_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
     size_t kvo = (size_t)c->kv_heads * c->head_dim, idx = (size_t)c->idx_dim;
     size_t nb = (size_t)ctx / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1;
-    size_t kv = (size_t)ch->n_attn * (((2 * kvo + idx) * (size_t)ctx + idx * nb) * sizeof(float)), q = vkc_dev_avail() / 4;
+    const size_t es = q38c_kvh_want() ? 2 : sizeof(float);   /* the K/V mirrors' element; the index keys stay float32 */
+    size_t kv = (size_t)ch->n_attn * ((2 * kvo * es + idx * sizeof(float)) * (size_t)ctx + idx * nb * sizeof(float)), q = vkc_dev_avail() / 4;
     if (kv > q) kv = q;
     /* a row's scratch counted as q38c_chunk_rows counts it, at this context's capacity */
     int keep = ch->rows, cap = m->kv_cap;
@@ -243,16 +251,22 @@ static int q38c_mirror(Q38Chain *ch, Model *m) {
             ch->pk[i] = vkc_buf((size_t)c->idx_dim * nbmax * 4, VKC_DEV);
             if (!ch->ik[i] || !ch->pk[i]) { ch->cap = 0; return 0; }
         }
-        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q38c_name(ch), ch->n_attn, row, m->kv_cap, 1, 1,
-                                            (size_t)ch->n_attn * ch->dev_rows * row) : 1;
+        const size_t held = (size_t)ch->n_attn * ch->dev_rows * row * (ch->kvh ? 1 : 2) / 2;
+        ch->kvh = q38c_kvh_want() && c->head_dim % 2 == 0;
+        if (ch->kvh) row /= 2;   /* halves */
+        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q38c_name(ch), ch->n_attn, row, m->kv_cap, 1, 1, held) : 1;
+        if (plan && ch->ks.on && ch->kvh) {   /* the split reads float32: planned again at it */
+            vkc_kv_free(&ch->ks); ch->kvh = 0; row *= 2;
+            plan = vkc_kv_plan(&ch->ks, q38c_name(ch), ch->n_attn, row, m->kv_cap, 1, 1, held);
+        }
         if (!plan) { ch->cap = 0; return 0; }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
         for (int i = ch->lo; i < ch->lo + ch->nl + (ch->mtp_on ? 1 : 0); i++) {
             if (!q38c_attn_at(c, i)) continue;
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]);
             ch->kv_valid[i] = 0;
-            ch->kc[i] = vkc_buf((size_t)kvo * ch->dev_rows * 4, VKC_DEV);
-            ch->vc[i] = vkc_buf((size_t)kvo * ch->dev_rows * 4, VKC_DEV);
+            ch->kc[i] = vkc_buf((size_t)kvo * ch->dev_rows * (ch->kvh ? 2 : 4), VKC_DEV);
+            ch->vc[i] = vkc_buf((size_t)kvo * ch->dev_rows * (ch->kvh ? 2 : 4), VKC_DEV);
             if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
         }
         ch->cap = m->kv_cap;
@@ -705,7 +719,7 @@ static void q38c_start(Model *m) {
     if (!vkc_init()) { g_vk_chain = 0; g_q38c_fitted = 0; free(lb); free(mb); return; }   /* the per-matrix path, as before */
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n0, with that device's free memory (the tier there sizes itself after the placement) */
-    if (partial && n0 < L && q38c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+    if (partial && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
         vkc_device(1);
         int n2 = vkc_fit("qwen38 dev2", L - n0, lb + n0, mb + n0, fixed, tail, &g_q38c_fit2);
         if (n2 > 0 && !vkc_init()) {
@@ -809,12 +823,27 @@ static void q38_embed_row(Model *m,int id,int abs_pos,float *out);
  * with them), then leave the chain off. The MTP head's own rows live on the host. With a
  * partial chain only the device's layers are rebuilt: the CPU's layers (and the PLE
  * layer's state and history when it is one of them) hold their own state already. */
+static int g_q38c_mode;   /* the chain's mode before a stop (q38c_retry brings it back) */
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. q38c_recover left the state on the host: the mirrors' rows, the index and pooled keys and the DeltaNet and
+ * PLE state go up from it at the next forward. One device. */
+static void q38c_retry(Model *m) {
+    Q38Chain *ch = q38c_of(m, 0);
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || q38c_of(m, 1) || !vkc_chain_retry("qwen38")) return;
+    Cfg *c = &m->c;
+    for (int i = ch->lo; i < ch->lo + ch->nl + (ch->mtp_on ? 1 : 0); i++)
+        if (q38c_attn_at(c, i)) { ch->kv_valid[i] = ch->pk_valid[i] = 0; }
+    if (ch->ks.on) for (int k = 0; k < ch->n_attn; k++) vkc_kv_lower(&ch->ks, k, 0);
+    ch->dn_where = Q38C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+    ch->failed = 0; g_vk_chain = g_q38c_mode ? g_q38c_mode : 1;
+}
 static void q38c_recover(Model *m, int upto) {
     Q38Chain *ch = (Q38Chain *)m->vkchain, *ch2 = (Q38Chain *)m->vkchain2;
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count;
     int nl = ch ? ch->nl : c->layers;
     if (ch && ch->ok && ch2 && ch2->ok) nl += ch2->nl;   /* the second device's layers ran in that forward too */
     int ple = c->ple_layer >= 0 && c->ple_layer < nl;
+    if (g_vk_chain) g_q38c_mode = g_vk_chain;
     g_vk_chain = 0;
     for (int d = 0; d < 2; d++) {
         Q38Chain *x = q38c_of(m, d);
@@ -830,8 +859,8 @@ static void q38c_recover(Model *m, int upto) {
     if (upto <= 0) return;
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         q38c_fatal("the device was lost with a recurrent state its token ids do not describe (an image)");
-    fprintf(stderr, "[VK] qwen38 chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on\n", upto);
+    fprintf(stderr, "[VK] qwen38 chain: %s; rebuilding the state of %d positions on the host's path, "
+                    "which runs from here on\n", vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", upto);
     int *ids = (int *)malloc((size_t)upto * sizeof(int));
     float *hyper = falloc((int64_t)upto * W), *mixed = falloc((int64_t)upto * H);
     float *inject = falloc((int64_t)upto * C), *block = falloc((int64_t)upto * H);
@@ -963,7 +992,16 @@ static int q38c_push_kv(Q38Chain *ch, Model *m, int i, int pos_base, int n_rows)
     int t0 = ch->kv_valid[i], n = pos_base - t0;
     for (int h = 0; h < KVH && ok && !ch->ks.on; h++) {
         size_t src = ((size_t)h * m->kv_cap + t0) * D, dst = ((size_t)h * ch->dev_rows + t0) * D;
-        ok = vkc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * D * 4) && vkc_write(ch->vc[i], dst, m->V[i] + src, (size_t)n * D * 4);
+        if (ch->kvh) {   /* the host's float16 values as halves, at half the offset (D even) */
+            uint16_t *hk = malloc((size_t)n * D * 2 * sizeof(uint16_t)), *hv = hk ? hk + (size_t)n * D : NULL;
+            ok = hk != NULL;
+            if (ok) {
+                kv16_pack(hk, m->K[i] + src, (int64_t)n * D); kv16_pack(hv, m->V[i] + src, (int64_t)n * D);
+                ok = vkc_write(ch->kc[i], dst / 2, hk, (size_t)n * D * 2) && vkc_write(ch->vc[i], dst / 2, hv, (size_t)n * D * 2);
+            }
+            free(hk);
+        } else
+            ok = vkc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * D * 4) && vkc_write(ch->vc[i], dst, m->V[i] + src, (size_t)n * D * 4);
     }
     ok = ok && vkc_write(ch->ik[i], (size_t)t0 * ID, m->IK[i] + (size_t)t0 * ID, (size_t)n * ID * 4);
     ch->kv_valid[i] = pos_base;
@@ -1044,7 +1082,8 @@ static int q38c_attention(Q38Chain *ch, Model *m, Layer *l, int i, int n, int pb
     VkcKvPart pk_ = {KVH, D, m->K[i], (size_t)m->kv_cap * D, ch->kc[i], 0, 0}, pv_ = {KVH, D, m->V[i], (size_t)m->kv_cap * D, ch->vc[i], 0, 0};
     ok = (ch->ks.on ? vkc_kv_store(&ch->ks, ch->attn_ord[i], &pk_, ch->k, 0, (size_t)kvo, (size_t)D, pb, n) &&
                       vkc_kv_store(&ch->ks, ch->attn_ord[i], &pv_, ch->v, 0, (size_t)kvo, (size_t)D, pb, n)
-                    : vkc_copy_regions(ch->kc[i], ch->k, rg, n * KVH) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * KVH)) &&
+                    : ch->kvh ? vkc_copy_regions_h(ch->kc[i], ch->k, rg, n * KVH) && vkc_copy_regions_h(ch->vc[i], ch->v, rg, n * KVH)
+                              : vkc_copy_regions(ch->kc[i], ch->k, rg, n * KVH) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * KVH)) &&
          vkc_copy_regions(ch->ik[i], ch->ip, ri, n) &&
          vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) &&
          vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
@@ -1076,7 +1115,8 @@ static int q38c_attention(Q38Chain *ch, Model *m, Layer *l, int i, int n, int pb
     VkcAttn at = {n, QH, KVH, D, pb, ch->dev_rows, 0, qo, 2 * D, D, qo, 2 * D, 1, 0, QH * D, 0, q38c_selrow(c),
                   1.f / sqrtf((float)D), 0, 0};
     return ok && vkc_qsa(ch->ip, NULL, ch->pk[i], NULL, ch->qsc, ch->sel, &ps) &&
-           vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at) &&
+           (ch->kvh ? vkc_attn_h(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at)
+                    : vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at)) &&
            vkc_matmul(q38c_t(&l->o), ch->ctx, 0, ch->blk, 0, n);
 }
 /* ns: the chunk's rows whose state a verify copies (rows 0..ns-1, into slots c0..c0+ns-1).
@@ -1497,7 +1537,7 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
     return ch->head ? 1 : 2;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     vkc_gemm_rows(-1);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("qwen38", pos_base, S);   /* the device lost only when it said so (#2793) */
     vkc_device(0);
     q38c_recover(m, pos_base);
     *lost = 1;
@@ -1655,7 +1695,7 @@ static int q38c_mtp_rows(Model *m, const float *streams, const int *next, int S,
 lost:   /* a frame failed: the device is gone; the CPU takes over, the head too */
     vkc_gemm_rows(-1);
     free(emb);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
+    vkc_frame_failed("qwen38 MTP", pos_base, S);   /* the device lost only when it said so (#2793) */
     vkc_device(0);
     q38c_recover(m, m->kv_len);
     return 0;

@@ -137,7 +137,6 @@ static int g_inkc_ran;   /* the layers the last forward ran on the devices, from
 static int inkc_ran(void) { return g_inkc_ran; }
 static InkChain *inkc_of(Model *m, int d) { return (InkChain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *inkc_name(const InkChain *ch) { return ch && ch->d ? "inkling dev2" : "inkling"; }
-static int inkc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 /* The device copy of a resident matrix or of a view of one (wt_off_i: a shared expert
  * of the fused [ns][R][I] tensors): the per-matrix path's copy when it keeps a table
@@ -369,7 +368,7 @@ static void inkc_fit_start(Model *m) {
      * n0 with that device's free memory, its pipelines up now (inkc_place_init places its
      * layers; the head goes with the last one when there is room) */
     int n0 = g_inkc_fit.n;
-    if (vkc_fit_partial(&g_inkc_fit) && n0 > 0 && n0 < L && inkc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
+    if (vkc_fit_partial(&g_inkc_fit) && n0 > 0 && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
         coli_vk_dev2_open_env()) {
         vkc_device(1);
         int n2 = vkc_fit("inkling dev2", L - n0, per + n0, mat + n0, fixed, tail, &g_inkc_fit2);
@@ -765,8 +764,8 @@ static void inkc_recover(Model *m, int upto) {
     if (upto <= 0) return;
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         inkc_fatal("the device was lost with a state its token ids do not describe (audio)");
-    fprintf(stderr, "[VK] inkling chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on%s\n", upto, nl < c->n_layers ? " (the device's layers; the CPU's have theirs)" : "");
+    fprintf(stderr, "[VK] inkling chain: %s; rebuilding the state of %d positions on the host's path, "
+                    "which runs from here on%s\n", vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", upto, nl < c->n_layers ? " (the device's layers; the CPU's have theirs)" : "");
     int *ids = malloc((size_t)upto * sizeof(int));
     float *x = falloc((int64_t)upto * D);
     if (!ids) { fprintf(stderr, "OOM rebuilding the state\n"); exit(1); }
@@ -988,7 +987,7 @@ static int inkc_forward_seg(Model *m, InkChain *ch, float *xh, int S, int pos_ba
     ch->forwards++;
     return full ? 1 : 2;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("inkling", pos_base, S);   /* the device lost only when it said so (#2793) */
     free(xfin);
     vkc_device(0);
     inkc_recover(m, pos_base);
