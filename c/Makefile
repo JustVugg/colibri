@@ -587,6 +587,10 @@ TEST_EXCLUDE += test_cu_tier
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 # runs qwen36.c's main on a GGUF named on its command line: tests/test_qwen36_gguf_hostdrop.py drives it
 TEST_EXCLUDE += test_qwen36_gguf_hostdrop
+# its hooks live in COLI_V4_UNIT_GPU_HOOK.o, linked into V4_TEST_LINK_OBJS on Windows
+ifeq ($(IS_WIN),)
+TEST_EXCLUDE += test_v4_gpu_priority
+endif
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -3413,6 +3417,15 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_
 		$(V4_TEST_EXTRA_TARGETS)
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_TEST_LINK_OBJS) \
 		-o $@ -pthread $(LDFLAGS)
+
+ifneq ($(IS_WIN),)
+tests/test_v4_gpu_priority$(EXE): tests/test_v4_gpu_priority.c tests/test_deepseek_v4.c sse41_kernels.h \
+		deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h compat.h Makefile.deepseek-v4.units \
+		Makefile.deepseek-v4 | tests/test_deepseek_v4$(EXE)
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) COLI_V4_UNIT_GPU_HOOK.o
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(filter-out COLI_V4_UNIT_GPU.o,$(V4_TEST_LINK_OBJS)) \
+		COLI_V4_UNIT_GPU_HOOK.o -o $@ -pthread $(LDFLAGS)
+endif
 
 # Real-DLL gate for the GPU router's retained input buffer (V4_GPU_ROUTE_REUSE=1):
 # bit-exact against the per-call path. Windows only: it needs a GPU and the

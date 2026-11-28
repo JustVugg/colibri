@@ -39,6 +39,10 @@ int coli_v4_hot_split_on(void) { return 0; }
 /* v4_gpu_place (the HIP build) hands the block unit its pick */
 void coli_v4_hot_split_auto(int on) { (void)on; }
 int coli_v4_gpu_resident_first(void) { return 0; }
+int (*coli_v4_expert_store_ram_first)(int layer, int expert);
+uint64_t coli_v4_expert_store_frequency(ColiExpertStore *store, ColiExpertKey key) {
+    (void)store; (void)key; return 0;
+}
 void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                        unsigned char *held, int experts);
 /* Backend entries dev gained after #1766's base (the bank-sized mirror reserve,

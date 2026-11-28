@@ -989,6 +989,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"V4_DECODE_PROJ6", CE_INT, CE_DSV4, 0, NULL},
     {"V4_DRAFT",                         CE_INT   , CE_DSV4                                         , 0             , NULL},
     {"V4_EXPERT_UNION",                  CE_BOOL  , CE_DSV4                                         , 0             , NULL},
+    {"V4_GPU_HOT_CACHE", CE_BOOL, CE_DSV4, 0, NULL},
     {"V4_GPU_RESIDENT_FIRST", CE_BOOL, CE_DSV4, 0, NULL},
     {"V4_GPU_ROUTE_REUSE", CE_BOOL, CE_DSV4, 0, NULL},
     {"V4_HC_TEAM", CE_INT, CE_DSV4, 0, NULL},
