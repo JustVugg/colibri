@@ -2745,17 +2745,34 @@ class VulkanPartialChainGlm53Test(unittest.TestCase):
         want = {"32": ([773352, 728408, 576744, 728408, 576744, 728408], 65792),
                 "8": ([234472, 312408, 184296, 312408, 184296, 312408], 16896),
                 "4": ([153832, 250456, 126184, 250456, 126184, 250456], 9216)}
+        # those numbers are the engine's 256-row first mirror: COLI_KV_PLAN=0 (the plan's case below)
         for bits, (layers, tail) in want.items():
             with self.subTest(bits=bits):
-                env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": bits}
+                env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": bits, "COLI_KV_PLAN": "0"}
                 fit = vk_chain_fit(self.info, "glm53", env, device)
                 self.assertEqual(fit["layers"], layers)
                 self.assertEqual(fit["fixed"] - vk_fit_pools(0), 4847872)
                 self.assertEqual((fit["n"], fit["tail"]), (6, True))
         small = vk_chain_fit(self.info, "glm53", {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": "4",
-                                                  "COLI_VK_CHAIN_ROWS": "7", "GLM53_MAXT": "300"}, device)
+                                                  "COLI_VK_CHAIN_ROWS": "7", "GLM53_MAXT": "300", "COLI_KV_PLAN": "0"}, device)
         self.assertEqual(small["fixed"] - vk_fit_pools(0), 155904)
         self.assertEqual(small["layers"], want["4"][0])
+        # planned (COLI_KV_PLAN, the default): an MLA layer's mirror at the serve slot's context (GLM53_MAXT, 8192),
+        # its latent rows at most 32768, as glm53_chain.h's g53c_fit_plan counts it; every other byte the same
+        from resource_plan import vk_buf_bytes
+        kvl, ID, pool = 64, 32, 2
+
+        def mirror(ctx):
+            return (vk_buf_bytes(min(ctx, 32768) * kvl * 4) + 2 * vk_buf_bytes(ctx * ID * 4) +
+                    vk_buf_bytes((ctx // pool + 1) * ID * 4))
+        for maxt in (None, "300", "40000"):
+            with self.subTest(planned=maxt):
+                env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": "32"}
+                if maxt:
+                    env["GLM53_MAXT"] = maxt
+                more = mirror(int(maxt or 8192)) - mirror(256)
+                fit = vk_chain_fit(self.info, "glm53", env, device)
+                self.assertEqual(fit["layers"], [x + more if i % 2 else x for i, x in enumerate(want["32"][0])])
 
     def test_device_only_credits_the_layers_on_the_device(self):
         from resource_plan import _glm53_dense_tensors, _vk_layer_index, _vk_released_tensor_bytes, vk_chain_fit

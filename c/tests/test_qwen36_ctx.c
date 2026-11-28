@@ -103,6 +103,24 @@ static void case_growth(void) {
     ck(1, "the grown cache is writable to its last element");
 }
 
+/* --- COLI_KV_PLAN: the whole context's rows at the first allocation ------------ */
+static void case_plan(void) {
+    Model m; shape_model(&m, REAL_LAYERS, REAL_KVHEADS, REAL_KHEADDIM);
+    printf("the cache planned once (COLI_KV_PLAN)\n");
+    unsetenv("COLI_KV_PLAN");
+    setenv("Q36_MAXT", "8192", 1);
+    m.max_t = 512; ensure_kv(&m);
+    void *first = m.K[3];
+    ck(m.kv_cap == 8192, "the first request's cache holds the whole context");
+    m.max_t = 6000; ensure_kv(&m);
+    ck(m.K[3] == first && m.kv_cap == 8192, "a longer turn finds its rows there: nothing reallocated or copied");
+    int64_t last = (int64_t)m.c.kv_heads * 8192 * m.c.k_head_dim - 1;
+    ((unsigned char *)m.K[3])[(size_t)(last + 1) * q36_kv_es() - 1] = 1;
+    ck(1, "the planned cache is writable to its last element");
+    unsetenv("Q36_MAXT");
+    setenv("COLI_KV_PLAN", "0", 1);
+}
+
 /* --- the ceiling itself --------------------------------------------------- */
 static void case_ceiling(void) {
     printf("attention capacity\n");
@@ -171,8 +189,10 @@ static void case_utf8(void) {
 }
 
 int main(void) {
+    setenv("COLI_KV_PLAN", "0", 1);   /* the cache grown as requests ask (the plan's own case: case_plan) */
     case_layout();
     case_growth();
+    case_plan();
     case_utf8();
     case_ceiling();
     case_budget();

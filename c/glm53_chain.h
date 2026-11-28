@@ -748,7 +748,7 @@ static void g53c_recover(GModel *m, GSession *s, int start, int dev0, int dev2, 
     }
     const char *nm = g53c_name(who);
     if (!had) {
-        fprintf(stderr, "[VK] %s chain: %s; the host's state is current, the host's path runs from here on\n", nm, vkc_lost() ? "the device was lost" : "the chain stopped, the device stays");
+        fprintf(stderr, "[VK] %s chain: %s; the host's state is current, the host's path runs from here on\n", nm, vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays");
         return;
     }
     const Cfg *c = &m->c; int H = c->hc_mult, D = c->hidden;
@@ -759,7 +759,7 @@ static void g53c_recover(GModel *m, GSession *s, int start, int dev0, int dev2, 
     }
     int n = start - ch->rec_base;
     fprintf(stderr, "[VK] %s chain: %s; rebuilding the state of %d positions on the host's path, "
-                    "which runs from here on\n", nm, vkc_lost() ? "the device was lost" : "the chain stopped, the device stays", n);
+                    "which runs from here on\n", nm, vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", n);
     /* the devices' layers only: a partial chain's CPU layers ran every position already */
     if (n <= 0) return;
     float *xs = malloc((size_t)n * H * D * sizeof(float)), *xn = malloc((size_t)n * H * D * sizeof(float));

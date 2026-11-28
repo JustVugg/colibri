@@ -177,7 +177,7 @@ static void q36c_recover(Model *m, int upto) {
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         q36c_fatal("the device was lost with a recurrent state its token ids do not describe (an image)");
     fprintf(stderr, "[VK] qwen36 chain: %s; rebuilding the state of %d positions on the host's path, "
-                    "which runs from here on\n", vkc_lost() ? "the device was lost" : "the chain stopped, the device stays", upto);
+                    "which runs from here on\n", vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", upto);
     int *ids = malloc((size_t)upto * sizeof(int));
     float *x = falloc((int64_t)upto * D);
     if (!ids) { fprintf(stderr, "OOM rebuilding the state\n"); exit(1); }

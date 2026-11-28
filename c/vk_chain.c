@@ -212,6 +212,7 @@ void vkc_shutdown_all(void) {   /* both devices' contexts, the second first (at 
     g_kd = was;
 }
 int vkc_lost(void) { return KC.lost; }
+int vkc_lost_any(void) { return g_kctx[0].lost || g_kctx[1].lost; }
 
 static void lose(const char *what, VkResult r) {
     if (!KC.lost) coli_event("[VK] chain: %s failed (%d): the device is lost", what, (int)r);
@@ -793,7 +794,10 @@ int vkc_init(void) {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
         uint32_t bits = KC.core.qfam < nqf ? qf[KC.core.qfam].timestampValidBits : 0;
         KC.gov_ms = frame_gov_ms();
-        if (KC.gov_ms > 0 && bits && pp.limits.timestampPeriod > 0) {
+        /* not on a CPU device (Lavapipe): no driver's timeout to keep under, and its vkGetQueryPoolResults waits for
+         * the whole device idle, a frame queued behind the one read waiting for a hybrid step's host signal the
+         * reader has not given yet (the host pool's gate hung there) */
+        if (KC.gov_ms > 0 && bits && pp.limits.timestampPeriod > 0 && pp.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
             KC.gq_period = pp.limits.timestampPeriod; KC.gq_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
             KC.gov_on = 1;
             for (int i = 0; i < VKC_FRAMES && KC.gov_on; i++) {
@@ -964,6 +968,10 @@ void vkc_restart_if_lost(const char *engine) {
     static int said;
     const char *e = getenv("COLI_VK_LOST_RESTART");
     if (e && *e == '0') return;
+    /* only an engine something starts again: the gateway sets COLI_ENGINE_SUPERVISED for the one keep_engine watches.
+     * Run alone (a test, a script, a front end of its own), an exit would end the service: the CPU runs on instead */
+    const char *sup = getenv("COLI_ENGINE_SUPERVISED");
+    if (!(sup && *sup == '1')) return;
     char mark[1024] = "";
     const char *home = getenv("HOME");
     if (!home || !*home) home = getenv("USERPROFILE");
@@ -1011,7 +1019,9 @@ int vkc_chain_retry(const char *engine) {
     return 1;
 }
 void vkc_frame_failed(const char *engine, int pos, int rows) {
-    const int dead = KC.lost || !vkc_finish();
+    /* either device: a chain split over two (COLI_VK_CHAIN_LAYERS2) reaches its lost: path back on the primary, the
+     * second one the device that went */
+    const int dead = vkc_lost_any() || !vkc_finish();
     if (dead) {
         coli_event("[VK] %s chain: the device is lost at position %d (%d rows); the CPU runs from here on", engine, pos, rows);
         return;
