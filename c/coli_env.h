@@ -255,7 +255,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_RELATTN_SPLIT", CE_BOOL, CE_INKLING, 0, NULL},
     {"COLI_CUDA_RESID",                  CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_ROUTER",                 CE_INT   , CE_COLIBRI                                      , 0             , NULL},
-    {"COLI_CUDA_ROUTE_FAST", CE_BOOL, CE_QWEN, 0, NULL}, /* Specialized router for 256 experts. Defaults to the active profile. */
+    {"COLI_CUDA_ROUTE_FAST", CE_BOOL, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL}, /* The chain's fast routers (256-expert profile router, one-warp-a-row router). Defaults to on, a profile's kernel mask under a profile. */
     {"COLI_CUDA_SHARED_W4A16",           CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_SHARED_W4A16_MIN_ROWS",  CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_SK_PART", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
