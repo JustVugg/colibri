@@ -14,7 +14,11 @@ DORY = "f84e14b1"
 
 
 def run(args, **kwargs):
-    return subprocess.check_output([str(a) for a in args], **kwargs)
+    try:
+        return subprocess.check_output([str(a) for a in args], timeout=120, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        print(exc.output.decode(errors="replace"))
+        raise
 
 
 def digest(data):
@@ -49,10 +53,12 @@ def main():
         "donor_revision": run(["git", "rev-parse", DORY], cwd=ROOT).decode().strip(),
         "platform": platform.platform(), "cpu": platform.processor(),
         "compiler": run([args.cc, "--version"]).decode().splitlines()[0],
-        "flags": ["-std=c11", "-O2", "-fno-fast-math", "-ffp-contract=off"],
+        "flags": ["-std=c11", "-O2", "-D_FILE_OFFSET_BITS=64",
+                  "-fno-fast-math", "-ffp-contract=off"],
         "sha256": {"baseline_header": digest(baseline), "donor_header": digest(donor),
                    "generated_header": digest(candidate.encode()),
-                   "harness": digest(Path(__file__).with_name("sample_screen.c").read_bytes())},
+                   "harness": digest(Path(__file__).with_name("sample_screen.c").read_bytes()),
+                   "runner": digest(Path(__file__).read_bytes())},
         "conditions": {"threads": 1, "concurrency": 1, "warmups_per_process": 1,
                        "paired_repetitions": 5, "draws_per_process": 3,
                        "gpu": "not used", "model_quantisation": "not applicable",
