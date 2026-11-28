@@ -1,0 +1,53 @@
+test_offline_demo_and_nonzero_drift (test_cli.CLITests.test_offline_demo_and_nonzero_drift) ... ok
+test_snapshot_hashes_exact_bytes_and_preserves_outputs (test_cli.CLITests.test_snapshot_hashes_exact_bytes_and_preserves_outputs) ... ok
+test_tampered_capture_has_nonzero_exit (test_cli.CLITests.test_tampered_capture_has_nonzero_exit) ... ok
+test_bad_inputs (test_client.RequestTests.test_bad_inputs) ... ok
+test_oversized_request_and_nonfinite_data (test_client.RequestTests.test_oversized_request_and_nonfinite_data) ... ok
+test_prompt_preserves_unicode_and_excludes_local_metadata (test_client.RequestTests.test_prompt_preserves_unicode_and_excludes_local_metadata) ... ok
+test_incomplete_response_is_rejected (test_client.TransportTests.test_incomplete_response_is_rejected) ... ok
+test_invalid_timeout_and_key_fail_before_connection (test_client.TransportTests.test_invalid_timeout_and_key_fail_before_connection) ... ok
+test_no_server_body_in_errors (test_client.TransportTests.test_no_server_body_in_errors) ... ok
+test_real_http_json_auth_and_no_proxy (test_client.TransportTests.test_real_http_json_auth_and_no_proxy) ... ok
+test_refuses_every_redirect_without_following (test_client.TransportTests.test_refuses_every_redirect_without_following) ... ok
+test_rejects_remote_hostname_url_credentials_and_query (test_client.TransportTests.test_rejects_remote_hostname_url_credentials_and_query) ... ok
+test_response_limit_declared_and_actual (test_client.TransportTests.test_response_limit_declared_and_actual) ... ok
+test_root_base_url_is_normalised (test_client.TransportTests.test_root_base_url_is_normalised) ... ok
+test_strict_json_response (test_client.TransportTests.test_strict_json_response) ... ok
+test_timeout_is_one_request (test_client.TransportTests.test_timeout_is_one_request) ... ok
+test_wrong_type_and_compression (test_client.TransportTests.test_wrong_type_and_compression) ... ok
+test_bounded_sources_and_unsafe_paths (test_core.CoreTests.test_bounded_sources_and_unsafe_paths) ... ok
+test_duplicate_claims_and_identifier_collision (test_core.CoreTests.test_duplicate_claims_and_identifier_collision) ... ok
+test_export_has_context_only_and_no_review (test_core.CoreTests.test_export_has_context_only_and_no_review) ... ok
+test_export_metadata_respects_utf16_bounds (test_core.CoreTests.test_export_metadata_respects_utf16_bounds) ... ok
+test_export_rejects_forged_report (test_core.CoreTests.test_export_rejects_forged_report) ... ok
+test_fabrication_empty_boolean_and_bounds_rejected (test_core.CoreTests.test_fabrication_empty_boolean_and_bounds_rejected) ... ok
+test_false_semantic_statement_can_pass_literal_check (test_core.CoreTests.test_false_semantic_statement_can_pass_literal_check) ... ok
+test_policy_changes_check_without_changing_capture (test_core.CoreTests.test_policy_changes_check_without_changing_capture) ... ok
+test_response_failures_are_recorded (test_core.CoreTests.test_response_failures_are_recorded) ... ok
+test_source_and_capture_tampering (test_core.CoreTests.test_source_and_capture_tampering) ... ok
+test_source_drift_and_removal_rejected (test_core.CoreTests.test_source_drift_and_removal_rejected) ... ok
+test_source_urls_reject_invalid_hosts_and_ports (test_core.CoreTests.test_source_urls_reject_invalid_hosts_and_ports) ... ok
+test_strict_json (test_core.CoreTests.test_strict_json) ... ok
+test_unicode_codepoints_and_semantic_status (test_core.CoreTests.test_unicode_codepoints_and_semantic_status) ... ok
+test_complete_candidate_through_actual_gateway (test_gateway.UpstreamGatewayTests.test_complete_candidate_through_actual_gateway) ... ok
+test_gateway_authentication_precedes_engine_work (test_gateway.UpstreamGatewayTests.test_gateway_authentication_precedes_engine_work) ... ok
+test_gateway_length_finish_is_not_accepted_as_complete (test_gateway.UpstreamGatewayTests.test_gateway_length_finish_is_not_accepted_as_complete) ... ok
+test_export_is_accepted_and_changed_source_flags_only_linked_claim (test_regnav.RegnavIntegration.test_export_is_accepted_and_changed_source_flags_only_linked_claim) ... ok
+test_drift_is_visible_and_does_not_claim_support (test_render.RenderTest.test_drift_is_visible_and_does_not_claim_support) ... ok
+test_missing_source (test_render.RenderTest.test_missing_source) ... ok
+test_model_source_and_title_cannot_insert_markup (test_render.RenderTest.test_model_source_and_title_cannot_insert_markup) ... ok
+test_missing_reweave_is_actionable_import_error (test_replay.MissingDependencyTests.test_missing_reweave_is_actionable_import_error) ... ok
+test_capture_larger_than_default_reweave_input_limit_is_supported (test_replay.ReplayTests.test_capture_larger_than_default_reweave_input_limit_is_supported) ... ok
+test_capture_tampering_fails_before_store_is_created (test_replay.ReplayTests.test_capture_tampering_fails_before_store_is_created) ... ok
+test_changed_policy_rejects_saved_evidence_and_blocks_cached_report (test_replay.ReplayTests.test_changed_policy_rejects_saved_evidence_and_blocks_cached_report) ... ok
+test_current_snapshot_does_not_borrow_mutable_caller_state (test_replay.ReplayTests.test_current_snapshot_does_not_borrow_mutable_caller_state) ... ok
+test_direct_revalidation_blocks_export_after_policy_change (test_replay.ReplayTests.test_direct_revalidation_blocks_export_after_policy_change) ... ok
+test_export_detects_modified_evidence (test_replay.ReplayTests.test_export_detects_modified_evidence) ... ok
+test_fabricated_quote_cannot_export_evidence (test_replay.ReplayTests.test_fabricated_quote_cannot_export_evidence) ... ok
+test_first_review_and_repeat_have_real_durable_reuse (test_replay.ReplayTests.test_first_review_and_repeat_have_real_durable_reuse) ... ok
+test_source_drift_changes_judgement_without_new_work (test_replay.ReplayTests.test_source_drift_changes_judgement_without_new_work) ... ok
+
+----------------------------------------------------------------------
+Ran 48 tests in 26.199s
+
+OK

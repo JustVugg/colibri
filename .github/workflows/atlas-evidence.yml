@@ -1,0 +1,40 @@
+name: Atlas Evidence Replay
+
+on:
+  push:
+    paths: ['examples/atlas_evidence/**', '.github/workflows/atlas-evidence.yml']
+  pull_request:
+    paths: ['examples/atlas_evidence/**', '.github/workflows/atlas-evidence.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/checkout@v4
+        with:
+          repository: Albertito-AI/regnav-source-watch
+          ref: d758e4e53b73eac1a2d627a534709042b4288a45
+          path: .test-deps/regnav
+          persist-credentials: false
+      - name: Install pinned optional replay dependency
+        run: python -m pip install -r examples/atlas_evidence/requirements.txt
+      - name: Run checks and real RegNav interoperability
+        env:
+          REGNAV_SOURCE_WATCH: ${{ github.workspace }}/.test-deps/regnav
+        run: python -m unittest discover -s examples/atlas_evidence/tests -v
+      - name: Exercise the deterministic replay demonstration
+        run: python -m examples.atlas_evidence demo --with-reweave --out "$RUNNER_TEMP/evidence-demo"
