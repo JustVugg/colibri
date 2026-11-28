@@ -1,0 +1,19 @@
+# directories replaced by summarize.py --shorten: <container on nvme0>, <copy on nvme2>, <copy on nvme3>
+== base-off-1
+[K3] prefill done in 109.1s (0.83 tok/s)
+[K3] decode 64 tokens in 249.6s (0.26 tok/s) | expert hit 14.5% (18207/125217) | 1877.7 GB streamed
+[K3] time: attn 50.0s moe 306.4s (eload 199.8s) head 1.1s | RSS 77.0 GB
+drive bytes: nvme0n1 nvme2n1 nvme3n1 nvme1n1 1946452377600 0 0 0
+output sha256: a1f8d5c503cecf8cf4bc1c91fd938dc3cef3b0a66a7f62be5d4cce01af546bc7
+== base-off-2
+[K3] prefill done in 109.3s (0.83 tok/s)
+[K3] decode 64 tokens in 249.6s (0.26 tok/s) | expert hit 14.5% (18207/125217) | 1877.7 GB streamed
+[K3] time: attn 50.1s moe 306.5s (eload 199.7s) head 1.1s | RSS 77.0 GB
+drive bytes: nvme0n1 nvme2n1 nvme3n1 nvme1n1 1946452377600 0 0 0
+output sha256: a1f8d5c503cecf8cf4bc1c91fd938dc3cef3b0a66a7f62be5d4cce01af546bc7
+== base-off-3
+[K3] prefill done in 109.3s (0.83 tok/s)
+[K3] decode 64 tokens in 249.5s (0.26 tok/s) | expert hit 14.5% (18207/125217) | 1877.7 GB streamed
+[K3] time: attn 50.1s moe 306.4s (eload 199.8s) head 1.1s | RSS 77.0 GB
+drive bytes: nvme0n1 nvme2n1 nvme3n1 nvme1n1 1946452377600 0 0 0
+output sha256: a1f8d5c503cecf8cf4bc1c91fd938dc3cef3b0a66a7f62be5d4cce01af546bc7

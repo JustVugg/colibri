@@ -1,0 +1,1 @@
+Write a connected adventure story in 40 chapters. The main character is a lighthouse keeper, and the story takes place on a remote island in the North Sea. Each chapter starts with its own line 'Chapter <number>: <title>' and has about 150 words. Write all 40 chapters in full, with no summary at the end.

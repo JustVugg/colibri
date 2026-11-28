@@ -145,6 +145,19 @@ setting with a `K3_LOGITS` A/B first). Note that K3's router was trained with Qu
 flat expert usage), so LRU hit rates are structurally lower than on models
 with skewed routing — expect the expert tier to be bandwidth-bound.
 
+A layer's 896 experts live in one shard, so one drive reads all the misses of
+a layer, and `K3_DIRS` cannot spread them. `COLI_MODEL_MIRROR` lists copies of
+the shards on other drives ([multidisk.md](multidisk.md)). The O_DIRECT misses
+of each batch then go round-robin over the drives, in proportion to
+`COLI_DISK_WEIGHTS` or to the startup probe. The cursor continues from batch to
+batch, so the extra read of a batch does not always go to the same drive.
+Buffered reads (`K3_DIRECT=0`) and reads outside a batch (the pins from the
+history, the tier's warm start) keep one fixed drive per expert, so a WILLNEED
+hint and the page cache see one copy. A copy that lacks a shard leaves that
+shard's experts on the primary. The policy is in `c/mirror_policy.h`, and the
+summary at the end of a run prints the reads of each drive
+(`[K3 MIRROR] reads:`).
+
 ## Repacked container (`tools/k3_repack.py`)
 
 ```
@@ -247,6 +260,8 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
 | `K3_THINK` | 1 | chat mode: open the structural think channel (0 = response-only) |
 | `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication) |
+| `COLI_MODEL_MIRROR` | unset | copies of the shards on other drives, separated by `;` or `,`: each batch of expert misses reads from all drives ([Streaming design](#streaming-design)) |
+| `COLI_DISK_WEIGHTS` | probe | one positive weight per drive, the primary first (`1,1,1` for three equal drives) |
 | `K3_MAXT` | prompt+ngen | context capacity |
 | `K3_LAYERS` | all | truncate the stack (validation) |
 | `K3_TRACE` | — | dump f32 hidden state after every layer (validation) |
