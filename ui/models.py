@@ -214,7 +214,7 @@ def serve_argv(argv):
     return argv[:at] + ["serve"] + rest
 
 
-# This UI as `coli web`'s child: it exits when that process does (server.py, --exit-with-stdin),
+# This UI as `coli web`'s child: it exits when that process does (server.py, --exit-with-parent),
 # but a model switch stops it on purpose. While `switching`, the UI stays; after, it follows `pid`,
 # the gateway the switch started (or the previous one brought back).
 LIFE = {"switching": False, "pid": None}
@@ -1165,7 +1165,7 @@ def start_catalog_download(model_id):
                 if os.path.exists(os.path.join(dest, creates)):
                     continue
                 r = subprocess.run([sys.executable, os.path.join(COLI_DIR, "tools", tool + ".py"), dest],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, stdin=subprocess.DEVNULL)
                 if r.returncode:
                     raise RuntimeError("tools/%s.py: %s" % (tool, (r.stderr or r.stdout)[-300:]))
         run_download(job, e.repo, e.revision, files, dest, after)
@@ -1190,7 +1190,8 @@ def start_gguf_download(repo, stem):
 
     def after(j):
         r = subprocess.run([sys.executable, COLI, "import", os.path.join(dest, v["files"][0]["path"]),
-                            "--out", out, "--mode", "link"], capture_output=True, text=True, cwd=COLI_DIR)
+                            "--out", out, "--mode", "link"], capture_output=True, text=True, cwd=COLI_DIR,
+                           stdin=subprocess.DEVNULL)
         if r.returncode:
             raise RuntimeError("coli import: %s" % (r.stderr or r.stdout)[-400:])
         j["msg"] = "importato in %s" % out
@@ -1309,7 +1310,7 @@ def switch_model(path, force=False, tier=None):
                     raise RuntimeError("manca il motore %s in %s" % (d.engine_artifact, COLI_DIR))
                 job.update(state="building", msg="compilo il motore %s (una volta sola)" % d.build_target)
                 r = subprocess.run(["make", "-j%d" % max(1, (os.cpu_count() or 2) // 2), d.build_target],
-                                   cwd=COLI_DIR, capture_output=True, text=True)
+                                   cwd=COLI_DIR, capture_output=True, text=True, stdin=subprocess.DEVNULL)
                 if r.returncode or not os.path.exists(binary):
                     raise RuntimeError("make %s non riuscito: %s" % (d.build_target, (r.stderr or r.stdout)[-300:]))
             if old and old["coli"]:

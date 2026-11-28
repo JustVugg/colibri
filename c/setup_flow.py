@@ -302,7 +302,7 @@ def _cc_lacks_static_openmp(cc):
     nothing, so it counts as "not missing" and never blocks a build that might work."""
     try:
         r = subprocess.run([cc, "-print-file-name=libgomp.a"], capture_output=True,
-                           text=True, timeout=30)
+                           text=True, timeout=30, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0 and r.stdout.strip() == "libgomp.a"
@@ -881,7 +881,7 @@ def build_engine(family, backend, tc, out=print, make_args=(), update=False):
         out(f"  building: make {' '.join(shown)}  (a few minutes; log: {log_file})")
     write_state("build", engine=family.engine_artifact, backend=backend)
     with open(_ensure_log(build_log_name(backend)), "w", encoding="utf-8", errors="replace") as log:
-        process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+        process = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
         tail = []
         for line in process.stdout:
@@ -1684,7 +1684,7 @@ def stop_server(cfg, out=print):
     # (cp1252 there) would raise on its box-drawing characters.
     result = subprocess.run([sys.executable, coli, "stop", "--port", str(cfg["port"])],
                             capture_output=True, encoding="utf-8", errors="replace", timeout=120,
-                            env=dict(os.environ, COLI_COLOR="0"))
+                            env=dict(os.environ, COLI_COLOR="0"), stdin=subprocess.DEVNULL)
     text = (result.stdout + result.stderr).strip()
     lines = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in text.splitlines()]
     # Keep what `coli stop` reports, not its banner.
@@ -1969,7 +1969,7 @@ def run_post_install(entry, launcher_dir, model_dir, ui):
         script = os.path.join(launcher_dir, "tools", f"{tool}.py")
         ui.say(f"  writing {creates} (tools/{tool}.py)")
         result = subprocess.run([sys.executable, script, model_dir], capture_output=True,
-                                encoding="utf-8", errors="replace")
+                                encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
         if result.returncode != 0 or not os.path.exists(os.path.join(model_dir, creates)):
             raise SetupError(f"tools/{tool}.py failed: {(result.stderr or result.stdout).strip()[-400:]}")
 

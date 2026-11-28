@@ -547,7 +547,7 @@ def _cuda_probe_inprocess():
 def _probe_cuda_child(timeout=25):
     try:
         result = subprocess.run([sys.executable, os.path.join(HERE, "setup_hw.py"), "--cuda-probe"],
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     for line in reversed(result.stdout.splitlines()):
@@ -838,7 +838,7 @@ def _probe_vulkan_child(extra_env=None, timeout=25):
         env.update(extra_env)
     try:
         result = subprocess.run([sys.executable, os.path.join(HERE, "setup_hw.py"), "--vulkan-probe"],
-                                capture_output=True, text=True, timeout=timeout, env=env)
+                                capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     for line in reversed(result.stdout.splitlines()):
@@ -917,7 +917,7 @@ def _run(cmd, timeout=10):
         # errors="replace": a GPU name in the console code page must not turn
         # into a UnicodeDecodeError that throws the whole probe away.
         return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                              timeout=timeout).stdout
+                              timeout=timeout, stdin=subprocess.DEVNULL).stdout
     except (OSError, subprocess.SubprocessError, ValueError):
         return ""
 

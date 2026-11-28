@@ -43,7 +43,7 @@ def _cwd():
 def _run(cmd, timeout=20):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                           cwd=_cwd(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                           cwd=_cwd(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), stdin=subprocess.DEVNULL)
         return r.stdout
     except (OSError, subprocess.SubprocessError):
         return ""
