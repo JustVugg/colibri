@@ -619,6 +619,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"DSV4_CUDA_RESIDENT_INDEXER", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_RESIDENT_RESERVE_MB", CE_INT, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_RESIDENT_ROUTE", CE_BOOL, CE_DSV4, 0, NULL},
+    {"DSV4_CUDA_STREAM_PRIORITY", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_TC",                     CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_CUDA_TP2_TRACE",              CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_CUDA_VRAM_RESERVE_MB",        CE_STR   , CE_DSV4                                         , 0             , NULL},
