@@ -389,7 +389,7 @@ static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t
         HANDLE wh = g->wh ? g->wh[t->file] : NULL;
         HANDLE h = wh ? wh : (HANDLE)_get_osfhandle(g->fds[t->file]);
         if (h == INVALID_HANDLE_VALUE) return -1;
-        DWORD want = left > (1 << 30) ? (DWORD)(1 << 30) : (DWORD)left, got = 0;
+        DWORD want = left > (16 << 20) ? (DWORD)(16 << 20) : (DWORD)left, got = 0;
         OVERLAPPED ov; memset(&ov, 0, sizeof ov);
         ov.Offset = (DWORD)(pos & 0xFFFFFFFFu); ov.OffsetHigh = (DWORD)(pos >> 32);
         if (wh) {   /* overlapped: an event of this read's own, waited on here */

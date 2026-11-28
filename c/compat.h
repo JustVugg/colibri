@@ -147,6 +147,15 @@ static __thread DWORD compat_pread_lasterr __attribute__((unused));
  * handle may return before it is done, and is then waited for on an event that
  * belongs to this call -- the file handle itself is signalled by every thread's
  * completions. On a synchronous handle the event is set and never needed. */
+/* Cap each Windows ReadFile transfer to 16 MiB (4 KiB-aligned for O_DIRECT /
+ * FILE_FLAG_NO_BUFFERING). Single OVERLAPPED ReadFile transfers > 256 MiB
+ * (e.g. 883 MiB - 1.2 GiB embed/lm_head tensors) lock massive MDLs and wedge
+ * Realtek 2.5GbE RTL8125B RX DMA on shared chipset PCIe switches (AMD X670E
+ * Promontory21), whereas 16 MiB chunks sustain full ~5.1 GB/s NVMe throughput
+ * with zero NIC packet drops. */
+#ifndef COMPAT_WIN_READ_CHUNK
+#define COMPAT_WIN_READ_CHUNK (16u << 20)
+#endif
 static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
@@ -156,7 +165,8 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     size_t total = 0;
     while(total < n){
         size_t chunk = n - total;
-        DWORD chunk32 = (chunk > 0x7FFFFFFF) ? 0x7FFFFFFF : (DWORD)chunk;
+        DWORD chunk32 = (chunk > COMPAT_WIN_READ_CHUNK) ? (DWORD)COMPAT_WIN_READ_CHUNK : (DWORD)chunk;
+        ResetEvent(done);
         OVERLAPPED ov = {0};
         ov.Offset     = (DWORD)( (off + (off_t)total)        & 0xFFFFFFFFULL);
         ov.OffsetHigh = (DWORD)(((off + (off_t)total) >> 32) & 0xFFFFFFFFULL);
