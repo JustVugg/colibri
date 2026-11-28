@@ -4,6 +4,15 @@ These scripts support model preparation and offline engineering work. They are
 not runtime dependencies of the C engine.
 
 - `convert_fp8_to_int4.py`, `download_glm52.py`: model preparation
+- `check_cuda_limits.py` (`make check-cuda-limits`): GPU-less sm_120 limits gate
+  for the product CUDA kernels: registers, shared memory, launch bounds and
+  spills from nvcc/ptxas, against planted controls in
+  `tests/cuda_limits_controls/` and the spill baseline in
+  `cuda_limits_baseline/`. `check_cuda_dups.py` (`make check-cuda-dups`)
+  reports device helpers copied across the CUDA sources. Both follow
+  TensorFold's no-GPU gates (kernel contract gate 5 and
+  `tools/zig/cuda_common_check.py`, Apache-2.0; the dups tokenizer is adapted
+  from the latter).
 - `qpack_install_policy.py`: source-bound resume decisions and manifest-last
   publication primitives for future qpack download/repack frontends. Hold its
   install session for the full transfer. Qpack v1 has sizes but no content
