@@ -1,0 +1,117 @@
+"""Freeze a bounded parent admission REQUEST, never an execution permit."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parents[3] / "docs/experiments/cascade"
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--request-url")
+    args = p.parse_args()
+    inventory = json.loads((OUT / "recipient-inventory.json").read_text())
+    prompts = {
+        name: "".join(f"Record {i}: alpha beta gamma delta.\n" for i in range(lines)) +
+              "Continue with a short story about a lighthouse.\n"
+        for name, lines in (("short", 4), ("long", 128))}
+    (OUT / "serving-prompts.json").write_text(json.dumps(prompts, indent=2) + "\n")
+    plan = {
+        "id": "CASCADE-Q36-SERVE-001", "version": 1, "cue": "DORY-M03",
+        "procedure": "ADAPTIVE_TRANSFER_DOE, existing G0-G5",
+        "status": "REQUESTED_NOT_ADMITTED", "admission_owner": "parent (Dory coordinating session)",
+        "request_url": args.request_url, "approval_receipt": None,
+        "gpu_jobs_launched": 0, "measured_model_results": None,
+        "target": {"inventory": "recipient-inventory.json", "model": inventory["model"],
+                   "engine_family": inventory["engine_family"],
+                   "weights_sha256": inventory["weight_sha256"],
+                   "precision": "Original Q6_K/F32 tensor mix; native Q36 arithmetic unchanged across arms",
+                   "not_literal_qwen36_35b": True},
+        "alternatives": {"NO_CHANGE": "production incumbent; retain unless model evidence passes",
+                         "minimal_fix": "only guarded stable sorting in generated header; default off",
+                         "device_sampling": "deferred for semantics/ABI cost",
+                         "literal_Qwen3.6_35B": "local partial is not eligible; no download authorized"},
+        "selection_reason": "Complete local model, V248320 matches synthetic pilot, existing registered config, fits a more bounded trial than 18.56GB Qwen3 MoE; not assumed GPU-resident until load gate",
+        "hardware": {"gpu": "NVIDIA GeForce RTX 5080", "reported_vram_mib": 16303,
+                     "driver": "621.40", "cpu": "AMD Ryzen Threadripper PRO 9955WX 16-Cores"},
+        "build_block": {
+            "base": "ab98f29f8acef3a48dc37838c3d896c9acc9b908",
+            "sampler_generated_sha256": json.loads((OUT / "sample-screen.json").read_text())["sha256"]["generated_header"],
+            "build_owner": "parent", "build_command_family": "c/Makefile qwen36 Windows CUDA_DLL=1 in source-only private staging; no installed overwrite",
+            "single_candidate_binary": True, "retained_original": True,
+            "diagnostic_selector": "CASCADE_SAMPLE_PROFILE startup flag (test-only instrumentation, to implement/review before build)",
+            "required_before_execution": ["Pin full source delta, compiler and flags",
+                "Hash private engine and actually loaded CUDA DLL/runtime",
+                "Re-run sampler/rank oracles with exact build configuration",
+                "Compare diagnostic-off original vs candidate-off control; verify selector on route",
+                "Finite logits/full sampled token equality in load/correctness gate",
+                "No kernel, activation regime, tensor representation or offload change"]},
+        "environment": {"SERVE": "1", "SERVE_BATCH": "1", "KV_SLOTS": "1", "SEED": "42",
+                        "Q36_MAXT": "2048", "COLI_KV_PREFIX": "0", "COLI_LOOKUP": "0",
+                        "Q36_MTP": "0", "COLI_CUDA_CHAIN": "1", "OMP_NUM_THREADS": "8",
+                        "COLI_NO_OMP_TUNE": "1", "USAGE_SAVE": "0"},
+        "environment_rules": ["SNAP is the existing registered qwen35-9b-q6 directory, read-only",
+            "Clean inherited tuning variables; record exact allowlisted environment and placement",
+            "Do not force GQ_EXACT or copy Dory selectors; native precision/placement identical in both arms",
+            "DORY_CPU_SAMPLE_RADIX=0/1 is the only algorithm factor; startup-cached, fresh process each arm",
+            "COLI_LOGIT_DUMP, DUMP, profiler and speculative/lookup drafter paths absent",
+            "Fail if chain declined, VRAM insufficient or fallback/placement differs; do not reduce workload"],
+        "workload_blocks": [{
+            "id": name, "prompt_file": "serving-prompts.json", "prompt_key": name,
+            "prompt_utf8_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "prompt_bytes": len(text.encode()), "actual_native_tokens": None,
+            "token_gate": "Freeze ACCEPT token count in CPU/preflight; short < long and long + 32 <= 2048; do not silently truncate",
+            "max_generated_tokens": 32, "temperature": .7, "top_p": 1.,
+            "cache": "prefix off; fixed complete native layer/DeltaNet state; no skipped layers"}
+            for name, text in prompts.items()],
+        "phase_A": {
+            "purpose": "baseline sampler fraction, capacity, correctness and cold setup, not speedup",
+            "maximum_fresh_processes": 2, "per_process": "One history block, selector=0, profile=1",
+            "requests": ["one fixed short greedy warmup (8 output tokens, excluded)",
+                         "one same-history greedy control (32 max tokens)",
+                         "one same-history full-sort sampled request (32 max tokens)"],
+            "instrumentation": "QPC total sampled-call wall time/count, token sequence hash, prefill start/end and completed forward boundaries; no vectors or GPU trace",
+            "fraction": "sum sampler wall / measured full sampled-request wall; also sampler / decode PROF wall. Report timer overhead and possible overlap; never add CPU/GPU times.",
+            "stopping": "Stop numerical, state or load failures. If credible full-removal Amdahl upper bound is <3% total-request gain, close model speed line without phase B. If fraction is invalid/overhead material, HOLD rather than infer benefit."},
+        "phase_B": {
+            "admission": "Conditional within parent approval only if phase A informative and worthwhile",
+            "maximum_fresh_processes": 8, "warmup": "Same fixed short greedy warmup, 8 output tokens per fresh process, excluded",
+            "per_block_pairs": [["off", "on"], ["on", "off"]],
+            "requests_per_process": ["same-history greedy control, 32 max tokens",
+                                     "same-history top_p1 sampled request, 32 max tokens"],
+            "profiling": "CASCADE_SAMPLE_PROFILE=0; trace-free paired wall-clock timing",
+            "checkpoint": "Atomically persist both arms and identities after every complete pair; preserve failed/incomplete runs, never count them as complete",
+            "precision": "No logits, tensor, RNG or state change beyond equivalent sorting",
+            "decision": "Require exact tokens/text/count/stop, matched contexts and positive useful effect per block with controls consistent with noise. No pooled history estimates. Clear loss/negligible benefit closes that workload; do not spend G3-G5 rescuing it.",
+            "augmentation": "No automatic extra pairs. Request one additional balanced pair only if noise/controls could change retention; no sweep"},
+        "measurements": [
+            "spawn-to-READY cold setup and first-request latency separately from warm ROI",
+            "prefill completed tokens/time; decode forward and emitted-token rates with denominators",
+            "client TTFT, inter-DATA intervals (not falsely per-token), end-to-end and aggregate emitted tokens/wall",
+            "per-request and per-token latency distributions; empirical p95 only, no population-tail claim from tiny n",
+            "Windows process-tree peak working set/private bytes and total GPU used/free sampled 50ms; record sampler observer overhead",
+            "peak sampled GPU memory is a lower bound, not exact instantaneous allocation high-water",
+            "raw counts, EOS/limit, token/text hash, errors, RNG call count/final probe after all measured requests",
+            "total experiment/setup/build/monitor wall time, all starts including failures"],
+        "cost_bounds": {"total_model_process_starts_max": 10,
+                        "wall_timeout_seconds_per_start": 240, "campaign_wall_cap_seconds": 1800,
+                        "concurrency": 1, "timed_gpu_job_families": 1,
+                        "no_parallel_compilers_or_heavy_CPU_work": True},
+        "gate_limits": {
+            "G0": "recipient fraction remains unknown until phase A",
+            "G1": "reuse bounded sampler oracles only after exact configuration/identity checks; full model gate pending",
+            "G2": "phase B short/long screen only, conditional",
+            "G3": "not admitted; alternate Qwen3 attention-only model if useful, held-out prompt/context first",
+            "G4_G5": "not admitted; full API/tools/cancel/recovery/rollback and configured regression before integration"},
+        "rollback": "Terminate private processes, remove no installed files; retain original runtime/profile/model hashes. Parent alone integrates any shared patch.",
+        "feedback": "Append observed fractions, pair results, failures and decision to existing TRANSFER_REGISTRY.json cascade section; preserve synthetic negatives",
+    }
+    (OUT / "serving-admission.json").write_text(json.dumps(plan, indent=2) + "\n")
+    print(json.dumps({"id": plan["id"], "status": plan["status"],
+                      "target": plan["target"], "blocks": plan["workload_blocks"],
+                      "cost_bounds": plan["cost_bounds"]}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

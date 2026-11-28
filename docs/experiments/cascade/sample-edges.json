@@ -1,0 +1,21 @@
+{
+  "scope": "G1 complete rank, guards, fallback, scratch refusal, RNG and TLS checks only",
+  "donor_fixture_sha256": "e0adb60e1acc10c1dd719b5453b4af0b0bc6bdc9d1ea506d4ca59486e0546418",
+  "generated_header_sha256": "b7ed7bd88b8c57f511b8d752f17b22298b7363ec1ac73bf950a3cf0780ab3964",
+  "runs": [
+    {
+      "selector": null,
+      "output": "sort/RNG correctness: 609 checks, 0 failures, mode=qsort"
+    },
+    {
+      "selector": "1",
+      "output": "sort/RNG correctness: 609 checks, 0 failures, mode=radix"
+    },
+    {
+      "selector": "other",
+      "output": "sort/RNG correctness: 609 checks, 0 failures, mode=qsort"
+    }
+  ],
+  "executable_sha256": "ff2411fc633f3447324d9197d9289bacf0465b83af25d9d03b633955c772931d",
+  "passed": true
+}
