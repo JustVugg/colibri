@@ -61,7 +61,7 @@ def main():
                 "regression": "three sampler oracle runs; no full model regression" if original_id == "M03" else None,
                 "confidence": "bounded synthetic evidence" if original_id == "M03" else "source-only",
                 "acceptance_status": "qualified_component_only" if original_id == "M03" else "deferred",
-                "pr": None,
+                "pr": "https://github.com/JustVugg/colibri/pull/3161",
                 "next_actions": ["Matched Q36 serving and peak RAM before promotion"] if original_id == "M03"
                                 else ["Resolve recipient dispatch/identity before timing"],
             },
@@ -163,6 +163,12 @@ def main():
         "cores": 16, "logical_processors": 32,
         "source": "Win32_Processor read after screen, same host; no continuous load monitor",
         "gpu": "not used"}
+    registry["publication"] = {
+        "pr": "https://github.com/JustVugg/colibri/pull/3161",
+        "state": "draft; human review pending",
+        "feedback": "docs/experiments/cascade/DORY_FEEDBACK.md",
+        "dory_issue_delivery": "Attempt failed: g-damilano/colibri has issues disabled. Feedback is published on the Cascade branch and PR, not acknowledged by Dory.",
+        "integration": "not merged; parent shared-code approval and GPU admission pending"}
     donor["cascade"] = registry
     target = ROOT / source_path
     target.parent.mkdir(parents=True, exist_ok=True)

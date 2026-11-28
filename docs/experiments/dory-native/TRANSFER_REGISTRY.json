@@ -1339,7 +1339,7 @@
           "regression": null,
           "confidence": "source-only",
           "acceptance_status": "deferred",
-          "pr": null,
+          "pr": "https://github.com/JustVugg/colibri/pull/3161",
           "next_actions": [
             "Resolve recipient dispatch/identity before timing"
           ]
@@ -1437,7 +1437,7 @@
           "regression": null,
           "confidence": "source-only",
           "acceptance_status": "deferred",
-          "pr": null,
+          "pr": "https://github.com/JustVugg/colibri/pull/3161",
           "next_actions": [
             "Resolve recipient dispatch/identity before timing"
           ]
@@ -1543,7 +1543,7 @@
           "regression": "three sampler oracle runs; no full model regression",
           "confidence": "bounded synthetic evidence",
           "acceptance_status": "qualified_component_only",
-          "pr": null,
+          "pr": "https://github.com/JustVugg/colibri/pull/3161",
           "next_actions": [
             "Matched Q36 serving and peak RAM before promotion"
           ]
@@ -1647,7 +1647,7 @@
           "regression": null,
           "confidence": "source-only",
           "acceptance_status": "deferred",
-          "pr": null,
+          "pr": "https://github.com/JustVugg/colibri/pull/3161",
           "next_actions": [
             "Resolve recipient dispatch/identity before timing"
           ]
@@ -1751,7 +1751,7 @@
           "regression": null,
           "confidence": "source-only",
           "acceptance_status": "deferred",
-          "pr": null,
+          "pr": "https://github.com/JustVugg/colibri/pull/3161",
           "next_actions": [
             "Resolve recipient dispatch/identity before timing"
           ]
@@ -1995,6 +1995,13 @@
       "logical_processors": 32,
       "source": "Win32_Processor read after screen, same host; no continuous load monitor",
       "gpu": "not used"
+    },
+    "publication": {
+      "pr": "https://github.com/JustVugg/colibri/pull/3161",
+      "state": "draft; human review pending",
+      "feedback": "docs/experiments/cascade/DORY_FEEDBACK.md",
+      "dory_issue_delivery": "Attempt failed: g-damilano/colibri has issues disabled. Feedback is published on the Cascade branch and PR, not acknowledged by Dory.",
+      "integration": "not merged; parent shared-code approval and GPU admission pending"
     }
   }
 }

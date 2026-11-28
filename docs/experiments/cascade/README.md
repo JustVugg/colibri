@@ -10,6 +10,9 @@ Bounded transfer proposal on `feat/colibri-optimisation-cascade`, based on
 - [Raw synthetic CPU observations](sample-screen.json)
 - [Same-build paired contrasts](contrasts.json)
 - [Complete-rank/edge/fallback checks](sample-edges.json)
+- [Dory feedback and parent admission request](DORY_FEEDBACK.md)
+
+Draft PR: https://github.com/JustVugg/colibri/pull/3161 (human review pending).
 
 Dory owns source discoveries; Cascade owns these trials/proposals. Parent
 (Dory coordinating session) is the **single shared-code integration and GPU
