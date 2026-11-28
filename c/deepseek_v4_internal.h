@@ -207,6 +207,16 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const uint16_t *gate, const float *bias,
                        const int *forced_indices, int experts, int dimension,
                        int topk, float route_scale);
+int coli_v4_route_bf16_scalar(float *weights, int *indices, const float *hidden,
+                              const uint16_t *gate, const float *bias,
+                              const int *forced_indices, int experts, int dimension,
+                              int topk, float route_scale);
+int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
+                              const uint16_t *gate, const float *bias,
+                              const int *forced_indices, int experts, int dimension,
+                              int topk, float route_scale, const float *logits);
+void coli_v4_route_bf16_rows(float *logits, const uint16_t *gate, const float *hidden,
+                             const int *rows, int count, int dimension);
 /* Re-read V4_ROUTE_FORCED_ONLY (the router reads it once; tests change it). */
 int coli_v4_route_forced_only_reload(void);
 
@@ -867,6 +877,19 @@ int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
 
 #endif /* COLI_VULKAN || COLI_CUDA */
+/* Resident dense layers table exposed by LAYER_RESIDENT so the block unit
+ * can run the next layer's router early (V4_NEXT_PREFETCH). */
+extern const ColiDeepSeekV4LayerWeights *g_v4_next_layers;
+extern const unsigned char *g_v4_next_ready;
+extern int g_v4_next_nlayers;
+/* Next-layer prefetcher hooks into the hot expert store:
+ *   lookup_set_prefetch  marks the calling thread's lookup as a prefetch
+ *                        (honoured by V4_PREFETCH_NO_CREDIT);
+ *   resident             1 if key sits in RAM cache, 0 if not, -1 on error;
+ *   record_bytes         bytes per expert record in the store (0 if unknown). */
+void coli_v4_expert_lookup_set_prefetch(int on);
+int coli_v4_expert_store_resident(ColiExpertStore *store, ColiExpertKey key);
+uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
 /* The compressor's and the indexer's views (the Vulkan dense chain, the
  * CUDA fused layer's state mirror). */
 typedef struct { float *kv, *score; int rows, projection, ratio, head_dim, rotate_fp4; } ColiV4CompressorView;
@@ -1172,6 +1195,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                                 ColiExpertStore *store,
                                 const float *inputs, const int *tokens,
                                 int batch);
+void coli_v4_gpu_moe_batch_routes_out(int *ids, float *weights, int *filled);
+void coli_v4_dump2_sync(void);
 /* Resident experts: 0 = done (or a budget fallback under auto), -1 = a hard
  * failure the engine must reject. */
 int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size);
