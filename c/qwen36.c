@@ -9819,6 +9819,8 @@ typedef struct {
     int mtp, ahead_src;          /* Q36_MTP: the head drafts too; the source of the verify ahead */
     int mtp_depth;               /* Q36_MTP_DRAFTS: drafts per verify, 1..7 (1 unset); 0 ("auto") = the gate's pick up to 7 */
     int mtp_pstep;               /* Q36_MTP_PSTEP: the verify's depth from the drafts' own probabilities */
+    int keep;                    /* COLI_SPEC_GATE_KEEP: the gate goes on from the generation before's */
+    int decline, decline_n;      /* Q36_SPEC_DECLINE: a fixed depth worth less than a plain step is not drafted; its probe's clock */
     float ahead_p[Q36_SPEC_ROWS];/* those probabilities, for the gate once the verify is judged */
     uint64_t mtp_drafts, mtp_accepted;
     int force, force_row;        /* COLI_LOOKUP_FORCE (tests): the oracle's tokens as the proposal */
@@ -9877,6 +9879,8 @@ static float q36_mtp_min_p(void) {
 }
 #endif
 
+static SpecGate g_q36_gate_kept; static int g_q36_gate_kept_on;   /* COLI_SPEC_GATE_KEEP=1 */
+
 static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     memset(sp, 0, sizeof *sp);
     const char *e = getenv("COLI_LOOKUP");
@@ -9891,6 +9895,11 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     sp->force = q36_spec_force_mode(getenv("COLI_LOOKUP_FORCE"), &sp->force_row);
     e = getenv("COLI_SPEC_GATE");
     spec_gate_init(&sp->gate, e && *e == '0');
+    /* COLI_SPEC_GATE_KEEP=1: what the last generation measured (acceptance, rho, the draft costs)
+     * instead of the priors: a turn of the MTP profile ran whole on rows 2:1.50 3:2.00 for a real 1.04 */
+    e = getenv("COLI_SPEC_GATE_KEEP");
+    sp->keep = e && *e == '1' && !sp->gate.off;
+    if (sp->keep && g_q36_gate_kept_on) spec_gate_carry(&sp->gate, &g_q36_gate_kept);
     /* DFlash2: a request's first step plain, so its deep verifies are priced with T(1) measured
      * (SPEC_RHO0 makes eight rows cost 4.5 steps: the drafts were cut at about four, 56 tok/s on code
      * against 65 at seven) */
@@ -9919,6 +9928,8 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
      * within a fixed depth above; Q36_MTP_PSTEP=0 keeps it whatever the drafts look like */
     e = getenv("Q36_MTP_PSTEP");
     sp->mtp_pstep = !(e && *e == '0');
+    e = getenv("Q36_SPEC_DECLINE");
+    sp->decline = e && *e == '1';
 #ifdef QWEN36_METAL_GRAPH
     /* The Metal graph drafts with its own MTP head (the other engines' head is not loaded beside it, so sp->mtp
      * is 0); prompt lookup only under COLI_LOOKUP_FORCE (tests of the verify). */
@@ -10066,6 +10077,19 @@ static int q36_mtp_depth(Q36Spec *sp, int room, double *value) {
             return 0;
         }
         int km = sp->mtp_depth < maxm ? sp->mtp_depth : maxm;
+        /* Q36_SPEC_DECLINE=1: no draft while no depth up to the fixed one is worth a plain step, by the
+         * measured acceptance, rows and the drafter's block (DFlash2 at 93k positions: a 181 ms block
+         * before a 51 ms step, 5.7 tok/s). The first such step of a generation and every SPEC_PROBE after it draft all the same (a kept gate,
+         * COLI_SPEC_GATE_KEEP, would else never probe in generations shorter than SPEC_PROBE), so the
+         * acceptance and the block's cost stay measured and drafting comes back. Needs T(1) measured. */
+        if (sp->decline && !sp->gate.off && !sp->mtp_force && sp->gate.t_w[1] > 0.0) {
+            double bv = 1.0;
+            for (int k = 1; k <= km; k++) { double v = spec_gate_value(&sp->gate, SPEC_SRC_MTP, k, NULL); if (v > bv) bv = v; }
+            if (!(bv > 1.0)) {
+                if (sp->decline_n++ % SPEC_PROBE) { sp->gate.declined[SPEC_SRC_MTP]++; if (value) *value = 1.0; return 0; }
+                sp->gate.probes[SPEC_SRC_MTP]++;
+            }
+        }
         if (value) *value = spec_gate_value(&sp->gate, SPEC_SRC_MTP, km, NULL);
         return km;
     }
@@ -10156,9 +10180,13 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
             free(emb);
             if (n < k) k = n;
             for (int j = 0; j < k; j++) sp->ahead_p[j] = pr[j];
-            if (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force && k > 1) {
+            /* Q36_SPEC_DECLINE: the block's time is the gate's cost of drafting, not the verify's rows'
+             * (lookup's verifies read the same T(rows)), and drafts the gate values under a plain step
+             * are dropped, the first too */
+            if (sp->decline && n > 0) { spec_gate_pre_cost(&sp->gate, SPEC_SRC_MTP, now_s() - t_verify); t_verify = 0; }
+            if (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force && k > (sp->decline ? 0 : 1)) {
                 int kp = spec_gate_pick_p(&sp->gate, SPEC_SRC_MTP, k, sp->ahead_p, NULL);
-                k = kp < 1 ? 1 : kp;
+                k = kp < 1 ? (sp->decline ? 0 : 1) : kp;
             }
             if (k && sp->mtp_force) {
                 Q36Spec forced = *sp; forced.force = sp->mtp_force; forced.force_row = sp->mtp_force_row;
@@ -10236,6 +10264,7 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
  * state is the one plain decoding leaves after the same tokens. */
 static void q36_spec_end(Model *m, Q36Spec *sp) {
     if (sp->ahead_n) { sp->ended_ahead = 1; q36_spec_settle(m, sp, sp->ahead_i, 0); }
+    if (sp->keep && !sp->gate.off) { g_q36_gate_kept = sp->gate; g_q36_gate_kept_on = 1; }
 #ifdef QWEN36_METAL_GRAPH
     if (m->graph) qg_gguf_lock(m, m->graph, 0, 1);   /* a request without a decode step: the dense pages go back */
 #endif

@@ -168,6 +168,41 @@ static void test_gate_p(void) {
     CHECK(g.prop[SPEC_SRC_MTP][0] == 40 && g.hit[SPEC_SRC_MTP][0] == 0, "the position counts follow too");
     CHECK(spec_gate_pbin(-1.0f) == 0 && spec_gate_pbin(2.0f) == SPEC_PBINS - 1 && spec_gate_pbin(0.0f / 0.0f) == 0,
           "estimates outside [0, 1] and NaN clamp to the ends");
+    /* a source's cost before any draft (a drafter's block): none told, the value as before; told, every
+     * depth dearer by it, so drafts that paid without it can lose to a plain step */
+    {
+        SpecGate a, b; spec_gate_init(&a, 0); spec_gate_init(&b, 0);
+        spec_gate_forward(&a, 1, 1.0); spec_gate_forward(&b, 1, 1.0);
+        spec_gate_forward(&a, 2, 1.1); spec_gate_forward(&b, 2, 1.1);
+        double e = 0, v0 = spec_gate_value(&a, SPEC_SRC_MTP, 1, &e);
+        CHECK(v0 == e / 1.1 && v0 > 1.0, "no block told: value %g", v0);
+        spec_gate_pre_cost(&b, SPEC_SRC_MTP, 3.0);
+        double v1 = spec_gate_value(&b, SPEC_SRC_MTP, 1, NULL);
+        CHECK(v1 == e / (1.1 + 3.0) && v1 < 1.0, "a block of three steps: value %g", v1);
+        CHECK(spec_gate_value(&b, SPEC_SRC_LOOKUP, 1, NULL) == spec_gate_value(&a, SPEC_SRC_LOOKUP, 1, NULL), "the other source's value is its own");
+        CHECK(spec_gate_pick(&a, SPEC_SRC_MTP, 1, NULL) == 1 && spec_gate_pick(&b, SPEC_SRC_MTP, 1, NULL) == 0, "the pick follows");
+    }
+    /* a gate carried into the next generation: the acceptance, rho and the costs stay; T(1) is asked
+     * again by a plain step first, the report counts start over */
+    {
+        SpecGate a, b; spec_gate_init(&a, 0); spec_gate_init(&b, 0);
+        spec_gate_forward(&a, 1, 1.0);
+        for (int i = 0; i < 20; i++) { spec_gate_forward(&a, 3, 1.1); spec_gate_result(&a, SPEC_SRC_MTP, 2, 2); }
+        spec_gate_draft_cost(&a, SPEC_SRC_MTP, 0.01); spec_gate_pre_cost(&a, SPEC_SRC_MTP, 0.02);
+        spec_gate_carry(&b, &a);
+        CHECK(b.acc[SPEC_SRC_MTP][0] == a.acc[SPEC_SRC_MTP][0] && b.acc[SPEC_SRC_MTP][0] > 0.9 && b.rho == a.rho && b.rho < 0.1 &&
+              b.d[SPEC_SRC_MTP] == 0.01 && b.pre[SPEC_SRC_MTP] == 0.02, "carry: acceptance, rho and costs kept");
+        CHECK(b.verifies[SPEC_SRC_MTP] == 0 && b.prop[SPEC_SRC_MTP][0] == 0 && b.hit[SPEC_SRC_MTP][0] == 0, "carry: the counts start over");
+        CHECK(b.t_w[1] == 0.0 && b.t_w[3] == 1.0 && b.t[3] == a.t[3], "carry: T(1) to measure again, T(3) one old measurement");
+        CHECK(spec_gate_rows_cost(&b, 3) == 1.0 + 2 * b.rho, "carry: rows priced by the kept rho until T(1) is back");
+        CHECK(spec_gate_pick(&b, SPEC_SRC_MTP, 2, NULL) == 0, "carry: the first pick is the plain step");
+        spec_gate_forward(&b, 1, 2.0);
+        CHECK(spec_gate_pick(&b, SPEC_SRC_MTP, 2, NULL) == 2, "carry: then the drafts, without relearning");
+        spec_gate_forward(&b, 3, 2.4);
+        CHECK(b.t[3] > 1.7499 && b.t[3] < 1.7501, "carry: a new T(3) weighs as much as all the old ones");
+        SpecGate o; spec_gate_init(&o, 1); spec_gate_carry(&o, &a);
+        CHECK(o.off == 1, "carry: the gate's own off stays");
+    }
     /* off, or no estimates: every draft */
     spec_gate_init(&g, 1);
     CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 4, doubt, NULL) == 4, "gate off: every draft");
