@@ -110,12 +110,14 @@ static void test_extension_combinations(void)
     const char *frames[] = {
         "SUBMIT req 0 3 4 0 1 4 2 logprobs=2 pin=1\nabcWXYZ\nSTOP req\n",
         "SUBMIT req 0 3 4 0 1 4 2 ids=0 pin=1 logprobs=2\nabcWXYZ\nSTOP req\n",
+        "SUBMIT req 0 3 4 0 1 4 2 seed=-7 pin=1 logprobs=2\nabcWXYZ\nSTOP req\n",
     };
     for (size_t i=0; i<sizeof(frames)/sizeof(*frames); i++) {
         FILE *input=bytes_input(frames[i], strlen(frames[i]));
         ColiServeCommand command;
         assert(coli_serve_read_command(input,&extended,&command)==COLI_SERVE_READ_OK);
         assert(command.pin==1 && command.logprobs==2 && command.prefix_bytes==2);
+        assert(command.has_seed==(i==2) && command.seed==(i==2 ? 0xFFFFFFFFFFFFFFF9ULL : 0));
         assert(!memcmp(command.payload,"abc",3));
         assert(!memcmp(coli_serve_command_extension(&command),"WXYZ",4));
         coli_serve_command_dispose(&command);

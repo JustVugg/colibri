@@ -21,7 +21,7 @@ from family_registry import family_by_id, family_ids
 from openai_server import (APIError, engine_exit_status, APIHandler, APIServer, ClientCancelled,
                            CONTINUATION_FAMILIES, _marker_cuts,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
-                           LOGPROBS_TOP_K_CAP, logprobs_options,
+                           LOGPROBS_TOP_K_CAP, logprobs_options, seed_option,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, _image_bytes_from_url, cap_for_arch,
                            conversation_cache_slot, model_arch,
@@ -2740,10 +2740,11 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
 
 
-def _capture_frames(body, path="/v1/completions"):
+def _capture_frames(body, path="/v1/completions", seeds=False):
     """Sends `body` to `path` against a FakeProcess-backed Engine/APIServer
     and returns (status, parsed_response, frames_written_to_the_engine).
     Shared by the test classes below so the harness lives in one place.
+    `seeds` stands in for an engine whose family seeds its requests.
     """
     frames = []
 
@@ -2756,6 +2757,7 @@ def _capture_frames(body, path="/v1/completions"):
     process = FakeProcess(respond)
     with patch("openai_server.subprocess.Popen", return_value=process):
         engine = Engine("glm", "model")
+    engine.supports_seed = seeds
     server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16)
     thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
     thread.start()
@@ -2902,6 +2904,68 @@ class SeedWireFrameTest(unittest.TestCase):
         self.assertEqual(status_seeded, 200)
         self.assertEqual(body_seeded["choices"][0], body_plain["choices"][0])
         self.assertEqual(frames_seeded, frames_plain)
+
+
+class SeededEngineWireTest(unittest.TestCase):
+    """On an engine that seeds its requests, a request's `seed` adds exactly one
+    key to its SUBMIT header, and a request without one keeps the header it had."""
+
+    base = {"model": "test-model", "prompt": "Complete me", "temperature": 0.8, "max_tokens": 4}
+
+    def test_seed_adds_one_key_and_nothing_else(self):
+        _, _, plain = _capture_frames(self.base, seeds=True)
+        self.assertEqual(plain, [b"SUBMIT 1 0 11 4 0.8 0.9\nComplete me\n"])
+        for seed, key in ((1234, b"seed=1234"), (0, b"seed=0"), (-7, b"seed=-7"),
+                          (2 ** 63 - 1, b"seed=9223372036854775807"),
+                          (-2 ** 63, b"seed=-9223372036854775808")):
+            with self.subTest(seed=seed):
+                status, _, frames = _capture_frames({**self.base, "seed": seed}, seeds=True)
+                self.assertEqual(status, 200)
+                # glm's header carries the seventh (gbytes) field ahead of its keys
+                self.assertEqual(frames, [b"SUBMIT 1 0 11 4 0.8 0.9 0 " + key + b"\nComplete me\n"])
+
+    def test_seed_rides_with_the_other_keys(self):
+        self.assertEqual(openai_server._engine_extension_args(0), {})
+        self.assertEqual(openai_server._engine_extension_args(2, 5),
+                         {"logprobs": 2, "seed": 5, "gbytes_before_ext": True})
+        self.assertEqual(openai_server._engine_extension_args(0, 0),
+                         {"seed": 0, "gbytes_before_ext": True})
+
+    def test_chat_request_carries_its_seed(self):
+        base = {"model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+                "temperature": 0.8, "max_tokens": 4}
+        _, _, plain = _capture_frames(base, path="/v1/chat/completions", seeds=True)
+        _, _, seeded = _capture_frames({**base, "seed": 99}, path="/v1/chat/completions", seeds=True)
+        head, _, rest = plain[0].partition(b"\n")
+        self.assertEqual(seeded, [head + b" 0 seed=99\n" + rest])
+
+    def test_a_seed_the_engine_cannot_take_is_a_named_400(self):
+        with self.assertRaises(HTTPError) as caught:
+            _capture_frames({**self.base, "seed": 2 ** 63}, seeds=True)
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(json.load(caught.exception)["error"]["param"], "seed")
+
+
+class SeedOptionValueTest(unittest.TestCase):
+    def test_an_engine_that_seeds_takes_any_int64(self):
+        for seed in (0, 1, -1, 2 ** 63 - 1, -2 ** 63):
+            with self.subTest(seed=seed):
+                self.assertEqual(seed_option({"seed": seed}, True), seed)
+        self.assertIsNone(seed_option({}, True))
+        self.assertIsNone(seed_option({"seed": None}, True))
+
+    def test_an_engine_that_seeds_refuses_anything_else(self):
+        for seed in (2 ** 63, -2 ** 63 - 1, 1.0, 1.5, "7", True, False, [1], {"v": 1}):
+            with self.subTest(seed=seed):
+                with self.assertRaises(APIError) as caught:
+                    seed_option({"seed": seed}, True)
+                self.assertEqual((caught.exception.status, caught.exception.param,
+                                  caught.exception.code), (400, "seed", "invalid_value"))
+
+    def test_an_engine_that_does_not_seed_ignores_the_field_as_before(self):
+        for seed in (1234, 2 ** 70, "7", True):
+            with self.subTest(seed=seed):
+                self.assertIsNone(seed_option({"seed": seed}, False))
 
 
 class CompletionTokenIdsTest(unittest.TestCase):
