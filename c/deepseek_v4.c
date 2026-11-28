@@ -5425,6 +5425,7 @@ static __thread int v4_moe_routed_only;
 /* ---- begin include deepseek_v4_block.c ---- */
 #include "deepseek_v4_internal.h"
 #include "deepseek_v4_hybrid.h"
+#include "deepseek_v4_lazy_shared.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -6715,10 +6716,31 @@ static int moe_token_pipeline(float *output,
                     fp8_view(&w3, weights, "ffn.shared_experts.w3")))
         result = moe_fail("layer %d: the shared expert's fp8 tensors are missing",
                           weights->plan.layer);
-    if (!result && V4_SHARED_HERE) result = coli_v4_shared_expert_forward_ref(
-        shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
-    if (result && !moe_reason()[0])
-        moe_fail("layer %d: the shared expert failed", weights->plan.layer);
+    /* V4_LAZY_SHARED (default 0, opt-in): the fused GPU MoE (dsv4_cuda_moe)
+     * computes the shared expert itself from GPU-resident sg/su/sd, so the
+     * host shared-expert forward is only needed by the fallback and CPU paths;
+     * defer it until one of them runs. */
+    int shared_ready = 0;
+    int shared_deferred = 0;
+#if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+    shared_deferred = coli_v4_lazy_shared_should_defer(
+        coli_v4_lazy_shared_enabled(),
+        store->gpu != NULL,
+        coli_v4_hybrid_enabled(),
+        hot_split,
+        coli_v4_layer_gpu(weights, "ffn.shared_experts.w1") != NULL,
+        coli_v4_layer_gpu(weights, "ffn.shared_experts.w3") != NULL,
+        coli_v4_layer_gpu(weights, "ffn.shared_experts.w2") != NULL);
+#endif
+#define V4_SHARED_ENSURE() do { \
+        if (!result && V4_SHARED_HERE && !shared_ready) { \
+            result = coli_v4_shared_expert_forward_ref( \
+                shared_output, &w1, &w2, &w3, input, config->swiglu_limit); \
+            if (result && !moe_reason()[0]) \
+                moe_fail("layer %d: the shared expert failed", weights->plan.layer); \
+            shared_ready = 1; \
+        } } while (0)
+    if (!shared_deferred) V4_SHARED_ENSURE();
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
@@ -6881,6 +6903,7 @@ static int moe_token_pipeline(float *output,
     }
     if (hot_group.count) {
         /* V4_HOT_SPLIT: the CPU's experts beside the group started above */
+        V4_SHARED_ENSURE();
         for (int current = 0; !result && current < selected; current++) {
             if (hot_on_gpu[current]) continue;
             result = coli_v4_expert_forward_ref(
@@ -6955,9 +6978,11 @@ static int moe_token_pipeline(float *output,
                  * the next lookup on. The views drop their mirror handles:
                  * coli_v4_expert_forward_ref would otherwise hand them back
                  * to the backend's matvec. */
-                result = v4_views_fetch_host(store, views, leased, selected,
-                                             weights->plan.layer, fetch,
-                                             jobs, loaders, loader_active, dec);
+                V4_SHARED_ENSURE();
+                if (!result)
+                    result = v4_views_fetch_host(store, views, leased, selected,
+                                                 weights->plan.layer, fetch,
+                                                 jobs, loaders, loader_active, dec);
                 for (int current = 0; !result && current < selected; current++) {
                     views[current].gate.gpu = views[current].up.gpu =
                         views[current].down.gpu = NULL;
@@ -6975,7 +7000,8 @@ static int moe_token_pipeline(float *output,
                     void *const *gate, void *const *up, void *const *down,
                     const float *weights, int count, float limit,
                     float *y, const float *x);
-                if (!dsv4_cuda_expert_group(gates, ups, downs,
+                V4_SHARED_ENSURE();
+                if (!result && !dsv4_cuda_expert_group(gates, ups, downs,
                     expert_weights, selected, config->swiglu_limit,
                     expert_output, input))
                     result = moe_fail("layer %d: the GPU expert group of %d experts "
@@ -7000,6 +7026,7 @@ static int moe_token_pipeline(float *output,
          * is timed to feed the host-bandwidth EMA. A backend failure on the
          * GPU half degrades that subset to the CPU loop instead of failing
          * the token. */
+        V4_SHARED_ENSURE();
         int gpu_n = hybrid_gpu_count, cpu_n = selected - hybrid_gpu_count;
         void **gates = malloc((size_t)gpu_n * sizeof(*gates));
         void **ups = malloc((size_t)gpu_n * sizeof(*ups));
@@ -7100,6 +7127,7 @@ static int moe_token_pipeline(float *output,
     } else
 #endif
     {
+        V4_SHARED_ENSURE();
 #if (defined(COLI_VULKAN) || defined(COLI_CUDA)) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
         if (vk_step.on) {
             if (!result)
@@ -7213,6 +7241,7 @@ static int moe_token_pipeline(float *output,
             coli_expert_release(store, &job.view);
     }
 #endif
+#undef V4_SHARED_ENSURE
 #if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
 moe_done:
 #endif

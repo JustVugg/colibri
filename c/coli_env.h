@@ -1000,6 +1000,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"V4_LAYER_FUSED", CE_INT, CE_DSV4, 0, NULL},
     {"V4_LAYER_FUSED_EMIT", CE_INT, CE_DSV4, 0, NULL},
     {"V4_LAYER_FUSED_VERIFY", CE_INT, CE_DSV4, 0, NULL},
+    {"V4_LAZY_SHARED", CE_BOOL, CE_DSV4, 0, NULL},
     {"V4_LOADER_LANES",                  CE_INT   , CE_DSV4                                         , 0             , NULL},
     {"V4_MIRROR_BLOCK", CE_BOOL, CE_DSV4, 0, NULL},
     {"V4_MIRROR_BLOCK_VERIFY", CE_BOOL, CE_DSV4, 0, NULL},
