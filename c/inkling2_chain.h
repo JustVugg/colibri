@@ -502,7 +502,7 @@ static void ink2c_recover(Model *m, int upto) {
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         ink2c_fatal("the device was lost with a state its token ids do not describe (audio or an image)");
     fprintf(stderr, "[VK] inkling2 chain: %s; rebuilding the state of %d positions on the host's path, "
-                    "which runs from here on\n", vkc_lost() ? "the device was lost" : "the chain stopped, the device stays", upto);
+                    "which runs from here on\n", vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", upto);
     float *x = falloc((int64_t)upto * D);
     for (int s = 0; s < upto; s++) {
         wt_row_f32(m->embed, (int64_t)m->kvp.fed[s] * D, x + (int64_t)s * D, D);

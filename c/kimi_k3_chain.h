@@ -289,7 +289,7 @@ static void k3c_recover(Model *m, int dev0, int dev2, int upto, const K3Chain *w
     for (int d = 0; d < 2; d++) { K3Chain *x = k3c_of(d); if (x) { x->failed = 1; x->where = K3C_HOST; } }
     const char *nm = k3c_name(who);
     if (!had || upto <= from) {
-        fprintf(stderr, "[VK] %s chain: %s; the host's state is current, the host's path runs from here on\n", nm, vkc_lost() ? "the device was lost" : "the chain stopped, the device stays");
+        fprintf(stderr, "[VK] %s chain: %s; the host's state is current, the host's path runs from here on\n", nm, vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays");
         return;
     }
     if (m->kvp.tainted || !m->kvp.fed || m->kvp.len < upto || !dev0) {
@@ -298,7 +298,7 @@ static void k3c_recover(Model *m, int dev0, int dev2, int upto, const K3Chain *w
         exit(1);
     }
     fprintf(stderr, "[VK] %s chain: %s; rebuilding the state of %d positions on the host's path, "
-                    "which runs from here on\n", nm, vkc_lost() ? "the device was lost" : "the chain stopped, the device stays", upto - from);
+                    "which runs from here on\n", nm, vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", upto - from);
     const Cfg *c = &m->c;
     if (zero) for (int i = 0; i < hi; i++) {   /* the host was told "zeros" and kept its old arrays (the devices' layers) */
         if (!m->L[i].kda) continue;

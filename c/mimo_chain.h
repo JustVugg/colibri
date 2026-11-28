@@ -639,7 +639,7 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
     if (ch2) ch2->failed = 1;
     fprintf(stderr, "[VK] mimo chain: %s at position %d; the host's caches hold every "
                     "position before it, and the host's path runs from there on\n",
-            vkc_lost() ? "the device was lost" : "the chain stopped, the device stays", pos_base + done);
+            vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", pos_base + done);
     return done;
 }
 

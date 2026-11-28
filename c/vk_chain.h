@@ -60,6 +60,7 @@ typedef struct VkcBuf VkcBuf;
 int  vkc_init(void);          /* after coli_vk_init; 1 = the chain's pipelines are up */
 int  vkc_ready(void);
 int  vkc_lost(void);
+int  vkc_lost_any(void);   /* either device lost: a chain split over two reaches its recovery back on the primary */
 void vkc_shutdown(void);      /* before coli_vk_shutdown (register it with atexit after it) */
 /* The device the calls go to: 0 the primary, 1 COLI_VK_DEV2's (coli_vk_core_dev), each
  * with a context of its own that vkc_init opens and vkc_shutdown closes while it is

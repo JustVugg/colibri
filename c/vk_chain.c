@@ -212,6 +212,7 @@ void vkc_shutdown_all(void) {   /* both devices' contexts, the second first (at 
     g_kd = was;
 }
 int vkc_lost(void) { return KC.lost; }
+int vkc_lost_any(void) { return g_kctx[0].lost || g_kctx[1].lost; }
 
 static void lose(const char *what, VkResult r) {
     if (!KC.lost) coli_event("[VK] chain: %s failed (%d): the device is lost", what, (int)r);
@@ -1018,7 +1019,9 @@ int vkc_chain_retry(const char *engine) {
     return 1;
 }
 void vkc_frame_failed(const char *engine, int pos, int rows) {
-    const int dead = KC.lost || !vkc_finish();
+    /* either device: a chain split over two (COLI_VK_CHAIN_LAYERS2) reaches its lost: path back on the primary, the
+     * second one the device that went */
+    const int dead = vkc_lost_any() || !vkc_finish();
     if (dead) {
         coli_event("[VK] %s chain: the device is lost at position %d (%d rows); the CPU runs from here on", engine, pos, rows);
         return;
