@@ -430,6 +430,15 @@ static int vkc_stage_sizes(uint32_t fmt, uint32_t rw, uint32_t gs, int rows, int
     return fmt >= 100 && fmt < 164;
 }
 static size_t vkc_stage_up(size_t b) { return (b + 255) & ~(size_t)255; }
+/* Whether the device has `bytes` free with 64 MiB beyond them, as its budget says (1 when it
+ * says nothing): stg is not taken from the device's last memory (the driver moves the rest
+ * out then, and FreeBSD's NVIDIA driver crashed in the allocation, #2975). *free_b: what is free. */
+static int vkc_stage_fits(size_t bytes, double *free_b) {
+    double used = 0, bud = 0;
+    if (!coli_vk_mem_budget(&used, &bud)) return 1;
+    *free_b = (bud - used) * 1e9;
+    return *free_b >= (double)bytes + 67108864.0;
+}
 static int vkc_dmoe_stage_read(VkcDmoe *d) {
     int L = d->L, E = d->E, D = d->D, I = d->I;
     const size_t ent = COLI_VK_XB_ENTRY;
@@ -462,15 +471,15 @@ static int vkc_dmoe_stage_read(VkcDmoe *d) {
     if (!need) return 0;
     if (need > d->stg_cap) {
         vkc_free(d->stg); d->stg = NULL; d->stg_cap = 0;
-        /* not into the device's last memory (the driver moves the rest out then) */
-        double used = 0, bud = 0;
-        if (coli_vk_mem_budget(&used, &bud) && (bud - used) * 1e9 < (double)need + 67108864.0) {
+        double free_b = 0;
+        if (!vkc_stage_fits(need, &free_b)) {
             if (!d->stg_said) fprintf(stderr, "[VK] chain: %.0f MiB free on the device, short of the host pool experts' staging "
-                                              "(%.0f MiB); a prompt chunk reads them over PCIe\n", (bud - used) * 1e9 / 1048576.0, need / 1048576.0);
+                                              "(%.0f MiB); a prompt chunk reads them over PCIe\n", free_b / 1048576.0, need / 1048576.0);
             d->stg_said = 1;
             return 0;
         }
-        if (room > need) need = room;   /* the whole room: between chunks it holds the hottest (vkc_dmoe_keep) */
+        /* the whole room when the device has it: between chunks it holds the hottest (vkc_dmoe_keep) */
+        if (room > need && vkc_stage_fits(room, &free_b)) need = room;
         if (!(d->stg = vkc_buf_addr(need, &d->stg_addr))) {
             fprintf(stderr, "[VK] chain: no VRAM to stage the host pool's experts in (%.0f MiB); a prompt chunk reads them over PCIe\n",
                     need / 1048576.0);
@@ -561,6 +570,8 @@ static void vkc_dmoe_keep(VkcDmoe *d) {
     if (d->stg_off || !vkc_stage_wanted() || !room || D < 1 || I < 1) return;
     if (!d->hostm && !(d->hostm = malloc((size_t)L * E))) return;
     if (!d->stg) {   /* stg before any prompt chunk: the room's size, as a chunk would make it */
+        double free_b = 0;
+        if (!vkc_stage_fits(room, &free_b)) return;   /* not now: the next read of the table asks again */
         if (!(d->stg = vkc_buf_addr(room, &d->stg_addr))) { d->stg_off = 1; return; }
         d->stg_cap = room;
         if (room > d->stg_peak) d->stg_peak = room;
