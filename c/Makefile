@@ -1588,6 +1588,15 @@ cuda-dflash-check: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_dflash.cu -o cuda_dflash_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_dflash_test$(EXE)
 
+# A GGUF's block formats on the device (cuda_bd.cuh) against the CPU's decoders (tests/test_cuda_bd.cu, which
+# includes backend_cuda.cu). SCALED=1: the per-tensor scale's checks alone (a GGUF's <name>.scale),
+# BENCH=1 times them as well. Needs a GPU.
+.PHONY: cuda-bd-check
+cuda-bd-check: tests/test_cuda_bd.cu tests/cuda_bd_ref.c backend_cuda.cu backend_cuda.h cuda_bd.cuh ggml_quants.h
+	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -Wno-unknown-pragmas -fPIC -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_bd.cu tests/cuda_bd_ref.o -o cuda_bd_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	$(if $(filter 1,$(SCALED)),SCALED_ONLY=1 )./cuda_bd_test$(EXE)
+
 hip-test:
 	$(MAKE) cuda-test HIP=1
 
@@ -3627,6 +3636,11 @@ tests/test_qwen36_ckpt_same_file_win$(EXE): tests/test_qwen36_ckpt_same_file_win
 # The CUDA dense chain (COLI_CUDA_CHAIN=1, qwen36_cuda_chain.h): logits, state, verify
 # rollback and a lost device against the CPU path, on the fake backend's host-side table.
 tests/test_qwen36_cuda_chain$(EXE): tests/test_qwen36_cuda_chain.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# A GGUF matrix with a per-tensor .scale placed on the tier with the scale on its tensor,
+# the DeltaNet in_proj of two scales as two tensors, and the chain's logits the CPU's (fake backend).
+tests/test_qwen36_scaled_gguf$(EXE): tests/test_qwen36_scaled_gguf.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # dnout / attnproj / shexp offered, placed and served from VRAM (fake backend).

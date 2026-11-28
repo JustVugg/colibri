@@ -29,7 +29,8 @@
 
 #include "../backend_cuda.h"
 
-struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; const float *sc; };
+/* own: w is the tensor's own copy, freed with it; os: a block tensor's per-tensor scale (0 = none) */
+struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; const float *sc; int own; float os; };
 
 static int fake_uploads;
 static int fake_overwrites;      /* coli_cuda_tensor_overwrite calls (in-place swaps) */
@@ -62,6 +63,13 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int
         if (q && s) { memcpy(q, w, (size_t)I * O); memcpy(s, sc, (size_t)O * sizeof(float)); n->w = q; n->sc = s; }
         else { free(q); free(s); n->w = NULL; n->sc = NULL; }
     }
+#ifdef GGML_QUANTS_H
+    if (fake_dense_compute && fmt >= 100 && w && gq_row_bytes(fmt - 100, I) > 0) {   /* a GGUF's rows: the caller may free its copy */
+        size_t nb = (size_t)gq_row_bytes(fmt - 100, I) * O;
+        void *c = malloc(nb);
+        if (c) { memcpy(c, w, nb); n->w = c; n->sc = NULL; n->own = 1; } else n->w = NULL;
+    }
+#endif
     if (fake_dense_compute && fmt == 0 && w) {   /* f32 rows (the chain's b|a, gate rows): the caller frees its copy */
         float *f = (float *)malloc((size_t)I * O * sizeof(float));
         if (f) { memcpy(f, w, (size_t)I * O * sizeof(float)); n->w = f; n->sc = NULL; } else n->w = NULL;
@@ -81,13 +89,31 @@ int coli_cuda_tensor_upload(ColiCudaTensor **t, const void *w, const float *s,
                             int fmt, int I, int O, int device) {
     return upload_common(t, w, s, fmt, I, O, device, 0);
 }
+/* the backend's rule (backend_cuda.cu): block formats only, a finite nonzero scale, 1 clears it;
+ * fake_out_scale_absent answers as a DLL that predates it. Counted. */
+static int fake_out_scale_absent, fake_out_scales;
+int coli_cuda_tensor_set_out_scale(ColiCudaTensor *t, float s) {
+    if (fake_out_scale_absent || !t || t->fmt < 100 || !(s == s) || s == 0.f || isinf(s)) return 0;
+    t->os = s == 1.f ? 0.f : s;
+    fake_out_scales++;
+    return 1;
+}
+#ifdef GGML_QUANTS_H
+/* y[S, O] of a GGUF block tensor: ggml_quants.h's float reference (the CPU's GQ_EXACT form), each
+ * output times the tensor's scale after its sum, as the backend's kernels apply it */
+static int fake_block_matmul(const ColiCudaTensor *t, float *y, const float *x, int S) {
+    if (!t->w || gq_matmul_f32(y, x, (const uint8_t *)t->w, t->fmt - 100, S, t->I, t->O)) return 0;
+    if (t->os != 0.f) for (int64_t i = 0; i < (int64_t)S * t->O; i++) y[i] *= t->os;
+    return 1;
+}
+#endif
 int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
                               int fmt, int I, int O, int device, int gs) {
     return upload_common(t, w, s, fmt, I, O, device, gs);
 }
 static int fake_tensor_frees;   /* tensors freed (a tier giving memory back) */
 void coli_cuda_tensor_free(ColiCudaTensor *t) {
-    if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
+    if (t && (t->own || (fake_dense_compute && t->fmt == 1))) { free((void *)t->w); free((void *)t->sc); }
     fake_tensor_frees += t != NULL;
     free(t);
 }
@@ -198,6 +224,9 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const vo
         return 0;
     }
     ColiCudaTensor *t = tensor ? *tensor : NULL;
+#ifdef GGML_QUANTS_H
+    if (fake_dense_compute && t && t->fmt >= 100 && t->I == I && t->O == O) return fake_block_matmul(t, y, x, S);
+#endif
     if (fake_dense_compute && t && t->fmt == 1 && t->w && t->sc && t->I == I && t->O == O) {
         const int8_t *q = (const int8_t *)t->w;
         for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
@@ -386,6 +415,10 @@ static int fcc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t y
             const float *w = (const float *)t->w;
             for (int o = 0; o < t->O; o++) { const float *wr = w + (size_t)o * t->I; float a = 0.f;
                 for (int i = 0; i < t->I; i++) a += xs[i] * wr[i]; ys[o] = a; }
+#ifdef GGML_QUANTS_H
+        } else if (t->fmt >= 100) {
+            if (!fake_block_matmul(t, ys, xs, 1)) return 0;
+#endif
         } else return 0;
     }
     return 1;

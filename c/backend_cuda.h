@@ -189,6 +189,11 @@ COLI_CUDA_DLLEXPORT int coli_cuda_planar_rows(int device, int D, int I);
  * when the backend does not take it (a row's width must be a multiple of it and of 32).
  * Optional in the DLL loader: 0 from a backend that predates it. */
 COLI_CUDA_DLLEXPORT int coli_cuda_block_elems(int fmt);
+/* A block-format tensor's per-tensor scale (a GGUF's <name>.scale: e.g. NVFP4 projections carry
+ * 1 / their global scale), multiplied into each output once after its sum by every product of the
+ * tensor; 1 clears it. 0 when not taken (another format, a scale not finite or 0, a backend that
+ * predates it: optional in the DLL loader), and the caller keeps the matrix on the host. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_set_out_scale(ColiCudaTensor *tensor, float scale);
 /* A block-format tensor (fmt >= 100) in device memory the caller owns (dev, cap bytes: an
  * arena's slot, at least O rows of the file's row padded to words), its rows uploaded from
  * weights; coli_cuda_tensor_free leaves the memory. No cudaMalloc, so none of its rounding

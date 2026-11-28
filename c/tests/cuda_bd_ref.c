@@ -9,3 +9,10 @@ long ref_row_bytes(int t, int n) { return (long)gq_row_bytes(t, n); }
 int ref_block_bytes(int t) { return GQ_TYPES[t].bytes; }
 int ref_block_elems(int t) { return GQ_TYPES[t].blck; }
 const char *ref_name(int t) { return gq_type_name(t); }
+/* qwen36.c's matmul_d on a GGUF matrix with a per-tensor scale gs (its .scale), in its GQ_EXACT form:
+ * the dequantized rows' products (gq_matmul_f32), then each output times gs */
+int ref_matmul_d(int t, const uint8_t *W, const float *x, int S, int I, int O, float gs, float *y) {
+    if (gq_matmul_f32(y, x, W, t, S, I, O)) return -1;
+    if (gs != 1.f) for (long long i = 0; i < (long long)S * O; i++) y[i] *= gs;
+    return 0;
+}
