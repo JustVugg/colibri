@@ -3265,6 +3265,7 @@ static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, flo
         }
         int ndev;
         if (xscaled) {
+            #pragma omp parallel for schedule(static) if (n > 512)
             for (int i = 0; i < n; i++) {
                 if (ib[i] < 0) continue;
                 const float sc = l->xgsc[ib[i]], *xr = xb + (int64_t)(i / K) * D;
@@ -3285,6 +3286,7 @@ static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, flo
             ink_vk_cpu_pairs(m, layer, xb, n, ib, taken, ctb, g);
             memset(taken, 0, (size_t)n);
         }
+        #pragma omp parallel for schedule(static) if (rows > 64)
         for (int s = 0; s < rows; s++) {
             float *os = out + (int64_t)(s0 + s) * D;
             const float *w = wgt + (int64_t)(s0 + s) * (K + ns);
@@ -3323,16 +3325,21 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
     int  *fl    = malloc((size_t)S*K*sizeof(int));
     uint8_t *fresh = malloc((size_t)S*K);   /* the round's pairs whose expert is being read */
     int nfill = 0;
-    /* pass 1: routing + slot bookkeeping (serial) */
+    /* pass 1: routing, the rows apart (a prompt chunk's thousands over the threads): each
+     * row's experts' sigmoid + bias once, then the same picks in the same order as before */
+    long long ereq = 0, euse = 0;
+    #pragma omp parallel for schedule(static) reduction(+:ereq, euse) if (S > 64)
     for (int s = 0; s < S; s++) {
         float *lg = logits + (int64_t)s*ET;
         int *si = idx + (int64_t)s*K;
+        float cr[E];
+        for (int e = 0; e < E; e++) cr[e] = sigmoidf(lg[e]) + l->rbias[e];
         /* selection: sigmoid(routed) + correction bias, top-K */
         for (int kk = 0; kk < K; kk++) {
             int best = -1; float bv = -1e30f;
             for (int e = 0; e < E; e++) {
                 int taken = 0; for (int j = 0; j < kk; j++) if (si[j]==e){taken=1;break;}
-                float ch = sigmoidf(lg[e]) + l->rbias[e];
+                float ch = cr[e];
                 if (!taken && ch > bv) { bv = ch; best = e; }
             }
             /* SEC: all-NaN logits leave best at -1, and lg[-1] / eusage[-1] are
@@ -3356,7 +3363,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
          * senza bias, quindi i pesi non sono garantiti decrescenti: si riordina la
          * coppia (peso, id) prima di tagliare, come fa colibri.c. */
         keff[s] = K;
-        m->ereq += K;
+        ereq += K;
         if (g_topp > 0.f && g_topp < 1.f) {
             for (int a = 1; a < K; a++) { int ii = si[a]; float ww = w[a]; int b = a-1;
                 while (b >= 0 && w[b] < ww) { w[b+1] = w[b]; si[b+1] = si[b]; b--; }
@@ -3366,8 +3373,9 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
             for (int kk = 0; kk < K; kk++) { cum += w[kk];
                 if (cum >= g_topp * tot) { keff[s] = kk+1; break; } }
         }
-        m->euse += keff[s];
+        euse += keff[s];
     }
+    m->ereq += ereq; m->euse += euse;
     if (shw) for (int s = 0; s < S; s++) for (int j = 0; j < ns; j++) shw[(int64_t)j*S + s] = wgt[(int64_t)s*(K+ns) + K + j];
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     if (XT(ready)()) {   /* the expert tier (Vulkan's or CUDA's) takes the layer from here (ink_vk_moe) */

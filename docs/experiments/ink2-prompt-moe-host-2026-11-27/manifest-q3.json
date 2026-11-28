@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "hypothesis": "A prompt chunk's routing, NVFP4 input scaling and rank-order sums in ink_vk_moe/moe_ex run on one thread; over the OpenMP team, with each row's sums in the same order, the host's share of a prompt step drops and the text stays the same",
+  "commit": "ab98f29f8acef3a48dc37838c3d896c9acc9b908",
+  "model": "unsloth Inkling-2-Mini UD-Q3_K_XL GGUF, all 3072 experts on the device",
+  "command": "make -C c inkling VK=1 in both trees; ab.sh: a fresh coli serve --ctx 24576 on a fresh copy of one .coli_usage history, a warm-up, then the 8K prompt with max_tokens 1; dev and the change interleaved, three rounds",
+  "prompt_hash": "49e72e323435fe19cb804187b39c5e064da3027b8ab9b9b68d43d854b3333788",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 7800X3D, 8 cores / 16 threads (OMP_NUM_THREADS=8)",
+    "ram": "32 GB DDR5",
+    "storage": "ZFS on LUKS2 over two NVMe SSDs",
+    "os": "NixOS, Linux 7.2.9, gcc 16.2.0, Mesa 26.2.5 RADV, AMD Radeon RX 9060 XT 16 GB"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "unsloth Inkling-2-Mini UD-Q3_K_XL GGUF, all 3072 experts on the device",
+      "COLI_VULKAN": "1",
+      "COLI_VK_STAGED": "1",
+      "COLI_PREFIX_STORE": "0",
+      "ctx": 24576,
+      "max_tokens": 1,
+      "prompt_tokens": 8021,
+      "engine_build": "dev ab98f29f"
+    },
+    "samples": {
+      "tok_s": [
+        72.6,
+        72.9,
+        72.5
+      ],
+      "prefill_s": [
+        110.49,
+        110.03,
+        110.57
+      ]
+    },
+    "median_tok_s": 72.6,
+    "quality": {
+      "method": "dev as it is",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/ink2-prompt-moe-host-2026-11-27/raw.txt",
+      "sha256": "444402f7729b36a2f4cf70baca93640f1fa1a88a586b659428e1382cf41da8b8"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "unsloth Inkling-2-Mini UD-Q3_K_XL GGUF, all 3072 experts on the device",
+      "COLI_VULKAN": "1",
+      "COLI_VK_STAGED": "1",
+      "COLI_PREFIX_STORE": "0",
+      "ctx": 24576,
+      "max_tokens": 1,
+      "prompt_tokens": 8021,
+      "engine_build": "ab98f29f + this change"
+    },
+    "samples": {
+      "tok_s": [
+        75.9,
+        75.7,
+        76.0
+      ],
+      "prefill_s": [
+        105.65,
+        106.02,
+        105.57
+      ]
+    },
+    "median_tok_s": 75.9,
+    "quality": {
+      "method": "Q3 (every expert on the device, runs repeat): the greedy code answer (512 tokens) and the 8K needle answer byte-identical to dev's; Q4's text differs between two runs of dev itself (the cold experts' placement follows measured timings), the needle 5/5 in every run; tests/test_inkling2_kernels, test_inkling_serve_framing, test_inkling_shared_batch, test_inkling_cache_index pass",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/ink2-prompt-moe-host-2026-11-27/raw.txt",
+      "sha256": "444402f7729b36a2f4cf70baca93640f1fa1a88a586b659428e1382cf41da8b8"
+    }
+  },
+  "outcome": "improvement"
+}

@@ -1,0 +1,101 @@
+--- a/c/inkling.c	2026-11-27 17:18:25.076483803 -0800
++++ b/c/inkling.c	2026-11-27 17:18:13.986089204 -0800
+@@ -3235,6 +3235,7 @@
+ #if defined(COLI_VULKAN) || defined(COLI_CUDA)
+ /* moe() with the tier on, after its routing pass: idx/keff/wgt as moe() made them;
+  * routed_only leaves the shared experts out (the dense chain runs them). */
++double g_hp_route, g_hp_prep, g_hp_issue, g_hp_cpu, g_hp_join, g_hp_sum, g_hp_steps, g_hp_wait, g_hp_kvdown, g_hp_copy;   /* HANDOFF_PROF */
+ static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, float *out,
+                        const int *idx, const int *keff, const float *wgt, int routed_only) {
+     Cfg *c = &m->c;
+@@ -3255,7 +3256,8 @@
+     for (int s0 = 0; s0 < S; s0 += B) {
+         int rows = S - s0 < B ? S - s0 : B, n = rows * K;
+         const float *xb = x + (int64_t)s0 * D;
+-        double te = now_s(), f0 = m->t_fill, sh = 0;
++        double te = now_s(), f0 = m->t_fill, sh = 0, hp0 = now_s();
++        if (rows > 8) g_hp_steps++;
+         for (int i = 0; i < n; i++) {           /* TOPP's trimmed ranks: -1, unused */
+             int s = s0 + i / K, kk = i % K;
+             ib[i] = kk < keff[s] ? idx[(int64_t)s * K + kk] : -1;
+@@ -3272,10 +3274,13 @@
+                 float *xd = xp + (int64_t)i * D;
+                 for (int d = 0; d < D; d++) xd[d] = xr[d] * sc;
+             }
++            double hp1 = now_s(); if (rows > 8) g_hp_prep += hp1 - hp0; hp0 = hp1;
+             ndev = XT(issue)(layer, xp, n, 1, ib, taken);
+-        } else ndev = XT(issue)(layer, xb, rows, K, ib, taken);
++        } else { double hp1 = now_s(); if (rows > 8) g_hp_prep += hp1 - hp0; hp0 = hp1; ndev = XT(issue)(layer, xb, rows, K, ib, taken); }
++        { double hp1 = now_s(); if (rows > 8) g_hp_issue += hp1 - hp0; hp0 = hp1; }
+         for (int i = 0; i < n; i++) want[i] = ib[i] >= 0 && !taken[i];
+         ink_vk_cpu_pairs(m, layer, xb, n, ib, want, ctb, g);
++        { double hp1 = now_s(); if (rows > 8) g_hp_cpu += hp1 - hp0; hp0 = hp1; }
+         if (shb) {
+             double ts = now_s();
+             memset(shb, 0, (size_t)rows * D * sizeof(float));
+@@ -3286,6 +3291,7 @@
+             ink_vk_cpu_pairs(m, layer, xb, n, ib, taken, ctb, g);
+             memset(taken, 0, (size_t)n);
+         }
++        { double hp1 = now_s(); if (rows > 8) g_hp_join += hp1 - hp0; hp0 = hp1; }
+         #pragma omp parallel for schedule(static) if (rows > 64)
+         for (int s = 0; s < rows; s++) {
+             float *os = out + (int64_t)(s0 + s) * D;
+@@ -3299,6 +3305,7 @@
+             }
+             if (shb) { const float *sp = shb + (int64_t)s * D; for (int d = 0; d < D; d++) os[d] += sp[d]; }
+         }
++        if (rows > 8) g_hp_sum += now_s() - hp0;
+         m->t_expert += now_s() - te - sh - (m->t_fill - f0);
+     }
+     free(xp); free(ctb); free(shb); free(g); free(hh); free(ib); free(taken); free(want); free(dev);
+@@ -3325,8 +3332,10 @@
+     int  *fl    = malloc((size_t)S*K*sizeof(int));
+     uint8_t *fresh = malloc((size_t)S*K);   /* the round's pairs whose expert is being read */
+     int nfill = 0;
+-    /* pass 1: routing, the rows apart (a prompt chunk's thousands over the threads): each
+-     * row's experts' sigmoid + bias once, then the same picks in the same order as before */
++    /* pass 1: routing + slot bookkeeping (serial) */
++    double hpr0 = now_s();
++    /* the rows apart (a prompt chunk's thousands over the threads): each row's experts'
++     * sigmoid + bias once, then the same picks in the same order as before */
+     long long ereq = 0, euse = 0;
+     #pragma omp parallel for schedule(static) reduction(+:ereq, euse) if (S > 64)
+     for (int s = 0; s < S; s++) {
+@@ -3377,6 +3386,7 @@
+     }
+     m->ereq += ereq; m->euse += euse;
+     if (shw) for (int s = 0; s < S; s++) for (int j = 0; j < ns; j++) shw[(int64_t)j*S + s] = wgt[(int64_t)s*(K+ns) + K + j];
++    if (S > 8) { extern double g_hp_route; g_hp_route += now_s() - hpr0; }
+ #if defined(COLI_VULKAN) || defined(COLI_CUDA)
+     if (XT(ready)()) {   /* the expert tier (Vulkan's or CUDA's) takes the layer from here (ink_vk_moe) */
+         ink_vk_moe(m, l, layer, x, S, out, idx, keff, wgt, shw != NULL);
+--- a/c/inkling2_chain.h	2026-11-27 17:18:13.994089490 -0800
++++ b/c/inkling2_chain.h	2026-11-27 17:18:13.988089276 -0800
+@@ -759,10 +759,15 @@
+             if (!ok) break;
+             for (int k = 0; k < ndq; k++) ink2c_dmoe_done(ch, m, dq[2 * k], dq[2 * k + 1], n, pb);
+             ndq = 0;
++            { extern double g_hp_wait; if (n > 8) g_hp_wait += now_s() - t0; }
++            double tkv = now_s();
+             ink2c_kv_down(ch, m, v, n, pb, (const float *)vkc_ptr(ch->kvd), (size_t)ch->rows * ch->kvo_max);
+             double t1 = now_s();
++            { extern double g_hp_kvdown; if (n > 8) g_hp_kvdown += t1 - tkv; }
+             moe_ex(m, l, i, (float *)vkc_ptr(ch->h2d), n, ch->host_routed, (const float *)vkc_ptr(ch->lgd), NULL);
++            double tm = now_s();
+             memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * D * sizeof(float));
++            { extern double g_hp_copy; if (n > 8) g_hp_copy += now_s() - tm; }
+             ch->host_ms += (now_s() - t1) * 1e3;
+             ok = vkc_begin();
+             if (ok && dmoe) ok = vkc_dmoe_upload(&ch->dm);   /* the host's step ran the tier: the table again */
+@@ -824,6 +829,10 @@
+                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps' experts in the frame, "
+                     "%.1f MiB on the device\n",
+             ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, ch->dm_layers, st.dev_bytes / 1048576.0);
++        { extern double g_hp_route, g_hp_prep, g_hp_issue, g_hp_cpu, g_hp_join, g_hp_sum, g_hp_steps, g_hp_wait, g_hp_kvdown, g_hp_copy;
++          fprintf(stderr, "[HANDOFF] %.0f prompt layer steps: chain wait %.2f s, kv_down %.2f s, routing %.2f s, prep %.2f s, issue %.2f s, "
++                  "cpu pairs %.2f s, join %.2f s, host sum %.2f s, routed copy %.2f s\n", g_hp_steps, g_hp_wait, g_hp_kvdown, g_hp_route,
++                  g_hp_prep, g_hp_issue, g_hp_cpu, g_hp_join, g_hp_sum, g_hp_copy); }
+     vkc_prof_print();
+ }
+ 
