@@ -4017,7 +4017,7 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
  * that rule. Dynamic shared memory: the heads' q rows and scores, G * (hd + 256) floats. */
 template <int G, typename KT = float>
 __global__ static void __launch_bounds__(256) cc_attn_decg_k(const float *__restrict__ q, const KT *__restrict__ kc,
-        const KT *__restrict__ vc, float *__restrict__ xs, CcAttn p, int nb, int win, int ring, int hc, int tpp) {
+        const KT *__restrict__ vc, float *__restrict__ xs, CcAttn p, int nb, int win, int ring, int hc, int tpp, int rows) {
     COLI_PDL_WAIT();
     extern __shared__ float4 cc_decg_sm[];
     __shared__ float red[G * 8];
@@ -4025,6 +4025,7 @@ __global__ static void __launch_bounds__(256) cc_attn_decg_k(const float *__rest
     float4 *qv = cc_decg_sm;                       /* G * NV: the heads' q rows, then the groups' V sums */
     float *sc = (float *)(cc_decg_sm + G * NV);    /* G * 256 */
     int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, kvh = blockIdx.x, b = blockIdx.y, s = blockIdx.z;
+    if (rows) { s = blockIdx.x; kvh = blockIdx.y; b = blockIdx.z; }   /* grid (S, KVH, nb): cc_decg_launch */
     int n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;
     int L = cc_attn_dec_len(n - first, hc), t0 = first + b * L, cnt = min(L, n - t0);
     size_t xo0 = ((size_t)(s * p.H + kvh * G) * nb + b) * stride, xg = (size_t)nb * stride;   /* head kvh * G + g at xo0 + g * xg */
@@ -4201,16 +4202,21 @@ static int cc_decg_tpp(void) {
 template <typename KT>
 static void cc_decg_launch(CcCtx *c, int G, const float *q, const KT *kc, const KT *vc, float *xs, const CcAttn &p, int nb,
                            int win, int ring, int hc) {
-    dim3 g((unsigned)p.KVH, (unsigned)nb, (unsigned)p.S);
+    /* COLI_CUDA_ATTN_DEC_ROWS=1 (read each call): a verify's rows of one block of positions launched
+     * next to each other, grid (S, KVH, nb), so the rows after the first find its K and V in L2
+     * instead of each row streaming the whole cache from DRAM. Each block computes what it did: the same bits */
+    const char *e = p.S > 1 ? getenv("COLI_CUDA_ATTN_DEC_ROWS") : nullptr;   /* a decode step's one row: no lookup */
+    int rows = e && *e == '1';
+    dim3 g = rows ? dim3((unsigned)p.S, (unsigned)p.KVH, (unsigned)nb) : dim3((unsigned)p.KVH, (unsigned)nb, (unsigned)p.S);
     size_t sm = (size_t)G * (p.hd + 256) * sizeof(float);
     int tpp = cc_decg_tpp();
     switch (G) {
-    case 2: coli_launch(cc_attn_decg_k<2, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
-    case 4: coli_launch(cc_attn_decg_k<4, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
-    case 6: coli_launch(cc_attn_decg_k<6, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
-    case 8: coli_launch(cc_attn_decg_k<8, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
-    case 12: coli_launch(cc_attn_decg_k<12, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
-    default: coli_launch(cc_attn_decg_k<16, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 2: coli_launch(cc_attn_decg_k<2, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp, rows); break;
+    case 4: coli_launch(cc_attn_decg_k<4, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp, rows); break;
+    case 6: coli_launch(cc_attn_decg_k<6, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp, rows); break;
+    case 8: coli_launch(cc_attn_decg_k<8, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp, rows); break;
+    case 12: coli_launch(cc_attn_decg_k<12, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp, rows); break;
+    default: coli_launch(cc_attn_decg_k<16, KT>, g, 256, sm, c->stream, q, kc, vc, xs, p, nb, win, ring, hc, tpp, rows); break;
     }
 }
 template <typename KT>
@@ -4226,7 +4232,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
     const auto read_decode_setting = [] {
         const char *e = getenv("COLI_CUDA_ATTN_DEC");
-        return !(e && *e == '0');
+        return e && *e == '2' ? 2 : !(e && *e == '0');
     };
     static int plain_dec = -1, profiled_dec = -1;
     int &dec = c->device_profile ? profiled_dec : plain_dec;
@@ -4278,7 +4284,8 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     }
 #endif
     (void)fl;
-    /* a decode's or a verify's rows over many positions: split over them */
+    /* a decode's or a verify's rows over many positions: split over them (COLI_CUDA_ATTN_DEC=2: also
+     * where a prompt chunk does not take cc_attn_fk, so tests and benches reach it on pre-Turing cards) */
     if (dec < 0) dec = read_decode_setting();
     int last = p->pos_base + p->S;
     /* only where a prompt chunk takes cc_attn_fk (f16 on the tensor cores): elsewhere a row's
@@ -4297,7 +4304,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     const int *sp = (const int *)fp(sel);
     int lists = 0;
     if (p->sel_row > 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_SEL"); lists = !(e && *e == '0') && sp; }
-    if (dec && (p->sel_row <= 0 ? fk : lists) && p->S <= max_dec_rows && last >= CC_ATTN_DEC_MIN) {
+    if (dec && (p->sel_row <= 0 ? fk || dec == 2 : lists) && p->S <= max_dec_rows && last >= CC_ATTN_DEC_MIN) {
         /* each row as a decode step of it alone: its own blocks of positions (cc_attn_dec_len),
          * and the rows whose positions are fewer than CC_ATTN_DEC_MIN through cc_attn_k */
         int k = CC_ATTN_DEC_MIN - (p->pos_base + 1);
@@ -4886,7 +4893,7 @@ static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, C
     const int win = w->win, so = w->sink_off;
     static int fl = -1, dec = -1;
     if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
-    if (dec < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC"); dec = !(e && *e == '0'); }
+    if (dec < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC"); dec = e && *e == '2' ? 2 : !(e && *e == '0'); }   /* 2: as in cc_attn */
     int G = p->H / p->KVH, fk = 0;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
@@ -4902,7 +4909,7 @@ static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, C
 #endif
     /* a row's positions: the window's at most */
     #define CC_WPOS(r) (win > 0 && p->pos_base + (r) + 1 > win ? win : p->pos_base + (r) + 1)
-    if (dec && fk && p->S <= CC_ATTN_DEC_ROWS && CC_WPOS(p->S - 1) >= CC_ATTN_DEC_MIN) {
+    if (dec && (fk || dec == 2) && p->S <= CC_ATTN_DEC_ROWS && CC_WPOS(p->S - 1) >= CC_ATTN_DEC_MIN) {
         int k = 0;   /* the rows with fewer than CC_ATTN_DEC_MIN positions: cc_attn_k, as in cc_attn */
         while (k < p->S && CC_WPOS(k) < CC_ATTN_DEC_MIN) k++;
         if (k > 0) {
