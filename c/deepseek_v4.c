@@ -368,6 +368,11 @@ int coli_st_expert_route(int layer, int eid) {
 
 int coli_st_mirror_active(void) { return g_v4_mirror; }
 int coli_st_mirror_nrep(void) { return g_v4_mir_nrep; }
+/* Share of replica rep in the read split, out of 256 (COLI_DISK_WEIGHTS). */
+int coli_st_mirror_share(int rep) {
+    if (!g_v4_mirror || rep < 0 || rep >= g_v4_mir_nrep) return 0;
+    return g_v4_mir_cut[rep] - (rep ? g_v4_mir_cut[rep - 1] : 0);
+}
 
 /* DUAL-SSD: measure one replica's read bandwidth with the engine's own access
  * pattern (parallel ~19 MB reads, O_DIRECT twin when available). Reads the
@@ -10667,6 +10672,85 @@ static int v4_slab_shift_on(void) {
     return !(setting && *setting == '0');
 }
 
+/* V4_STRIPE (default 0, opt-in): split one aligned direct read between the
+ * routed replica and a second full copy, both halves in flight at once, sized
+ * by the COLI_DISK_WEIGHTS shares (mirrors COLI_MIR_STRIPE). */
+#define V4_STRIPE_ALIGN 4096u
+#define V4_STRIPE_MIN_BYTES ((size_t)1 << 20)
+
+size_t coli_v4_stripe_head_bytes(size_t direct_length, int share_rep,
+                                 int share_other) {
+    if (direct_length < V4_STRIPE_MIN_BYTES ||
+        (direct_length & (V4_STRIPE_ALIGN - 1)) != 0 ||
+        share_rep <= 0 || share_other <= 0)
+        return 0;
+    size_t head = (size_t)((double)direct_length * share_rep /
+                           ((double)share_rep + (double)share_other));
+    head &= ~(size_t)(V4_STRIPE_ALIGN - 1);
+    if (head < V4_STRIPE_ALIGN || head >= direct_length) return 0;
+    return head;
+}
+
+typedef struct {
+    int fd;
+    unsigned char *buffer;
+    size_t length;
+    uint64_t offset;
+    int result;
+} V4StripePart;
+
+static void *v4_stripe_part_worker(void *argument) {
+    V4StripePart *part = argument;
+    part->result = v4_pread_full_try(part->fd, part->buffer, part->length,
+                                     part->offset);
+    return NULL;
+}
+
+static int v4_stripe_enabled(void) {
+    const char *text = getenv("V4_STRIPE");
+    return text && *text && atoi(text) != 0;
+}
+
+/* Returns 1 when slab[0..direct_length) was filled by this call (*other_bytes
+ * receives bytes served by *other_rep, or 0 if the tail fell back to dfd),
+ * 0 when striping did not apply (caller reads the whole window), or -1 on an
+ * unrecoverable read error. */
+static int v4_stripe_read(const V4ExpertStoreState *state, int shard,
+                          int rep, int dfd, unsigned char *slab,
+                          size_t direct_length, uint64_t base,
+                          int *other_rep, size_t *other_bytes) {
+    *other_rep = -1;
+    *other_bytes = 0;
+    if (!v4_stripe_enabled() || coli_st_mirror_nrep() < 2)
+        return 0;
+    int other = (rep + 1) % coli_st_mirror_nrep();
+    int odfd = other ? state->index->mdfds[other - 1][shard]
+                     : state->index->dfds[shard];
+    int share_rep = coli_st_mirror_share(rep);
+    int share_other = coli_st_mirror_share(other);
+    if (odfd < 0) return 0;
+    size_t head = coli_v4_stripe_head_bytes(direct_length, share_rep,
+                                            share_other);
+    if (!head) return 0;
+    V4StripePart tail = {odfd, slab + head, direct_length - head,
+                         base + head, -1};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, v4_stripe_part_worker, &tail)) return 0;
+    int head_result = v4_pread_full_try(dfd, slab, head, base);
+    pthread_join(thread, NULL);
+    if (head_result) return -1;
+    if (tail.result) {
+        /* The second copy failed: read the tail from the routed replica. */
+        if (v4_pread_full_try(dfd, slab + head, direct_length - head,
+                              base + head))
+            return -1;
+        return 1;
+    }
+    *other_rep = other;
+    *other_bytes = direct_length - head;
+    return 1;
+}
+
 /* shift: NULL moves the range to slab + destination_offset, as a caller that
  * tiles several ranges into one slab needs. Otherwise the range stays where
  * the window put it, *shift bytes into the slab (destination_offset is then
@@ -10693,7 +10777,13 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
     uint64_t available = file_bytes - base;
     if ((uint64_t)direct_length > available)
         direct_length = (size_t)(available & ~(alignment - 1));
-    if (direct_length && v4_pread_full_try(dfd, slab, direct_length, base)) return -1;
+    int other = -1;
+    size_t moved = 0;
+    int striped = direct_length ? v4_stripe_read(
+        state, shard, rep, dfd, slab, direct_length, base, &other, &moved) : 0;
+    if (striped < 0) return -1;
+    if (direct_length && !striped &&
+        v4_pread_full_try(dfd, slab, direct_length, base)) return -1;
     if (direct_length < wanted && v4_pread_full_try(
             fd, slab + direct_length,
             wanted - direct_length, base + direct_length)) return -1;
@@ -10701,8 +10791,15 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
         *shift = pad;
     else
         memmove(slab + destination_offset, slab + pad, length);
-    __atomic_fetch_add(&g_v4_mir_bytes[rep], (uint64_t)length, __ATOMIC_RELAXED);
+    size_t on_other = moved < length ? moved : length;
+    __atomic_fetch_add(&g_v4_mir_bytes[rep], (uint64_t)(length - on_other),
+                       __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_v4_mir_nread[rep], 1, __ATOMIC_RELAXED);
+    if (other >= 0 && on_other) {
+        __atomic_fetch_add(&g_v4_mir_bytes[other], (uint64_t)on_other,
+                           __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_v4_mir_nread[other], 1, __ATOMIC_RELAXED);
+    }
     return 0;
 }
 
@@ -11487,6 +11584,17 @@ int coli_v4_test_force_streaming_direct(ColiExpertStore *store) {
         if (state->index->dfds[i] >= 0) enabled = 1;
     }
     return enabled ? 0 : -1;
+}
+
+int coli_v4_test_read_direct_window(ColiSafetensorsIndex *index, int shard,
+                                    int rep, unsigned char *slab,
+                                    uint64_t offset, size_t length,
+                                    size_t destination_offset, size_t *shift) {
+    V4ExpertStoreState stub;
+    memset(&stub, 0, sizeof(stub));
+    stub.index = index;
+    return v4_read_direct_window(&stub, shard, rep, slab, offset, length,
+                                 destination_offset, shift);
 }
 #endif
 
