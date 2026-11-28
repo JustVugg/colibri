@@ -685,7 +685,7 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
 static int q36c_kvh_want(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_KV16"); on = !(e && *e == '0'); }
-    return on && q36_kv16() && g_q36_mux_slots <= 1 && !getenv("COLI_VK_CHAIN_MUX") && vkc_kvh_ready();
+    return on && q36_kv16() && vkc_kvh_ready();   /* the places too (q36c_attention_mx, q36c_mux_push) */
 }
 static size_t q36c_kves(const Q36Chain *ch) { return ch && ch->kvh ? 2 : sizeof(float); }
 /* a step's float32 K or V rows into a mirror */
@@ -1011,13 +1011,13 @@ static void q36c_conv_free(Model *m, Q36cConv *v) {
 /* the room the planned places past the chain's own take (q36_places_plan), for the expert tier */
 static size_t q36c_places_bytes(Model *m) {
     size_t b = 0;
-    if (g_q36_mux_slots > 1 && coli_kv_plan()) q36_places_plan(m, sizeof(float), vkc_dev_avail(), &b);
+    if (g_q36_mux_slots > 1 && coli_kv_plan()) q36_places_plan(m, q36c_kvh_want() ? 2 : sizeof(float), vkc_dev_avail(), &b);
     return b;
 }
 static size_t q36c_conv_kv_bytes(Model *m, Q36Chain *ch, int cap) {
     Cfg *c = &m->c; size_t b = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++)
-        if (c->is_attn[i]) b += 2 * (size_t)c->kv_heads * (q36c_ring(m, i) ? m->kv_ring : cap) * c->k_head_dim * sizeof(float);
+        if (c->is_attn[i]) b += 2 * (size_t)c->kv_heads * (q36c_ring(m, i) ? m->kv_ring : cap) * c->k_head_dim * q36c_kves(ch);
     return b;
 }
 /* the device's free memory as the places see it: COLI_VK_TEST_CONV_ROOM_MB=n holds it at n MiB
@@ -1075,8 +1075,8 @@ static int q36c_conv_grow(Q36Chain *ch, Model *m, int k, int need) {
         if (R && v->kc[i]) continue;   /* a ring keeps its rows */
         int rows = R ? m->kv_ring : cap;
         vkc_free(v->kc[i]); vkc_free(v->vc[i]);
-        v->kc[i] = vkc_buf((size_t)KV * rows * kvd * sizeof(float), VKC_DEV);
-        v->vc[i] = vkc_buf((size_t)KV * rows * kvd * sizeof(float), VKC_DEV);
+        v->kc[i] = vkc_buf((size_t)KV * rows * kvd * q36c_kves(ch), VKC_DEV);   /* float16 with the chain's mirrors */
+        v->vc[i] = vkc_buf((size_t)KV * rows * kvd * q36c_kves(ch), VKC_DEV);
         v->kv_valid[i] = 0; v->kv_rows[i] = rows;
         if (!v->kc[i] || !v->vc[i]) { v->cap = 0; return 0; }
     }
@@ -1096,7 +1096,7 @@ static void q36c_conv_shrink(Q36Chain *ch, Model *m, int k, int need) {
     for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         if (!c->is_attn[i] || q36c_ring(m, i)) continue;
         freed += vkc_bytes(v->kc[i]) + vkc_bytes(v->vc[i]);
-        again += 2 * (size_t)c->kv_heads * ((keep + 1023) / 1024 * 1024) * c->k_head_dim * sizeof(float);
+        again += 2 * (size_t)c->kv_heads * ((keep + 1023) / 1024 * 1024) * c->k_head_dim * q36c_kves(ch);
         vkc_free(v->kc[i]); vkc_free(v->vc[i]); v->kc[i] = v->vc[i] = NULL; v->kv_valid[i] = 0; v->kv_rows[i] = 0;
     }
     v->cap = 0; ch->conv_shrinks++;
@@ -1172,6 +1172,8 @@ static void q36c_mux_init(Model *m) {
         return;
     }
     if (!q36c_pool_ok(ch, m) || ch->conv || !(ch->conv = calloc((size_t)g_q36_mux_slots, sizeof *ch->conv))) return;
+    /* the mirrors' element before any place takes one: the places' K/V are the chain's (float16, q36c_kvh_want) */
+    if (!ch->kvh_set) { ch->kvh = !ch->d && q36c_kvh_want(); ch->kvh_set = 1; }
     for (int k = 0; k < g_q36_mux_slots; k++) ch->conv[k].slot = -1;
     ch->nconv = 1; ch->conv_cur = 0;
     q36c_conv_save(ch);
@@ -1592,13 +1594,13 @@ static int q36c_attention_mx(Q36Chain *ch, Model *m, Layer *l, int i, int n, int
         int pos = ch->mx_rows[c0 + s].pos, rows = v->kv_rows[i];
         for (int h = 0; h < KV; h++)
             rg[h] = (VkcRegion){((size_t)h * rows + (R ? pos % R : pos)) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-        ok = vkc_copy_regions(v->kc[i], ch->k, rg, KV) && vkc_copy_regions(v->vc[i], ch->v, rg, KV);
+        ok = q36c_kv_put(ch, v->kc[i], ch->k, rg, KV) && q36c_kv_put(ch, v->vc[i], ch->v, rg, KV);
         VkcAttn a = {1, H, KV, hd, pos, rows, s * qo, qo, qdim, s * qo + hd, qo, qdim, gate_dim > 0, s * H * hd, H * hd, 0, 0,
                      1.f / sqrtf((float)hd), 0, 0};
         if (win || l->sinks) {
             VkcAttnW w = {a, win, R, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
-            ok = ok && vkc_attn_w(ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, NULL, l->sinks ? ch->prm : NULL, &w);
-        } else ok = ok && vkc_attn(ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, NULL, &a);
+            ok = ok && q36c_attn_wc(ch, ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, l->sinks ? ch->prm : NULL, &w);
+        } else ok = ok && q36c_attn_c(ch, ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, &a);
     }
     free(rg);
     return ok && q36c_attn_out(ch, m, l, n);
@@ -1652,16 +1654,16 @@ static int q36c_mux_push(Q36Chain *ch, Model *m, int c0, int n) {
                     int r = t % R, run = pos - t < R - r ? pos - t : R - r;
                     for (int h = 0; h < KV && ok; h++) {
                         size_t at = ((size_t)h * R + r) * kvd;
-                        ok = q36c_kv_up(0, v->kc[i], at, q->K[i], (int64_t)at, (size_t)run * kvd) &&
-                             q36c_kv_up(0, v->vc[i], at, q->V[i], (int64_t)at, (size_t)run * kvd);
+                        ok = q36c_kv_up(ch->kvh, v->kc[i], at, q->K[i], (int64_t)at, (size_t)run * kvd) &&
+                             q36c_kv_up(ch->kvh, v->vc[i], at, q->V[i], (int64_t)at, (size_t)run * kvd);
                     }
                     t += run;
                 }
             } else
                 for (int h = 0; h < KV && ok; h++) {
                     size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * v->kv_rows[i] + t0) * kvd;
-                    ok = q36c_kv_up(0, v->kc[i], dst, q->K[i], (int64_t)src, (size_t)(pos - t0) * kvd) &&
-                         q36c_kv_up(0, v->vc[i], dst, q->V[i], (int64_t)src, (size_t)(pos - t0) * kvd);
+                    ok = q36c_kv_up(ch->kvh, v->kc[i], dst, q->K[i], (int64_t)src, (size_t)(pos - t0) * kvd) &&
+                         q36c_kv_up(ch->kvh, v->vc[i], dst, q->V[i], (int64_t)src, (size_t)(pos - t0) * kvd);
                 }
             v->kv_valid[i] = pos;
         }
