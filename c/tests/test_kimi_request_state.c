@@ -35,6 +35,7 @@ static void free_model(Model *m){
 }
 
 int main(void){
+    setenv("COLI_KV_PLAN","0",1);   /* the cache grown as requests ask; the plan's own case at the end */
     Model m; init_model(&m);
     const int first[]={1,2,3};
     int reuse=prepare_request_state(&m,first,3,8);
@@ -76,6 +77,19 @@ int main(void){
           "request after cancellation did not cold-rebuild cleanly");
 
     free_model(&m);
+
+    /* COLI_KV_PLAN (coli_kv_plan.h): the whole context (K3_MAXT) at the first request, so a longer one
+     * reuses the rows where they are instead of growing them */
+    unsetenv("COLI_KV_PLAN"); setenv("K3_MAXT","64",1);
+    Model p; init_model(&p);
+    reuse=prepare_request_state(&p,first,3,8);
+    CHECK(reuse==0&&p.Lc&&p.Lc[1]&&p.max_t==64,"planned first allocation max_t=%d (want the whole context, 64)",p.max_t);
+    kv_prefix_record(&p.kvp,first,0,3);
+    float *planned_l=p.Lc[1];
+    reuse=prepare_request_state(&p,extended,4,12);
+    CHECK(reuse==3&&p.Lc[1]==planned_l,"planned: a longer request reallocated the cache (reuse %d)",reuse);
+    free_model(&p);
+    unsetenv("K3_MAXT");
     if(failures){ fprintf(stderr,"kimi request state: %d failure(s)\n",failures); return 1; }
     puts("kimi request state: ok");
     return 0;
