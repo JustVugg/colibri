@@ -121,6 +121,63 @@ int main(int argc, char **argv_in) {
     qt_shutdown();
     tk(!G_fp8_stream && !G.on, "shutdown leaves the mode");
 
+    /* Q38_RAM_EXCL=1: a full RAM layer prefers evicting an expert already
+     * resident in VRAM over a non-VRAM expert (matching Vulkan's vkt_ram_first).
+     * Pass with cap=3 (3 RAM slots per layer, 6-expert VRAM budget across 4 layers):
+     * switch off gives up 0 VRAM-resident slots; switch on gives up >0 and reproduces
+     * the oracle; direct q38_victim check pins that a newer VRAM-resident slot is
+     * evicted ahead of an older non-VRAM slot while protect is still respected. */
+    printf(" Q38_RAM_EXCL=1 on the FP8 fixture (3 RAM slots a layer)\n");
+    {
+        char *argv3[] = { (char *)"qwen38", (char *)"3", (char *)"8", (char *)"./qwen38_tiny_fp8/ref.json" };
+        unsigned long long gave[2] = {0, 0};
+        for (int a = 0; a < 2; a++) {
+            setenv("Q38_RAM_EXCL", a ? "1" : "0", 1);
+            unsigned long long g0 = g_q38_ram_excl_gave;
+            rc = qwen38_main_unused(4, argv3);
+            qt_fill_wait();
+            gave[a] = g_q38_ram_excl_gave - g0;
+            tk(rc == 0, a ? "Q38_RAM_EXCL=1 reproduces the oracle (cap 3)" : "Q38_RAM_EXCL=0 reproduces the oracle (cap 3)");
+            tk(a ? g_q38_ram_excl == 4 : g_q38_ram_excl == 0, a ? "Q38_RAM_EXCL=1: active for all 4 layers" : "Q38_RAM_EXCL=0 (default): plain LRU");
+            if (a == 1) {
+                /* Find a layer with both a VRAM-resident expert and a non-resident expert */
+                int test_l = -1, e_res = -1, e_non = -1;
+                for (int l = 0; l < G.nl && test_l < 0; l++) {
+                    int r = -1, nr = -1;
+                    for (int e = 0; e < G.ne; e++) {
+                        if (qt_is_resident(l, e)) { if (r < 0) r = e; }
+                        else { if (nr < 0) nr = e; }
+                    }
+                    if (r >= 0 && nr >= 0) { test_l = l; e_res = r; e_non = nr; }
+                }
+                tk(test_l >= 0, "found a layer with both VRAM-resident and non-resident experts");
+                if (test_l >= 0) {
+                    Slot s[2]; memset(s, 0, sizeof s);
+                    s[0].eid = e_non; s[0].used = 1;    /* older, NOT in VRAM */
+                    s[1].eid = e_res; s[1].used = 10;   /* newer, resident in VRAM */
+                    LCache lc; memset(&lc, 0, sizeof lc);
+                    lc.slots = s; lc.n = 2; lc.cap = 2;
+                    /* With Q38_RAM_EXCL off, plain LRU picks slot 0 (older non-VRAM) */
+                    int saved = g_q38_ram_excl;
+                    g_q38_ram_excl = 0;
+                    tk(q38_victim(&lc, test_l, NULL) == 0, "Q38_RAM_EXCL=0: plain LRU picks older non-VRAM slot");
+                    /* With Q38_RAM_EXCL on, picks slot 1 (newer VRAM-resident), preserving non-VRAM slot 0 */
+                    g_q38_ram_excl = saved;
+                    unsigned long long gb = g_q38_ram_excl_gave;
+                    tk(q38_victim(&lc, test_l, NULL) == 1 && g_q38_ram_excl_gave == gb + 1,
+                       "Q38_RAM_EXCL=1: prefers VRAM-resident slot as victim and preserves non-VRAM expert");
+                    /* Protected VRAM-resident slot falls back to non-VRAM slot 0 */
+                    uint8_t prot[2] = {0, 1};
+                    tk(q38_victim(&lc, test_l, prot) == 0, "Q38_RAM_EXCL=1: respects protect mask");
+                }
+            }
+            qt_shutdown();
+        }
+        unsetenv("Q38_RAM_EXCL");
+        printf("  slots given up because VRAM held their expert: %llu (off %llu)\n", gave[1], gave[0]);
+        tk(gave[0] == 0 && gave[1] > 0, "Q38_RAM_EXCL=1 gave up VRAM-resident RAM slots, default gave up none");
+    }
+
     /* Second pass: the dense trunk on the fake tier. Every dense matrix of the
      * fixture is offered (Q38_TRUNK_MIN_KB=0), quantized to int8 per row and
      * "uploaded"; the fake backend now computes fmt 1 from the uploaded bytes,

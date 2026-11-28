@@ -881,6 +881,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q38_PREFIX_DISK", CE_BOOL, CE_QWEN38, 0, NULL},
     {"Q38_PREFIX_DISK_MB", CE_FLOAT, CE_QWEN38, 0, NULL},
     {"Q38_PREFIX_LOG",                   CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_RAM_EXCL", CE_BOOL, CE_QWEN38, 0, NULL},
     {"Q38_TRUNK_CPU_INT4", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_TRUNK_CPU_INT8", CE_BOOL, CE_QWEN38, 0, NULL},
     {"Q38_TRUNK_GPU", CE_BOOL, CE_QWEN38, 0, NULL},
