@@ -1135,6 +1135,10 @@ int coli_v4_layer_gpu_set(ColiDeepSeekV4LayerWeights *weights,
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS_V2 = COLI_V4_RESIDENT_MAX_LAYERS };
 
+const ColiDeepSeekV4LayerWeights *g_v4_next_layers;
+const unsigned char *g_v4_next_ready;
+int g_v4_next_nlayers;
+
 static int resident_enabled_v2(ColiV4Engine *engine) {
     return engine && engine->runtime.dense_resident;
 }
@@ -1230,6 +1234,10 @@ int coli_v4_layer_load(ColiV4Engine *engine,
                             "continuing-CPU\n", layer);
 #endif
         engine->dense_resident.ready[layer] = 1;
+        /* V4_NEXT_PREFETCH reads the next layer's router from here. */
+        g_v4_next_layers = engine->dense_resident.layers;
+        g_v4_next_ready = engine->dense_resident.ready;
+        g_v4_next_nlayers = COLI_V4_RESIDENT_MAX_LAYERS_V2;
         engine->dense_resident.total_bytes +=
             engine->dense_resident.layers[layer].stats.total_bytes;
         /* device only: the layer's matrices to the device and their host pages back,
@@ -6466,6 +6474,766 @@ static int v4_views_fetch_host(ColiExpertStore *store, ColiExpertView *views,
 }
 #endif
 
+/* ==== V4_NEXT_PREFETCH: next-layer expert prefetch ====
+ * Decode reads a layer's missing experts only after that layer has routed, so
+ * the drives idle while compute runs and compute idles while they read.
+ * Right after layer L routes, run layer L+1's router on L's MoE input (exact
+ * for hash-routed layers via tid2eid) and hand the predicted experts to
+ * background threads that pull them into the host expert cache. Output never
+ * changes: prediction only decides what is read early, routing still uses
+ * L+1's real input.
+ *   V4_NEXT_PREFETCH=1        enable prefetch (default 0)
+ *   V4_NEXT_PREFETCH_K=n      experts predicted per layer (default 6, max 16)
+ *   V4_NEXT_PREFETCH_DEPTH=2  also guess layer L+2 from layer L's input
+ *                             (V4_NEXT_PREFETCH_K2 experts, default 4)
+ *   V4_NEXT_PREFETCH_THREADS  background readers (default 2, max 8)
+ *   V4_NEXT_PREFETCH_TOKSTART=1  at the start of a decode forward, queue the
+ *                             leading hash layers' experts (tid2eid of token);
+ *                             implies V4_NEXT_PREFETCH_KEEP=1
+ *   V4_NEXT_PREFETCH_KEEP=1   a newer guess drops only stale unstarted reads
+ *                             instead of wiping the whole queue (keeps later
+ *                             layers' token-start and depth-2 reads)
+ *   V4_NEXT_PREFETCH_VRAM=n   also upload the n best guesses to the VRAM
+ *                             mirror cache (default 0 = RAM only)
+ *   V4_NEXT_PREFETCH_AVX2=1   run the predictor's gate GEMV in AVX2+FMA
+ *                             (v4_np_route.h: bit-identical to scalar)
+ *   V4_PREDICT_STATS=1        log prediction recall, fresh recall, route
+ *                             latency, queue traffic, and confidence buckets
+ *   V4_NP_MIN_CONF=x          minimum predicted confidence (0..1) to move bytes
+ *   V4_NP_TOKEN_MB=n          per-forward prefetch byte budget in MB */
+#include "v4_np_route.h"
+#define V4_NP_MAXK 16
+#define V4_NP_LAYERS 128
+#define V4_NP_QUEUE 256
+typedef struct {
+    ColiExpertStore *store;
+    ColiExpertKey key;
+    int rank;
+    uint32_t stamp;
+    float conf;
+} V4NpItem;
+static struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t ready;
+    V4NpItem queue[V4_NP_QUEUE];
+    int head, tail, started;
+} v4_np = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, {{0}}, 0, 0, 0};
+static int v4_np_mode = -1;     /* bit 0 prefetch, bit 1 stats */
+static int v4_np_k = 6, v4_np_threads = 2, v4_np_vram = 0;
+static int v4_np_depth = 1, v4_np_k2 = 4;
+static int v4_np_tokstart, v4_np_keep, v4_np_avx2;
+/* Token start's lists: queued for forward `stamp` on `token`, one bit per
+ * layer, cleared when v4_np_predict reaches that layer (avoids re-queuing). */
+static uint32_t v4_np_tokstart_stamp;
+static int v4_np_tokstart_token = -1;
+static unsigned v4_np_tokstart_mask;
+/* Gating: V4_NP_MIN_CONF, V4_NP_TOKEN_MB in bytes (0 = unlimited). */
+static float v4_np_min_conf;
+static uint64_t v4_np_token_bytes;
+static int v4_np_gating;
+static uint32_t v4_np_spend_stamp;
+static uint64_t v4_np_spent;
+enum { V4_NPG_ADMITTED, V4_NPG_CONF, V4_NPG_BUDGET, V4_NPG_BYTES, V4_NPG_COUNT };
+static unsigned long long v4_np_gstat[V4_NPG_COUNT];
+static void v4_np_at_exit(void);
+/* V4_PREDICT_STATS: {used, guessed} per confidence bucket of 0.05 (last open). */
+#define V4_NP_CONF_BUCKETS 10
+static unsigned long long v4_np_conf_hist[V4_NP_CONF_BUCKETS][2];
+enum { V4_NP_APPEND, V4_NP_REPLACE, V4_NP_PRUNE, V4_NP_RESET };
+static int v4_np_decode;
+enum { V4_NPQ_QUEUED, V4_NPQ_DROPPED, V4_NPQ_KEPT, V4_NPQ_STALE, V4_NPQ_TOKSTART,
+       V4_NPQ_FULL, V4_NPQ_COUNT };
+static unsigned long long v4_np_qstat[V4_NPQ_COUNT];
+static unsigned long long v4_np_route_ns, v4_np_route_calls, v4_np_route_refined,
+                          v4_np_route_vector;
+static unsigned long long v4_np_fresh_hits, v4_np_fresh_total, v4_np_fresh_layers,
+                          v4_np_fresh_missing, v4_np_fresh2_hits, v4_np_fresh2_total;
+static int v4_np_pred[V4_NP_LAYERS][V4_NP_MAXK];
+static float v4_np_pred_conf[V4_NP_LAYERS][V4_NP_MAXK];
+static int v4_np_pred_n[V4_NP_LAYERS];
+static unsigned long long v4_np_hits, v4_np_total, v4_np_layers;
+static uint32_t v4_np_forward;
+static uint32_t v4_np_stamp[V4_NP_LAYERS], v4_np_stamp2[V4_NP_LAYERS];
+static int v4_np_pred2[V4_NP_LAYERS][V4_NP_MAXK], v4_np_pred2_n[V4_NP_LAYERS];
+
+static void v4_np_init(void) {
+    if (v4_np_mode >= 0) return;
+    const char *prefetch = getenv("V4_NEXT_PREFETCH");
+    const char *stats = getenv("V4_PREDICT_STATS");
+    const char *k = getenv("V4_NEXT_PREFETCH_K");
+    const char *threads = getenv("V4_NEXT_PREFETCH_THREADS");
+    if (k && atoi(k) >= 1 && atoi(k) <= V4_NP_MAXK) v4_np_k = atoi(k);
+    if (threads && atoi(threads) >= 1 && atoi(threads) <= 8)
+        v4_np_threads = atoi(threads);
+    const char *depth = getenv("V4_NEXT_PREFETCH_DEPTH");
+    const char *k2 = getenv("V4_NEXT_PREFETCH_K2");
+    if (depth && atoi(depth) == 2) v4_np_depth = 2;
+    if (k2 && atoi(k2) >= 1 && atoi(k2) <= V4_NP_MAXK) v4_np_k2 = atoi(k2);
+    const char *vram = getenv("V4_NEXT_PREFETCH_VRAM");
+    if (vram && *vram && atoi(vram) >= 0) v4_np_vram = atoi(vram);
+    const char *tokstart = getenv("V4_NEXT_PREFETCH_TOKSTART");
+    const char *keep = getenv("V4_NEXT_PREFETCH_KEEP");
+    const char *avx2 = getenv("V4_NEXT_PREFETCH_AVX2");
+    int mode = (prefetch && atoi(prefetch) ? 1 : 0) | (stats && atoi(stats) ? 2 : 0);
+    if (mode & 1) {
+        v4_np_tokstart = tokstart && atoi(tokstart) != 0;
+        /* a default replace at layer 0 would wipe token start's layer-2 reads */
+        v4_np_keep = v4_np_tokstart || (keep && atoi(keep) != 0);
+        const char *min_conf = getenv("V4_NP_MIN_CONF");
+        const char *token_mb = getenv("V4_NP_TOKEN_MB");
+        if (min_conf && atof(min_conf) > 0.0) v4_np_min_conf = fminf((float)atof(min_conf), 1.0f);
+        if (token_mb && atof(token_mb) > 0.0)
+            v4_np_token_bytes = (uint64_t)(fmin(atof(token_mb), 1e9) * 1048576.0);
+        v4_np_gating = v4_np_min_conf > 0.0f || v4_np_token_bytes > 0;
+        if (v4_np_gating) atexit(v4_np_at_exit);
+    }
+#ifdef V4_NP_ROUTE_AVX2
+    v4_np_avx2 = mode && avx2 && atoi(avx2) != 0;
+#endif
+    v4_np_mode = mode;
+    if (v4_np_mode)
+        fprintf(stderr, "v4_next_prefetch prefetch=%d stats=%d k=%d threads=%d depth=%d k2=%d\n",
+                v4_np_mode & 1, (v4_np_mode >> 1) & 1, v4_np_k, v4_np_threads,
+                v4_np_depth, v4_np_k2);
+    if (v4_np_mode && (tokstart || keep || avx2))
+        fprintf(stderr, "v4_next_prefetch tokstart=%d keep=%d avx2=%d\n",
+                v4_np_tokstart, v4_np_keep, v4_np_avx2);
+    if (v4_np_gating)
+        fprintf(stderr, "v4_next_prefetch min_conf=%g token_mb=%.4g: a guess below the "
+                        "confidence or past its forward's budget moves no bytes\n",
+                v4_np_min_conf, (double)v4_np_token_bytes / 1048576.0);
+}
+
+static double v4_np_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static void v4_np_print(const char *what, uint32_t forward, uint64_t spent,
+                        const unsigned long long *g) {
+    fprintf(stderr, "npprof%s forward=%u mb=%.1f admitted=%llu gated=%llu conf=%llu "
+                    "budget=%llu total_mb=%.0f\n",
+            what, forward, (double)spent / 1048576.0, g[V4_NPG_ADMITTED],
+            g[V4_NPG_CONF] + g[V4_NPG_BUDGET], g[V4_NPG_CONF], g[V4_NPG_BUDGET],
+            (double)g[V4_NPG_BYTES] / 1048576.0);
+}
+
+static void v4_np_at_exit(void) {
+    unsigned long long g[V4_NPG_COUNT];
+    pthread_mutex_lock(&v4_np.mutex);
+    memcpy(g, v4_np_gstat, sizeof g);
+    uint32_t forward = v4_np_spend_stamp;
+    uint64_t spent = v4_np_spent;
+    pthread_mutex_unlock(&v4_np.mutex);
+    v4_np_print(" total", forward, spent, g);
+}
+
+static int v4_np_admit(const V4NpItem *item, uint64_t bytes) {
+    unsigned long long g[V4_NPG_COUNT];
+    uint32_t forward = 0;
+    uint64_t spent = 0;
+    int line = 0;
+    pthread_mutex_lock(&v4_np.mutex);
+    if ((int32_t)(item->stamp - v4_np_spend_stamp) > 0) {
+        memcpy(g, v4_np_gstat, sizeof g);
+        line = g[V4_NPG_ADMITTED] + g[V4_NPG_CONF] + g[V4_NPG_BUDGET] > 0;
+        forward = v4_np_spend_stamp;
+        spent = v4_np_spent;
+        v4_np_spend_stamp = item->stamp;
+        v4_np_spent = 0;
+    }
+    int refused = item->conf < v4_np_min_conf ? 1
+                : v4_np_token_bytes && v4_np_spent + bytes > v4_np_token_bytes ? 2 : 0;
+    if (refused) {
+        v4_np_gstat[refused == 1 ? V4_NPG_CONF : V4_NPG_BUDGET]++;
+    } else {
+        v4_np_spent += bytes;
+        v4_np_gstat[V4_NPG_ADMITTED]++;
+        v4_np_gstat[V4_NPG_BYTES] += bytes;
+    }
+    pthread_mutex_unlock(&v4_np.mutex);
+    if (line) v4_np_print("", forward, spent, g);
+    return refused;
+}
+
+static int v4_np_refused(const V4NpItem *item, int *charged) {
+    if (!v4_np_gating || (*charged)++) return 0;
+    uint64_t bytes = coli_v4_expert_store_record_bytes(item->store);
+    static int unsized;
+    if (!bytes && v4_np_token_bytes && !__atomic_exchange_n(&unsized, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "v4_next_prefetch V4_NP_TOKEN_MB ignored: record size unknown\n");
+    return v4_np_admit(item, bytes);
+}
+
+static void v4_np_work(V4NpItem item) {
+    int charged = 0;
+    ColiExpertView view;
+    memset(&view, 0, sizeof(view));
+    view.key = item.key;
+#ifdef COLI_V4_GPU_TIER
+    /* Already on the GPU: decode will not touch the host store for it. */
+    if (item.store->gpu && coli_v4_gpu_resident_first() &&
+        !coli_v4_hybrid_enabled() &&
+        coli_v4_gpu_expert_peek(item.store, &view) == 0)
+        return;
+    memset(&view, 0, sizeof(view));
+#endif
+    if (v4_np_gating && coli_v4_expert_store_resident(item.store, item.key) != 1 &&
+        v4_np_refused(&item, &charged))
+        return;
+    coli_v4_expert_lookup_set_prefetch(1);
+    int found = coli_expert_lookup(item.store, item.key, &view);
+    coli_v4_expert_lookup_set_prefetch(0);
+    if (found == 0) {
+#ifdef COLI_V4_GPU_TIER
+        if (item.rank < v4_np_vram && item.store->gpu &&
+            coli_v4_gpu_resident_first() && !coli_v4_hybrid_enabled()) {
+            if (!v4_np_refused(&item, &charged))
+                coli_v4_gpu_expert_attach(item.store, &view);
+        }
+#endif
+        coli_expert_release(item.store, &view);
+    }
+}
+
+static void *v4_np_worker(void *argument) {
+    (void)argument;
+    for (;;) {
+        pthread_mutex_lock(&v4_np.mutex);
+        while (v4_np.head == v4_np.tail)
+            pthread_cond_wait(&v4_np.ready, &v4_np.mutex);
+        V4NpItem item = v4_np.queue[v4_np.head];
+        v4_np.head = (v4_np.head + 1) % V4_NP_QUEUE;
+        pthread_mutex_unlock(&v4_np.mutex);
+        v4_np_work(item);
+    }
+    return NULL;
+}
+
+static void v4_np_issue_w(ColiExpertStore *store, int layer, const int *experts,
+                          const float *conf, int count, int mode, uint32_t stamp) {
+    static V4NpItem kept[V4_NP_QUEUE];   /* under v4_np.mutex */
+    int held = 0, stats = v4_np_mode > 0 && (v4_np_mode & 2);
+    pthread_mutex_lock(&v4_np.mutex);
+    if (!v4_np.started) {
+        v4_np.started = 1;
+        for (int i = 0; i < v4_np_threads; i++) {
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, v4_np_worker, NULL) == 0)
+                pthread_detach(thread);
+        }
+    }
+    if (v4_np_keep && mode != V4_NP_RESET &&
+        (int32_t)(stamp - __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED)) < 0) {
+        if (stats) v4_np_qstat[V4_NPQ_STALE] += (unsigned long long)count;
+        pthread_mutex_unlock(&v4_np.mutex);
+        return;
+    }
+    int queued = (v4_np.tail - v4_np.head + V4_NP_QUEUE) % V4_NP_QUEUE;
+    if (mode == V4_NP_RESET || (mode == V4_NP_REPLACE && !v4_np_keep)) {
+        v4_np.head = v4_np.tail;
+        if (stats) v4_np_qstat[V4_NPQ_DROPPED] += (unsigned long long)queued;
+    } else if (mode != V4_NP_APPEND) {
+        for (int r = v4_np.head; r != v4_np.tail; r = (r + 1) % V4_NP_QUEUE) {
+            const V4NpItem *item = &v4_np.queue[r];
+            int32_t age = (int32_t)(item->stamp - stamp);
+            if (age > 0 || (age == 0 && (item->key.layer > layer ||
+                                         (mode == V4_NP_PRUNE && item->key.layer == layer))))
+                kept[held++] = *item;
+        }
+        v4_np.head = v4_np.tail = 0;
+        if (stats) {
+            v4_np_qstat[V4_NPQ_DROPPED] += (unsigned long long)(queued - held);
+            v4_np_qstat[V4_NPQ_KEPT] += (unsigned long long)held;
+        }
+    }
+    for (int i = 0; i < count + held; i++) {
+        int next_tail = (v4_np.tail + 1) % V4_NP_QUEUE;
+        if (next_tail == v4_np.head) {
+            if (stats) v4_np_qstat[V4_NPQ_FULL] += (unsigned long long)(count + held - i);
+            break;
+        }
+        v4_np.queue[v4_np.tail] = i < count
+            ? (V4NpItem){store, {layer, experts[i]}, i, stamp, conf ? conf[i] : 1.0f}
+            : kept[i - count];
+        v4_np.tail = next_tail;
+        if (stats && i < count) v4_np_qstat[V4_NPQ_QUEUED]++;
+    }
+    pthread_cond_broadcast(&v4_np.ready);
+    pthread_mutex_unlock(&v4_np.mutex);
+}
+
+static void v4_np_issue_ex(ColiExpertStore *store, int layer,
+                           const int *experts, int count, int mode, uint32_t stamp) {
+    v4_np_issue_w(store, layer, experts, NULL, count, mode, stamp);
+}
+
+static void v4_np_confs(float *conf, const float *weights, int k, int topk) {
+    float total = 0.0f;
+    for (int i = 0; i < topk; i++) total += weights[i];
+    for (int i = 0; i < k; i++) conf[i] = total > 0.0f ? weights[i] / total : 0.0f;
+}
+
+static void v4_np_conf_count(const int *guess, const float *conf, int n,
+                             const int *routed, int selected) {
+    for (int j = 0; j < n; j++) {
+        float c = conf[j] * 20.0f;
+        int bucket = c >= V4_NP_CONF_BUCKETS - 1 ? V4_NP_CONF_BUCKETS - 1 : c > 0.0f ? (int)c : 0;
+        int used = 0;
+        for (int i = 0; i < selected && !used; i++) used = guess[j] == routed[i];
+        v4_np_conf_hist[bucket][0] += (unsigned long long)used;
+        v4_np_conf_hist[bucket][1]++;
+    }
+}
+
+static void v4_np_score(const ColiDeepSeekV4LayerWeights *weights,
+                        const int *expert_ids, int selected) {
+    int layer = weights->plan.layer;
+    if (!(v4_np_mode & 2) || layer < 0 || layer >= V4_NP_LAYERS) return;
+    int guessed = v4_np_pred_n[layer];
+    v4_np_pred_n[layer] = 0;
+    if (weights->plan.uses_hash_router || !guessed) return;
+    v4_np_conf_count(v4_np_pred[layer], v4_np_pred_conf[layer], guessed,
+                     expert_ids, selected);
+    int hits = 0;
+    for (int i = 0; i < selected; i++)
+        for (int j = 0; j < guessed; j++)
+            if (v4_np_pred[layer][j] == expert_ids[i]) { hits++; break; }
+    v4_np_hits += (unsigned long long)hits;
+    v4_np_total += (unsigned long long)selected;
+    if (++v4_np_layers % 2000 == 0) {
+        fprintf(stderr, "v4_next_predict recall=%.1f%% k=%d layers=%llu\n",
+                100.0 * (double)v4_np_hits / (double)v4_np_total, v4_np_k,
+                v4_np_layers);
+        char text[512];
+        int at = snprintf(text, sizeof text, "v4_next_predict_conf used/guessed per 0.05 d1");
+        for (int b = 0; b < V4_NP_CONF_BUCKETS; b++)
+            at += snprintf(text + at, sizeof text - (size_t)at, " %llu/%llu",
+                           v4_np_conf_hist[b][0], v4_np_conf_hist[b][1]);
+        fprintf(stderr, "%s\n", text);
+    }
+}
+
+static void v4_np_publish_w(ColiExpertStore *store, int next, const int *indices,
+                            const float *conf, int k, uint32_t stamp, int issue) {
+    memcpy(v4_np_pred[next], indices, (size_t)k * sizeof(*indices));
+    for (int i = 0; i < k; i++) v4_np_pred_conf[next][i] = conf ? conf[i] : 1.0f;
+    v4_np_pred_n[next] = k;
+    __atomic_store_n(&v4_np_stamp[next], stamp, __ATOMIC_RELEASE);
+    if (issue && (v4_np_mode & 1))
+        v4_np_issue_w(store, next, indices, conf, k, V4_NP_REPLACE, stamp);
+}
+
+static void v4_np_publish_ex(ColiExpertStore *store, int next,
+                             const int *indices, int k, uint32_t stamp, int issue) {
+    v4_np_publish_w(store, next, indices, NULL, k, stamp, issue);
+}
+
+static void v4_np_score_fresh(const ColiDeepSeekV4LayerWeights *weights,
+                              const int *expert_ids, int selected) {
+    int layer = weights->plan.layer;
+    if (!v4_np_decode || weights->plan.uses_hash_router || layer < 0 ||
+        layer >= V4_NP_LAYERS)
+        return;
+    uint32_t current = __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED);
+    int n1 = 0, n2 = 0, hits = 0, hits2 = 0;
+    if (__atomic_load_n(&v4_np_stamp[layer], __ATOMIC_ACQUIRE) == current) {
+        n1 = v4_np_pred_n[layer];
+        if (n1 > V4_NP_MAXK) n1 = V4_NP_MAXK;
+        if (n1 < 0) n1 = 0;
+        for (int i = 0; i < selected; i++)
+            for (int j = 0; j < n1; j++)
+                if (v4_np_pred[layer][j] == expert_ids[i]) { hits++; break; }
+    }
+    if (__atomic_load_n(&v4_np_stamp2[layer], __ATOMIC_ACQUIRE) == current) {
+        n2 = v4_np_pred2_n[layer];
+        if (n2 > V4_NP_MAXK) n2 = V4_NP_MAXK;
+        if (n2 < 0) n2 = 0;
+        for (int i = 0; i < selected; i++)
+            for (int j = 0; j < n2; j++)
+                if (v4_np_pred2[layer][j] == expert_ids[i]) { hits2++; break; }
+    }
+    v4_np_fresh_hits += (unsigned long long)hits;
+    v4_np_fresh_total += (unsigned long long)selected;
+    if (!n1) v4_np_fresh_missing++;
+    if (n2) {
+        v4_np_fresh2_hits += (unsigned long long)hits2;
+        v4_np_fresh2_total += (unsigned long long)selected;
+    }
+    if (++v4_np_fresh_layers % 2000) return;
+    unsigned long long q[V4_NPQ_COUNT];
+    pthread_mutex_lock(&v4_np.mutex);
+    memcpy(q, v4_np_qstat, sizeof q);
+    pthread_mutex_unlock(&v4_np.mutex);
+    unsigned long long calls = __atomic_load_n(&v4_np_route_calls, __ATOMIC_RELAXED);
+    unsigned long long vector = __atomic_load_n(&v4_np_route_vector, __ATOMIC_RELAXED);
+    double ns = (double)__atomic_load_n(&v4_np_route_ns, __ATOMIC_RELAXED);
+    double refined = (double)__atomic_load_n(&v4_np_route_refined, __ATOMIC_RELAXED);
+    fprintf(stderr, "v4_next_predict_fresh recall=%.1f%% notready=%.1f%% depth2=%.1f%% "
+                    "route_ms=%.3f avx2=%llu refined=%.1f queued=%llu "
+                    "dropped=%llu kept=%llu stale=%llu tokstart=%llu full=%llu layers=%llu\n",
+            100.0 * (double)v4_np_fresh_hits / (double)v4_np_fresh_total,
+            100.0 * (double)v4_np_fresh_missing / (double)v4_np_fresh_layers,
+            v4_np_fresh2_total ? 100.0 * (double)v4_np_fresh2_hits /
+                                 (double)v4_np_fresh2_total : 0.0,
+            calls ? ns / (double)calls * 1e-6 : 0.0, vector,
+            vector ? refined / (double)vector : 0.0,
+            q[V4_NPQ_QUEUED], q[V4_NPQ_DROPPED], q[V4_NPQ_KEPT], q[V4_NPQ_STALE],
+            q[V4_NPQ_TOKSTART], q[V4_NPQ_FULL], v4_np_fresh_layers);
+}
+
+#define V4_NP_SELF_CHECK 16
+static int v4_np_route(float *route_weights, int *indices, const float *hidden,
+                       float *scratch, const uint16_t *gate, const float *bias,
+                       int n, int d, int k, float scale) {
+    int stats = v4_np_mode > 0 && (v4_np_mode & 2), refined = -1, result;
+    double began = stats ? v4_np_now() : 0.0;
+#ifdef V4_NP_ROUTE_AVX2
+    static int checked;
+    if (v4_np_avx2) {
+        result = v4_np_route_bf16_avx2(route_weights, indices, hidden, gate, bias, n, d, k,
+                                       scale, scratch, &refined);
+        if (checked < V4_NP_SELF_CHECK && k <= V4_NP_MAXK) {
+            float w[V4_NP_MAXK];
+            int ids[V4_NP_MAXK];
+            int scalar = coli_v4_route_bf16_scalar(w, ids, hidden, gate, bias, NULL, n, d, k, scale);
+            if (scalar != result ||
+                (!scalar && (memcmp(ids, indices, (size_t)k * sizeof(*ids)) ||
+                             memcmp(w, route_weights, (size_t)k * sizeof(*w))))) {
+                fprintf(stderr, "v4_next_prefetch avx2=0 self-check=differs call=%d: "
+                                "scalar route kept\n", checked + 1);
+                v4_np_avx2 = 0;
+                memcpy(indices, ids, (size_t)k * sizeof(*ids));
+                memcpy(route_weights, w, (size_t)k * sizeof(*w));
+                result = scalar;
+                refined = -1;
+            } else if (++checked == V4_NP_SELF_CHECK) {
+                fprintf(stderr, "v4_next_prefetch avx2=1 self-check=ok calls=%d\n", checked);
+            }
+        }
+    } else
+#endif
+        result = coli_v4_route_bf16(route_weights, indices, hidden, gate, bias, NULL,
+                                    n, d, k, scale);
+    if (stats) {
+        __atomic_fetch_add(&v4_np_route_ns,
+                           (unsigned long long)((v4_np_now() - began) * 1e9), __ATOMIC_RELAXED);
+        __atomic_fetch_add(&v4_np_route_calls, 1ull, __ATOMIC_RELAXED);
+        if (refined >= 0) {
+            __atomic_fetch_add(&v4_np_route_vector, 1ull, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&v4_np_route_refined, (unsigned long long)refined,
+                               __ATOMIC_RELAXED);
+        }
+    }
+    return result;
+}
+
+static struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t ready;
+    int started, pending;
+    ColiExpertStore *store;
+    const ColiDeepSeekV4LayerWeights *following, *after;
+    int next, n, d, k, k2;
+    float scale;
+    float *input;
+    size_t capacity;
+    uint32_t stamp;
+    int topk;
+} v4_np_router = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
+                  0, 0, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0.0f, NULL, 0, 0, 0};
+
+static void *v4_np_router_worker(void *argument) {
+    (void)argument;
+    float *hidden = NULL, *scratch = NULL;
+    size_t hidden_capacity = 0;
+    for (;;) {
+        pthread_mutex_lock(&v4_np_router.mutex);
+        while (!v4_np_router.pending)
+            pthread_cond_wait(&v4_np_router.ready, &v4_np_router.mutex);
+        v4_np_router.pending = 0;
+        ColiExpertStore *store = v4_np_router.store;
+        const ColiDeepSeekV4LayerWeights *following = v4_np_router.following;
+        const ColiDeepSeekV4LayerWeights *after = v4_np_router.after;
+        int next = v4_np_router.next, n = v4_np_router.n;
+        int d = v4_np_router.d, k = v4_np_router.k, k2 = v4_np_router.k2;
+        int topk = v4_np_router.topk;
+        int deep = k > topk ? k : topk;
+        float scale = v4_np_router.scale;
+        uint32_t stamp = v4_np_router.stamp;
+        if (hidden_capacity < (size_t)d) {
+            compat_aligned_free(hidden);
+            hidden = NULL;
+            if (posix_memalign((void **)&hidden, 32, (size_t)d * sizeof(*hidden)) != 0) {
+                hidden_capacity = 0;
+                pthread_mutex_unlock(&v4_np_router.mutex);
+                continue;
+            }
+            hidden_capacity = (size_t)d;
+            if (v4_np_avx2) {
+                compat_aligned_free(scratch);
+                scratch = NULL;
+                if (posix_memalign((void **)&scratch, 32, (size_t)d * sizeof(*scratch)) != 0)
+                    scratch = NULL;
+            }
+        }
+        memcpy(hidden, v4_np_router.input, (size_t)d * sizeof(*hidden));
+        pthread_mutex_unlock(&v4_np_router.mutex);
+        const uint16_t *gate = value(following, "ffn.gate.weight", NULL);
+        const float *bias = value(following, "ffn.gate.bias", NULL);
+        int indices[V4_NP_MAXK];
+        float route_weights[V4_NP_MAXK], conf[V4_NP_MAXK];
+        if (gate && deep <= n && v4_np_route(route_weights, indices, hidden,
+                                             scratch, gate, bias, n, d, deep, scale) == 0) {
+            v4_np_confs(conf, route_weights, k, topk);
+            v4_np_publish_w(store, next, indices, conf, k, stamp, 1);
+        }
+        if (after && (v4_np_mode & 1)) {
+            const uint16_t *gate2 = value(after, "ffn.gate.weight", NULL);
+            const float *bias2 = value(after, "ffn.gate.bias", NULL);
+            int deep2 = k2 > topk ? k2 : topk;
+            if (gate2 && deep2 <= n &&
+                v4_np_route(route_weights, indices, hidden,
+                            scratch, gate2, bias2, n, d, deep2, scale) == 0) {
+                v4_np_confs(conf, route_weights, k2, topk);
+                if (next + 1 < V4_NP_LAYERS) {
+                    memcpy(v4_np_pred2[next + 1], indices,
+                           (size_t)k2 * sizeof(*indices));
+                    v4_np_pred2_n[next + 1] = k2;
+                    __atomic_store_n(&v4_np_stamp2[next + 1], stamp, __ATOMIC_RELEASE);
+                }
+                v4_np_issue_w(store, next + 1, indices, conf, k2, V4_NP_APPEND, stamp);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void v4_np_predict(ColiExpertStore *store,
+                          const ColiDeepSeekV4Config *config, int layer,
+                          const float *input, int token) {
+    v4_np_init();
+    if (!v4_np_mode) return;
+    int next = layer + 1;
+    uint32_t stamp = __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED);
+    if (v4_np_keep) v4_np_issue_ex(store, next, NULL, 0, V4_NP_PRUNE, stamp);
+    if (next >= config->num_hidden_layers || next >= V4_NP_LAYERS ||
+        next >= g_v4_next_nlayers || !g_v4_next_layers || !g_v4_next_ready ||
+        !g_v4_next_ready[next])
+        return;
+    const ColiDeepSeekV4LayerWeights *following = &g_v4_next_layers[next];
+    int n = config->n_routed_experts, d = config->hidden_size;
+    int topk = config->num_experts_per_tok;
+    if (following->plan.uses_hash_router) {
+        const int64_t *table = value(following, "ffn.gate.tid2eid", NULL);
+        if (!table || token < 0 || token >= config->vocab_size ||
+            topk > V4_NP_MAXK)
+            return;
+        /* token start queued this very list for this forward already */
+        if (next < 32 && (v4_np_tokstart_mask & (1u << next)) &&
+            v4_np_tokstart_stamp == stamp && v4_np_tokstart_token == token) {
+            v4_np_tokstart_mask &= ~(1u << next);
+            return;
+        }
+        int indices[V4_NP_MAXK];
+        for (int i = 0; i < topk; i++)
+            indices[i] = (int)table[(size_t)token * topk + i];
+        v4_np_publish_ex(store, next, indices, topk, stamp, 1);
+        return;
+    }
+    if (v4_np_k > n) return;
+    pthread_mutex_lock(&v4_np_router.mutex);
+    if (v4_np_router.capacity < (size_t)d) {
+        compat_aligned_free(v4_np_router.input);
+        v4_np_router.input = NULL;
+        if (posix_memalign((void **)&v4_np_router.input, 32, (size_t)d * sizeof(float)) != 0) {
+            v4_np_router.capacity = 0;
+            pthread_mutex_unlock(&v4_np_router.mutex);
+            return;
+        }
+        v4_np_router.capacity = (size_t)d;
+    }
+    if (!v4_np_router.started) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, v4_np_router_worker, NULL) != 0) {
+            pthread_mutex_unlock(&v4_np_router.mutex);
+            return;
+        }
+        pthread_detach(thread);
+        v4_np_router.started = 1;
+    }
+    memcpy(v4_np_router.input, input, (size_t)d * sizeof(float));
+    v4_np_router.store = store;
+    v4_np_router.following = following;
+    v4_np_router.after = NULL;
+    if (v4_np_depth == 2 && next + 1 < config->num_hidden_layers &&
+        next + 1 < V4_NP_LAYERS && next + 1 < g_v4_next_nlayers &&
+        g_v4_next_ready[next + 1] &&
+        !g_v4_next_layers[next + 1].plan.uses_hash_router &&
+        v4_np_k2 <= n)
+        v4_np_router.after = &g_v4_next_layers[next + 1];
+    v4_np_router.next = next;
+    v4_np_router.n = n;
+    v4_np_router.d = d;
+    v4_np_router.k = v4_np_k;
+    v4_np_router.k2 = v4_np_k2;
+    v4_np_router.topk = topk > V4_NP_MAXK ? V4_NP_MAXK : topk;
+    v4_np_router.scale = config->routed_scaling_factor;
+    v4_np_router.stamp = stamp;
+    v4_np_router.pending = 1;
+    pthread_cond_signal(&v4_np_router.ready);
+    pthread_mutex_unlock(&v4_np_router.mutex);
+}
+
+/* V4_NEXT_PREFETCH_TOKSTART: a decode forward on `token` is about to start
+ * (target_token_impl, before the embedding). The hash-routed layers route by
+ * token id alone (tid2eid), so their experts are known now and go to the
+ * readers while the embedding and layer 0's attention run: layer 0 gets a
+ * prefetch at all, layers 1-2 one layer more of lead. What is still queued
+ * belongs to the previous forward, whose layers have all routed: it goes. The
+ * lists carry the coming forward's stamp, and v4_np_predict does not queue
+ * them again. Decode thread. */
+void coli_v4_np_token_start(ColiExpertStore *store, const ColiDeepSeekV4Config *config,
+                            int token) {
+    if (v4_np_mode < 0) v4_np_init();
+    if (!v4_np_tokstart || !store || !config || !g_v4_next_layers || !g_v4_next_ready)
+        return;
+    int topk = config->num_experts_per_tok;
+    if (token < 0 || token >= config->vocab_size || topk < 1 || topk > V4_NP_MAXK) return;
+    uint32_t stamp = __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED) + 1;
+    unsigned mask = 0;
+    for (int l = 0; l < config->num_hidden_layers && l < g_v4_next_nlayers &&
+                    l < V4_NP_LAYERS && l < 32; l++) {
+        if (!g_v4_next_ready[l] || !g_v4_next_layers[l].plan.uses_hash_router) break;
+        const int64_t *table = value(&g_v4_next_layers[l], "ffn.gate.tid2eid", NULL);
+        if (!table) break;
+        int indices[V4_NP_MAXK];
+        for (int i = 0; i < topk; i++)
+            indices[i] = (int)table[(size_t)token * topk + i];
+        v4_np_publish_ex(store, l, indices, topk, stamp, 0);
+        v4_np_issue_ex(store, l, indices, topk, mask ? V4_NP_APPEND : V4_NP_RESET, stamp);
+        mask |= 1u << l;
+    }
+    if (mask && v4_np_mode > 0 && (v4_np_mode & 2)) {
+        pthread_mutex_lock(&v4_np.mutex);
+        v4_np_qstat[V4_NPQ_TOKSTART] += (unsigned long long)topk * __builtin_popcount(mask);
+        pthread_mutex_unlock(&v4_np.mutex);
+    }
+    v4_np_tokstart_stamp = stamp;
+    v4_np_tokstart_token = token;
+    v4_np_tokstart_mask = mask;
+}
+
+#ifdef COLI_V4_NP_TEST
+void coli_v4_np_test_setup(int keep, int tokstart, int stats) {
+    v4_np_mode = 1 | (stats ? 2 : 0);
+    v4_np_keep = keep || tokstart;
+    v4_np_tokstart = tokstart;
+    v4_np_tokstart_mask = 0;
+    v4_np_depth = 1;
+    v4_np_k2 = 4;
+    pthread_mutex_lock(&v4_np.mutex);
+    v4_np.started = 1;
+    v4_np.head = v4_np.tail = 0;
+    memset(v4_np_qstat, 0, sizeof v4_np_qstat);
+    pthread_mutex_unlock(&v4_np.mutex);
+}
+void coli_v4_np_test_depth(int depth, int k2) {
+    v4_np_depth = depth == 2 ? 2 : 1;
+    if (k2 >= 1 && k2 <= V4_NP_MAXK) v4_np_k2 = k2;
+}
+void coli_v4_np_test_set_forward(uint32_t forward) {
+    __atomic_store_n(&v4_np_forward, forward, __ATOMIC_RELAXED);
+}
+void coli_v4_np_test_issue(ColiExpertStore *store, int layer, const int *experts, int count,
+                           int mode, uint32_t stamp) {
+    v4_np_issue_ex(store, layer, experts, count, mode, stamp);
+}
+void coli_v4_np_test_predict(ColiExpertStore *store, const ColiDeepSeekV4Config *config,
+                             int layer, const float *input, int token) {
+    v4_np_predict(store, config, layer, input, token);
+}
+int coli_v4_np_test_queue(int *layers, int *experts, uint32_t *stamps, int max) {
+    pthread_mutex_lock(&v4_np.mutex);
+    int n = 0;
+    for (int r = v4_np.head; r != v4_np.tail; r = (r + 1) % V4_NP_QUEUE, n++) {
+        if (n < max) {
+            layers[n] = v4_np.queue[r].key.layer;
+            experts[n] = v4_np.queue[r].key.expert;
+            stamps[n] = v4_np.queue[r].stamp;
+        }
+    }
+    pthread_mutex_unlock(&v4_np.mutex);
+    return n;
+}
+void coli_v4_np_test_stats(unsigned long long *queue_stats, int layer, int *n,
+                           uint32_t *stamp, int *ids) {
+    pthread_mutex_lock(&v4_np.mutex);
+    memcpy(queue_stats, v4_np_qstat, sizeof v4_np_qstat);
+    pthread_mutex_unlock(&v4_np.mutex);
+    *stamp = __atomic_load_n(&v4_np_stamp[layer], __ATOMIC_ACQUIRE);
+    *n = v4_np_pred_n[layer];
+    if (*n > 0 && *n <= V4_NP_MAXK)
+        memcpy(ids, v4_np_pred[layer], (size_t)(*n) * sizeof(*ids));
+}
+void coli_v4_np_test_pred2(int layer, int *n, uint32_t *stamp, int *ids) {
+    *stamp = __atomic_load_n(&v4_np_stamp2[layer], __ATOMIC_ACQUIRE);
+    *n = v4_np_pred2_n[layer];
+    if (*n > 0 && *n <= V4_NP_MAXK)
+        memcpy(ids, v4_np_pred2[layer], (size_t)(*n) * sizeof(*ids));
+}
+void coli_v4_np_test_gate(float min_conf, double token_mb) {
+    pthread_mutex_lock(&v4_np.mutex);
+    v4_np_min_conf = min_conf;
+    v4_np_token_bytes = (uint64_t)(token_mb * 1048576.0);
+    v4_np_gating = v4_np_min_conf > 0.0f || v4_np_token_bytes > 0;
+    v4_np_spend_stamp = 0;
+    v4_np_spent = 0;
+    memset(v4_np_gstat, 0, sizeof v4_np_gstat);
+    memset(v4_np_conf_hist, 0, sizeof v4_np_conf_hist);
+    pthread_mutex_unlock(&v4_np.mutex);
+}
+int coli_v4_np_test_admit(float conf, uint32_t stamp, uint64_t bytes) {
+    V4NpItem item = {NULL, {0, 0}, 0, stamp, conf};
+    return v4_np_admit(&item, bytes);
+}
+void coli_v4_np_test_gate_stats(unsigned long long *gate_stats, uint32_t *stamp,
+                                uint64_t *spent) {
+    pthread_mutex_lock(&v4_np.mutex);
+    memcpy(gate_stats, v4_np_gstat, sizeof v4_np_gstat);
+    *stamp = v4_np_spend_stamp;
+    *spent = v4_np_spent;
+    pthread_mutex_unlock(&v4_np.mutex);
+}
+int coli_v4_np_test_confs(float *conf, int max) {
+    pthread_mutex_lock(&v4_np.mutex);
+    int n = 0;
+    for (int r = v4_np.head; r != v4_np.tail; r = (r + 1) % V4_NP_QUEUE, n++)
+        if (n < max) conf[n] = v4_np.queue[r].conf;
+    pthread_mutex_unlock(&v4_np.mutex);
+    return n;
+}
+void coli_v4_np_test_score_conf(ColiExpertStore *store, const ColiDeepSeekV4LayerWeights *layer,
+                                const int *guess, const float *weights, int k, int topk,
+                                const int *routed, int selected, unsigned long long *hist) {
+    float conf[V4_NP_MAXK];
+    uint32_t stamp = __atomic_load_n(&v4_np_forward, __ATOMIC_RELAXED);
+    v4_np_confs(conf, weights, k, topk);
+    v4_np_publish_w(store, layer->plan.layer, guess, conf, k, stamp, 1);
+    v4_np_score(layer, routed, selected);
+    memcpy(hist, v4_np_conf_hist, sizeof v4_np_conf_hist);
+}
+void coli_v4_np_test_router(int k) {
+    v4_np_k = k;
+}
+void coli_v4_np_test_work(ColiExpertStore *store, ColiExpertKey key, int rank, float conf,
+                          uint32_t stamp) {
+    V4NpItem item = {store, key, rank, stamp, conf};
+    v4_np_work(item);
+}
+#endif
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -6576,6 +7344,10 @@ static int moe_token_pipeline(float *output,
     if (!result && selected != topk)
         result = moe_fail("layer %d: routing selected %d experts, wanted %d",
                           weights->plan.layer, selected, topk);
+    if (!result && v4_np_mode > 0 && (v4_np_mode & 2))
+        v4_np_score_fresh(weights, expert_ids, selected);
+    if (!result)
+        v4_np_score(weights, expert_ids, selected);
 #if (defined(COLI_VULKAN) || defined(COLI_CUDA)) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
     /* the Vulkan tier first: what it takes is never read from the store */
     V4VkToken vk_step;
@@ -6709,6 +7481,8 @@ static int moe_token_pipeline(float *output,
             loader_active = 1;
     }
 #endif
+    if (!result)
+        v4_np_predict(store, config, weights->plan.layer, input, token);
     ColiTensorView w1, w2, w3;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
@@ -7234,6 +8008,8 @@ static int block_token_pipeline(float *output_hc,
                                 char *error, size_t error_size) {
     if (!output_hc || !weights || !config || !experts || !input_hc)
         return set_error(error, error_size, "invalid block arguments");
+    if (weights->plan.layer == 0)
+        __atomic_add_fetch(&v4_np_forward, 1, __ATOMIC_RELAXED);
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
     float *residual = malloc(hd * sizeof(*residual));
@@ -7289,8 +8065,10 @@ static int block_token_pipeline(float *output_hc,
                                                  "ffn_norm.weight", team);
     DP_MARK(dp_hc);
     if (!result) stage = "MoE";
+    v4_np_decode = 1;
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
+    v4_np_decode = 0;
     DP_MARK(dp_moe);
     if (!result) stage = "FFN hyper-connection post";
     if (!result) result = coli_v4_hc_post_team(output_hc, branch, residual,
@@ -10511,9 +11289,13 @@ typedef struct V4HotPolicy {
     /* warming: the cache is being filled before the first request, and a lookup
      * counts nothing (history, heat, hit rate); prewarmed: that fill is done. */
     int warming, prewarmed;
+    int prefetch_no_credit; /* immutable after construction; selection history only */
     uint64_t keep_free;   /* options->keep_free_bytes */
     struct V4HotPolicy *next;
 } V4HotPolicy;
+
+static _Thread_local int v4_lookup_prefetch_tls;
+void coli_v4_expert_lookup_set_prefetch(int on) { v4_lookup_prefetch_tls = on != 0; }
 
 static pthread_mutex_t hot_policies_mutex = PTHREAD_MUTEX_INITIALIZER;
 static V4HotPolicy *hot_policies;
@@ -11275,7 +12057,8 @@ static int hot_lookup(ColiExpertStore *store, V4HotPolicy *policy,
     pthread_mutex_lock(&state->mutex);
     if (!policy->warming) {   /* the fill before the first request is not a use */
     state->stats.requests++;
-    if (counted) hot_count_locked(policy, state, key);
+    int credit = counted && (!policy->prefetch_no_credit || !v4_lookup_prefetch_tls);
+    if (credit) hot_count_locked(policy, state, key);
     /* ESPERIMENTO LOCALE (replay policy cache): sequenza ordinata delle
      * richieste come le vede la cache, hit e miss. V4_REPLAY_TRACE=<path>. */
     {
@@ -11668,11 +12451,6 @@ int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key) {
     return resident;
 }
 
-uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store) {
-    return store && store->state && hot_find(store)
-        ? ((V4ExpertStoreState *)store->state)->record_bytes : 0;
-}
-
 int coli_v4_expert_store_gguf_form(ColiExpertStore *store, int layer, int types[3], int *mx) {
     if (!store || !store->state || !hot_find(store)) return -1;
     V4ExpertStoreState *state = store->state;
@@ -11706,6 +12484,23 @@ int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
     return 0;
 }
 #endif
+
+int coli_v4_expert_store_resident(ColiExpertStore *store, ColiExpertKey key) {
+    if (!store || !store->state || !hot_find(store)) return -1;
+    V4ExpertStoreState *state = store->state;
+    if (key.layer < 0 || key.layer >= state->layers ||
+        key.expert < 0 || key.expert >= state->experts_per_layer) return -1;
+    pthread_mutex_lock(&state->mutex);
+    V4ExpertSlot *slot = indexed_expert_slot(state, key);
+    int resident = slot && slot->slab && slot->expert == key.expert;
+    pthread_mutex_unlock(&state->mutex);
+    return resident;
+}
+
+uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store) {
+    return store && store->state && hot_find(store)
+        ? ((V4ExpertStoreState *)store->state)->record_bytes : 0;
+}
 
 static void destroy_hot(ColiExpertStore *store) {
     pthread_mutex_lock(&hot_policies_mutex);
@@ -11910,6 +12705,8 @@ int COLI_V4_ROWS16_STORE_OPEN(
     for (size_t i = 0; i < pins; i++) policy->pins[i] = -1;
     policy->store = *output; policy->pin_count = pin_count;
     policy->keep_free = options->keep_free_bytes;
+    const char *no_credit = getenv("V4_PREFETCH_NO_CREDIT");
+    policy->prefetch_no_credit = no_credit && atoi(no_credit) != 0;
     policy->history_path = hot_history_path(options->model_dir);
     policy->repin_interval = options->repin_interval
         ? options->repin_interval : (uint64_t)minimum_slots;
@@ -12299,6 +13096,7 @@ int coli_v4_expert_forward_batch_ref(float *outputs,
 #endif /* COLI_V4_UNIT_EXPERT_ROWS16 */
 
 #ifdef COLI_V4_UNIT_ROUTE_BF16
+#include "v4_np_route.h"
 /* ######## deepseek_v4_route_bf16.c ######## */
 #include <math.h>
 #include <stdint.h>
@@ -12461,12 +13259,30 @@ static int route_bf16_impl(float *weights, int *indices, const float *hidden,
     return result;
 }
 
+int coli_v4_route_bf16_scalar(float *weights, int *indices, const float *hidden,
+                              const uint16_t *gate, const float *bias,
+                              const int *forced_indices, int experts, int dimension,
+                              int topk, float route_scale) {
+    return route_bf16_impl(weights, indices, hidden, gate, bias, forced_indices,
+                           experts, dimension, topk, route_scale, NULL);
+}
+/* Exact bounded vector route; opt-in via V4_ROUTER_AVX2=1.
+ * Scalar recomputation retains top-K indices, order and weights bit for bit.
+ * Hash routing/forced indices and other shapes keep their original path. */
 int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const uint16_t *gate, const float *bias,
                        const int *forced_indices, int experts, int dimension,
                        int topk, float route_scale) {
-    return route_bf16_impl(weights, indices, hidden, gate, bias, forced_indices,
-                           experts, dimension, topk, route_scale, NULL);
+#ifdef V4_NP_ROUTE_AVX2
+    if (v4_exact_router_enabled(experts, dimension, topk) && !forced_indices &&
+        weights && indices && hidden && gate) {
+        __attribute__((aligned(32))) float scratch[8192];
+        return v4_np_route_bf16_avx2(weights, indices, hidden, gate, bias,
+                                     experts, dimension, topk, route_scale, scratch, NULL);
+    }
+#endif
+    return coli_v4_route_bf16_scalar(weights, indices, hidden, gate, bias,
+                                     forced_indices, experts, dimension, topk, route_scale);
 }
 int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
                               const uint16_t *gate, const float *bias,
@@ -12474,6 +13290,20 @@ int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
                               int topk, float route_scale, const float *logits) {
     return route_bf16_impl(weights, indices, hidden, gate, bias, forced_indices,
                            experts, dimension, topk, route_scale, logits);
+}
+/* The gate logits of the listed rows by route_bf16_core's own loop (same unit,
+ * same flags, same order of operations), for the predictor's AVX2 path
+ * (v4_np_route.h, V4_NEXT_PREFETCH_AVX2): the experts it cannot place from
+ * its vector logits are recomputed here, bit-identical to the scalar route. */
+void coli_v4_route_bf16_rows(float *logits, const uint16_t *gate, const float *hidden,
+                             const int *rows, int count, int dimension) {
+    for (int i = 0; i < count; i++) {
+        float sum = 0.0f;
+        const uint16_t *row = gate + (size_t)rows[i] * dimension;
+        for (int column = 0; column < dimension; column++)
+            sum += route_bf16_decode(row[column]) * hidden[column];
+        logits[i] = sum;
+    }
 }
 #endif /* COLI_V4_UNIT_ROUTE_BF16 */
 
@@ -18614,6 +19444,9 @@ static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **ne
                         const ColiDeepSeekV4Config *config,
                         ColiExpertStore *experts, int token, int position,
                         char *error, size_t error_size) {
+    /* V4_NEXT_PREFETCH_TOKSTART: queue leading hash-routed layers' exact
+     * experts before the embedding lookup (no-op when disabled). */
+    coli_v4_np_token_start(experts, config, token);
     float *state = *state_ptr, *next = *next_ptr;
     if (load_embedding(state, index, config, token)) return -1;
     int first_layer = 0;

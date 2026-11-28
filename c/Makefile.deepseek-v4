@@ -314,14 +314,18 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
+V4_NP_TEST_OBJ = COLI_V4_UNIT_BLOCK_HYBRID_NP_TEST.o
 V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ) $(V4_VK_OBJ) $(V4_CUT_OBJS)
 REGISTRY_OBJ = expert_store_registry.o
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
 V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
+V4_NP_ROUTE_TEST := tests/test_v4_np_route$(if $(IS_WIN),.exe,)
+V4_NP_QUEUE_TEST := tests/test_v4_np_queue$(if $(IS_WIN),.exe,)
+V4_NP_QUEUE_TEST_OBJS := $(filter-out COLI_V4_UNIT_BLOCK_HYBRID.o COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16.o COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS)) $(V4_NP_TEST_OBJ) $(V4_HOT_TEST_OBJ)
 
 # Include every C object, even when its backend is disabled in this invocation.
 V4_C_DEP_OBJS = $(sort $(TARGET_OBJS) $(TEST_UNIT_OBJS) $(REGISTRY_OBJ) \
-    $(V4_HOT_TEST_OBJ) $(V4_BATCH_TEST_OBJ) backend_loader_dsv4.o \
+    $(V4_HOT_TEST_OBJ) $(V4_BATCH_TEST_OBJ) $(V4_NP_TEST_OBJ) backend_loader_dsv4.o \
     backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o)
 V4_C_DEPS = $(V4_C_DEP_OBJS:.o=.d)
 V4_DEPFLAGS = -MMD -MP -MF $(@:.o=.d)
@@ -419,7 +423,7 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c coli_env.h deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_gpu_devices.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
 	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
-	native_quant_fp4_rows16.h expert_store_registry.h v4_topk.h $(V4_FLAGS_STAMP)
+	native_quant_fp4_rows16.h expert_store_registry.h v4_topk.h v4_np_route.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -D$* -c deepseek_v4.c -o $@
 
 $(V4_HOT_TEST_OBJ): deepseek_v4.c coli_env.h deepseek_v4.h deepseek_v4_internal.h \
@@ -442,6 +446,19 @@ COLI_V4_UNIT_GENERATE_STATS.o: serve_codec.h
 $(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c coli_env.h deepseek_v4.h \
 		deepseek_v4_internal.h serve_codec.h $(V4_SERVE_TEST_OBJS)
 	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
+
+$(V4_NP_TEST_OBJ): deepseek_v4.c coli_env.h deepseek_v4.h deepseek_v4_internal.h \
+		st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
+		native_quant.h native_quant_batch.h native_quant_dual.h \
+		native_quant_fp4_rows16.h expert_store_registry.h v4_topk.h v4_np_route.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -DCOLI_V4_NP_TEST \
+		-DCOLI_V4_UNIT_BLOCK_HYBRID -c deepseek_v4.c -o $@
+
+$(V4_NP_ROUTE_TEST): tests/test_v4_np_route.c v4_np_route.h COLI_V4_UNIT_ROUTE_BF16.o
+	$(CC) $(CFLAGS) $< COLI_V4_UNIT_ROUTE_BF16.o -o $@ $(LDFLAGS)
+
+$(V4_NP_QUEUE_TEST): tests/test_v4_np_queue.c deepseek_v4_internal.h compat.h $(V4_NP_QUEUE_TEST_OBJS)
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_NP_QUEUE_TEST_OBJS) -o $@ $(LDFLAGS)
 
 tools/bench_dsv4_head_batch: tools/bench_dsv4_head_batch.c deepseek_v4.c deepseek_v4.h \
 		deepseek_v4_internal.h deepseek_v4_dspark.inc serve_codec.h $(V4_SERVE_TEST_OBJS)
@@ -541,9 +558,9 @@ endif
 
 deepseek-v4-clean:
 	rm -f deepseek_v4 deepseek_v4.exe $(V4_OBJS) $(V4_C_DEP_OBJS) $(V4_C_DEPS) $(V4_LINK_STAMP) \
-		$(V4_BATCH_TEST_OBJ) \
+		$(V4_BATCH_TEST_OBJ) $(V4_NP_TEST_OBJ) \
 		tools/bench_dsv4_head_batch \
-		$(V4_SERVE_TEST) tests/test_dsv4_multigpu_cuda \
+		$(V4_SERVE_TEST) $(V4_NP_ROUTE_TEST) $(V4_NP_QUEUE_TEST) tests/test_dsv4_multigpu_cuda \
 		tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
 		tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_wo_decode_cuda tests/test_dsv4_head_cuda \
 		tests/test_dsv4_quant_cuda tests/test_dsv4_resident_route tests/test_dsv4_resident_indexer \
