@@ -133,6 +133,8 @@ typedef struct {
     const Vq2Books *vqb;           /* Q38_WEIGHT_VQ2: the sidecar's codebooks (borrowed) */
     const Vq1Books *vq1b;          /* Q38_WEIGHT_VQ1: the sidecar's codebooks (borrowed) */
     void *cc;                      /* COLI_CUDA_CHAIN: the chain's own device copy of a matrix the tier did not place (qwen38_cuda_chain.h) */
+    const char *src;               /* its tensor's name (the shard index owns it): to read a dropped host copy back */
+    int q8_gone;                   /* COLI_CUDA_CHAIN: the card holds the int8 rows alone (q38_trunk_card_only) */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -704,6 +706,9 @@ static void q38_xf16_rows(float *y,int ys,const Q38Weight *w,const gq_act *ga,in
     }
 }
 #endif
+#ifdef COLI_CUDA
+static void q38_trunk_reload(Q38Weight *w);   /* below, beside q38_trunk_place_all */
+#endif
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                               int S,int I,int O) {
     /* Every CPU kernel below computes a row the same way whatever S is, so an
@@ -752,6 +757,18 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
        q38_vk_matmul(y,x,weight,S,I,O))return;
     /* the CPU needs a matrix the device holds alone (a lost device): read it back */
     if(weight&&weight->vk_gone)q38_dho_reload((Q38Weight*)weight);
+#endif
+#ifdef COLI_CUDA
+    /* the card holds this matrix alone (q38_trunk_card_only): its batched GEMV, else read it back */
+    if(weight&&weight->q8_gone){
+        /* in pieces of 64 rows: a failed GEMV turns the handle off for good (qt_dense_matmul_batch),
+         * and a whole prompt chunk's input on a card the chain found full would fail on its size */
+        int ok=weight->gpu&&weight->rows==O&&weight->cols==I;
+        for(int s=0;ok&&s<S;s+=64)
+            ok=qt_dense_matmul_batch(weight->gpu-1,y+(int64_t)s*O,x+(int64_t)s*I,S-s<64?S-s:64,I,O);
+        if(ok)return;
+        q38_trunk_reload((Q38Weight*)weight);
+    }
 #endif
     if(weight&&weight->q8&&weight->rows==O&&weight->cols==I){
         /* the trunk's int8 rows (the same the GPU holds) meet an int8
@@ -1443,6 +1460,7 @@ static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
         st_read_f32(&m->S,name,(float*)weight.data,1);
     }
     m->resident_weight_bytes+=q38_weight_bytes(&weight);
+    weight.src=tensor->name;
 #ifdef COLI_VULKAN
     weight.vk_res=1;   /* resident for the life of the model: its rows may live on the device */
     weight.vk_name=strdup(name);   /* to read it back if the device ends up holding it alone */
@@ -4181,6 +4199,57 @@ static void q38_dho_count(Q38Weight *w,size_t *bytes,int *n) {
 }
 #endif
 
+#ifdef COLI_CUDA
+/* ---- the trunk on the card only -------------------------------------------------
+ * With the CUDA chain up, every matrix the tier placed answers from the card: the chain's
+ * steps and a decode GEMV. Its int8 rows on the host (3.97 GiB on Qwen3.8-Flash-Next)
+ * served only prefill rows on the per-matrix path. They go once the chain is up
+ * (Q38_TRUNK_HOST_KEEP=1 keeps them). A CPU that needs such a matrix again takes the
+ * card's batched GEMV first, else reads it back from the checkpoint and quantizes it as
+ * at load (the same bytes), and keeps it. */
+static Model *g_q38_card_only_model;
+static pthread_mutex_t g_q38_card_only_mx=PTHREAD_MUTEX_INITIALIZER;
+static unsigned g_q38_card_only_reloads;
+static int q38_trunk_host_keep(void) { return q38_env_bool("Q38_TRUNK_HOST_KEEP",0); }
+/* The host bytes of the placed matrices' int8 rows; release = 1 frees them. */
+static size_t q38_trunk_card_only(Model *m,int release) {
+    size_t bytes=0; int n=0;
+    for(int i=0;i<g_trunk_n;i++){
+        Q38Weight *w=g_trunk[i].w;
+        if(!w->gpu||!w->q8||!w->src)continue;
+        size_t b=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
+        bytes+=b; n++;
+        if(!release)continue;
+        free(w->q8); free(w->q8sc); w->q8=NULL; w->q8sc=NULL; w->q8_gone=1;
+        m->resident_weight_bytes-=b;
+    }
+    if(release&&n){
+        g_q38_card_only_model=m;
+        fprintf(stderr,"[qwen38] trunk: %d matrices on the card only, %.2f GiB of host int8 rows released "
+                       "(read back from the checkpoint if the CPU needs one; Q38_TRUNK_HOST_KEEP=1 keeps them)\n",
+                n,bytes/1073741824.0);
+    }
+    return bytes;
+}
+static void q38_trunk_reload(Q38Weight *w) {
+    pthread_mutex_lock(&g_q38_card_only_mx);
+    if(w->q8_gone){
+        Model *m=g_q38_card_only_model;
+        if(!m||!w->src){fprintf(stderr,"qwen38: a trunk matrix the card held alone cannot be read back\n");exit(1);}
+        size_t keep=m->resident_weight_bytes;
+        Q38Weight nw=q38_load_weight(m,w->src,w->rows,w->cols);
+        q38_trunk_quantize(&nw,&w->q8,&w->q8sc);
+        q38_weight_free(&nw);
+        m->resident_weight_bytes=keep+(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
+        w->q8_gone=0;
+        if(!g_q38_card_only_reloads++)
+            fprintf(stderr,"[qwen38] trunk: the CPU needs %s, which the card held alone: read back from the checkpoint "
+                           "(each one read stays)\n",w->src);
+    }
+    pthread_mutex_unlock(&g_q38_card_only_mx);
+}
+#endif
+
 /* after qt_init: quantize and upload what the placer accepted */
 static void q38_trunk_place_all(Model *m) {
     int placed=0,offered=g_trunk_n,release=q38_trunk_cpu_int8_wanted(); size_t placed_bytes=0,released=0; double t0=now_s();
@@ -6746,6 +6815,9 @@ static void q38_model_free(Model *m) {
     free(m->draft_codes);free(m->draft_sc);m->draft_codes=NULL;m->draft_sc=NULL;
     free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);
     free(m->ple_history); free(m->PLE_conv_state); free(m->c.is_attn); st_destroy(&m->S);
+#ifdef COLI_CUDA
+    if(g_q38_card_only_model==m)g_q38_card_only_model=NULL;
+#endif
     memset(m,0,sizeof(*m));
 }
 

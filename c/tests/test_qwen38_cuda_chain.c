@@ -16,6 +16,7 @@
 #undef main
 
 #ifdef _WIN32
+#undef IN
 #undef unsetenv
 #define unsetenv(name) _putenv_s(name, "")
 #endif
@@ -455,6 +456,112 @@ int main(void) {
         cc_free(cc.dm_tabb); cc_free(cc.dm_stage); cc_free(pool_b[0]);
         G.on = on0; G.nl = nl0; G.wfmt = wf0; G_gtg = gtg0; G_gtd = gtd0;
         fake_chain_table.size = sz0;
+    }
+
+    printf(" the trunk on the card only (Q38_TRUNK_HOST_KEEP)\n");
+    {
+        unsetenv("Q38_TRUNK_HOST_KEEP");
+        tk(!q38_trunk_host_keep(), "Q38_TRUNK_HOST_KEEP unset: defaults to 0 (card-only)");
+        setenv("Q38_TRUNK_HOST_KEEP", "1", 1);
+        tk(q38_trunk_host_keep(), "Q38_TRUNK_HOST_KEEP=1: keeps host int8 trunk rows");
+        unsetenv("Q38_TRUNK_HOST_KEEP");
+
+        /* Full-model logits: card-only (default) vs host-kept (Q38_TRUNK_HOST_KEEP=1) must be bit-identical */
+        setenv("SNAP", "./qwen38_tiny_fp8", 1);
+        setenv("COLI_CUDA_CHAIN", "1", 1);
+        setenv("Q38_MTP", "0", 1);
+        int ids[4] = {1, 3, 4, 5};
+        float *lo_keep = NULL, *lo_card = NULL;
+        int V = 0;
+        for (int k = 0; k < 2; k++) {
+            setenv("Q38_TRUNK_HOST_KEEP", k ? "0" : "1", 1);
+            Model m; model_init(&m, "./qwen38_tiny_fp8", 8, 8);
+            q38_tier_start(&m, 8);
+            q38_trunk_cpu_int8(&m);
+            int up = q38cc_setup(&m, 1) != NULL;
+            g_cuda_chain = up ? 1 : 0;
+            if (g_cuda_chain && !q38_trunk_host_keep()) q38_trunk_card_only(&m, 1);
+            int placed = 0, gone = 0, kept = 0;
+            for (int i = 0; i < g_trunk_n; i++) {
+                Q38Weight *w = g_trunk[i].w;
+                if (!w->gpu || !w->src) continue;
+                placed++;
+                if (w->q8_gone && !w->q8 && !w->q8sc) gone++;
+                if (!w->q8_gone && w->q8 && w->q8sc) kept++;
+            }
+            if (!k) tk(up && placed > 0 && kept == placed && gone == 0, "Q38_TRUNK_HOST_KEEP=1: every placed trunk matrix keeps its host int8 rows");
+            else    tk(up && placed > 0 && gone == placed && kept == 0, "Q38_TRUNK_HOST_KEEP=0: every placed trunk matrix drops its host int8 rows");
+            m.max_t = 16; ensure_kv(&m);
+            V = m.c.vocab;
+            float *lo = step(&m, ids, 4, 0);
+            if (!k) lo_keep = lo; else lo_card = lo;
+            g_cuda_chain = 0;
+            cc_shutdown();
+            qt_shutdown();
+            q38_model_free(&m);
+        }
+        unsetenv("Q38_TRUNK_HOST_KEEP");
+        tk(lo_keep && lo_card && !memcmp(lo_keep, lo_card, (size_t)V * sizeof(float)),
+           "full-model logits with card-only trunk are bit-identical to host-kept trunk");
+        free(lo_keep); free(lo_card);
+
+        /* Direct matrix checks: resident_weight_bytes drop, 64-row batched GEMV, lost-device reload, q38cc_t reload */
+        Model m; model_init(&m, "./qwen38_tiny_fp8", 8, 8);
+        q38_tier_start(&m, 8);
+        q38_trunk_cpu_int8(&m);
+        Q38Weight *w = NULL, *w2 = NULL;
+        for (int i = 0; i < g_trunk_n; i++) {
+            if (g_trunk[i].w->gpu && g_trunk[i].w->q8 && g_trunk[i].w->src) {
+                if (!w) w = g_trunk[i].w; else if (!w2) { w2 = g_trunk[i].w; break; }
+            }
+        }
+        if (w && w2) {
+            int O = w->rows, I = w->cols;
+            int8_t *q0 = (int8_t *)malloc((size_t)O * I);
+            float *s0 = falloc(O), *x = falloc(3 * I), *y = falloc(3 * O), *yc = falloc(3 * O);
+            float *x130 = falloc(130 * I), *y130 = falloc(130 * O), *yc130 = falloc(130 * O);
+            memcpy(q0, w->q8, (size_t)O * I); memcpy(s0, w->q8sc, (size_t)O * sizeof(float));
+            for (int k = 0; k < 3 * I; k++) x[k] = sinf(0.37f * k);
+            for (int k = 0; k < 130 * I; k++) x130[k] = cosf(0.11f * k);
+            q38_weight_matmul(yc, x, w, 3, I, O);
+            q38_weight_matmul(yc130, x130, w, 130, I, O);
+
+            size_t held = q38_trunk_card_only(&m, 0);
+            uint64_t before = m.resident_weight_bytes;
+            size_t freed = q38_trunk_card_only(&m, 1);
+            tk(held > 0 && freed == held && !w->q8 && w->q8_gone && m.resident_weight_bytes == before - held,
+               "q38_trunk_card_only releases host int8 rows and updates resident_weight_bytes");
+
+            q38_weight_matmul(y, x, w, 3, I, O);
+            double err = 0; for (int k = 0; k < 3 * O; k++) err = fmax(err, fabs(y[k] - yc[k]));
+            tk(w->q8_gone && err < 0.05, "3 rows on per-matrix path: card batched GEMV, nothing read back");
+
+            fake_matmul_rows = 0;
+            q38_weight_matmul(y130, x130, w, 130, I, O);
+            err = 0; for (int k = 0; k < 130 * O; k++) err = fmax(err, fabs(y130[k] - yc130[k]));
+            tk(w->q8_gone && err < 0.05 && fake_matmul_rows > 0 && fake_matmul_rows <= 64,
+               "130 rows: card batched GEMV runs in pieces of at most 64 rows without reloading");
+
+            fake_matmul_fail = 1;
+            q38_weight_matmul(y, x, w, 3, I, O);
+            fake_matmul_fail = 0;
+            tk(w->q8 && !w->q8_gone && !memcmp(w->q8, q0, (size_t)O * I) && !memcmp(w->q8sc, s0, (size_t)O * sizeof(float)) &&
+               !memcmp(y, yc, (size_t)3 * O * sizeof(float)),
+               "lost device: reloads from checkpoint with bit-identical int8 rows and CPU output");
+
+            /* q38cc_t with tier handle off reloads a q8_gone weight instead of failing */
+            Q38CChain dummy; memset(&dummy, 0, sizeof dummy); dummy.dev = 0;
+            w2->gpu = 0;
+            ColiCudaTensor *ct = q38cc_t(&dummy, w2);
+            tk(ct != NULL && w2->q8 && !w2->q8_gone, "q38cc_t reloads a card-only weight when its tier handle is off");
+            if (ct) { coli_cuda_tensor_free(ct); w2->cc = NULL; }
+
+            free(q0); free(s0); free(x); free(y); free(yc); free(x130); free(y130); free(yc130);
+        } else {
+            tk(0, "at least two placed trunk matrices found");
+        }
+        qt_shutdown();
+        q38_model_free(&m);
     }
 
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }

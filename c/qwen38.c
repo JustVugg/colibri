@@ -3809,6 +3809,7 @@ int main(int argc, char **argv) {
      * now that the tier placed the trunk and the CPU holds its int8 rows (the chain's own
      * copies of the rest come from the same bytes) */
     if (q38cc_env_on() && q38cc_setup(&m, g_q38_mux_slots)) { g_cuda_chain=1; atexit(cc_shutdown); }
+    if (g_cuda_chain && !q38_trunk_host_keep()) q38_trunk_card_only(&m, 1);
     q38_df_attach(&m);   /* COLI_DFLASH=<dir>: DFlash2's drafter, in the MTP head's place */
     /* The MTP head stays on the CPU beside the CUDA chain, and its drafts cost more than they
      * save there (an RTX PRO 4000, Qwen3.8-Flash-Next IQ2_XS with the host pool: plain decode
