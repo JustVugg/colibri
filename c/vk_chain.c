@@ -793,7 +793,10 @@ int vkc_init(void) {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
         uint32_t bits = KC.core.qfam < nqf ? qf[KC.core.qfam].timestampValidBits : 0;
         KC.gov_ms = frame_gov_ms();
-        if (KC.gov_ms > 0 && bits && pp.limits.timestampPeriod > 0) {
+        /* not on a CPU device (Lavapipe): no driver's timeout to keep under, and its vkGetQueryPoolResults waits for
+         * the whole device idle, a frame queued behind the one read waiting for a hybrid step's host signal the
+         * reader has not given yet (the host pool's gate hung there) */
+        if (KC.gov_ms > 0 && bits && pp.limits.timestampPeriod > 0 && pp.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
             KC.gq_period = pp.limits.timestampPeriod; KC.gq_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
             KC.gov_on = 1;
             for (int i = 0; i < VKC_FRAMES && KC.gov_on; i++) {
