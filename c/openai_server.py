@@ -11211,7 +11211,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 # takes the engine down with this server, however the server ends.
                 image._win_job = _win_kill_on_close_job(getattr(image.process, "pid", None))
                 return image
-            return Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+            # COLI_ENGINE_SUPERVISED: keep_engine starts this engine again when it ends, so an engine whose GPU was
+            # lost for real may exit to come back on a fresh device (vkc_restart_if_lost); one run without it stays
+            return Engine(engine,model,cap,max_tokens,dict(env or os.environ, COLI_ENGINE_SUPERVISED="1"),kv_slots,family)
 
         if family.modality == "image":
             runtime = start_engine()

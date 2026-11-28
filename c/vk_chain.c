@@ -964,6 +964,10 @@ void vkc_restart_if_lost(const char *engine) {
     static int said;
     const char *e = getenv("COLI_VK_LOST_RESTART");
     if (e && *e == '0') return;
+    /* only an engine something starts again: the gateway sets COLI_ENGINE_SUPERVISED for the one keep_engine watches.
+     * Run alone (a test, a script, a front end of its own), an exit would end the service: the CPU runs on instead */
+    const char *sup = getenv("COLI_ENGINE_SUPERVISED");
+    if (!(sup && *sup == '1')) return;
     char mark[1024] = "";
     const char *home = getenv("HOME");
     if (!home || !*home) home = getenv("USERPROFILE");
