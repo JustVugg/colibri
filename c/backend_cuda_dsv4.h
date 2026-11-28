@@ -130,6 +130,16 @@ int dsv4_cuda_attn_decode_chain(int device,int layer,const float *q,const float 
                                 float *out,float *att_out,float *oa_out,
                                 const float *qa,int q_rank,Dsv4CudaTensor *wqb,float eps,
                                 int norm_fma,float *q_out);
+/* V4_PREFILL_CHAIN: a prompt chunk's attention after the indexer on the card
+ * (wq_b, the query's norm and RoPE, the cached sparse attention, the inverse
+ * RoPE, wo_a + wo_b); out [tokens][hidden] before the host's bf16 round.
+ * 0 = refused. */
+int dsv4_cuda_attn_prefill_chain(int device,int layer,const float *qa,int q_rank,Dsv4CudaTensor *wqb,float eps,
+                                 int norm_fma,const float *icos,const float *isin,int rope_dim,int rope_fma,
+                                 const float *chunk,int chunk_start,const float *sinks,const int *meta,
+                                 const int *sel,int selstride,int abs_base,int comp_limit,int heads,int dim,
+                                 float scale,int tokens,Dsv4CudaTensor *wa,int groups,Dsv4CudaTensor *wb,
+                                 float *out);
 int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **tensor,const uint8_t *w,
                             const float *scales,int rows,int cols,int packed_rows8,int device);
 int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *tensor,const float *x,
