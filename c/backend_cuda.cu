@@ -5465,11 +5465,50 @@ __global__ static void __launch_bounds__(256) f32_gemv_k(float *__restrict__ y, 
     for (; i < I; i += 256) sum = fmaf(xr[i], wr[i], sum);
     partial[threadIdx.x] = sum;
     __syncthreads();
-    for (int n = 128; n; n >>= 1) {
-        if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
-        __syncthreads();
+    if (threadIdx.x < 128) partial[threadIdx.x] += partial[threadIdx.x + 128];
+    __syncthreads();
+    if (threadIdx.x < 64) partial[threadIdx.x] += partial[threadIdx.x + 64];
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = partial[threadIdx.x] + partial[threadIdx.x + 32];
+        #pragma unroll
+        for (int n = 16; n > 0; n >>= 1) v += f8_shfl_down(v, n);
+        if (!threadIdx.x) y[(size_t)s * O + o] = v;
     }
-    if (!threadIdx.x) y[(size_t)s * O + o] = partial[0];
+}
+/* Bit-exact F32 GEMV for small K (I <= 256, e.g. Inkling-2 loop-gate F/G: I=64, O=2304):
+ * 1 warp (32 lanes) per output row, 4 warps = 4 rows per 128-thread block; stages x[0..I-1]
+ * once in shared memory and folds products in the exact 256-lane binary tree of quant_matmul. */
+__global__ static void __launch_bounds__(128) f32_gemv_smallk_k(float *__restrict__ y, const float *__restrict__ x,
+                                                                const float *__restrict__ w, int I, int O) {
+    COLI_PDL_WAIT();
+    __shared__ float sx[256];
+    const int tid = (int)threadIdx.x, s = (int)blockIdx.y;
+    const float *xr = x + (size_t)s * I;
+    for (int i = tid; i < I; i += 128) sx[i] = xr[i];
+    __syncthreads();
+    const int warp = tid >> 5, lane = tid & 31;
+    const int o = (int)blockIdx.x * 4 + warp;
+    if (o >= O) return;
+    const float *wr = w + (size_t)o * I;
+    float v;
+    if (I <= 64) {
+        const float p0 = lane < I ? fmaf(sx[lane], wr[lane], 0.f) : 0.f;
+        const float p1 = (lane + 32) < I ? fmaf(sx[lane + 32], wr[lane + 32], 0.f) : 0.f;
+        v = p0 + p1;
+    } else {
+        float p[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int idx = lane + 32 * k;
+            p[k] = idx < I ? fmaf(sx[idx], wr[idx], 0.f) : 0.f;
+        }
+        const float q0 = p[0] + p[4], q1 = p[1] + p[5], q2 = p[2] + p[6], q3 = p[3] + p[7];
+        v = (q0 + q2) + (q1 + q3);
+    }
+    #pragma unroll
+    for (int n = 16; n > 0; n >>= 1) v += f8_shfl_down(v, n);
+    if (lane == 0) y[(size_t)s * O + o] = v;
 }
 /* f32_gemm_k's products on the tensor cores in three TF32 parts (sm_80 and later): x = xh + xl,
  * w = wh + wl, each part rounded to TF32, xh wh and the corrections xh wl + xl wh summed apart in
@@ -5834,6 +5873,11 @@ static int tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev
     if (t->fmt == 0 && S <= GEMV_I8_MAX_S && t->O <= 512 && t->I >= 1024) {   /* few outputs, long rows: quant_matmul's bits */
         coli_launch(f32_gemv_k, dim3((unsigned)t->O, (unsigned)S), 256, 0, st, y_dev, x_dev, (const float *)t->weights, t->I, t->O);
         return cuda_ok(cudaGetLastError(), "chain f32 gemv launch");
+    }
+    if (t->fmt == 0 && S <= GEMV_I8_MAX_S && t->I <= 256) {   /* small K (e.g. Inkling-2 loop-gate F/G): quant_matmul's exact bits */
+        coli_launch(f32_gemv_smallk_k, dim3((unsigned)((t->O + 3) / 4), (unsigned)S), 128, 0, st,
+                    y_dev, x_dev, (const float *)t->weights, t->I, t->O);
+        return cuda_ok(cudaGetLastError(), "chain f32 gemv smallk launch");
     }
     if (t->fmt == 0 && S > GEMV_I8_MAX_S && t->O <= F32_FEW_MAX) {   /* few outputs, a chunk's rows: a block a row */
         coli_launch(f32_few_k, dim3((unsigned)S), 256, 0, st, y_dev, x_dev, (const float *)t->weights, t->I, t->O);

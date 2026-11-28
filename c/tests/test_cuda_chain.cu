@@ -945,8 +945,8 @@ int main(void) {
             if (t6) coli_cuda_tensor_free(t6);
             T->free(xb6); T->free(yb6); T->free(yb7);
         }
-        for (int shape = 0; shape < 3; shape++) {   /* and quant_matmul's bits (coli_cuda_matmul still runs it) */
-            static const int sI[3] = {10240, 2048, 2048}, sO[3] = {4, 256, 1};
+        for (int shape = 0; shape < 6; shape++) {   /* and quant_matmul's bits (coli_cuda_matmul still runs it) */
+            static const int sI[6] = {10240, 2048, 2048, 64, 256, 97}, sO[6] = {4, 256, 1, 2304, 513, 77};
             const int I5 = sI[shape], O5 = sO[shape], S5 = 2;
             std::vector<float> x5 = rnd((size_t)S5 * I5, 16 + shape), w5 = rnd((size_t)I5 * O5, 19 + shape), one5(O5, 1.f), q5((size_t)S5 * O5);
             ColiCudaTensor *t5 = NULL, *tq = NULL;
@@ -977,6 +977,17 @@ int main(void) {
         std::vector<float> refn = refh; ref_norm(refh.data(), NULL, refn.data(), &pn);
         ck(T->begin() && T->write(yb, 0, refh.data(), refh.size() * 4) && T->norm(xb, NULL, yb, &pn) && T->submit(1) && maxdiff(down(yb, x.size()).data(), refn.data(), x.size()) < 1e-5, "L2, no weight, post scale");
         T->free(xb); T->free(wb); T->free(yb);
+        static const int wdims[4] = {2304, 3072, 4096, 5120};
+        for (int di = 0; di < 4; di++) {
+            const int W = wdims[di];
+            std::vector<float> xw = rnd((size_t)2 * W, 23 + di, 2.f), ww = rnd(W, 27 + di), rw = xw;
+            CcBuf *xbw = up(xw), *wbw = up(ww), *ybw = up(xw);
+            CcNorm pw = {2, W, 1, 0, W, W, 0, W, W, 0, 0, CC_NORM_ADD1, 1e-6f, 1.f};
+            ref_norm(xw.data(), ww.data(), rw.data(), &pw);
+            char what[64]; snprintf(what, sizeof what, "wide D %d single/multi-pass norm", W);
+            ck(T->begin() && T->norm(xbw, wbw, ybw, &pw) && T->submit(1) && maxdiff(down(ybw, xw.size()).data(), rw.data(), xw.size()) < 1e-5, what);
+            T->free(xbw); T->free(wbw); T->free(ybw);
+        }
     }
     printf("addnorm\n");
     /* the branch (normalised first or not) into x and x's norm in one pass: the same bits as the

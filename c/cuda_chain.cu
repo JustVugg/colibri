@@ -308,6 +308,18 @@ __global__ static void cc_norm_pack_k(const float *__restrict__ x, const float *
         y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
     }
 }
+#ifndef cc_shfl_down
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#define cc_shfl_down(v, o) __shfl_down((v), (o), 32)
+#else
+#define cc_shfl_down(v, o) __shfl_down_sync(0xffffffffu, (v), (o), 32)
+#endif
+#endif
+/* Single-pass bit-exact RMSNorm up to D <= NV * 256 (NV=8: 2048, NV=12: 3072 covering D=2304/2560,
+ * NV=16: 4096; NV=0: arbitrary D 2-pass fallback). Preserves the exact tid + 256*k accumulation
+ * order and 256-lane binary-tree reduction while avoiding a second memory trip on x/w and cutting
+ * the reduction from 8 barriers to 3. */
+template<int NV>
 __global__ static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w, float *__restrict__ y, CcNorm p) {
     COLI_PDL_WAIT();
     __shared__ float red[256];
@@ -319,44 +331,52 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
     int wb = p.w_off + (p.w_mod > 0 ? (j % p.w_mod) * p.D : 0);
     int tid = threadIdx.x;
     float acc = 0.f;
-    const bool pre = (p.flags & 8) != 0, wt = pre || !(p.flags & 2);
-    /* up to 2048 a row: x and the weights in registers, loaded together before the sum (the
-     * weights used to be read after it, a second trip to memory on the step's path); the same
-     * values in the same order, so the same bits */
-    const bool fit = p.D <= 8 * 256;
-    float xv[8], wv8[8];
-    if (fit) {
+    const bool pre = (p.flags & 8) != 0;
+    constexpr int NARR = NV > 0 ? NV : 1;
+    float xv[NARR], wv[NARR];
+    if constexpr (NV > 0) {
+        const bool wt = pre || !(p.flags & 2);
         #pragma unroll
-        for (int k = 0; k < 8; k++) {
+        for (int k = 0; k < NV; k++) {
             const int i = tid + 256 * k;
             xv[k] = i < p.D ? x[xb + i] : 0.f;
-            wv8[k] = wt && i < p.D ? w[wb + i] : 0.f;
+            wv[k] = wt && i < p.D ? w[wb + i] : 0.f;
         }
         #pragma unroll
-        for (int k = 0; k < 8; k++)
-            if (tid + 256 * k < p.D) { float v = pre ? xv[k] * wv8[k] : xv[k]; acc += v * v; }
-    } else
+        for (int k = 0; k < NV; k++)
+            if (tid + 256 * k < p.D) { float v = pre ? xv[k] * wv[k] : xv[k]; acc += v * v; }
+    } else {
+        (void)xv; (void)wv;
         for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
+    }
     red[tid] = acc;
     __syncthreads();
-    for (int off = 128; off > 0; off >>= 1) {
-        if (tid < off) red[tid] += red[tid + off];
-        __syncthreads();
-    }
-    float r = (p.flags & 4) ? 1.f / sqrtf(red[0] + p.eps) : 1.f / sqrtf(red[0] / (float)p.D + p.eps);
-    if (fit) {
+    if (tid < 128) red[tid] += red[tid + 128];
+    __syncthreads();
+    if (tid < 64) red[tid] += red[tid + 64];
+    __syncthreads();
+    if (tid < 32) {
+        float v = red[tid] + red[tid + 32];
         #pragma unroll
-        for (int k = 0; k < 8; k++) {
+        for (int off = 16; off > 0; off >>= 1) v += cc_shfl_down(v, off);
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    float r = (p.flags & 4) ? 1.f / sqrtf(red[0] + p.eps) : 1.f / sqrtf(red[0] / (float)p.D + p.eps);
+    if constexpr (NV > 0) {
+        #pragma unroll
+        for (int k = 0; k < NV; k++) {
             const int i = tid + 256 * k;
             if (i >= p.D) continue;
-            float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + wv8[k] : wv8[k]);
-            y[yb + i] = xv[k] * (pre ? wv8[k] : wv) * r * p.post;
+            float wf = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + wv[k] : wv[k]);
+            y[yb + i] = xv[k] * (pre ? wv[k] : wf) * r * p.post;
         }
-    } else
+    } else {
         for (int i = tid; i < p.D; i += 256) {
-            float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + i] : w[wb + i]);
-            y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
+            float wf = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + i] : w[wb + i]);
+            y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wf) * r * p.post;
         }
+    }
 }
 /* cc_addnorm: a block a row, a thread elements tid + 256 k as cc_norm_k's loops take them and its
  * tree, so each sum, scale and product is cc_norm_k's and the add cc_ew_k's (the products and the
@@ -3800,7 +3820,11 @@ static int cc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
     if (!c->device_profile || (mode ? !strcmp(mode, "1") : !cc_uses_feature(c, Q36_FUSED_NORM))) {
         CcNorm ordinary = *p;
         if (c->device_profile && ordinary.eps < 0.f) ordinary.eps = -ordinary.eps;
-        coli_launch(cc_norm_k, grid1((size_t)p->nseg, 1), 256, 0, c->stream, fp(x), fp(w), fpw(y), ordinary);
+        const unsigned g = grid1((size_t)p->nseg, 1);
+        if (ordinary.D <= 8 * 256)       coli_launch(cc_norm_k<8>,  g, 256, 0, c->stream, fp(x), fp(w), fpw(y), ordinary);
+        else if (ordinary.D <= 12 * 256) coli_launch(cc_norm_k<12>, g, 256, 0, c->stream, fp(x), fp(w), fpw(y), ordinary);
+        else if (ordinary.D <= 16 * 256) coli_launch(cc_norm_k<16>, g, 256, 0, c->stream, fp(x), fp(w), fpw(y), ordinary);
+        else                             coli_launch(cc_norm_k<0>,  g, 256, 0, c->stream, fp(x), fp(w), fpw(y), ordinary);
         return launched(c, "norm");
     }
     const bool req_skip_y = p->eps < 0.f;
@@ -5331,7 +5355,7 @@ static int cc_preload(void) {
     return 1;
 #else
     cudaFuncAttributes fa;
-    const int own = cudaFuncGetAttributes(&fa, (const void *)cc_norm_k) == cudaSuccess;
+    const int own = cudaFuncGetAttributes(&fa, (const void *)cc_norm_k<8>) == cudaSuccess;
     (void)cudaGetLastError();
     return own && coli_cuda_load_module();
 #endif
