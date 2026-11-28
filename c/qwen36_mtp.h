@@ -353,15 +353,18 @@ static void q36_mtp_kv_rows(Model *m, const int *tok, const float *hid, int R, i
     double t0 = now_s();
     float *cat = falloc((int64_t)R * 2 * D), *x = falloc((int64_t)R * D), *nrm = falloc((int64_t)R * D);
     float *k = falloc((int64_t)R * kvo), *v = falloc((int64_t)R * kvo);
+    q36_embed_batch(m, tok, R, pos0, x);
+    #pragma omp parallel for schedule(static) if (R >= 16)
     for (int r = 0; r < R; r++) {
         float *em = cat + (int64_t)r * 2 * D;
-        q36_embed_row(m, tok[r], pos0 + r, em);
-        rmsnorm_row(em, em, p->enorm, D, c->eps);
-        rmsnorm_row(cat + (int64_t)r * 2 * D + D, hid + (int64_t)r * D, p->hnorm, D, c->eps);
+        rmsnorm_row(em, x + (int64_t)r * D, p->enorm, D, c->eps);
+        rmsnorm_row(em + D, hid + (int64_t)r * D, p->hnorm, D, c->eps);
     }
     matmul_d(x, cat, &p->eh, R, 2 * D, D);
+    #pragma omp parallel for schedule(static) if (R >= 16)
     for (int r = 0; r < R; r++) rmsnorm_row(nrm + (int64_t)r * D, x + (int64_t)r * D, p->L.in_ln, D, c->eps);
     matmul_d(k, nrm, &p->L.k, R, D, kvo); matmul_d(v, nrm, &p->L.v, R, D, kvo);
+    #pragma omp parallel for schedule(static) if (R >= 16)
     for (int r = 0; r < R; r++) for (int h = 0; h < KV; h++) {
         float *kh = k + (int64_t)r * kvo + h * kvd;
         if (p->L.kn) rmsnorm_row(kh, kh, p->L.kn, kvd, c->eps);
@@ -496,13 +499,18 @@ static int q36_mg_input(Model *m, const int *tok, const float *hid, int R, int p
     Q36MtpGpu *g = &g_q36_mg; Cfg *c = &m->c;
     int D = c->hidden, KV = c->kv_heads, kvd = c->k_head_dim, kvo = KV * kvd, half = c->rotary_dim / 2;
     float *em = vkc_ptr(g->emb), *cs = vkc_ptr(g->cs);
-    for (int r = 0; r < R; r++) q36_embed_row(m, tok[r], pos0 + r, em + (size_t)r * D);
+    q36_embed_batch(m, tok, R, pos0, em);
     if (hid) memcpy(vkc_ptr(g->hin), hid, (size_t)R * D * 4);
-    for (int s = 0; s < R; s++)
-        for (int j = 0; j < half; j++) {
-            float ang = (pos0 + s) * powf(c->theta, -2.0f * j / c->rotary_dim);
-            cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
-        }
+    if (half > 0) {
+        float inv[256];
+        for (int j = 0; j < half && j < 256; j++) inv[j] = powf(c->theta, -2.0f * j / c->rotary_dim);
+        #pragma omp parallel for schedule(static) if (R >= 16)
+        for (int s = 0; s < R; s++)
+            for (int j = 0; j < half; j++) {
+                float ang = (pos0 + s) * (j < 256 ? inv[j] : powf(c->theta, -2.0f * j / c->rotary_dim));
+                cs[((size_t)s * half + j) * 2] = cosf(ang); cs[((size_t)s * half + j) * 2 + 1] = sinf(ang);
+            }
+    }
     VkcRegion *rg = malloc(sizeof *rg * (size_t)R * KV);
     if (!rg) return 0;
     for (int s = 0; s < R; s++) for (int h = 0; h < KV; h++)
@@ -657,11 +665,12 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
     if (!logits) { q36_mtp_kv_rows(m, tok, hid, R, pos0); return; }
     double t0 = now_s();
     float *cat = falloc((int64_t)R * 2 * D), *x = falloc((int64_t)R * D), *nrm = falloc((int64_t)R * D), *tmp = falloc((int64_t)R * D);
+    q36_embed_batch(m, tok, R, pos0, x);
+    #pragma omp parallel for schedule(static) if (R >= 16)
     for (int r = 0; r < R; r++) {
         float *em = cat + (int64_t)r * 2 * D;
-        q36_embed_row(m, tok[r], pos0 + r, em);
-        rmsnorm_row(em, em, p->enorm, D, c->eps);
-        rmsnorm_row(cat + (int64_t)r * 2 * D + D, hid + (int64_t)r * D, p->hnorm, D, c->eps);
+        rmsnorm_row(em, x + (int64_t)r * D, p->enorm, D, c->eps);
+        rmsnorm_row(em + D, hid + (int64_t)r * D, p->hnorm, D, c->eps);
     }
     matmul_d(x, cat, &p->eh, R, 2 * D, D);
     for (int r = 0; r < R; r++) rmsnorm_row(nrm + (int64_t)r * D, x + (int64_t)r * D, p->L.in_ln, D, c->eps);

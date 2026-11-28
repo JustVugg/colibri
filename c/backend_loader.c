@@ -106,6 +106,7 @@ typedef int            (*fn_dn_step)(ColiCudaDn *d, ColiCudaTensor *proj, ColiCu
 typedef int            (*fn_tensor_overwrite)(ColiCudaTensor *tensor, const void *weights, const float *scales);
 typedef int            (*fn_host_register)(void *p, size_t bytes);
 typedef void           (*fn_host_unregister)(void *p);
+typedef int            (*fn_copy_async)(int device, void *dst, const void *src, size_t bytes);
 typedef int            (*fn_planar_rows)(int device, int D, int I);
 typedef int            (*fn_block_elems)(int fmt);
 typedef int            (*fn_tensor_upload_at)(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device);
@@ -203,7 +204,7 @@ static struct {
     fn_tensor_upload_g tensor_upload_g;
     fn_dn_create dn_create; fn_dn_free dn_free; fn_dn_set_state dn_set_state; fn_dn_get_state dn_get_state; fn_dn_step dn_step;   /* optional: gated delta layer on the device */
     fn_tensor_overwrite tensor_overwrite;   /* optional: DLLs before it leave it NULL */
-    fn_host_register host_register; fn_host_unregister host_unregister; fn_planar_rows planar_rows;   /* optional: the tier's RAM staged for a prompt chunk */
+    fn_host_register host_register; fn_host_unregister host_unregister; fn_copy_async copy_async; fn_planar_rows planar_rows;   /* optional: the tier's RAM staged for a prompt chunk */
     fn_block_elems block_elems;   /* optional: a GGUF's block formats on the device */
     fn_tensor_upload_at tensor_upload_at;   /* optional: a block-format tensor in an arena's slot */
     fn_chain_ops chain_ops;                 /* optional: the dense chain (cuda_chain.h); NULL = none */
@@ -1473,6 +1474,7 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(tensor_overwrite, fn_tensor_overwrite)
     RESOLVE_OPT(host_register, fn_host_register)
     RESOLVE_OPT(host_unregister, fn_host_unregister)
+    RESOLVE_OPT(copy_async, fn_copy_async)
     RESOLVE_OPT(planar_rows, fn_planar_rows)
     RESOLVE_OPT(block_elems, fn_block_elems)
     RESOLVE_OPT(tensor_upload_at, fn_tensor_upload_at)
@@ -1718,6 +1720,9 @@ int coli_cuda_host_register(void *p, size_t bytes){
 }
 void coli_cuda_host_unregister(void *p){
     if(g_cuda.available && g_cuda.host_unregister) g_cuda.host_unregister(p);
+}
+int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes){
+    return g_cuda.available && g_cuda.copy_async ? g_cuda.copy_async(device, dst, src, bytes) : 0;
 }
 int coli_cuda_planar_rows(int device, int D, int I){
     return g_cuda.available && g_cuda.planar_rows ? g_cuda.planar_rows(device, D, I) : 0;

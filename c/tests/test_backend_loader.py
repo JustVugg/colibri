@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 27 optional, parsed from backend_loader.c.
+        """47 mandatory + 28 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,12 +929,15 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 27)  # +ink_ops (inkling's bf16 matrices, backend_cuda_ink.h); +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tier_ops (the routed-expert tier's table, cu_tier_ops.h); +vision_attention (the Qwen vision tower's attention); +tensor_upload_rows (qwen36's GGUF matrices read straight to the device); +ledger_label/ledger_step (Ledger's memory map and decode window, #3016)
-        self.assertEqual(len(f.exports), 74)
+        self.assertEqual(len(f.optional), 28)  # +ink_ops (inkling's bf16 matrices, backend_cuda_ink.h); +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/copy_async/planar_rows (the qwen36 tier's host pool and direct GGUF wave warmstart); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tier_ops (the routed-expert tier's table, cu_tier_ops.h); +vision_attention (the Qwen vision tower's attention); +tensor_upload_rows (qwen36's GGUF matrices read straight to the device); +ledger_label/ledger_step (Ledger's memory map and decode window, #3016)
+        self.assertEqual(len(f.exports), 75)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
         self.assertIn("coli_cuda_expert_mxfp4", f.optional)
+        # copy_async: double-buffered async H2D wave warmstart for GGUF checkpoints; an older
+        # DLL answers 0 and the engine falls back to coli_cuda_pipe_upload.
+        self.assertIn("coli_cuda_copy_async", f.optional)
         # block_elems / tensor_upload_at: a GGUF's block formats on the device and the
         # qwen36 tier's arena; a DLL predating them answers 0 (no block format, no arena).
         self.assertIn("coli_cuda_block_elems", f.optional)

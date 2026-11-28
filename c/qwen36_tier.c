@@ -2239,6 +2239,80 @@ void qt_note_planned(int layer,int eid,
     pthread_mutex_unlock(&G.mx);
 }
 
+/* Direct-to-VRAM GGUF exact-arena wave warmstart (zero 20 GB RAM cache, single pinned DMA per wave). */
+int qt_warm_gguf_ready(void){
+    if(!G.on || G.wfmt != QT_GGUF || !G_arena_on || !G_arena[0] || !G_exact || G.ndev != 1 || G_chain_own || G_trunk_only ||
+       G.Ih <= 0 || G.D <= 0) return 0;
+    for(int l = 0; l < G.nl; l++){
+        if(G.off && G.off[l]) continue;
+        if((G_gmb[l] / (size_t)G.Ih) & 3u) return 0;
+        if((G_gmbd[l] / (size_t)G.D) & 3u) return 0;
+    }
+    return 1;
+}
+size_t qt_warm_gguf_max_slot(void){
+    if(!qt_warm_gguf_ready()) return 0;
+    /* The engines call this once before a warm start (0: no warm start). A backend whose
+     * coli_cuda_copy_async is missing (a 0-byte copy fails) predates tensor_upload_at's
+     * weights == NULL wrap as well, and every commit would fail. */
+    static const char probe;
+    if(!coli_cuda_copy_async(G.dev[0], G_arena[0], &probe, 0)) return 0;
+    size_t mx = 0;
+    for(int l = 0; l < G.nl; l++){
+        if(G.off && G.off[l]) continue;
+        if(G_lsl[l] > mx) mx = G_lsl[l];
+    }
+    return mx;
+}
+int qt_warm_gguf_begin(int layer, int eid, int *dev_out, void **dev_ptr, size_t *ou_out, size_t *od_out,
+                       size_t *slot_out, int *aslot_out){
+    if(!qt_warm_gguf_ready() || !dev_out || !dev_ptr || !ou_out || !od_out || !slot_out || !aslot_out) return 0;
+    QSlot *s = qs(layer, eid);
+    pthread_mutex_lock(&G.mx);
+    if(s->resident || s->queued || !s->planned){ pthread_mutex_unlock(&G.mx); return 0; }
+    long long o = qt_slot_take(layer);
+    if(o < 0){ pthread_mutex_unlock(&G.mx); return 0; }
+    int aslot = (int)(o / 256u);
+    *dev_out   = G.dev[0];
+    *dev_ptr   = (char *)G_arena[0] + (size_t)aslot * 256u;
+    *ou_out    = G_lou[layer];
+    *od_out    = G_lod[layer];
+    *slot_out  = G_lsl[layer];
+    *aslot_out = aslot;
+    pthread_mutex_unlock(&G.mx);
+    return 1;
+}
+int qt_warm_gguf_commit(int layer, int eid, int aslot, int ok){
+    if(!qt_warm_gguf_ready() || aslot < 0) return 0;
+    QSlot *s = qs(layer, eid);
+    int dv = G.dev[0];
+    ColiCudaTensor *tg = NULL, *tu = NULL, *td = NULL;
+    if(ok){
+        char *b = (char *)G_arena[0] + (size_t)aslot * 256u;
+        size_t ou = G_lou[layer], od = G_lod[layer], sl = G_lsl[layer];
+        ok = coli_cuda_tensor_upload_at(&tg, b,      ou,      NULL, 100 + G_gtg[layer], G.D,  G.Ih, dv)
+          && coli_cuda_tensor_upload_at(&tu, b + ou, od - ou, NULL, 100 + G_gtg[layer], G.D,  G.Ih, dv)
+          && coli_cuda_tensor_upload_at(&td, b + od, sl - od, NULL, 100 + G_gtd[layer], G.Ih, G.D,  dv);
+        if(!ok){
+            if(tg) coli_cuda_tensor_free(tg);
+            if(tu) coli_cuda_tensor_free(tu);
+            if(td) coli_cuda_tensor_free(td);
+        }
+    }
+    pthread_mutex_lock(&G.mx);
+    if(ok){
+        s->tg = tg; s->tu = tu; s->td = td;
+        s->aslot = aslot + 1;
+        s->planned = 0;
+        res_set(s, 1);
+        G.uploads++;
+    } else {
+        qt_slot_give(layer, (size_t)aslot * 256u);
+    }
+    pthread_mutex_unlock(&G.mx);
+    return ok;
+}
+
 /* Blocks until every enqueued upload has COMPLETED (end of warmstart): the
  * engine frees the RAM int8 copies of the planned experts right after this
  * returns, so "dequeued" is not enough -- the uploader drops qn before it

@@ -183,6 +183,63 @@ static void run_exact(void) {
     free(g); free(u); free(d); free(counts);
 }
 
+/* The direct warm start (qwen36.c's tier_warmstart, qwen38_core.h's q38_tier_warm): an expert's
+ * matrices go into its exact slot, then the commit wraps the slot (tensor_upload_at, weights
+ * NULL). A backend older than that has no copy_async and refuses the wrap: max_slot says no warm
+ * start, and a commit that fails gives the slot back and leaves the expert planned, its
+ * reservation held, so the engine's qt_note_planned loop still takes it. */
+static void run_warm(void) {
+    printf("the direct warm start:\n");
+    static const int wt[NL] = {12, 12, 12};   /* Q4_K: 144 bytes a row of 256, a multiple of 4 */
+    static const size_t wg[NL] = {(size_t)IH * 144, (size_t)IH * 144, (size_t)IH * 144}, wd[NL] = {(size_t)D * 144, (size_t)D * 144, (size_t)D * 144};
+    fake_alloc_fail = 0;
+    qt_gguf_exact_slots(1);
+    if (!qt_init_gguf(NL, NE, D, IH, NE, TOPK, wt, wt, wg, wd, 0)) { printf("  FAIL: the tier refused a GGUF's experts\n"); fails++; qt_gguf_exact_slots(0); return; }
+    check(qt_warm_gguf_ready() && qt_warm_gguf_max_slot() == qt_ebytes(0), "the warm start runs on exact slots, the slot an expert's");
+    fake_copy_async_absent = 1;
+    check(qt_warm_gguf_max_slot() == 0, "a backend without copy_async: no warm start");
+    fake_copy_async_absent = 0;
+
+    int layers[NL * NE], eids[NL * NE];
+    int planned = qt_plan_fill(layers, eids, NL * NE);
+    check(planned == NL * NE, "every expert fits");
+    size_t used0 = G.used[0], bump0 = G_abump;
+    int dev, aslot; void *p; size_t ou, od, sl;
+    int l = layers[0], e = eids[0];
+    check(qt_warm_gguf_begin(l, e, &dev, &p, &ou, &od, &sl, &aslot) && sl == qt_ebytes(l) && G_abump == bump0 + sl,
+          "begin hands out the expert's slot");
+    fake_upload_at_null_fail = 1;   /* an older backend: the wrap is refused */
+    int at0 = fake_upload_at;
+    check(!qt_warm_gguf_commit(l, e, aslot, 1), "a refused wrap fails the commit");
+    QSlot *s = qs(l, e);
+    check(!s->resident && s->planned && G.used[0] == used0 && fake_upload_at == at0, "the expert stays planned, its reservation held");
+    check(G_cnfree[G_lcls[l]] == 1 && G_cfree[G_lcls[l]][0] == (size_t)aslot * 256u, "the slot goes back to its size's free list");
+    fake_upload_at_null_fail = 0;
+
+    /* the engine's loop takes every expert the warm start did not */
+    unsigned char *g = calloc(1, wg[0]), *u = calloc(1, wg[0]), *d = calloc(1, wd[0]);
+    int before = fake_uploads;
+    for (int i = 0; i < planned; i++) qt_note_planned(layers[i], eids[i], g, u, d, NULL, NULL, NULL);
+    drain(before + 3 * planned);
+    qt_fill_wait();
+    int res = 0;
+    for (int i = 0; i < NL * NE; i++) res += G.slot[i].resident && !G.slot[i].planned;
+    check(res == NL * NE && G.used[0] == used0, "every expert resident, the budget counted once each");
+    qt_shutdown();
+
+    /* the commit that works: resident in the slot begin gave, nothing left planned */
+    if (!qt_init_gguf(NL, NE, D, IH, NE, TOPK, wt, wt, wg, wd, 0)) { printf("  FAIL: the tier refused a GGUF's experts\n"); fails++; qt_gguf_exact_slots(0); free(g); free(u); free(d); return; }
+    planned = qt_plan_fill(layers, eids, NL * NE);
+    l = layers[0]; e = eids[0]; s = qs(l, e);
+    at0 = fake_upload_at;
+    check(qt_warm_gguf_begin(l, e, &dev, &p, &ou, &od, &sl, &aslot) && qt_warm_gguf_commit(l, e, aslot, 1) &&
+          s->resident && !s->planned && s->aslot == aslot + 1 && fake_upload_at == at0 + 3, "a commit wraps the slot's three matrices");
+    check(!qt_warm_gguf_begin(l, e, &dev, &p, &ou, &od, &sl, &aslot), "a resident expert gets no second slot");
+    qt_shutdown();
+    qt_gguf_exact_slots(0);
+    free(g); free(u); free(d);
+}
+
 int main(void) {
     setenv("COLI_CUDA", "1", 1);
     setenv("COLI_GPUS", "0", 1);
@@ -194,6 +251,7 @@ int main(void) {
     run(0);
     run_own();
     run_exact();
+    run_warm();
     printf(fails ? "qwen36 tier gguf: %d FAIL\n" : "qwen36 tier gguf: ok\n", fails);
     return fails != 0;
 }

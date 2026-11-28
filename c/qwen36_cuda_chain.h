@@ -642,13 +642,14 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
     size_t r = (size_t)rows, F = sizeof(float);
     /* the routed sum's rows: the experts' width (Muse Spark's latent), at least the hidden */
     const size_t RW = (size_t)(q36_eh(c) > D ? q36_eh(c) : D), LT = (size_t)q36_eh(c), AG = (size_t)H * hd;
+    size_t fin_r = (size_t)Q36_SPEC_ROWS;
     int ok = cc_reserve(&ch->x, r * D * F, CC_DEV) && cc_reserve(&ch->nrm, r * D * F, CC_DEV) && cc_reserve(&ch->tmp, r * D * F, CC_DEV) &&
              cc_reserve(&ch->q, r * qo * F, CC_DEV) && cc_reserve(&ch->k, r * kvo * F, CC_DEV) && cc_reserve(&ch->v, r * kvo * F, CC_DEV) &&
              cc_reserve(&ch->ctx, r * H * hd * F, CC_DEV) && cc_reserve(&ch->qkvz, r * (c->dn_conv_dim + vd) * F, CC_DEV) &&
              cc_reserve(&ch->ab, r * 2 * c->dn_vheads * F, CC_DEV) && cc_reserve(&ch->cv, r * c->dn_conv_dim * F, CC_DEV) &&
              cc_reserve(&ch->dny, r * vd * F, CC_DEV) && cc_reserve(&ch->h2, r * D * F, CC_DEV) && cc_reserve(&ch->lg, r * (E + 1) * F, CC_DEV) &&
              cc_reserve(&ch->gs, r * SI * F, CC_DEV) && cc_reserve(&ch->us, r * SI * F, CC_DEV) && cc_reserve(&ch->hs, r * SI * F, CC_DEV) &&
-             cc_reserve(&ch->ds, r * D * F, CC_DEV) && cc_reserve(&ch->sgd, r * F, CC_DEV) && cc_reserve(&ch->fin, D * F, CC_DEV) &&
+             cc_reserve(&ch->ds, r * D * F, CC_DEV) && cc_reserve(&ch->sgd, r * F, CC_DEV) && cc_reserve(&ch->fin, fin_r * D * F, CC_DEV) &&
              cc_reserve(&ch->h2d, r * D * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
              cc_reserve(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo * F, CC_DOWN) &&
              cc_reserve(&ch->out, (size_t)c->vocab * F, CC_DEV) && cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) &&
@@ -1475,14 +1476,15 @@ static int q36cc_mux_push(Q36CChain *ch, Model *m, int c0, int n) {
     }
     return ok;
 }
-static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
+static int q36cc_shared_gu(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
     int ok = 1, SI = l->sh_I; (void)m;   /* shared_inter, or a Flint dense layer's MLP width */
-    if (SI > 0) {
+    if (ch->t_sg[i] && !(ch->rgf[i] && n <= Q36CC_RG_ROWS)) ok = cc_matmul(ch->t_sg[i], ch->h2, 0, ch->sgd, 0, n);
+    if (ok && SI > 0) {
         CcEw p = {CC_EW_SWIGLU, n * SI, SI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
         int glu = -1;
         if (!ch->device_profile || (q36_has_request_rules(ch->device_profile) && !q36cc_permits(ch, Q36_SHARED_SWIGLU) && q36cc_swiglu_override() < 0))
             glu = cc_matmul_glu(ch->t_shg[i], ch->t_shu[i], ch->h2, ch->hs, n);
-        else if (q36cc_shared_swiglu(ch) && !l->sh_g.gq && !l->sh_u.gq) {
+        else if (q36cc_shared_swiglu(ch) && !l->sh_g.gq && !l->sh_g.gq_gone && !l->sh_u.gq && !l->sh_u.gq_gone) {
             if (ch->request_phase == Q36CC_REQUEST_PREFILL && ch->swiglu_pair_rows == n && !ch->mx_rows &&
                 q36cc_permits(ch, Q36_SHARED_SWIGLU) && q36cc_swiglu_override() < 0 && SI == 512 &&
                 !m->c.router_sigmoid && !q36_dense_l(&m->c, i))
@@ -1493,10 +1495,14 @@ static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
         ok = glu > 0 || (glu < 0 && cc_matmul(ch->t_shg[i], ch->h2, 0, ch->gs, 0, n) &&
                                     cc_matmul(ch->t_shu[i], ch->h2, 0, ch->us, 0, n) &&
                                     cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &p));
-        ok = ok && cc_matmul(ch->t_shd[i], ch->hs, 0, ch->ds, 0, n);
     }
-    if (ok && ch->t_sg[i] && !(ch->rgf[i] && n <= Q36CC_RG_ROWS)) ok = cc_matmul(ch->t_sg[i], ch->h2, 0, ch->sgd, 0, n);
     return ok;
+}
+static int q36cc_shared_dn(Q36CChain *ch, Layer *l, int i, int n) {
+    return l->sh_I > 0 ? cc_matmul(ch->t_shd[i], ch->hs, 0, ch->ds, 0, n) : 1;
+}
+static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
+    return q36cc_shared_gu(ch, m, l, i, n) && q36cc_shared_dn(ch, l, i, n);
 }
 /* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it */
 /* with y, then x's norm (weights at wo) into y: the next layer's input norm */
@@ -2141,9 +2147,10 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
              cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K) &&
              cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && cc_signal(ch->dm_dfl, 0, *v);
     }
-    if (q36cc_permits(ch, Q36_EXPERT_MATMUL) && !*v) mp.parts = 3;
-    ok = ok && q36cc_shared(ch, m, l, i, n) && (!stg || q36cc_fetch_wait(ch, i)) &&
-         cc_moe(tab, ch->h2, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
+    if ((ch->dm_fmt >= 100 || q36cc_permits(ch, Q36_EXPERT_MATMUL)) && !*v && !stg) mp.parts = 3;
+    ok = ok && q36cc_shared_gu(ch, m, l, i, n) && (!stg || q36cc_fetch_wait(ch, i)) &&
+         cc_moe(tab, ch->h2, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp) &&
+         q36cc_shared_dn(ch, l, i, n);
     /* The sum reads no weights, so this bank can stage its next layer. */
     if (ok && stg) ok = q36cc_fetch_done(ch, i) && (ch->dm_routed || q36cc_stage_from(ch, m, i + 1, q36cc_banks(ch)));
     if (mp.parts == 1) {

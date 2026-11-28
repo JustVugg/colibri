@@ -71,7 +71,7 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int
     fake_uploads++;
     last_fmt = fmt;
     last_bytes = (size_t)I * O / ((fmt == 1 || fmt == 8) ? 1 : 2);
-    if (fake_uploads == 1) {
+    if (fake_uploads == 1 && w) {
         captured_len = last_bytes < sizeof captured ? last_bytes : sizeof captured;
         memcpy(captured, w, captured_len);
     }
@@ -105,6 +105,11 @@ int coli_cuda_host_register(void *p, size_t bytes) {
     return ok;
 }
 void coli_cuda_host_unregister(void *p) { (void)p; fake_host_unregs++; }
+/* fake_copy_async_absent: a backend that predates coli_cuda_copy_async (the loader's 0) */
+static int fake_copy_async_absent;
+int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes) {
+    (void)device; if (fake_copy_async_absent || !dst || !src) return 0; memcpy(dst, src, bytes); return 1;
+}
 int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (void)I; return fake_planar_rows; }
 /* a GGUF's block formats: fake_block_elems for every fmt >= 100 (0: the backend takes none) */
 static int fake_block_elems;
@@ -115,10 +120,17 @@ void coli_cuda_ledger_label(const char *kind, const char *name) { (void)kind; (v
 void coli_cuda_ledger_step(void) {}
 void *coli_cuda_pipe_alloc(int device, size_t bytes) { (void)device; return fake_alloc_fail ? NULL : calloc(1, bytes ? bytes : 1); }
 void coli_cuda_pipe_free(int device, void *p) { (void)device; free(p); }
-/* an arena's slot: the fake keeps the host bytes as an upload would */
-static int fake_upload_at;
+int coli_cuda_pipe_upload(int device, void *dst, const void *src, size_t bytes) {
+    (void)device; if (!dst || !src) return 0; memcpy(dst, src, bytes); return 1;
+}
+int coli_cuda_pipe_sync(int device) { (void)device; return 1; }
+/* an arena's slot: the fake keeps the host bytes as an upload would; fake_upload_at_null_fail:
+ * an older backend that refuses weights == NULL (wrapping bytes already in the slot) */
+static int fake_upload_at, fake_upload_at_null_fail;
 int coli_cuda_tensor_upload_at(ColiCudaTensor **t, void *dev, size_t cap, const void *w, int fmt, int I, int O, int device) {
-    (void)dev; (void)cap; fake_upload_at++;
+    (void)dev; (void)cap;
+    if (!w && fake_upload_at_null_fail) return 0;
+    fake_upload_at++;
     return upload_common(t, w, NULL, fmt, I, O, device, 0);
 }
 /* a block-format matrix a range of rows at a time: the first range makes the tensor (one upload),

@@ -253,7 +253,16 @@ GQ_EXACT_FN static void gq_blk_q5_1(const uint8_t *b, float *y) {
 GQ_EXACT_FN static void gq_blk_q8_0(const uint8_t *b, float *y) {
     GQ_EXACT_BEGIN
     const float d = gq_f16(gq_rd16(b)); const int8_t *qs = (const int8_t *)(b + 2);
+#if defined(__AVX2__)
+    const __m256 vd = _mm256_set1_ps(d);
+    for (int j = 0; j < 32; j += 8) {
+        __m128i q8 = _mm_loadl_epi64((const __m128i *)(qs + j));
+        __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8));
+        _mm256_storeu_ps(y + j, _mm256_mul_ps(vf, vd));
+    }
+#else
     for (int j = 0; j < 32; j++) y[j] = (float)qs[j] * d;
+#endif
 }
 GQ_EXACT_FN static void gq_blk_q2_k(const uint8_t *b, float *y) {
     GQ_EXACT_BEGIN

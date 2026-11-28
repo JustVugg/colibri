@@ -363,7 +363,10 @@ static int gguf_open(gguf_ctx *g, const char *path) {
          * the other. An overlapped handle does not queue them. No such handle: fds[] as before. */
         if (g->wh) {
             HANDLE h = CreateFileA(pp, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, NULL);
+#ifdef FILE_SKIP_SET_EVENT_ON_HANDLE
+            if (h != INVALID_HANDLE_VALUE) SetFileCompletionNotificationModes(h, FILE_SKIP_SET_EVENT_ON_HANDLE);
+#endif
             g->wh[p] = h == INVALID_HANDLE_VALUE ? NULL : h;
         }
 #endif
@@ -380,6 +383,34 @@ static int gguf_open(gguf_ctx *g, const char *path) {
     return 0;
 }
 
+#ifdef _WIN32
+/* Per-thread FLS-cached manual-reset event for overlapped gguf_read: avoids CreateEventA/CloseHandle
+ * on every single tensor/expert read while remaining safe across OpenMP thread creation/exit. */
+static VOID WINAPI gguf_win_ev_free(PVOID p) { if (p) CloseHandle((HANDLE)p); }
+static HANDLE gguf_win_event(int *owned) {
+    static volatile LONG fls_state = 0;
+    static DWORD fls_idx = FLS_OUT_OF_INDEXES;
+    if (fls_state != 2) {
+        if (InterlockedCompareExchange(&fls_state, 1, 0) == 0) {
+            fls_idx = FlsAlloc(gguf_win_ev_free);
+            InterlockedExchange(&fls_state, 2);
+        } else {
+            while (fls_state != 2) SwitchToThread();
+        }
+    }
+    if (fls_idx != FLS_OUT_OF_INDEXES) {
+        HANDLE ev = (HANDLE)FlsGetValue(fls_idx);
+        if (!ev) {
+            ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+            if (ev && !FlsSetValue(fls_idx, ev)) { CloseHandle(ev); ev = NULL; }
+        }
+        if (ev) { ResetEvent(ev); *owned = 0; return ev; }
+    }
+    *owned = 1;
+    return CreateEventA(NULL, TRUE, FALSE, NULL);
+}
+#endif
+
 /* Read n bytes at byte `off` inside tensor t into dst. 0 or -1. */
 static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t off, int64_t n) {
     if (off < 0 || n < 0 || off > t->nbytes || n > t->nbytes - off) return -1;
@@ -389,15 +420,18 @@ static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t
         HANDLE wh = g->wh ? g->wh[t->file] : NULL;
         HANDLE h = wh ? wh : (HANDLE)_get_osfhandle(g->fds[t->file]);
         if (h == INVALID_HANDLE_VALUE) return -1;
-        DWORD want = left > (1 << 30) ? (DWORD)(1 << 30) : (DWORD)left, got = 0;
+        DWORD want = left > (16 << 20) ? (DWORD)(16 << 20) : (DWORD)left, got = 0;
         OVERLAPPED ov; memset(&ov, 0, sizeof ov);
         ov.Offset = (DWORD)(pos & 0xFFFFFFFFu); ov.OffsetHigh = (DWORD)(pos >> 32);
-        if (wh) {   /* overlapped: an event of this read's own, waited on here */
-            ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (wh) {   /* overlapped: fast-path synchronous completion, wait only on ERROR_IO_PENDING */
+            int owned = 0;
+            ov.hEvent = gguf_win_event(&owned);
             if (!ov.hEvent) return -1;
-            BOOL ok = ReadFile(h, p, want, NULL, &ov) || GetLastError() == ERROR_IO_PENDING;
-            ok = ok && GetOverlappedResult(h, &ov, &got, TRUE);
-            CloseHandle(ov.hEvent);
+            BOOL ok = ReadFile(h, p, want, &got, &ov);
+            if (!ok) {
+                if (GetLastError() == ERROR_IO_PENDING) ok = GetOverlappedResult(h, &ov, &got, TRUE);
+            }
+            if (owned) CloseHandle(ov.hEvent);
             if (!ok) return -1;
         } else if (!ReadFile(h, p, want, &got, &ov)) return -1;
         int64_t r = (int64_t)got;

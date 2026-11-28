@@ -181,6 +181,10 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const
  * that predates them, and the tier keeps the host's step. */
 COLI_CUDA_DLLEXPORT int coli_cuda_host_register(void *p, size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_host_unregister(void *p);
+/* coli_cuda_copy_async: bytes from src to dst queued on the device's stream (a GGUF warm start's
+ * waves into the tier's arena); src must stay valid and unchanged until coli_cuda_pipe_sync(device)
+ * returns. Optional in the DLL loader: 0 from a backend that predates it. */
+COLI_CUDA_DLLEXPORT int coli_cuda_copy_async(int device, void *dst, const void *src, size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_planar_rows(int device, int D, int I);
 /* A GGUF's block formats (cuda_bd.cuh): fmt 100 + ggml type t, each row as the file stores
  * it (no scale array: the scales are in the blocks), uploaded with coli_cuda_tensor_upload
@@ -191,7 +195,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_planar_rows(int device, int D, int I);
 COLI_CUDA_DLLEXPORT int coli_cuda_block_elems(int fmt);
 /* A block-format tensor (fmt >= 100) in device memory the caller owns (dev, cap bytes: an
  * arena's slot, at least O rows of the file's row padded to words), its rows uploaded from
- * weights; coli_cuda_tensor_free leaves the memory. No cudaMalloc, so none of its rounding
+ * weights (or wrapped in place when weights == NULL and file rows are word-aligned);
+ * coli_cuda_tensor_free leaves the memory. No cudaMalloc, so none of its rounding
  * (a 576 KiB matrix took 1 MiB) and none of its synchronisation. Optional in the DLL loader. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights,
                                                    int fmt, int I, int O, int device);
