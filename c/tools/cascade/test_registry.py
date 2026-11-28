@@ -79,6 +79,36 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(derived["same_build_pairs_pct"], paired(raw, "off"))
             self.assertEqual(derived["same_build_median_pct"], statistics.median(paired(raw, "off")))
 
+    def test_recipient_inventory_and_admission_are_not_results(self):
+        import sys
+        sys.path.insert(0, str(OUT.parents[2] / "c"))
+        from family_registry import family_for_config
+        inventory = json.loads((OUT / "recipient-inventory.json").read_text())
+        self.assertEqual(family_for_config({"model_type": inventory["model_type"]}).id, "qwen36")
+        self.assertEqual(sum(inventory["tensor_types"].values()), inventory["tensor_count"])
+        self.assertEqual(inventory["largest_tensor_end"], inventory["weight_bytes"])
+        self.assertTrue(inventory["all_tensor_ranges_present"])
+        self.assertEqual(len(inventory["weight_sha256"]), 64)
+        self.assertFalse(inventory["execution_ready"])
+        plan = json.loads((OUT / "serving-admission.json").read_text())
+        self.assertEqual(plan["target"]["weights_sha256"], inventory["weight_sha256"])
+        self.assertEqual(plan["status"], "REQUESTED_NOT_ADMITTED")
+        self.assertIsNone(plan["approval_receipt"])
+        self.assertIsNone(plan["measured_model_results"])
+        self.assertEqual(plan["gpu_jobs_launched"], 0)
+        self.assertEqual(plan["phase_B"]["per_block_pairs"], [["off", "on"], ["on", "off"]])
+        prompts = json.loads((OUT / "serving-prompts.json").read_text())
+        for block in plan["workload_blocks"]:
+            data = prompts[block["prompt_key"]].encode()
+            self.assertEqual(len(data), block["prompt_bytes"])
+            self.assertEqual(hashlib.sha256(data).hexdigest(), block["prompt_utf8_sha256"])
+            self.assertIsNone(block["actual_native_tokens"])
+        catalog = json.loads((OUT / "local-model-candidates.json").read_text())
+        self.assertGreaterEqual(len(catalog["candidates"]), 6)
+        for model in catalog["candidates"]:
+            self.assertEqual(model["engine_family"], "qwen36")
+            self.assertTrue(model["tensor_bounds_present"])
+
 
 if __name__ == "__main__":
     unittest.main()

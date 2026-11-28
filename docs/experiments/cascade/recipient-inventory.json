@@ -1,0 +1,85 @@
+{
+  "id": "CASCADE-Q36-RECIPIENT-001",
+  "version": 1,
+  "scope": "read-only metadata, complete tensor bounds and full file hash; no inference",
+  "model": "Qwen3.5-9B",
+  "engine_family": "qwen36",
+  "not_literal_qwen36_35b": true,
+  "route_evidence": "c/family_registry.py qwen36.model_types includes qwen3_5_text; engine_artifact=qwen36",
+  "model_type": "qwen3_5_text",
+  "weight_basename": "Qwen3.5-9B-Q6_K.gguf",
+  "weight_bytes": 7359259040,
+  "weight_sha256": "b2ccc477f0a2449de299bef560b63e498cae94a2f3a3bae13df01168d77773e6",
+  "tensor_count": 427,
+  "tensor_types": {
+    "Q6_K": 250,
+    "F32": 177
+  },
+  "tensor_index_sha256": "6e72c80e47a63f86be591dc2fd1a7a1eb97558954624fc6a035522aa5b220ab3",
+  "largest_tensor_end": 7359259040,
+  "all_tensor_ranges_present": true,
+  "quantisation": "Q6_K with other tensor types as inventoried; unchanged file",
+  "metadata": {
+    "general.architecture": "qwen35",
+    "general.file_type": 18,
+    "general.quantization_version": 2,
+    "qwen35.block_count": 32,
+    "qwen35.embedding_length": 4096,
+    "qwen35.context_length": 262144
+  },
+  "geometry": {
+    "hidden_size": 4096,
+    "num_hidden_layers": 32,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "vocab_size": 248320,
+    "max_position_embeddings": 262144
+  },
+  "layer_type_counts": {
+    "linear_attention": 24,
+    "full_attention": 8
+  },
+  "local_files": {
+    "config.json": {
+      "bytes": 1701,
+      "sha256": "b4cb925f8ba3b7f59679e1b14f08e8e23bd2dae3c264119b15957874dee27169"
+    },
+    "gguf.json": {
+      "bytes": 216,
+      "sha256": "87f286d8367f25938988669ebac5c77048415c1879b2f0bdf2ed3e1fa964186b"
+    },
+    "tokenizer.json": {
+      "bytes": 9839484,
+      "sha256": "aef33b834eb88f4b341793dea22e04777dad152cc02a144ffb238d15e4d14e10"
+    },
+    "tokenizer_config.json": {
+      "bytes": 8134,
+      "sha256": "8d8bbf0b9ff42adbb5391f8dab960ce7820dafab7046a69be0dc3b1dcb99a38f"
+    },
+    "generation_config.json": {
+      "bytes": 99,
+      "sha256": "a9517c680bab9c590ccfec7880d05f3d38a971c53084ee502d1e0ec3031fe090"
+    }
+  },
+  "execution_ready": false,
+  "pending": [
+    "parent GPU/build admission",
+    "same-build private engine/backend hashes and load gate",
+    "frozen prompt token counts",
+    "sampler fraction and full-model metrics"
+  ],
+  "gpu_jobs": 0,
+  "model_modifications": 0,
+  "literal_qwen36_availability": {
+    "status": "incomplete_not_eligible",
+    "partial_files": [
+      {
+        "basename": "Qwen3.6-35B-A3B-Q4_K_M.gguf.partial",
+        "bytes": 1608028160
+      }
+    ],
+    "complete_gguf_files": 0
+  },
+  "inventory_wall_seconds": 5.680047099998774
+}

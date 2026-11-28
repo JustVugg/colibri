@@ -1,0 +1,91 @@
+{
+  "scope": "read-only Qwen GGUF metadata inventory under user-provided root; no full hashes or inference",
+  "candidates": [
+    {
+      "relative_locator": "DavidAU/Qwen3-8B-Hivemind-Instruct-Heretic-Abliterated-Uncensored-NEO-Imatrix-GGUF/Qwen3-8B-Hivemind-Inst-Hrtic-Ablit-Uncensored-Q4_K_M-imat.gguf",
+      "bytes": 4669552000,
+      "full_file_sha256": null,
+      "architecture": "qwen3",
+      "tensor_count": 794,
+      "tensor_types": {
+        "F32": 289,
+        "Q6_K": 73,
+        "Q4_K": 432
+      },
+      "tensor_bounds_present": true,
+      "engine_family": "qwen36",
+      "qualification": "source-compatible only; not loaded or benchmarked"
+    },
+    {
+      "relative_locator": "lmstudio-community/DeepSeek-R1-0528-Qwen3-8B-GGUF/DeepSeek-R1-0528-Qwen3-8B-Q8_0.gguf",
+      "bytes": 8709517376,
+      "full_file_sha256": null,
+      "architecture": "qwen3",
+      "tensor_count": 399,
+      "tensor_types": {
+        "Q8_0": 254,
+        "F32": 145
+      },
+      "tensor_bounds_present": true,
+      "engine_family": "qwen36",
+      "qualification": "source-compatible only; not loaded or benchmarked"
+    },
+    {
+      "relative_locator": "lmstudio-community/Qwen3-14B-GGUF/Qwen3-14B-Q6_K.gguf",
+      "bytes": 12121937696,
+      "full_file_sha256": null,
+      "architecture": "qwen3",
+      "tensor_count": 443,
+      "tensor_types": {
+        "Q6_K": 282,
+        "F32": 161
+      },
+      "tensor_bounds_present": true,
+      "engine_family": "qwen36",
+      "qualification": "source-compatible only; not loaded or benchmarked"
+    },
+    {
+      "relative_locator": "lmstudio-community/Qwen3-30B-A3B-Instruct-2507-GGUF/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+      "bytes": 18556685824,
+      "full_file_sha256": null,
+      "architecture": "qwen3moe",
+      "tensor_count": 579,
+      "tensor_types": {
+        "Q6_K": 49,
+        "F32": 241,
+        "Q4_K": 289
+      },
+      "tensor_bounds_present": true,
+      "engine_family": "qwen36",
+      "qualification": "source-compatible only; not loaded or benchmarked"
+    },
+    {
+      "relative_locator": "lmstudio-community/Qwen3-8B-GGUF/Qwen3-8B-Q8_0.gguf",
+      "bytes": 8709518624,
+      "full_file_sha256": null,
+      "architecture": "qwen3",
+      "tensor_count": 399,
+      "tensor_types": {
+        "Q8_0": 254,
+        "F32": 145
+      },
+      "tensor_bounds_present": true,
+      "engine_family": "qwen36",
+      "qualification": "source-compatible only; not loaded or benchmarked"
+    },
+    {
+      "relative_locator": "lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q6_K.gguf",
+      "bytes": 7359259040,
+      "full_file_sha256": null,
+      "architecture": "qwen35",
+      "tensor_count": 427,
+      "tensor_types": {
+        "Q6_K": 250,
+        "F32": 177
+      },
+      "tensor_bounds_present": true,
+      "engine_family": "qwen36",
+      "qualification": "source-compatible only; not loaded or benchmarked"
+    }
+  ]
+}

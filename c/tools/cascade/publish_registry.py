@@ -169,6 +169,20 @@ def main():
         "feedback": "docs/experiments/cascade/DORY_FEEDBACK.md",
         "dory_issue_delivery": "Attempt failed: g-damilano/colibri has issues disabled. Feedback is published on the Cascade branch and PR, not acknowledged by Dory.",
         "integration": "not merged; parent shared-code approval and GPU admission pending"}
+    admission_path = OUT / "serving-admission.json"
+    if admission_path.exists():
+        admission = json.loads(admission_path.read_text())
+        registry["next_experiment"] = {
+            "id": admission["id"], "plan": "docs/experiments/cascade/serving-admission.json",
+            "status": admission["status"], "approval_receipt": admission["approval_receipt"],
+            "request_url": admission["request_url"],
+            "inventory": "docs/experiments/cascade/recipient-inventory.json",
+            "local_candidate_catalog": "docs/experiments/cascade/local-model-candidates.json",
+            "model": admission["target"]["model"],
+            "weights_sha256": admission["target"]["weights_sha256"],
+            "gpu_jobs_launched": 0, "model_gain": None}
+        registry["compatibility"]["Qwen3.5-9B-Q6_K"] = {
+            "engine": "qwen36", "M03": "source compatible and file inventoried; model execution pending admission"}
     donor["cascade"] = registry
     target = ROOT / source_path
     target.parent.mkdir(parents=True, exist_ok=True)

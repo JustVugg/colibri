@@ -1782,6 +1782,10 @@
       },
       "llama.cpp": {
         "M03": "different_sampler_RNG_contract_no_drop_in_transfer"
+      },
+      "Qwen3.5-9B-Q6_K": {
+        "engine": "qwen36",
+        "M03": "source compatible and file inventoried; model execution pending admission"
       }
     },
     "dependency_edges": [
@@ -2002,6 +2006,19 @@
       "feedback": "docs/experiments/cascade/DORY_FEEDBACK.md",
       "dory_issue_delivery": "Attempt failed: g-damilano/colibri has issues disabled. Feedback is published on the Cascade branch and PR, not acknowledged by Dory.",
       "integration": "not merged; parent shared-code approval and GPU admission pending"
+    },
+    "next_experiment": {
+      "id": "CASCADE-Q36-SERVE-001",
+      "plan": "docs/experiments/cascade/serving-admission.json",
+      "status": "REQUESTED_NOT_ADMITTED",
+      "approval_receipt": null,
+      "request_url": null,
+      "inventory": "docs/experiments/cascade/recipient-inventory.json",
+      "local_candidate_catalog": "docs/experiments/cascade/local-model-candidates.json",
+      "model": "Qwen3.5-9B",
+      "weights_sha256": "b2ccc477f0a2449de299bef560b63e498cae94a2f3a3bae13df01168d77773e6",
+      "gpu_jobs_launched": 0,
+      "model_gain": null
     }
   }
 }

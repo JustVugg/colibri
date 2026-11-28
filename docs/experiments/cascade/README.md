@@ -11,6 +11,8 @@ Bounded transfer proposal on `feat/colibri-optimisation-cascade`, based on
 - [Same-build paired contrasts](contrasts.json)
 - [Complete-rank/edge/fallback checks](sample-edges.json)
 - [Dory feedback and parent admission request](DORY_FEEDBACK.md)
+- [Concrete Q36 serving admission request](SERVING_REQUEST.md)
+- [Verified recipient inventory](recipient-inventory.json) and [other local Qwen candidates](local-model-candidates.json)
 
 Draft PR: https://github.com/JustVugg/colibri/pull/3161 (human review pending).
 
@@ -60,6 +62,9 @@ python c/tools/cascade/test_registry.py -v
 
 No automation authorizes model/GPU timing. Parent must admit a subsequent
 matched Q36 serving test before execution; the next plan is in RESULTS.md.
+The concrete bounded request is now `serving-admission.json`, supported by a
+full-file recipient hash and metadata inventory. Its status is
+`REQUESTED_NOT_ADMITTED`; none of its model measurements exists yet.
 No G2–G5, canonical CALR/AST compliance, 10/10/5 streak, deployment, model
 speedup or global convergence is claimed.
 
