@@ -54,9 +54,9 @@
 #include "qwen38_nfc.h"
 #include "qi_gemm.h"
 #ifdef COLI_METAL
-#include "qwen36_gpu.h"  /* shared row-INT8 Metal matrix kernel */
+#include "qwen36_gpu.h"  /* shared Metal projection kernels */
 static int g_metal_ready;
-static unsigned long long g_metal_calls;
+static unsigned long long g_metal_calls, g_metal_gg_calls;
 static q36_tensor *g_metal_input, *g_metal_output;
 #endif
 #include "serve_poll.h"
@@ -300,9 +300,17 @@ static void lin_load_storage(shards *S, const char *name, int N, int K, int bits
                     name, gt, gt < GQ_TYPE_MAX ? gq_type_name(gt) : "?", N, K);
             exit(1);
         }
-        uint8_t *raw = xmalloc((size_t)t->nbytes);
-        st_read_raw_cap(S, name, raw, t->nbytes, 1);
         if (bits == 8 && g_native && qi_gg_keep(gt, K)) {
+            memset(out, 0, sizeof *out);
+            uint8_t *raw = NULL;
+#ifdef COLI_METAL
+            if (device && g_metal_ready && q36_gq_row_bytes(gt, K) == (uint64_t)rb) {
+                out->metal_weight = q36_tensor_new((size_t)t->nbytes);
+                if (out->metal_weight) raw = q36_tensor_data(out->metal_weight);
+            }
+#endif
+            if (!raw) raw = out->own = xmalloc((size_t)t->nbytes);
+            st_read_raw_cap(S, name, raw, t->nbytes, 1);
             /* the file's rows, and the int8 scale of each decoded row (qi_quantize_i8's) */
             float *sc = fmalloc(N), *row = fmalloc(K);
             for (int n = 0; n < N; n++) {
@@ -312,14 +320,15 @@ static void lin_load_storage(shards *S, const char *name, int N, int K, int bits
                 sc[n] = am > 1e-12f ? am / 127.f : 1.f;
             }
             free(row);
-            memset(out, 0, sizeof *out);
             out->m.N = N; out->m.K = K; out->m.fmt = QI_GG;
             out->gg = (QiGG){ raw, rb, gt, qi_gg_decode };
-            out->m.w = &out->gg; out->own = raw; out->m.sc = out->own_sc = sc;
+            out->m.w = &out->gg; out->m.sc = out->own_sc = sc;
             #pragma omp atomic
             g_lin_gg++;
             return;
         }
+        uint8_t *raw = xmalloc((size_t)t->nbytes);
+        st_read_raw_cap(S, name, raw, t->nbytes, 1);
         float *tmp = fmalloc((size_t)N * K);
         for (int n = 0; n < N; n++) qi_gg_decode(gt, raw + (int64_t)n * rb, tmp + (int64_t)n * K, K);
         free(raw);
@@ -429,14 +438,17 @@ static int qi_metal_linear(float *y, const float *x, int M, const Lin *l){
     size_t ybytes = (size_t)M * l->m.N * sizeof(float);
     if (!qi_metal_reserve(&g_metal_input, xbytes) || !qi_metal_reserve(&g_metal_output, ybytes)) return 0;
     memcpy(q36_tensor_data(g_metal_input), x, xbytes);
-    if (!q36_dot_i8(g_metal_output, g_metal_input, l->metal_weight, l->metal_scale, M, l->m.K, l->m.N) ||
-        !q36_gpu_sync()) {
+    int packed = l->m.fmt == QI_GG;
+    int ok = packed ? q36_dot_gq(g_metal_output, g_metal_input, l->metal_weight, l->gg.gt, 1.f, M, l->m.K, l->m.N)
+                    : q36_dot_i8(g_metal_output, g_metal_input, l->metal_weight, l->metal_scale, M, l->m.K, l->m.N);
+    if (!ok || !q36_gpu_sync()) {
         fprintf(stderr, "[Metal] qwenimage: projection dispatch failed; using CPU for later projections\n");
         g_metal_ready = 0;
         return 0;
     }
     memcpy(y, q36_tensor_data(g_metal_output), ybytes);
     g_metal_calls++;
+    if (packed) g_metal_gg_calls++;
     return 1;
 }
 
@@ -2059,7 +2071,7 @@ static int run_oracle(Engine *e, const char *refdir){
 static void qi_gpu_report(void){
 #ifdef COLI_METAL
     if (g_metal_ready || g_metal_calls)
-        fprintf(stderr, "[Metal] qwenimage: %llu DiT projections on the GPU\n", g_metal_calls);
+        fprintf(stderr, "[Metal] qwenimage: %llu DiT projections on the GPU (%llu from GGUF blocks)\n", g_metal_calls, g_metal_gg_calls);
 #endif
 #ifdef COLI_VULKAN
     if (g_vk_ready) fprintf(stderr, "[VK] qwenimage: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
@@ -2080,7 +2092,7 @@ static void usage(void){
         "       COLI_IMG_NATIVE=0  a GGUF's block types (Q2_K..Q6_K, IQ*) as int8 rows too (default: the file's blocks)\n"
         "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n"
         "       COLI_IMG_LOAD_THREADS=n  layers loaded at once (default 4)\n"
-        "       COLI_IMG_METAL=1 (a METAL=1 build): DiT projections with int8 rows and f32 activations on Apple GPUs\n"
+        "       COLI_IMG_METAL=1 (a METAL=1 build): DiT projections with int8 rows or native GGUF blocks and f32 activations on Apple GPUs\n"
         "       COLI_VK_QI_RESIDENT=n  transformer blocks kept on the GPU (default: what its free memory holds)\n"
         "       COLI_VULKAN=1 (a VK=1 build): the transformer on the GPU; COLI_VK_CHAIN=0 keeps each step's blocks\n"
         "                    off the device chain (the matrices one by one)\n");
@@ -2138,7 +2150,7 @@ int main(int argc, char **argv){
             atexit(qi_metal_cleanup);
             fprintf(stderr, "[Metal] qwenimage: DiT projections on %s\n", q36_gpu_device_name());
         } else {
-            fprintf(stderr, "[Metal] qwenimage: Metal projections need int8 row weights, f32 activations and a usable GPU\n");
+            fprintf(stderr, "[Metal] qwenimage: Metal projections need COLI_IMG_BITS=8, f32 activations and a usable GPU\n");
         }
 #else
         fprintf(stderr, "[qwenimage] COLI_IMG_METAL needs a METAL=1 build\n");

@@ -1427,6 +1427,7 @@ int q36_dot_gq(q36_tensor *y, q36_tensor *x, q36_tensor *w, int type, float scal
         int k = g_exact ? K_DOT_GQ_EXACT : rows == 1 && a.lpr == 32 ? K_DOT_GQ_ROW32 : rows <= 8 ? K_DOT_GQ_VEC
                 : g_pipe[K_DOT_GQ_MM].maxTotalThreadsPerThreadgroup >= 128 ? K_DOT_GQ_MM : K_DOT_GQ_EXACT;
         id<MTLComputeCommandEncoder> e = q36_encoder(k);
+        if (!e) return 0;
         q36_bind(e, w, 0); [e setBuffer:g_gq_table offset:0 atIndex:1]; q36_bind(e, x, 2); q36_bind(e, y, 3);
         [e setBytes:&a length:sizeof(a) atIndex:4];
         if (k == K_DOT_GQ_MM) {
