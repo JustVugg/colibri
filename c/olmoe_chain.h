@@ -865,7 +865,7 @@ static int olc_forward_seg(Model *m, OlmChain *ch, const int *ids, float *xh, in
     *rows_only = part;
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("olmoe", pos_base, S);   /* the device lost only when it said so (#2793) */
     free(xfin);
     vkc_device(0);
     olc_lost(m, pos_base);

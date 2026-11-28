@@ -26,6 +26,7 @@
  * layers; KV_SLOTS above 1. COLI_CUDA_CHAIN=0: never. COLI_CUDA_V41_ROWS: a chunk's rows (256). */
 #ifndef DEEPSEEK_V41_CUCHAIN_H
 #define DEEPSEEK_V41_CUCHAIN_H
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "cuda_chain.h"
 
 typedef struct {
@@ -244,6 +245,7 @@ static int v41u_cache(V41U *ch, Model *m, int i, int rows) {
     if (ch->ccap[i] >= rows) return 1;
     int r = c->compress_ratio[i], host = c->max_positions / (r > 0 ? r : 1), cap = 64;
     while (cap < rows) cap *= 2;
+    if (coli_kv_plan()) cap = host;   /* planned: the whole context at the first, never grown (coli_kv_plan.h) */
     if (cap > host) cap = host;
     if (cap < rows) return 0;
     cc_free(ch->ckv[i]); cc_free(ch->ikey[i]);

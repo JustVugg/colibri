@@ -24,6 +24,7 @@
 #include <string.h>
 #include <time.h>
 #include "compat.h"
+#include "coli_event_log.h"   /* why the chain or the device stopped, kept in a file too (#2793) */
 
 /* Every device memory block goes through the backend's books (COLI_VK_DEVICE_CAP_MB,
  * coli_vk_mem_alloc): the chain's buffers count against the device's budget as its
@@ -98,6 +99,8 @@ typedef struct {
     unsigned long long serial;
     uint64_t wait_h, sig_g;           /* hybrid steps: the host's value this frame waits for, the value it signals */
     VkQueryPool qp; int nq; unsigned char kind[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF: a timestamp after each op */
+    VkQueryPool gq; int gq_set;       /* the frame's start and end on the device, for the frame governor (frame_gov) */
+    int nops, nattn, ncopy; double copy_mb;   /* the ops recorded in it, of them attention; its copies (the governor's line) */
     uint32_t shape[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF=2: a matmul's (fmt, O, I) slot in prof_sh, else 0 */
 } VkcFrame;
 
@@ -108,6 +111,8 @@ typedef struct {
     VkDevice dev;
     VkQueue queue;
     uint64_t fence_ns;                /* a frame's wait before the device counts as lost (vkc_init) */
+    int gov_on, gov_shrink, gov_fast; double gov_ms, gov_max_ms;   /* the frame governor (COLI_VK_FRAME_MS) */
+    float gq_period; uint64_t gq_mask;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
@@ -207,12 +212,21 @@ void vkc_shutdown_all(void) {   /* both devices' contexts, the second first (at 
     g_kd = was;
 }
 int vkc_lost(void) { return KC.lost; }
+int vkc_lost_any(void) { return g_kctx[0].lost || g_kctx[1].lost; }
 
 static void lose(const char *what, VkResult r) {
-    if (!KC.lost) fprintf(stderr, "[VK] chain: %s failed (%d): the device is lost\n", what, (int)r);
+    if (!KC.lost) coli_event("[VK] chain: %s failed (%d): the device is lost", what, (int)r);
     KC.lost = 1;
     coli_vk_mark_lost_dev(g_kd);
 }
+/* The last request the chain's memory refused (#2793: a frame could not be built and nothing said why): what was
+ * asked and how many bytes, for the line a chain prints when it stops (vkc_frame_failed) */
+static struct { char what[160]; size_t bytes; unsigned long long n; } g_kc_ref;
+static void kc_refused(const char *what, size_t bytes) {
+    snprintf(g_kc_ref.what, sizeof g_kc_ref.what, "%s", what);
+    g_kc_ref.bytes = bytes; g_kc_ref.n++;
+}
+static const char *kc_kind_name(int kind) { return kind == VKC_UP ? "host-written" : kind == VKC_DOWN ? "host-read" : "device"; }
 
 /* ---- blocks ---------------------------------------------------------------------- */
 #define VKC_BLOCK ((uint64_t)64 << 20)
@@ -267,7 +281,12 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
     if (!vkc_ready() || kind < 0 || kind > 2) return NULL;
     if (!bytes) bytes = 4;
     bytes = (bytes + 3) & ~(size_t)3;
-    if (KC.core.ssbo_range && bytes > KC.core.ssbo_range) return NULL;   /* one binding could not address it */
+    char why[160];
+    if (KC.core.ssbo_range && bytes > KC.core.ssbo_range) {   /* one binding could not address it */
+        snprintf(why, sizeof why, "a %s buffer past the device's %llu-byte binding range", kc_kind_name(kind), (unsigned long long)KC.core.ssbo_range);
+        kc_refused(why, bytes);
+        return NULL;
+    }
     VkcBuf *b = calloc(1, sizeof *b);
     if (!b) return NULL;
     b->kind = kind; b->bytes = bytes; b->d = g_kd;
@@ -277,7 +296,10 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,   /* vkc_moe_rows' dispatches */
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    if (vkCreateBuffer(KC.dev, &bi, NULL, &b->buf) != VK_SUCCESS) { free(b); return NULL; }
+    if (vkCreateBuffer(KC.dev, &bi, NULL, &b->buf) != VK_SUCCESS) {
+        snprintf(why, sizeof why, "a %s buffer (vkCreateBuffer)", kc_kind_name(kind)); kc_refused(why, bytes);
+        free(b); return NULL;
+    }
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(KC.dev, b->buf, &req);
     VkcPool *P = &KC.pool[kind];
@@ -285,6 +307,8 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
     if (!(req.memoryTypeBits & (1u << P->memtype)) ||
         (!vka_alloc(&P->p, req.size, align, &b->r) &&
          !(pool_grow(P, req.size + align) && vka_alloc(&P->p, req.size, align, &b->r)))) {
+        snprintf(why, sizeof why, "a %s buffer (memory type %u: the driver gave no block for it)", kc_kind_name(kind), P->memtype);
+        kc_refused(why, bytes);
         vkDestroyBuffer(KC.dev, b->buf, NULL); free(b); return NULL;
     }
     VkcBlock *bk = P->p.b[b->r.block].user;
@@ -320,6 +344,7 @@ static void buf_release(VkcBuf *b) {
 
 /* a frame that may still read b must finish first */
 static int frame_wait(VkcFrame *f);
+static double frame_gov_ms(void);
 static void vkc_free_here(VkcBuf *b) {
     if (!KC.dev) { free(b); return; }
     if (!KC.lost)
@@ -762,6 +787,26 @@ int vkc_init(void) {
             }
         }
     }
+    {   /* the frame governor's two timestamps a frame (frame_gov) */
+        uint32_t nqf = 0; vkGetPhysicalDeviceQueueFamilyProperties((VkPhysicalDevice)KC.core.phys, &nqf, NULL);
+        VkQueueFamilyProperties qf[16]; if (nqf > 16) nqf = 16;
+        vkGetPhysicalDeviceQueueFamilyProperties((VkPhysicalDevice)KC.core.phys, &nqf, qf);
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        uint32_t bits = KC.core.qfam < nqf ? qf[KC.core.qfam].timestampValidBits : 0;
+        KC.gov_ms = frame_gov_ms();
+        /* not on a CPU device (Lavapipe): no driver's timeout to keep under, and its vkGetQueryPoolResults waits for
+         * the whole device idle, a frame queued behind the one read waiting for a hybrid step's host signal the
+         * reader has not given yet (the host pool's gate hung there) */
+        if (KC.gov_ms > 0 && bits && pp.limits.timestampPeriod > 0 && pp.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+            KC.gq_period = pp.limits.timestampPeriod; KC.gq_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+            KC.gov_on = 1;
+            for (int i = 0; i < VKC_FRAMES && KC.gov_on; i++) {
+                VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
+                if (vkCreateQueryPool(KC.dev, &qi, NULL, &KC.fr[i].gq) != VK_SUCCESS) { KC.fr[i].gq = VK_NULL_HANDLE; KC.gov_on = 0; }
+            }
+        }
+    }
     for (int k = 0; k < 3; k++) {
         KC.pool[k].memtype = memtype_of(k);
         KC.pool[k].mapped = memtype_host_visible(KC.pool[k].memtype);
@@ -807,6 +852,52 @@ static long chain_spin_us(void) {
     }
     return v;
 }
+/* ---- the frame governor (COLI_VK_FRAME_MS) ---------------------------------------------
+ * A submission the device runs too long is killed by its driver and the device is lost: Windows'
+ * TDR at 2 s, amdgpu's job timeout at 10 s (#3149: a 64K prompt of Inkling-2 on an RX 9060 XT,
+ * "ring gfx timeout", then the CPU for the rest of the request), and the CPU takes everything
+ * from there on. The chain's work a submission had fixed sizes: the attention's slices
+ * (COLI_VK_ATTN_SLICE), a frame every few layers (COLI_VK_CHAIN_SPLIT), set on fast GPUs. Each
+ * frame's time on the device is now read from two timestamps when it comes back: past
+ * COLI_VK_FRAME_MS (400; 0 = off) the next frames are made smaller, a level a time (the
+ * attention's budget halved, a frame every 2 layers, then every one), and after 64 frames under
+ * a quarter of it one level back. The same ops in the same order cut at other places: the
+ * bytes do not move. A frame past the limit says so on stderr and in the event log, with what it
+ * held, so that a run that comes close to a driver's timeout leaves a line saying which. */
+#define FRAME_GOV_LEVELS 6
+static double frame_gov_ms(void) {
+    const char *e = getenv("COLI_VK_FRAME_MS");
+    double v = e && *e ? atof(e) : 400.0;
+    return v < 0 ? 0 : v;
+}
+static void frame_gov(const VkcFrame *f, double ms) {
+    if (ms > KC.gov_max_ms) KC.gov_max_ms = ms;
+    if (!KC.gov_on) return;
+    if (ms > KC.gov_ms) {
+        KC.gov_fast = 0;
+        if (KC.gov_shrink < FRAME_GOV_LEVELS) {
+            KC.gov_shrink++;
+            KC.st.gov_shrinks++;
+            /* a line for a level never reached before or a frame well past the longest one said: the governor's
+             * swings between two levels say nothing new */
+            static int top; static double said_ms;
+            const int news = KC.gov_shrink > top || ms > 1.5 * said_ms;
+            if (KC.gov_shrink > top) top = KC.gov_shrink;
+            if (ms > said_ms) said_ms = ms;
+            if (news) coli_event("[VK] chain: a frame ran %.0f ms on the device (%d ops, %d of them attention; %d copies, %.1f MiB; "
+                       "COLI_VK_FRAME_MS %.0f): the next frames smaller (level %d of %d)", ms, f->nops, f->nattn, f->ncopy, f->copy_mb,
+                       KC.gov_ms, KC.gov_shrink, FRAME_GOV_LEVELS);
+        } else if (ms > 4 * KC.gov_ms) {
+            static int said;
+            if (said++ < 8)
+                coli_event("[VK] chain: a frame ran %.0f ms on the device (%d ops, %d of them attention; %d copies, %.1f MiB) at the "
+                           "smallest frames; a driver's timeout is near (COLI_VK_CHAIN_ROWS lowers the prompt's chunk)",
+                           ms, f->nops, f->nattn, f->ncopy, f->copy_mb);
+        }
+    } else if (ms < KC.gov_ms / 4 && KC.gov_shrink > 0 && ++KC.gov_fast >= 64) {
+        KC.gov_shrink--; KC.gov_fast = 0;
+    }
+}
 static int frame_wait(VkcFrame *f) {
     if (!f->inflight) return 1;
     /* A hybrid step's host part, which a frame still running may wait for. Only then: vkc_begin
@@ -822,6 +913,12 @@ static int frame_wait(VkcFrame *f) {
     KC.st.wait_ms += vkc_now_ms() - t0; KC.st.waits++;
     f->inflight = 0;
     if (r != VK_SUCCESS) { lose("fence wait", r); return 0; }
+    if (f->gq_set) {
+        uint64_t ts[2];
+        f->gq_set = 0;
+        if (vkGetQueryPoolResults(KC.dev, f->gq, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            frame_gov(f, (double)((ts[1] - ts[0]) & KC.gq_mask) * KC.gq_period / 1e6);
+    }
     if (KC.prof && f->qp && f->nq > 1) {
         uint64_t ts[VKC_PROF_Q];
         if (vkGetQueryPoolResults(KC.dev, f->qp, 0, (uint32_t)f->nq, sizeof ts, ts, sizeof ts[0],
@@ -855,6 +952,91 @@ int vkc_finish(void) {
     if (KC.cur >= 0 && !vkc_submit(0)) return 0;
     for (int i = 0; i < VKC_FRAMES; i++) if (!frame_wait(&KC.fr[i])) return 0;
     return !KC.lost;
+}
+/* A chain's frame failed and the chain turns itself off (its `lost:` exits). The device is lost only when it said
+ * so (a submission, a fence, a reset: lose() marked it then); a frame refused for want of memory leaves the device
+ * to the backend's per-matrix path and the expert tier, where every such frame had marked it lost and the CPU had
+ * taken everything until the process ended (#2793: "the device stopped answering", 300 s for a 12.7k prompt and
+ * 7 tok/s after). The line says which of the two, what the chain's memory refused last, at which position. */
+/* Between two requests: a device lost for real (the chain's or the expert tier's: a driver reset, Windows' 2 s
+ * watchdog) leaves this process on the CPU, and a Vulkan device does not come back in it. The engine exits instead,
+ * after saying why, and the gateway starts it again (keep_engine) on a fresh device: the next request waits for it
+ * there and runs at the device's speed again. Once in ten minutes: a second loss within them keeps the CPU
+ * (colibri-logs/lost-restart holds the time). COLI_VK_LOST_RESTART=0 keeps the CPU always. */
+void vkc_restart_if_lost(const char *engine) {
+    if (!(g_kctx[0].lost || g_kctx[1].lost || vkt_lost())) return;
+    static int said;
+    const char *e = getenv("COLI_VK_LOST_RESTART");
+    if (e && *e == '0') return;
+    /* only an engine something starts again: the gateway sets COLI_ENGINE_SUPERVISED for the one keep_engine watches.
+     * Run alone (a test, a script, a front end of its own), an exit would end the service: the CPU runs on instead */
+    const char *sup = getenv("COLI_ENGINE_SUPERVISED");
+    if (!(sup && *sup == '1')) return;
+    char mark[1024] = "";
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = getenv("USERPROFILE");
+    if (home && *home) { snprintf(mark, sizeof mark, "%s/colibri-logs", home); (void)coli_ev_mkdir(mark); }
+    if (*mark) { size_t l = strlen(mark); snprintf(mark + l, sizeof mark - l, "/lost-restart"); }
+    time_t now = time(NULL);
+    FILE *f = *mark ? fopen(mark, "r") : NULL;
+    long long last = 0;
+    if (f) { if (fscanf(f, "%lld", &last) != 1) last = 0; fclose(f); }
+    if (last > 0 && now - (time_t)last < 600) {
+        if (!said++) coli_event("[VK] %s: the device was lost again within ten minutes of a restart for that; the CPU runs "
+                                "from here on (COLI_VK_LOST_RESTART=0 always keeps it)", engine);
+        return;
+    }
+    /* the time kept, or no restart: without it a device lost at every start would restart the engine for ever */
+    f = *mark ? fopen(mark, "w") : NULL;
+    if (!f || fprintf(f, "%lld\n", (long long)now) < 0) {
+        if (f) fclose(f);
+        if (!said++) coli_event("[VK] %s: the device was lost; %s cannot be written, so the engine stays (the CPU runs from "
+                                "here on) rather than risk restarting for ever", engine, *mark ? mark : "the home folder");
+        return;
+    }
+    fclose(f);
+    coli_event("[VK] %s: the device was lost; the engine exits so that the gateway starts it again on a fresh device", engine);
+    fflush(stdout); fflush(stderr);
+    _Exit(75);   /* C99: no atexit handlers (the device is gone), the same on Windows */
+}
+/* every submitted frame waited for, their temporaries and staging buffers given back (stage_relieve's, between two
+ * requests: no frame open after vkc_finish) */
+static void stage_relieve_idle(void) {
+    if (KC.lost || !vkc_finish()) return;
+    for (int i = 0; i < VKC_FRAMES; i++) {
+        VkcFrame *g = &KC.fr[i];
+        frame_reclaim(g);
+        if (g->stage) { buf_release(g->stage); g->stage = NULL; }
+    }
+}
+/* the soft stops (vkc_frame_failed with the device alive) and the requests to wait before the next try */
+static int g_chain_soft, g_chain_wait;
+int vkc_chain_retry(const char *engine) {
+    if (!g_chain_soft || KC.lost || !KC.ready) return 0;
+    if (--g_chain_wait > 0) return 0;
+    stage_relieve_idle();
+    coli_event("[VK] %s chain: back on the device after its stop (%d so far); the state goes up from the host's", engine, g_chain_soft);
+    return 1;
+}
+void vkc_frame_failed(const char *engine, int pos, int rows) {
+    /* either device: a chain split over two (COLI_VK_CHAIN_LAYERS2) reaches its lost: path back on the primary, the
+     * second one the device that went */
+    const int dead = vkc_lost_any() || !vkc_finish();
+    if (dead) {
+        coli_event("[VK] %s chain: the device is lost at position %d (%d rows); the CPU runs from here on", engine, pos, rows);
+        return;
+    }
+    g_chain_soft++;
+    g_chain_wait = 1 << (g_chain_soft - 1 < 6 ? g_chain_soft - 1 : 6);   /* the next request, then 2, 4, ... 64 later */
+    if (g_kc_ref.n)
+        coli_event("[VK] %s chain: a frame failed at position %d (%d rows) without a device error: %s of %.1f MiB was refused; "
+                   "the chain off, the device stays (the per-matrix path and the expert tier), the chain again in %d request%s",
+                   engine, pos, rows, g_kc_ref.what, g_kc_ref.bytes / 1048576.0, g_chain_wait, g_chain_wait == 1 ? "" : "s");
+    else
+        coli_event("[VK] %s chain: a frame failed at position %d (%d rows) without a device error or a refused buffer; "
+                   "the chain off, the device stays (the per-matrix path and the expert tier), the chain again in %d request%s",
+                   engine, pos, rows, g_chain_wait, g_chain_wait == 1 ? "" : "s");
+    g_kc_ref.n = 0;
 }
 
 static void barrier_now(VkCommandBuffer c, VkPipelineStageFlags dst_stage, VkAccessFlags dst) {
@@ -894,6 +1076,11 @@ int vkc_begin(void) {
         vkCmdPipelineBarrier(f->cmd, VK_PIPELINE_STAGE_HOST_BIT, ALL_STAGES, 0, 1, &hb, 0, NULL, 0, NULL);
     }
     track_reset();
+    f->nops = f->nattn = f->ncopy = 0; f->copy_mb = 0;
+    if (KC.gov_on && f->gq) {
+        vkCmdResetQueryPool(f->cmd, f->gq, 0, 2);
+        vkCmdWriteTimestamp(f->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, f->gq, 0);
+    }
     if (KC.prof && f->qp) {
         vkCmdResetQueryPool(f->cmd, f->qp, 0, VKC_PROF_Q);
         f->nq = 0;
@@ -910,13 +1097,25 @@ int vkc_submit(int wait) {
      * submitted before the value it waits for */
     if (f->wait_h && g_hyb_flush) g_hyb_flush();
     barrier_now(f->cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    if (KC.gov_on && f->gq) { vkCmdWriteTimestamp(f->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f->gq, 1); f->gq_set = 1; }
     vkEndCommandBuffer(f->cmd);
     f->open = 0; KC.cur = -1;
     if (KC.lost) return 0;
     {   /* COLI_VK_CHAIN_FAULT=n (tests): the primary device's n-th submission fails as a lost
          * device would; COLI_VK_CHAIN_FAULT2 the second device's */
         static long fault[2] = {-2, -2};
-        if (fault[g_kd] == -2) { const char *e = getenv(g_kd ? "COLI_VK_CHAIN_FAULT2" : "COLI_VK_CHAIN_FAULT"); fault[g_kd] = e && *e ? atol(e) : -1; }
+        if (fault[g_kd] == -2) {
+            const char *e = getenv(g_kd ? "COLI_VK_CHAIN_FAULT2" : "COLI_VK_CHAIN_FAULT");
+            fault[g_kd] = e && *e ? atol(e) : -1;
+            /* COLI_VK_CHAIN_FAULT_ONCE=file: only a process that finds no such file (it makes it), so the engine
+             * the gateway starts again after the loss runs on a working device, as after a driver's reset */
+            const char *once = getenv("COLI_VK_CHAIN_FAULT_ONCE");
+            if (fault[g_kd] > 0 && once && *once) {
+                FILE *fo = fopen(once, "r");
+                if (fo) { fclose(fo); fault[g_kd] = -1; }
+                else if ((fo = fopen(once, "w"))) fclose(fo);
+            }
+        }
         if (fault[g_kd] > 0 && (long)KC.st.frames + 1 >= fault[g_kd])
             { lose(g_kd ? "queue submit (COLI_VK_CHAIN_FAULT2)" : "queue submit (COLI_VK_CHAIN_FAULT)", VK_ERROR_DEVICE_LOST); return 0; }
     }
@@ -971,7 +1170,9 @@ int vkc_hybrid_host_signal(uint64_t h) {
 int vkc_split_layers(void) {
     static int n = -1;
     if (n < 0) { const char *e = getenv("COLI_VK_CHAIN_SPLIT"); n = e && *e ? atoi(e) : 4; if (n < 0) n = 0; }
-    return n;
+    if (!KC.gov_shrink) return n;
+    const int base = n ? n : 4;   /* the frame governor: a frame every base >> level layers, one at least */
+    return base >> KC.gov_shrink > 0 ? base >> KC.gov_shrink : 1;
 }
 int vkc_layer_recorded(int *layers) {
     const int every = vkc_split_layers();
@@ -1027,11 +1228,12 @@ static int record(VkPipeline pipe, const VkcBind *bd, int n, const void *pc, siz
     VkcFrame *f = open_frame();
     if (KC.misuse) { KC.misuse = 0; return 0; }
     if (!f || KC.lost || !gx || !gy || !gz) return f && !KC.lost;
+    f->nops++; f->nattn += KC.kind == PK_ATTN;
     VkBuffer rd[VKC_BIND], wr[VKC_BIND]; int nr = 0, nw = 0;
     VkDescriptorBufferInfo bi[VKC_BIND];
     VkWriteDescriptorSet w[VKC_BIND];
     VkDescriptorSet set = alloc_set(f);
-    if (!set) { fprintf(stderr, "[VK] chain: out of descriptor sets\n"); return 0; }
+    if (!set) { fprintf(stderr, "[VK] chain: out of descriptor sets\n"); kc_refused("a descriptor set (the frame's pools are full)", 0); return 0; }
     for (int i = 0; i < VKC_BIND; i++) {
         if (i < n && bd[i].buf) {
             bi[i] = (VkDescriptorBufferInfo){bd[i].buf, bd[i].off, bd[i].range ? bd[i].range : VK_WHOLE_SIZE};
@@ -1076,6 +1278,7 @@ static int copy_bytes(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t
     if (dst->d != g_kd || src->d != g_kd) { fprintf(stderr, "[VK] chain: a copy across devices\n"); return 0; }
     VkBuffer r = src->buf, w = dst->buf;
     hazard(f, &r, 1, &w, 1);
+    f->ncopy++; f->copy_mb += bytes / 1048576.0;
     VkBufferCopy c = {soff, doff, bytes};
     vkCmdCopyBuffer(f->cmd, src->buf, dst->buf, 1, &c);
     prof_mark(f, PK_COPY);
@@ -1295,6 +1498,42 @@ static void zero_now(VkcBuf *b) {
     vkc_zero(b, 0, b->bytes / 4);
     if (!was_open) vkc_submit(1);
 }
+/* COLI_VK_CHAIN_STAGE_REFUSE=n (tests): the n-th staging buffer vkc_write asks for is refused, as a driver short of
+ * host-visible memory would, and COLI_VK_CHAIN_STAGE_REFUSE_N (1) of them in a row (2: the least's retry too, so the
+ * frames so far are done and their staging given back); COLI_VK_CHAIN_STAGE_REFUSE_ALL=1: every one from there on */
+static int stage_refused(size_t want) {
+    static long at = -2, all = -1, rn = 1, seen;
+    if (at == -2) {
+        const char *e = getenv("COLI_VK_CHAIN_STAGE_REFUSE"), *a = getenv("COLI_VK_CHAIN_STAGE_REFUSE_ALL"),
+                   *k = getenv("COLI_VK_CHAIN_STAGE_REFUSE_N");
+        at = e && *e ? atol(e) : -1; all = a && *a == '1'; rn = k && atol(k) > 0 ? atol(k) : 1;
+    }
+    if (at < 1) return 0;
+    ++seen;
+    if ((seen >= at && seen < at + rn) || (all && seen > at)) {
+        kc_refused("a host-written staging buffer (COLI_VK_CHAIN_STAGE_REFUSE)", want);
+        return 1;
+    }
+    return 0;
+}
+static VkcBuf *stage_buf(size_t want) { return stage_refused(want) ? NULL : vkc_buf(want, VKC_UP); }
+/* A frame's staging refused (#2793: right after the expert tier gave device memory back and the KV mirror grew,
+ * a long prompt chunk's doubled staging buffer was refused, the frame could not be built and the device was taken
+ * for lost): every frame so far submitted and waited for, their temporaries and staging buffers given back, and a
+ * new frame opened, as vkc_layer_recorded splits one every few layers. Not a frame that waits for the host's value
+ * (a hybrid step's goes off as it is). 1: the open frame is a new one. */
+static int stage_relieve(void) {
+    VkcFrame *f = open_frame();
+    if (!f || f->wait_h || f->sig_g || KC.lost) return 0;
+    if (!vkc_finish()) return 0;
+    for (int i = 0; i < VKC_FRAMES; i++) {
+        VkcFrame *g = &KC.fr[i];
+        frame_reclaim(g);
+        if (g->stage) { buf_release(g->stage); g->stage = NULL; }
+    }
+    KC.st.stage_relieved++;
+    return vkc_begin();
+}
 int vkc_write(VkcBuf *dst, size_t off, const void *src, size_t bytes) {
     VkcFrame *f = open_frame();
     if (!f || KC.lost) return 0;
@@ -1306,7 +1545,29 @@ int vkc_write(VkcBuf *dst, size_t off, const void *src, size_t bytes) {
         /* a new staging buffer; the old one stays alive until the frame comes back */
         size_t want = f->stage ? 2 * f->stage->bytes : VKC_STAGE0;
         while (want < bytes) want *= 2;
-        VkcBuf *n = vkc_buf(want, VKC_UP);
+        VkcBuf *n = stage_buf(want);
+        /* refused: the least that holds this write (not the doubled size), then the frames so far done and their
+         * staging given back, once more (the same copies in the same order: the bytes do not move) */
+        const size_t least = (bytes + 65535) & ~(size_t)65535;
+        if (!n && least < want) n = stage_buf(least);
+        if (!n) {
+            static int said;
+            if (said++ < 4)
+                fprintf(stderr, "[VK] chain: a staging buffer of %.1f MiB refused (%s); the frames so far done and their "
+                                "staging given back, once more\n", want / 1048576.0, g_kc_ref.what);
+        }
+        if (!n && stage_relieve()) {
+            f = open_frame();
+            n = stage_buf(want);
+            if (!n && least < want) n = stage_buf(least);
+            if (n) {   /* the new frame's first staging buffer */
+                f->stage = n;
+                memcpy(n->ptr, src, bytes);
+                f->stage_used = bytes;
+                KC.st.bytes_up += bytes;
+                return copy_bytes(dst, off * 4, n, 0, bytes);
+            }
+        }
         if (!n) return 0;
         if (f->stage) {
             if (f->ntmp == f->ctmp) {
@@ -1775,9 +2036,10 @@ static void kab_shutdown(void) {
  * integrated GPU keeps the budget alone (0) until one is measured: the budget is there for
  * the slow GPUs a driver's timeout catches (the 780M above; Windows' TDR at 2 s). */
 static long long attn_slice_budget(void) {
-    const char *e = getenv("COLI_VK_ATTN_SLICE");
+    const char *e = getenv("COLI_VK_ATTN_SLICE");   /* read at each call, as the tests change it */
     long long v = e && *e ? atoll(e) : (1LL << 32);
-    return v < 0 ? 0 : v;
+    if (v < 0) v = 0;
+    return v ? v >> KC.gov_shrink : 0;   /* the frame governor's level halves it */
 }
 long long vkc_attn_slice_budget(void) { return attn_slice_budget(); }
 static int attn_slice_wg(void) {
@@ -3098,7 +3360,7 @@ static int record_indirect(VkPipeline pipe, const VkcBind *bd, int n, const void
     KC.st.barriers++;
     /* record's own work with an empty grid, then the indirect dispatch in its place */
     VkDescriptorSet set = alloc_set(f);
-    if (!set) { fprintf(stderr, "[VK] chain: out of descriptor sets\n"); return 0; }
+    if (!set) { fprintf(stderr, "[VK] chain: out of descriptor sets\n"); kc_refused("a descriptor set (the frame's pools are full)", 0); return 0; }
     VkBuffer rd[VKC_BIND], wr[VKC_BIND]; int nr = 0, nw = 0;
     VkDescriptorBufferInfo bi[VKC_BIND];
     VkWriteDescriptorSet w[VKC_BIND];
@@ -3340,12 +3602,64 @@ static VkPipeline kx_pipe(int k) {
     if ((KX.mod[k] = load_module(KC.core.spv_path, file[k]))) KX.pipe[k] = make_pipe(KX.mod[k], NULL);
     return KX.pipe[k];
 }
+/* chain_relattn_tile.comp (a prompt chunk's rows, vkc_relattn below): a pipeline per (G, ND), its
+ * specialization constants, G = H / KVH from 1 to 4, ND 1 for hd <= 128 and 2 for hd <= 256 */
+static struct { VkShaderModule mod; VkPipeline pipe[4][2][2][2]; int tried, ptried[4][2][2][2]; VkPipeline rel16; int rel16_tried; } g_kt[2];
+static int g_relattn_kv16;   /* vkc_relattn_kv16: the rings' K and V float16 */
+#define KRT (g_kt[g_kd])
+#define RELATTN_TILE_SHARED ((4096 + 24 * 16 + 24 * 128 + 4 * 24) * 4)   /* the shader's shared arrays */
+static VkPipeline kt_pipe(int G, int nd, int split) {
+    const int h = g_relattn_kv16 ? 1 : 0;
+    if (G < 1 || G > 4 || nd < 1 || nd > 2 || split < 0 || split > 1 || !vkc_ready()) return VK_NULL_HANDLE;
+    if (KRT.pipe[G - 1][nd - 1][split][h] || KRT.ptried[G - 1][nd - 1][split][h]) return KRT.pipe[G - 1][nd - 1][split][h];
+    KRT.ptried[G - 1][nd - 1][split][h] = 1;
+    if (!KRT.tried) { KRT.tried = 1; KRT.mod = load_module(KC.core.spv_path, "chain_relattn_tile.spv"); }
+    if (!KRT.mod || kc_shared_limit() < RELATTN_TILE_SHARED) return VK_NULL_HANDLE;
+    int32_t v[4] = {G, nd, split, h};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
+    VkSpecializationInfo si = {4, me, sizeof v, v};
+    return KRT.pipe[G - 1][nd - 1][split][h] = make_pipe(KRT.mod, &si);
+}
+/* chain_relattn.comp itself: its float32 pipeline (kx_pipe), or KV16's */
+static VkPipeline rel_pipe(void) {
+    if (!g_relattn_kv16) return kx_pipe(1);
+    if (KRT.rel16 || KRT.rel16_tried || !kx_pipe(1)) return KRT.rel16;
+    KRT.rel16_tried = 1;
+    VkBool32 on = VK_TRUE;
+    VkSpecializationMapEntry me = {0, 0, sizeof on};
+    VkSpecializationInfo si = {1, &me, sizeof on, &on};
+    return KRT.rel16 = make_pipe(KX.mod[1], &si);
+}
+int vkc_relattn_kv16(int on) {
+    int was = g_relattn_kv16;
+    if (on >= 0) g_relattn_kv16 = on != 0;
+    return was;
+}
+int vkc_relattn_kv16_ready(void) {
+    int was = vkc_relattn_kv16(1);
+    VkPipeline p = rel_pipe();
+    vkc_relattn_kv16(was);
+    return p != VK_NULL_HANDLE && vkc_kvh_ready();
+}
+/* rb and jc for chain_relattn_tile.comp: rb rows a block (24 / G at most), jc V rows a pass, (jc + rb - 1) * hd
+ * within its 4096 floats */
+static void kt_block(int G, int hd, int *rb, int *jc) {
+    int b = 24 / G;
+    while (b > 1 && 4096 / hd - b + 1 < 4) b--;
+    int j = 4096 / hd - b + 1;
+    *rb = b; *jc = j > 32 ? 32 : j;
+}
 static void kx_shutdown(void) {
     for (int k = 0; k < 3; k++) {
         if (KX.pipe[k]) vkDestroyPipeline(KC.dev, KX.pipe[k], NULL);
         if (KX.mod[k]) vkDestroyShaderModule(KC.dev, KX.mod[k], NULL);
     }
     memset(&KX, 0, sizeof KX);
+    for (int g = 0; g < 4; g++) for (int n = 0; n < 2; n++) for (int t = 0; t < 2; t++) for (int h = 0; h < 2; h++)
+        if (KRT.pipe[g][n][t][h]) vkDestroyPipeline(KC.dev, KRT.pipe[g][n][t][h], NULL);
+    if (KRT.rel16) vkDestroyPipeline(KC.dev, KRT.rel16, NULL);
+    if (KRT.mod) vkDestroyShaderModule(KC.dev, KRT.mod, NULL);
+    memset(&KRT, 0, sizeof KRT);
 }
 int vkc_sconv_ready(void) { return kx_pipe(0) != VK_NULL_HANDLE; }
 int vkc_relattn_ready(void) { return kx_pipe(1) != VK_NULL_HANDLE; }
@@ -3406,9 +3720,28 @@ static int relattn_split_wanted(void) {
     if (on < 0) { const char *e = getenv("COLI_VK_RELATTN_SPLIT"); on = !(e && *e == '0'); }
     return on;
 }
+/* COLI_VK_RELATTN_TILE: the rows from which a step's attention runs chain_relattn_tile.comp (9, past the
+ * split decode's 8; 0 never), the same arithmetic as chain_relattn's mode 0 */
+static int g_relattn_tile = -1;
+int vkc_relattn_tile_rows(int rows) {
+    if (g_relattn_tile < 0) { const char *e = getenv("COLI_VK_RELATTN_TILE"); g_relattn_tile = e && *e ? atoi(e) : 9; }
+    int was = g_relattn_tile;
+    if (rows >= 0) g_relattn_tile = rows;
+    return was;
+}
+/* COLI_VK_RELATTN_TILE_DEC=1: the split decode on chain_relattn_tile.comp's SPLIT (a workgroup a KV head and tile,
+ * its query heads at once) instead of chain_relattn.comp's mode 1 (a workgroup a (head, row, tile)). Off: Inkling-2-Mini
+ * UD-Q3_K_XL on an RTX PRO 4000 decoded 37.0 tok/s at 10K positions on mode 1 and 36.6 on it */
+static int g_relattn_tile_dec = -1;
+int vkc_relattn_tile_dec(int on) {
+    if (g_relattn_tile_dec < 0) { const char *e = getenv("COLI_VK_RELATTN_TILE_DEC"); g_relattn_tile_dec = e && *e == '1'; }
+    int was = g_relattn_tile_dec;
+    if (on >= 0) g_relattn_tile_dec = on;
+    return was;
+}
 int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                 const VkcRelAttn *p) {
-    VkPipeline pipe = kx_pipe(1);
+    VkPipeline pipe = rel_pipe();
     if (!pipe || p->hd > 256 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
     KC.kind = PK_ATTN;
     /* a decode step over many positions: its positions over workgroups, then their combine */
@@ -3421,7 +3754,17 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
             struct { VkcRelAttn a; int s0, mode, nc; } x = {*p, 0, 1, nc};
             VkcBind b1[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(g_relattn_part, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
             VkcBind b2[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(g_relattn_part, 0), B(r, 0), B(relp, 0), B(tau, 0)};
-            if (!record(pipe, b1, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)p->S, (uint32_t)nc)) return 0;
+            /* the tiles: a workgroup a KV head and tile with its query heads (chain_relattn_tile.comp SPLIT),
+             * the same partials as mode 1's */
+            const int G = p->H / p->KVH;
+            VkPipeline sp = G <= 4 && vkc_relattn_tile_dec(-1) ? kt_pipe(G, p->hd > 128 ? 2 : 1, 1) : VK_NULL_HANDLE;
+            if (sp) {
+                int rb, jc;
+                kt_block(G, p->hd, &rb, &jc);
+                struct { VkcRelAttn a; int s0, rb, jc, nc; } xs = {*p, 0, rb, jc, nc};
+                if (!record(sp, b1, 8, &xs, sizeof xs, (uint32_t)p->KVH, (uint32_t)((p->S + rb - 1) / rb), (uint32_t)nc)) return 0;
+                KC.st.relattn_tile++;
+            } else if (!record(pipe, b1, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)p->S, (uint32_t)nc)) return 0;
             x.mode = 2;
             return record(pipe, b2, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)p->S, 1);
         }
@@ -3430,6 +3773,23 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows): the
      * shader's s0 is the slice's first row, pos_base stays the step's */
     int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1, p->H), ok = 1;
+    /* a prompt chunk's rows: chain_relattn_tile.comp, rb rows of a KV head's G heads a workgroup */
+    const int G = p->H / p->KVH, tile_rows = vkc_relattn_tile_rows(-1);
+    VkPipeline tp = tile_rows > 0 && S >= tile_rows && G <= 4 ? kt_pipe(G, p->hd > 128 ? 2 : 1, 0) : VK_NULL_HANDLE;
+    if (tp) {
+        int rb, jc;
+        kt_block(G, p->hd, &rb, &jc);
+        for (int r0 = 0; ok && r0 < S; r0 += rr) {
+            struct { VkcRelAttn a; int s0, rb, jc, nc; } x = {*p, r0, rb, jc, 0};
+            x.a.S = S - r0 < rr ? S - r0 : rr;
+            x.a.q_off += r0 * p->q_row; x.a.o_off += r0 * p->o_row; x.a.r_off += r0 * p->r_row; x.a.tau_off += r0;
+            if (p->has_sink) x.a.sink_off += r0 * p->H;
+            if (r0 && !attn_slice_next()) return 0;
+            ok = record(tp, bd, 8, &x, sizeof x, (uint32_t)p->KVH, (uint32_t)((x.a.S + rb - 1) / rb), 1);
+            KC.st.relattn_tile += ok;
+        }
+        return ok;
+    }
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         struct { VkcRelAttn a; int s0, mode, nc; } x = {*p, r0, 0, 0};
         x.a.S = S - r0 < rr ? S - r0 : rr;
@@ -3844,6 +4204,7 @@ void vkc_shutdown(void) {
         free(f->pools);
         if (f->fence) vkDestroyFence(KC.dev, f->fence, NULL);
         if (f->qp) vkDestroyQueryPool(KC.dev, f->qp, NULL);
+        if (f->gq) vkDestroyQueryPool(KC.dev, f->gq, NULL);
     }
     if (KC.tsem_g) p_vkDestroySemaphore(KC.dev, KC.tsem_g, NULL);
     if (KC.tsem_h) p_vkDestroySemaphore(KC.dev, KC.tsem_h, NULL);

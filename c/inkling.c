@@ -2482,13 +2482,17 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     int win = kv_ring_rows(c, li, m->max_t);
     float scale = 1.f / (float)hd;
     float *ctx = falloc((int64_t)S*qdim);
+    /* a (KV head, row) at a time with the KV head's `group` query heads one after the other, so the K and V rows
+     * one head reads are in the cache for the next: each head's arithmetic is the (head, row) loop's, word for word
+     * (a reordered form changed the compiler's fusions, and with them the bits) */
     #pragma omp parallel
     {
         float *rl = malloc(ext * sizeof(float));
         float *sc = malloc((size_t)m->max_t * sizeof(float));
         #pragma omp for collapse(2) schedule(static)
-        for (int h = 0; h < H; h++) {
-            for (int s = 0; s < S; s++) {
+        for (int g = 0; g < KV; g++) {
+            for (int s = 0; s < S; s++) for (int hh = 0; hh < group; hh++) {
+                int h = g * group + hh;
                 int qpos = mr ? mr[s].pos : pos0 + s;
                 int sp0 = mr ? qpos : pos0;       /* the scratch's first position: the row's own in a multiplexed step */
                 int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
@@ -2497,6 +2501,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 int64_t srow = mr ? (int64_t)s*kvdim : 0;
                 /* mix the relative-bias bank for this (token, head): rl[dist] */
                 const float *rv = rr + (int64_t)s*H*c->d_rel + h*c->d_rel;
+                /* dev's loop: run over the bank's rows first, the compiler fused it otherwise in this file */
                 for (int e = 0; e < ext; e++) {
                     float acc = 0.f;
                     for (int d = 0; d < c->d_rel; d++) acc += rv[d] * l->relp[(int64_t)d*ext + e];
@@ -2638,6 +2643,10 @@ static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
     free(bg); free(bh);
 }
 
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
+/* the positions the plan (coli_kv_plan.h) holds the KV caches at from the first request (0: grown as requests
+ * ask, as before), set where the device's mirrors at the whole served context fit (ink2c_plan_bytes, ink2cc) */
+static int g_ink_kv_plan_t;
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* ---- the routed-expert tier (vk_tier.c on Vulkan; on CUDA, cu_tier.c: XT) ------
  * With the tier on, one MoE layer runs per block of rows: the block's resident
@@ -3707,6 +3716,7 @@ static int64_t ink_cs_cells(Cfg *c, int bank, int layer);
 #endif
 #ifdef COLI_CUDA
 #include "cuda_chain.h"
+#include "kv16.h"            /* kv16_pack: the float16 mirrors (COLI_CUDA_KV16) */
 #include "inkling2_cuchain.h"   /* COLI_CUDA_CHAIN: Inkling-2's on a CUDA device */
 #endif
 
@@ -4634,6 +4644,9 @@ static int ink_ps_marks(const Tok *T, const int *ids, int np, int from, int *mar
 
 static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out, float **logit_out,
                            InkReqClock *clk, int lone) {
+#ifdef COLI_VULKAN
+    if (m->c.v2) ink2c_retry(m);   /* a chain that stopped with the device alive comes back (vkc_chain_retry) */
+#endif
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
@@ -4706,7 +4719,15 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
      *     so ids alone cannot tell two different clips apart
      * Either the reused positions are token-identical or nothing is reused;
      * the emitted tokens are unchanged in both cases. */
-    kv_alloc(m, np + q->max_tok + 8);
+    {   /* planned (g_ink_kv_plan_t): the whole context at once, where the RAM holds it (coli_kv_plan_host) */
+        int want = np + q->max_tok + 8;
+        if (g_ink_kv_plan_t > want) {
+            double b = 0;
+            for (int i = 0; i < m->c.n_state; i++) b += 2.0 * L_KV(&m->c, i) * L_HD(&m->c, i) * 4.0 * kv_ring_rows(&m->c, i, g_ink_kv_plan_t);
+            if (coli_kv_plan_host(b * (g_ink_mux_slots > 1 ? g_ink_mux_slots : 1), compat_mem_available_gb() * 1e9)) want = g_ink_kv_plan_t;
+        }
+        kv_alloc(m, want);
+    }
     /* naud>0 taints this turn before the comparison, not after: a request that
      * brings its own audio must not match a text-only state either. */
     if (media) kv_prefix_taint(&m->kvp);
@@ -5176,6 +5197,9 @@ static void serve_loop(Model *m, Tok *T) {
     serve_tiers_emap(m);
     if (g_ink_mux_slots > 1) { serve_mux(m, T); coli_ps_report(&g_ink_ps); return; }
     for (;;) {
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("inkling");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) { coli_ps_report(&g_ink_ps); return; }   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));

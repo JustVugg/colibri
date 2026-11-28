@@ -18439,6 +18439,7 @@ static const float *v4_mainh_get(int64_t position) {
 #include "deepseek_v4_dspark.inc"
 
 #ifdef COLI_VULKAN
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
 #include "deepseek_v4_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
 
@@ -21321,6 +21322,9 @@ static int v4_serve_main(void) {
     for (; n == 1;) {
         V4ServeRequest request = {0};
         int result;
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("deepseek_v4");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         do result = v4_serve_read_request(stdin, stdout, &request, NULL);
         while (result == 0);
         if (result < 0) break;

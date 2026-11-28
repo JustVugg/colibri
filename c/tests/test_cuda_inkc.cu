@@ -16,6 +16,7 @@
 #include <vector>
 #include "../backend_cuda.h"
 #include "../cuda_chain.h"
+#include "../kv16.h"
 
 static const ColiCudaChainOps *T;
 static int fails;
@@ -68,8 +69,10 @@ static void test_sconv(int C, int CK, int S1, int S2) {
     T->free(bx); T->free(bw); T->free(br);
 }
 
-static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink) {
-    int H = 4, KVH = 2, kvd = KVH * hd, Tn = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8, soff = toff + S + 3;
+/* every case on the tiles (ccg_relattn_tile_k, H / KVH <= 4) and off them: where the rest is a block a
+ * (head, row) over every tile (not the decode's split), the two the same bits */
+static void test_relattn_h(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink, int H, int KVH) {
+    int kvd = KVH * hd, Tn = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8, soff = toff + S + 3;
     std::vector<float> q = fvec((size_t)S * H * hd, 1.f), kt = fvec((size_t)Tn * kvd, 1.f), vt = fvec((size_t)Tn * kvd, 1.f);
     std::vector<float> r = fvec((size_t)S * H * dr, 0.5f), relp = fvec((size_t)dr * ext, 0.5f), snk = fvec((size_t)S * H, 3.f), tau(S);
     for (int s = 0; s < S; s++) tau[s] = 1.f + (rnd() % 1000) / 2000.f;
@@ -108,12 +111,72 @@ static void test_relattn(int S, int pos_base, int window, int cap, int hd, int d
     CcBuf *bo = T->buf((size_t)S * H * hd * 4, CC_DEV);
     CcRelAttn p = {S, H, KVH, hd, pos_base, cap, window, ext, dr, 0, H * hd, 0, H * hd, koff, koff, (int)ks, (int)vs, kvd,
                    roff, H * dr, poff, toff, scale, sink, sink ? soff : 0};
+    setenv("COLI_CUDA_RELATTN_TILE", "1", 1);
     int ok = T->begin() && T->relattn(bq, bk, bv, bo, bs, brr, bp, bt, &p) && T->submit(1);
+    std::vector<float> yt = down(bo, 0, ref.size());
+    setenv("COLI_CUDA_RELATTN_TILE", "0", 1);
+    ok = ok && T->begin() && T->relattn(bq, bk, bv, bo, bs, brr, bp, bt, &p) && T->submit(1);
     std::vector<float> y = down(bo, 0, ref.size());
-    char what[128]; snprintf(what, sizeof what, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d", S, pos_base, window, cap, hd, dr, ext, sink);
+    unsetenv("COLI_CUDA_RELATTN_TILE");
+    char what[160]; snprintf(what, sizeof what, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d heads %d/%d", S, pos_base, window, cap, hd, dr, ext, sink, H, KVH);
     check(ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30, 2e-5, what);
+    char wt[180]; snprintf(wt, sizeof wt, "%s, tiles", what);
+    check(ok ? rel_to_max(yt.data(), ref.data(), ref.size()) : 1e30, 2e-5, wt);
+    const int nmax = window > 0 ? window : pos_base + S, nc = (nmax + 127) / 128;
+    if (H / KVH <= 4 && !(S <= 8 && nc >= 2)) {
+        size_t diff = 0;
+        for (size_t i = 0; i < y.size(); i++) diff += memcmp(&y[i], &yt[i], 4) != 0;
+        printf("  %s %s: tiles and a block a (head, row): %zu of %zu floats differ\n", diff ? "FAIL" : "ok  ", what, diff, y.size());
+        if (diff) fails++;
+    }
+    /* the rings in float16 (relattn_kv16): the tiles and a block a (head, row) the same bits again, within the halves'
+     * rounding of the reference */
+    if (T->size >= offsetof(ColiCudaChainOps, relattn_kv16) + sizeof T->relattn_kv16 && T->relattn_kv16 && hd % 2 == 0) {
+        std::vector<uint16_t> kh(nr), vh(nr);
+        kv16_pack(kh.data(), kr.data(), (int64_t)nr); kv16_pack(vh.data(), vr.data(), (int64_t)nr);
+        CcBuf *bkh = T->buf((nr + 1) / 2 * 4, CC_DEV), *bvh = T->buf((nr + 1) / 2 * 4, CC_DEV);
+        int ok16 = bkh && bvh && T->begin() && T->write(bkh, 0, kh.data(), nr * 2) && T->write(bvh, 0, vh.data(), nr * 2) && T->submit(1);
+        const int was = T->relattn_kv16(1);
+        setenv("COLI_CUDA_RELATTN_TILE", "1", 1);
+        ok16 = ok16 && T->begin() && T->relattn(bq, bkh, bvh, bo, bs, brr, bp, bt, &p) && T->submit(1);
+        std::vector<float> t16 = down(bo, 0, ref.size());
+        setenv("COLI_CUDA_RELATTN_TILE", "0", 1);
+        ok16 = ok16 && T->begin() && T->relattn(bq, bkh, bvh, bo, bs, brr, bp, bt, &p) && T->submit(1);
+        std::vector<float> m16 = down(bo, 0, ref.size());
+        unsetenv("COLI_CUDA_RELATTN_TILE");
+        T->relattn_kv16(was);
+        char w16[200]; snprintf(w16, sizeof w16, "%s, float16 rings", what);
+        check(ok16 ? rel_to_max(t16.data(), ref.data(), ref.size()) : 1e30, 4e-3, w16);
+        if (H / KVH <= 4 && !(S <= 8 && nc >= 2)) {
+            size_t diff = 0;
+            for (size_t i = 0; i < m16.size(); i++) diff += memcmp(&m16[i], &t16[i], 4) != 0;
+            printf("  %s %s: tiles and a block a (head, row) on float16 rings: %zu of %zu floats differ\n", diff ? "FAIL" : "ok  ", what, diff, m16.size());
+            if (diff) fails++;
+        }
+        T->free(bkh); T->free(bvh);
+    }
+    if (H / KVH <= 4 && S <= 8 && nc >= 2) {   /* the split decode: on the KV heads and a block a (head, row, tile) */
+        setenv("COLI_CUDA_RELATTN_TILE", "0", 1);
+        setenv("COLI_CUDA_RELATTN_TILE_DEC", "1", 1);   /* opt-in: the test turns it on */
+        int okd = T->begin() && T->relattn(bq, bk, bv, bo, bs, brr, bp, bt, &p) && T->submit(1);
+        std::vector<float> yd = down(bo, 0, ref.size());
+        setenv("COLI_CUDA_RELATTN_TILE_DEC", "0", 1);
+        okd = okd && T->begin() && T->relattn(bq, bk, bv, bo, bs, brr, bp, bt, &p) && T->submit(1);
+        std::vector<float> ys = down(bo, 0, ref.size());
+        unsetenv("COLI_CUDA_RELATTN_TILE"); unsetenv("COLI_CUDA_RELATTN_TILE_DEC");
+        char wd[200]; snprintf(wd, sizeof wd, "%s, split on the KV heads", what);
+        check(okd ? rel_to_max(yd.data(), ref.data(), ref.size()) : 1e30, 2e-5, wd);
+        size_t diff = 0;
+        for (size_t i = 0; i < ys.size(); i++) diff += memcmp(&ys[i], &yd[i], 4) != 0;
+        printf("  %s %s: split on the KV heads and a block a (head, row, tile): %zu of %zu floats differ\n", diff ? "FAIL" : "ok  ", what, diff, ys.size());
+        if (diff) fails++;
+    }
     CcBuf *all[] = {bq, bk, bv, bs, brr, bp, bt, bo};
     for (CcBuf *b : all) T->free(b);
+}
+
+static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink) {
+    test_relattn_h(S, pos_base, window, cap, hd, dr, ext, sink, 4, 2);
 }
 
 static void test_mix(int S, int D, int nb) {
@@ -221,6 +284,20 @@ int main(void) {
     test_relattn(2, 9, 0, 64, 256, 64, 8, 1);
     test_relattn(1, 1500, 0, 1501, 128, 16, 512, 1);   /* a decode step at 1500 positions: twelve tiles split and joined */
     test_relattn(8, 700, 0, 708, 64, 8, 64, 0);
+    /* the tiles' blocks: Inkling-2-Mini's heads (24 over 8), one, two and four heads a KV head, a window sliding
+     * inside a block over a wrapped ring, the largest head */
+    test_relattn_h(37, 0, 0, 64, 128, 16, 64, 1, 24, 8);
+    test_relattn_h(70, 1100, 1024, 1024, 128, 16, 1024, 1, 6, 2);
+    test_relattn_h(45, 200, 64, 64, 128, 16, 64, 0, 3, 1);
+    test_relattn_h(29, 5, 0, 64, 24, 4, 16, 1, 2, 2);
+    test_relattn_h(30, 300, 0, 400, 32, 8, 100, 0, 8, 4);
+    test_relattn_h(19, 140, 100, 100, 64, 16, 100, 1, 8, 2);
+    test_relattn_h(17, 40, 0, 64, 256, 64, 32, 1, 3, 1);
+    test_relattn_h(9, 600, 0, 700, 128, 16, 512, 1, 24, 8);
+    test_relattn_h(1, 1500, 0, 1501, 128, 16, 1024, 1, 24, 8);   /* the split decode on the KV heads */
+    test_relattn_h(4, 2000, 1024, 1024, 128, 16, 1024, 1, 24, 8);
+    test_relattn_h(8, 700, 0, 708, 64, 8, 64, 0, 8, 2);
+    test_relattn_h(3, 300, 0, 303, 256, 64, 32, 1, 3, 1);
     printf("loop gate\n");
     {
         const int caps = T->size >= offsetof(ColiCudaChainOps, ink2_caps) + sizeof T->ink2_caps && T->ink2_caps ? T->ink2_caps() : 0;

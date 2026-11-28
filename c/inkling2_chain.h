@@ -58,6 +58,7 @@
  * memory. It needs the dense matrices on the device (the per-matrix path's copies); the router,
  * the sink projection and the dynamic taps' projections go up as f32. */
 
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "vk_dmoe.h"   /* the routed experts in the frame */
 
 #define INK2C_HOST 0   /* the host's convolution states are newer than the device's */
@@ -94,6 +95,7 @@ typedef struct {
      * convolutions keeping their states after each row at rings + (s+1)*snap, and leaves every
      * row's logits (softcapped) in vlog */
     int snap, vrows; float *vlog;
+    int kvh, kvh_set;                          /* the K/V mirrors in float16 (ink2c_kvh_want), decided at the first */
 } Ink2Chain;
 
 static int ink2mc_capture(Model *m, int k, VkcBuf *x, int n);   /* inkling2_mtp.h */
@@ -131,6 +133,16 @@ static int ink2c_geometry_ok(const Model *m, int say) {
  * per-matrix path): the f32 router, sink and dynamic-tap projections, the parameters, the
  * convolution states, the K/V mirrors at the served context (ink_ctx_max) and the scratch of a
  * prompt chunk of 256 rows. The tier's budget leaves them (ink_vk_dense_bytes). */
+/* COLI_VK_KV16 (on): the K/V mirrors in float16 (chain_relattn's KV16), where the device takes them; the host's
+ * cache stays float32, so the device's attention reads each earlier position rounded to the nearest half (a step's
+ * own rows stay float32). Half the mirrors' memory: twice the context in the room the plan keeps. */
+static int ink2c_kvh_want(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_KV16"); on = !(e && *e == '0'); }
+    return on;
+}
+/* the mirrors' bytes a float: 2 where they will be float16 (the device asked once it runs), 4 otherwise */
+static size_t ink2c_kves_plan(void) { return ink2c_kvh_want() && (!vkc_ready() || vkc_relattn_kv16_ready()) ? 2 : 4; }
 static size_t ink2c_plan_bytes(const Model *m) {
     const Cfg *c = &m->c;
     size_t D = (size_t)c->hidden, E = (size_t)c->n_experts, CK = (size_t)c->conv_k, b = 0, row = 0;
@@ -139,9 +151,18 @@ static size_t ink2c_plan_bytes(const Model *m) {
      * ink2c_mirror claim more via vkt_give_back. */
     int t = ink_ctx_max() + 8;
     if (t > 16392) t = 16392;
+    /* planned (coli_kv_plan.h): the whole served context where its mirrors take at most half of the device's free
+     * memory; then the host's cache is allocated at it too (g_ink_kv_plan_t, kv_alloc), so the mirrors are made
+     * once and never again. Past that half, the start's horizon and the growth, as before. */
+    if (coli_kv_plan()) {
+        const int full = ink_ctx_max() + 8;
+        size_t kvb = 0;
+        for (int v = 0; v < c->n_state; v++) kvb += 2 * (size_t)L_KV(c, v) * L_HD(c, v) * (size_t)kv_ring_rows(c, v, full) * ink2c_kves_plan();
+        if (kvb <= vkc_dev_avail() / 2) { t = full; g_ink_kv_plan_t = full; }
+    }
     for (int v = c->n_layers; v < c->n_state; v++) {                   /* the loop's later passes' state */
         size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v);
-        b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2 + 2 * kvo * (size_t)kv_ring_rows(c, v, t) * 4;
+        b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2 + 2 * kvo * (size_t)kv_ring_rows(c, v, t) * ink2c_kves_plan();
     }
     if (c->loop_p > 1) {                                               /* the gates and the queries */
         size_t nl = (size_t)(c->loop_e - c->loop_s), r = (size_t)c->loop_r;
@@ -153,7 +174,7 @@ static size_t ink2c_plan_bytes(const Model *m) {
         if (!c->local[i]) b += 2 * KV * CK * D * 4;                   /* the dynamic taps' projections */
         b += (6 * D + H * hd + H * c->d_rel + (size_t)c->d_rel * L_EXT(c, i) + 2 * kvo * CK + 2 * D * CK) * 4;
         b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2;                     /* the states and their read-back */
-        b += 2 * kvo * (size_t)kv_ring_rows(c, i, t) * 4;             /* the K/V mirror */
+        b += 2 * kvo * (size_t)kv_ring_rows(c, i, t) * ink2c_kves_plan();             /* the K/V mirror */
         size_t r1 = (14 * D + 3 * H * hd + 4 * kvo + H * c->d_rel + 2 * E + KV * CK + 2 * H) * 4;
         if (r1 > row) row = r1;
     }
@@ -367,12 +388,19 @@ static VkcBuf *ink2c_dev_buf(size_t bytes) {
 static int ink2c_mirror(Ink2Chain *ch, Model *m) {
     Cfg *c = &m->c;
     if (ch->max_t == m->max_t && ch->hostK == m->K) return 1;
+    if (!ch->kvh_set) {   /* float16 mirrors where the device takes them (every head dim even) */
+        int even = 1;
+        for (int i = 0; i < ch->NS; i++) even &= L_HD(c, i) % 2 == 0;
+        ch->kvh = ink2c_kvh_want() && even && vkc_relattn_kv16_ready();
+        ch->kvh_set = 1;
+    }
+    vkc_relattn_kv16(ch->kvh);
     for (int i = 0; i < ch->NS; i++) {
         vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
         int cap = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i), KV = L_KV(c, i);
         ch->cap[i] = cap;
         ch->dlo[i] = 0; ch->dhi[i] = cap < m->max_t ? m->max_t : m->kv_len;   /* a ring: every row; else the positions held */
-        size_t nb = (size_t)KV * cap * hd * sizeof(float);
+        size_t nb = (size_t)KV * cap * hd * (ch->kvh ? 2 : sizeof(float));
         ch->kc[i] = ink2c_dev_buf(nb);
         ch->vc[i] = ink2c_dev_buf(nb);
         if (!ch->kc[i] || !ch->vc[i]) { ch->max_t = 0; ch->hostK = NULL; return 0; }
@@ -431,8 +459,17 @@ static int ink2c_push_state(Ink2Chain *ch, Model *m) {
             int row = t % cap, run = ch->dhi[i] - t < cap - row ? ch->dhi[i] - t : cap - row;
             for (int h = 0; h < KV && ok; h++) {
                 size_t off = ((size_t)h * cap + row) * hd;
-                ok = vkc_write(ch->kc[i], off, m->K[i] + off, (size_t)run * hd * sizeof(float)) &&
-                     vkc_write(ch->vc[i], off, m->V[i] + off, (size_t)run * hd * sizeof(float));
+                if (ch->kvh) {   /* the host's rows rounded to halves, at half the offset (off even: hd is) */
+                    uint16_t *hk = malloc((size_t)run * hd * 2 * sizeof(uint16_t)), *hv = hk ? hk + (size_t)run * hd : NULL;
+                    ok = hk != NULL;
+                    if (ok) {
+                        kv16_pack(hk, m->K[i] + off, (int64_t)run * hd); kv16_pack(hv, m->V[i] + off, (int64_t)run * hd);
+                        ok = vkc_write(ch->kc[i], off / 2, hk, (size_t)run * hd * 2) && vkc_write(ch->vc[i], off / 2, hv, (size_t)run * hd * 2);
+                    }
+                    free(hk);
+                } else
+                    ok = vkc_write(ch->kc[i], off, m->K[i] + off, (size_t)run * hd * sizeof(float)) &&
+                         vkc_write(ch->vc[i], off, m->V[i] + off, (size_t)run * hd * sizeof(float));
             }
             t += run;
         }
@@ -442,9 +479,21 @@ static int ink2c_push_state(Ink2Chain *ch, Model *m) {
 }
 /* The device was lost with the newest state on it: rebuild the K/V cache and the convolution
  * states on the CPU from the `upto` positions the prefix record names, and leave the chain off. */
+static int g_ink2c_mode;   /* the chain's mode before a stop (ink2c_retry brings it back) */
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. ink2c_recover left the state on the host: every held row and the convolution states go up from it at the
+ * next forward (ink2c_push_state). */
+static void ink2c_retry(Model *m) {
+    Ink2Chain *ch = ink2c_of(m);
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || !vkc_chain_retry("inkling2")) return;
+    for (int i = 0; i < ch->NS; i++) { ch->dlo[i] = 0; ch->dhi[i] = m->kv_len; }
+    ch->cs_where = INK2C_HOST; ch->host_zero = 0;
+    ch->failed = 0; g_vk_chain = g_ink2c_mode ? g_ink2c_mode : 1;
+}
 static void ink2c_recover(Model *m, int upto) {
     Ink2Chain *ch = ink2c_of(m);
     Cfg *c = &m->c; int D = c->hidden;
+    if (g_vk_chain) g_ink2c_mode = g_vk_chain;
     g_vk_chain = 0;
     if (ch) ch->failed = 1;
     for (int i = 0; i < c->n_state; i++)
@@ -452,8 +501,8 @@ static void ink2c_recover(Model *m, int upto) {
     if (upto <= 0) return;
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         ink2c_fatal("the device was lost with a state its token ids do not describe (audio or an image)");
-    fprintf(stderr, "[VK] inkling2 chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on\n", upto);
+    fprintf(stderr, "[VK] inkling2 chain: %s; rebuilding the state of %d positions on the host's path, "
+                    "which runs from here on\n", vkc_lost_any() ? "the device was lost" : "the chain stopped, the device stays", upto);
     float *x = falloc((int64_t)upto * D);
     for (int s = 0; s < upto; s++) {
         wt_row_f32(m->embed, (int64_t)m->kvp.fed[s] * D, x + (int64_t)s * D, D);
@@ -517,7 +566,8 @@ static int ink2c_attention(Ink2Chain *ch, Model *m, int i, int v, int sep, int n
         rk[(s - s0) * KV + h] = (VkcRegion){dst, src, (size_t)hd};
         rv[(s - s0) * KV + h] = (VkcRegion){dst, vs + src, (size_t)hd};
     }
-    ok = vkc_copy_regions(ch->kc[v], ch->kvs, rk, nr) && vkc_copy_regions(ch->vc[v], ch->kvs, rv, nr) &&
+    ok = (ch->kvh ? vkc_copy_regions_h(ch->kc[v], ch->kvs, rk, nr) && vkc_copy_regions_h(ch->vc[v], ch->kvs, rv, nr)
+                  : vkc_copy_regions(ch->kc[v], ch->kvs, rk, nr) && vkc_copy_regions(ch->vc[v], ch->kvs, rv, nr)) &&
          vkc_copy(kvdst, ko, ch->kvs, 0, (size_t)n * kvo) && vkc_copy(kvdst, ko + vstride, ch->kvs, vs, (size_t)n * kvo);
     free(rk);
     return ok && vkc_matmul(ch->t_o[i], ch->ctx, 0, ch->a, 0, n);
@@ -809,7 +859,7 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
     ch->forwards++;
     return 1;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
+    vkc_frame_failed("inkling2", pos_base, S);   /* the device lost only when it said so (#2793) */
     free(xfin); free(dq);
     vkc_relattn_part(NULL);
     ink2c_recover(m, pos_base);

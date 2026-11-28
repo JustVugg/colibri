@@ -4141,6 +4141,8 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
     return streams;
 }
 #ifdef COLI_VULKAN
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
+static int g53_slot_ctx_env(void);   /* below: a serve slot's context */
 #include "glm53_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 #ifdef COLI_CUDA
@@ -5280,6 +5282,9 @@ static int glm53_ps_marks(const Tok *T, const int *ids, int np, int from, int *m
  * che dopo non c'e' piu' un gateway a cui rispondere e puo' uscire. */
 static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     if (!q->plen) { serve_line("ERROR %llu EMPTY_PROMPT\n", q->id); return 0; }
+#ifdef COLI_VULKAN
+    g53c_retry();   /* a chain that stopped with the device alive comes back (vkc_chain_retry) */
+#endif
     g_temp = q->temp; g_topp = q->top_p > 0.0f ? q->top_p : 1.0f;
 
     if (q->slot < 0 || q->slot >= g_n_slots) {
@@ -5840,9 +5845,16 @@ static size_t g53_tier_dense_bytes(const GModel *m) {
 #ifdef COLI_VULKAN
     if (!xt_cuda())   /* a partial chain: nothing more of the trunk goes up, but the chain's first
                        * forward allocates its scratch and the N layers' MLA caches */
-        return g_g53_partial ? g_g53c_lazy : g_vk_dense && !coli_vk_dense_device_only() ? glm53_dense_dev_bytes(m) : 0;
+        return g_g53_partial ? g_g53c_lazy : (g_vk_dense && !coli_vk_dense_device_only() ? glm53_dense_dev_bytes(m) : 0) +
+               (coli_kv_plan() ? g_g53c_mir_sum : 0);   /* planned: a whole chain's MLA mirrors too (coli_kv_plan.h) */
 #endif
     (void)m; return 0;
+}
+/* a serve slot's context as slots_init will read it (GLM53_MAXT, 8192) */
+static int g53_slot_ctx_env(void) {
+    const char *mt = getenv("GLM53_MAXT");
+    int t = mt ? atoi(mt) : 8192;
+    return t < 64 ? 64 : t;
 }
 /* The state a serve allocates once it runs: every slot's session at GLM53_MAXT
  * (session_open's latent, index keys and gates; the KDA layers' state), which the
@@ -6012,13 +6024,18 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     serve_line("\x01\x01READY\x01\x01\n");
     /* Fra READY e STAT: il gateway lo legge nella stretta di mano, quindi sa
      * che modalita' serve prima della prima richiesta (docs/serve_protocol.md). */
-    serve_line("CAPS vision=%d\n", m->has_vision ? 1 : 0);
+    /* concurrent=1: one request at a time over the KV_SLOTS conversations (serve_cancel_read answers SLOT_BUSY to
+     * a second): the gateway keeps the others in its queue */
+    serve_line("CAPS vision=%d concurrent=1\n", m->has_vision ? 1 : 0);
     serve_line("STAT 0 0.00 0.0 %.1f\n", rss_gb());
     /* La griglia va DOPO READY: il lettore di boot del server scarta tutto
      * fino al sentinel, e colibri.c fa lo stesso (READY, STAT, poi EMAP). */
     emap_emit(m);
     for (;;) {
         ServeReq q; char verb[16];
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("glm53");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         if (!serve_read_req(stdin, &q, verb, sizeof(verb))) break;   /* EOF: si esce */
         if (!strcmp(verb, "SUBMIT")) {
             /* < 0: stdin e' finito mentre il turno girava. Il turno e' stato

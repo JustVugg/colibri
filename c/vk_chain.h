@@ -60,6 +60,7 @@ typedef struct VkcBuf VkcBuf;
 int  vkc_init(void);          /* after coli_vk_init; 1 = the chain's pipelines are up */
 int  vkc_ready(void);
 int  vkc_lost(void);
+int  vkc_lost_any(void);   /* either device lost: a chain split over two reaches its recovery back on the primary */
 void vkc_shutdown(void);      /* before coli_vk_shutdown (register it with atexit after it) */
 /* The device the calls go to: 0 the primary, 1 COLI_VK_DEV2's (coli_vk_core_dev), each
  * with a context of its own that vkc_init opens and vkc_shutdown closes while it is
@@ -433,6 +434,19 @@ int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcB
  * * (hd + 2) floats at most, the engine's for its widest step (NULL: no split, as before).
  * COLI_VK_RELATTN_SPLIT=0 keeps every step whole. */
 void vkc_relattn_part(VkcBuf *part);
+/* From COLI_VK_RELATTN_TILE rows (9; 0 never) a step's attention runs chain_relattn_tile.comp: a workgroup a
+ * KV head and a block of rows with that head's query heads (H / KVH <= 4), each K and V row of a tile read once
+ * for all of them, the arithmetic chain_relattn's mode 0's in its order (the same bits). rows >= 0 sets the
+ * threshold (tests); returns the one before. */
+int  vkc_relattn_tile_rows(int rows);
+/* The rings vkc_relattn reads (kc, vc) in float16, two a word (offsets in halves): on >= 0 sets it for the calls
+ * after (the engine, at its chain's start), returns the one before. The step's own rows (kvs) stay float32;
+ * vkc_copy_regions_h puts them into such a ring. _ready: 1 when the device takes it. */
+int  vkc_relattn_kv16(int on);
+int  vkc_relattn_kv16_ready(void);
+/* COLI_VK_RELATTN_TILE_DEC (off): the split decode's partials on chain_relattn_tile.comp (a KV head's query
+ * heads a workgroup, the same bits as mode 1); on >= 0 sets it (tests), returns the one before */
+int  vkc_relattn_tile_dec(int on);
 /* Inkling-2's ops (chain_ink2.comp, made on first use; inkling2_chain.h):
  *   vkc_ink2_mix   the attention residuals' mix of nb block states (b_off + s*b_row + e*D) and
  *                  the partial stream (x_off + s*x_row), each RMS-normalised without a weight,
@@ -914,6 +928,8 @@ int vkc_vae_ready(void);
 /* counters, for the engines' [VK] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, gemms, barriers, bytes_up, bytes_down;
+    unsigned long long stage_relieved;   /* staging refused, the frames so far done and their staging back (vkc_write) */
+    unsigned long long gov_shrinks;      /* frames past COLI_VK_FRAME_MS: the next ones made smaller (the frame governor) */
     double wait_ms;               /* host time blocked in fence waits */
     size_t dev_bytes;             /* live chain buffers */
     unsigned long long attn_blocked;   /* attention calls through chain_attnb (blocks of rows) */
@@ -932,8 +948,20 @@ typedef struct {
     unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
     unsigned long long dsa_tiled;      /* DeepSeek V4's indexer scores in tiles of rows (chain_dsv4_idx.comp, mode 11) */
     unsigned long long moe_pipes;      /* chain_moe.comp's pipelines made (a driver's compile each: 20 minutes on a Radeon RX 580) */
+    unsigned long long relattn_tile;   /* Inkling attention dispatches on chain_relattn_tile.comp */
 } VkcStats;
 void vkc_stats(VkcStats *st);
+/* A chain's frame failed and the chain turns itself off: the device lost only when it said so; a frame refused for
+ * want of memory leaves it to the per-matrix path and the expert tier. One line (stderr and the event log) says which,
+ * what the memory refused last, at which position (#2793). */
+void vkc_frame_failed(const char *engine, int pos, int rows);
+/* After a stop with the device alive (vkc_frame_failed's second case), 1 when the engine may bring its chain back at
+ * this request: the first after the stop, then the 2nd, 4th ... 64th after each further one, so a cause that persists
+ * costs one failed frame ever more rarely. The frames' staging is given back first. 0 after a lost device. */
+int  vkc_chain_retry(const char *engine);
+/* Between two requests (a serve loop, before it reads the next): after a device lost for real, the engine exits for
+ * the gateway to start it again on a fresh device (once in ten minutes; COLI_VK_LOST_RESTART=0 keeps the CPU). */
+void vkc_restart_if_lost(const char *engine);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
 void vkc_prof_print(void);
 

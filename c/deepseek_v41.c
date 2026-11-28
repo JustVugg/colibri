@@ -4824,6 +4824,7 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
 }
 
 #ifdef COLI_VULKAN
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
 #include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
 #ifdef COLI_CUDA
@@ -5958,6 +5959,9 @@ static int v41_ps_marks(const Tok *T, const int *ids, int np, int from, int *mar
 
 static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
                            float **pending_image, int *pending_h, int *pending_w, V41Req *rq, int lone) {
+#ifdef COLI_VULKAN
+    v41c_retry(m);   /* a chain that stopped with the device alive comes back (vkc_chain_retry) */
+#endif
     Cfg *c = &m->c;
     double turn_started = now_s();
     double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn, engram0 = m->t_engram;
@@ -6316,6 +6320,9 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
 
     for (;;) {
         ColiServeCommand command;
+#ifdef COLI_VULKAN
+        vkc_restart_if_lost("deepseek_v41");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         ColiServeReadResult result = coli_serve_read_command(stdin, &v41_wire, &command);
         if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) break;
         if (result == COLI_SERVE_READ_NOMEM) {

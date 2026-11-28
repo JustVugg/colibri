@@ -2979,6 +2979,9 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
     int pending_h = 0, pending_w = 0;
     for (;;) {
         ColiServeCommand command;
+#ifdef COLI_VULKAN
+        vkc_restart_if_lost("mimo");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         ColiServeReadResult result = coli_serve_read_command(stdin, &mimo_wire, &command);
         if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) break;
         if (result == COLI_SERVE_READ_NOMEM) { coli_serve_write_error(stdout, command.id, "out of memory"); break; }

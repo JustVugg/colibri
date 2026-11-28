@@ -71,6 +71,7 @@
  * layers, then the second device's from the streams it hands over; a lost second device
  * leaves the CPU to run its layers from there (the host's state is current: nothing to
  * rebuild), and both chains go off. */
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
@@ -323,6 +324,16 @@ static void v41c_lower_one(Model *m, V41Chain *ch, int pos) {
     }
 }
 static void v41c_lower(Model *m, int pos) { for (int d = 0; d < 2; d++) v41c_lower_one(m, v41c_of(d), pos); }   /* both chains */
+static int g_v41c_mode;   /* the chain's mode before a stop (v41c_retry brings it back) */
+/* A request after the chain stopped with the device alive (vkc_frame_failed): the chain again where vkc_chain_retry
+ * says so. The host's state is canonical: every watermark down to 0, so the next forward takes every row up. */
+static void v41c_retry(Model *m) {
+    V41Chain *ch = v41c_of(0);
+    if (g_vk_chain || !ch || !ch->ok || !ch->failed || !vkc_chain_retry("deepseek_v41")) return;
+    v41c_lower(m, 0);
+    for (int d = 0; d < 2; d++) if (v41c_of(d)) v41c_of(d)->failed = 0;
+    g_vk_chain = g_v41c_mode ? g_v41c_mode : 1;
+}
 static void v41c_cpu_step(Model *m, int start_pos) { v41c_lower(m, start_pos); }      /* a CPU forward from start_pos */
 static void v41c_rollback(Model *m, int committed_end) { v41c_lower(m, committed_end); }  /* rows past it rejected */
 static void v41c_reset(Model *m) { v41c_lower(m, 0); }
@@ -742,7 +753,7 @@ static int v41c_plan(V41Chain *ch, Model *m, int ctx) {
         if (ch->sli[i] < 0) continue;
         int r = c->compress_ratio[i], host = c->max_positions / r, want = ctx / r > 0 ? ctx / r : 1, cap = ch->ccap[i];
         if (host > tcap) tcap = host;
-        if (cap < want) { cap = 64; while (cap < want) cap *= 2; if (cap > host) cap = host; grow = 1; }
+        if (cap < want) { cap = 64; while (cap < want) cap *= 2; if (coli_kv_plan()) cap = host; if (cap > host) cap = host; grow = 1; }
         need += (size_t)cap * hd * sizeof(float); held += (size_t)ch->ccap[i] * hd * sizeof(float);
     }
     if (!grow) return 1;
@@ -765,6 +776,7 @@ static int v41c_cache(V41Chain *ch, Model *m, int i, int rows) {
     if (ch->ccap[i] >= rows) return 1;
     int r = c->compress_ratio[i], host = c->max_positions / (r > 0 ? r : 1), own = v41c_own(ch, i);
     int cap = 64; while (cap < rows) cap *= 2;
+    if (coli_kv_plan()) cap = host;   /* planned: the whole context at the first, never grown (coli_kv_plan.h) */
     if (cap > host) cap = host;
     if (cap < rows) return 0;
     if (own && !ch->ks.on) {   /* under the split the compressed rows keep their ks.rows */
@@ -1556,7 +1568,7 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
     return ch->n;
 lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(f.keyl); free(f.praw); free(need); free(outs); free(pres); free(wl); free(cs_); free(er); free(pc);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("deepseek_v41", start, n);   /* the device lost only when it said so (#2793) */
     *lost = 1;
     return 0;
 }
@@ -1574,6 +1586,7 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     if (ch2) { vkc_device(1); lost2 = vkc_lost(); vkc_device(0); }
     if (vkc_lost() || lost2) {
         for (int d = 0; d < 2; d++) if (v41c_of(d)) v41c_of(d)->failed = 1;
+        if (g_vk_chain) g_v41c_mode = g_vk_chain;
         g_vk_chain = 0;
         return 0;
     }
@@ -1598,6 +1611,7 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     v41c_lower_one(m, ch2, start);
     if (lost) {
         for (int d = 0; d < 2; d++) if (v41c_of(d)) v41c_of(d)->failed = 1;
+        if (g_vk_chain) g_v41c_mode = g_vk_chain;
         g_vk_chain = 0;
         fprintf(stderr, "[VK] deepseek_v41 dev2 chain: the device was lost; the CPU runs its layers, and every layer from the next "
                         "forward on (the host's state is current: there is nothing to rebuild)\n");

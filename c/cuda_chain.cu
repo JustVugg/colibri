@@ -5345,6 +5345,18 @@ static int cc_relattn_split(void) {
     if (on < 0) { const char *e = getenv("COLI_CUDA_RELATTN_SPLIT"); on = !(e && *e == '0'); }
     return on;
 }
+/* COLI_CUDA_RELATTN_TILE: the rows from which a step's Inkling attention runs ccg_relattn_tile_k (9, past the split
+ * decode's 8; 0 never); COLI_CUDA_RELATTN_TILE_DEC=1: the split decode a block a KV head and tile with its query heads
+ * (ccg_relattn_split_k) instead of a block a (head, row, tile) (ccg_relattn_k). Read at each call (the tests). */
+static int cc_relattn_tile_rows(void) {
+    const char *e = getenv("COLI_CUDA_RELATTN_TILE");
+    return e && *e ? atoi(e) : 9;
+}
+static int cc_relattn_tile_dec(void) {   /* off: on an RTX PRO 4000 the decode ran 48.7 -> 45.7 tok/s on it (one row, few blocks) */
+    const char *e = getenv("COLI_CUDA_RELATTN_TILE_DEC");
+    return e && *e == '1';
+}
+static int g_cc_rel16;       /* Inkling's rings in float16 (cuda_inkc.cuh, relattn_kv16) */
 #include "cuda_inkc.cuh"    /* Inkling's and Inkling-2's ops */
 #include "cuda_dflash.cuh"  /* DFlash2's drafter's convolution */
 /* graphs: the ops between graph_begin and graph_end recorded on the stream, instantiated once and
@@ -5446,5 +5458,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_probe_qwen36_profile_,
     CC_GRAPH_OPS,
     cc_relattn_pb, cc_ink2_kv_put,
+    cc_relattn_kv16_set,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

@@ -2991,6 +2991,9 @@ static void q38_prefix_miss_log(Model *m,const int *ids,int np){
 static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
                            Q38ReqClock *clk, int lone){
     int *ids=NULL, np=0;
+#ifdef COLI_VULKAN
+    if(lone) q38c_retry(m);   /* a chain that stopped with the device alive comes back (vkc_chain_retry) */
+#endif
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
     if(g_pending_image.present){
         /* Le patch arrivano gia' float32 dal gateway: qui si controlla solo che
@@ -3530,6 +3533,9 @@ static void serve_loop(Model *m){
     if(g_q38_mux_slots>1){serve_mux(m);q38_mux_free(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
     for(;;){
         ServeReq q={0}; int r;
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("qwen38");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r!=2&&r>=0);
         if(r<0){q38_prefix_cache_release(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
         if(r==2){

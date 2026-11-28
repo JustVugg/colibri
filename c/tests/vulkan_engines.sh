@@ -623,18 +623,19 @@ PY
   tier_gate inkling "inkling2 tier int4 g64 container cap=4, reads held back" INK_FILL_DELAY_US=3000 SNAP=cont_g64 -- 4 0 $RG
   # Inkling-2's dense chain (inkling2_chain.h, its line "[VK] inkling2 chain: ..."): every layer
   # on the device, the routed experts on the host; then prompts only, the state handed to the
-  # CPU's decode and back
+  # CPU's decode and back. Its K/V mirrors float32 (COLI_VK_KV16=0) where a gate holds the logits to
+  # the CPU's within 1e-4: the float16 mirrors round K and V (their reads: tests/test_vk_chain)
   for cap in 1 8; do
-    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 f32 cap=$cap" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- $cap 0 $R2
-    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 int4 g64 container cap=$cap" 1 COLI_VK_DENSE=1 SNAP=cont_g64 -- $cap 0 $RG
+    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 f32 cap=$cap" 1 COLI_VK_KV16=0 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- $cap 0 $R2
+    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 int4 g64 container cap=$cap" 1 COLI_VK_KV16=0 COLI_VK_DENSE=1 SNAP=cont_g64 -- $cap 0 $RG
   done
-  CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 prompts only" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- 8 0 $R2
+  CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 prompts only" 1 COLI_VK_KV16=0 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- 8 0 $R2
   # a GGUF's: the attention's matrices and the head as Q8_0 blocks the chain takes up itself;
   # the block GEMVs' logits against the CPU's float kernels, then the prompt's rows through the
   # tiled GEMM (its own rounding, 6e-4 here): the same tokens
-  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense" 1 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 \
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense" 1 COLI_VK_KV16=0 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 \
     SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
-  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense, tiled GEMM" 0 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense, tiled GEMM" 0 COLI_VK_KV16=0 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
     SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
   # Inkling-2-Mini's loop (tools/make_tiny_inkling2_loop.py, transformers' Inkling2LoopForCausalLM:
   # tools/oracle-inkling2-loop-requirements.txt): the tier with the layers on the CPU, then the
@@ -645,9 +646,9 @@ PY
     local RL=tiny_loop/ref_inkling2.json
     for cap in 1 8; do
       tier_gate inkling "inkling2 loop tier f32 cap=$cap" SNAP=tiny_loop -- $cap 0 $RL
-      CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop f32 cap=$cap" 1 COLI_VK_DENSE=1 SNAP=tiny_loop -- $cap 0 $RL
+      CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop f32 cap=$cap" 1 COLI_VK_KV16=0 COLI_VK_DENSE=1 SNAP=tiny_loop -- $cap 0 $RL
     done
-    CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop prompts only" 1 COLI_VK_DENSE=1 SNAP=tiny_loop -- 8 0 $RL
+    CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop prompts only" 1 COLI_VK_KV16=0 COLI_VK_DENSE=1 SNAP=tiny_loop -- 8 0 $RL
   else
     echo "  skip: the Inkling-2-Mini loop gates need transformers with Inkling2LoopForCausalLM (tools/oracle-inkling2-loop-requirements.txt)"
   fi
@@ -665,7 +666,7 @@ p = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
 json.dump({"prompt_ids": p, "full_ids": p + [0] * 16}, open("ink2m_nv/ref.json", "w"))
 PY
   fi
-  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop GGUF NVFP4 experts in the frame" 1 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop GGUF NVFP4 experts in the frame" 1 COLI_VK_KV16=0 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
     COLI_VK_CHAIN_GEMM=0 SNAP=ink2m_nv/gg -- 8 0 ink2m_nv/ref.json
 }
 
@@ -2172,22 +2173,27 @@ family_qwen_chain() {
     CHAIN_SERVE_SLOTS=$n CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
       $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=$n
   done
-  # one conversation past the places' first 2048 rows: its mirrors grow, the others' stay
+  # The mirrors that grow and shrink with a conversation (COLI_KV_PLAN=0; planned, the default above, they take the
+  # whole context at the first and keep it). One conversation past the places' first 2048 rows: its mirrors grow,
+  # the others' stay
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
-    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2 COLI_KV_PLAN=0
   # one slot: a conversation past twice the mirror's start, then shorter ones: the mirror cut to
   # them, what it held past that back to the expert tier (#2733)
   CHAIN_SERVE_LONG=17000 CHAIN_SERVE_EXPECT='KV mirror cut to a shorter conversation [1-9]' \
-    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 Q36_MAXT=32768
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 Q36_MAXT=32768 COLI_KV_PLAN=0
   # a long conversation, then shorter ones in its slot: the place's mirrors cut to them, what they
   # held past that back to the expert tier (#2733)
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=4500 CHAIN_SERVE_LONG_ONCE=1 \
     CHAIN_SERVE_EXPECT="[1-9][0-9]* places' mirrors cut to a shorter conversation" \
-    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2 COLI_KV_PLAN=0
   # a place that cannot grow (COLI_VK_TEST_CONV_ROOM_MB=0: no room past the first 2048 rows): the
   # places close, and the next conversation that enters opens them again (#2733); the text the CPU's
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='places open again' \
-    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2 COLI_VK_TEST_CONV_ROOM_MB=0
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2 COLI_VK_TEST_CONV_ROOM_MB=0 COLI_KV_PLAN=0
+  # planned: a conversation past 17000 positions on a 32768 slot, then shorter ones, the text the CPU's, the mirror
+  # never cut (it was the whole context from the first)
+  CHAIN_SERVE_LONG=17000 $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 Q36_MAXT=32768
   # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
   # after another, two slots; the logits of a fresh read on the same chain (the rows go up again)
   QWEN36_TINY=qwen36_tiny_c QWEN36_PS_BACKEND=vulkan $PY -m unittest tests.test_qwen36_prefix_store

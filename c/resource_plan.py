@@ -1152,8 +1152,17 @@ def _glm53_chain_layout(info, env, vulkan):
                      mat(ID, D, a + "indexer.wk.weight") + mat(IH, D, a + "indexer.weights_proj.weight") +
                      mat(ID, D, a + "indexer.index_kpool_compress_gate"))
             floats = 2 * D + 2 * (3 + nm) + ql + kvl + 2 * ID + pool * ID
-            size += (vk_buf_bytes(256 * kvl * 4) + 2 * vk_buf_bytes(256 * ID * 4) +
-                     vk_buf_bytes((256 // pool + 1) * ID * 4))
+            # g53c_fit's mirror: 256 rows, or planned (COLI_KV_PLAN, on) a serve slot's whole context
+            # (GLM53_MAXT, 8192), its latent rows at most 32768 (glm53_chain.h)
+            ctx0 = 256
+            if str(env.get("COLI_KV_PLAN", "1"))[:1] != "0":
+                try:
+                    ctx0 = max(64, int(env.get("GLM53_MAXT") or 8192))
+                except ValueError:
+                    ctx0 = 8192
+            cap0 = min(ctx0, 32768)
+            size += (vk_buf_bytes(cap0 * kvl * 4) + 2 * vk_buf_bytes(ctx0 * ID * 4) +
+                     vk_buf_bytes((ctx0 // pool + 1) * ID * 4))
         else:
             a = p + "self_attn."
             size += (mat(P, D, a + "q_proj.weight") + mat(P, D, a + "k_proj.weight") + mat(P, D, a + "v_proj.weight") +

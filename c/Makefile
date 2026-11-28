@@ -818,7 +818,7 @@ VK_SPV   += shaders/qmatmul_grp_q.spv shaders/qmatmul_grp_gate_up_q.spv
 VK_SPV   += shaders/qmatmul_grp_qc.spv shaders/qmatmul_grp_gate_up_qc.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
-VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
+VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv shaders/chain_relattn_tile.spv
 # blocked attention for prompt chunks (made on first use; vk_chain.c, chain_attnb.comp)
 VK_SPV   += shaders/chain_attnb.spv
 # a grid of copy regions in one dispatch (made on first use; vk_chain.c, chain_copy2d.comp)

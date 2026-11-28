@@ -200,6 +200,9 @@ class GenerationScheduler:
         self.max_queue = max_queue
         self.queue_timeout = queue_timeout
         self.capacity = capacity
+        # the requests the engine runs at once: its slots, or fewer when its CAPS line says so (`concurrent=N`,
+        # set_concurrency): an engine that serves one request at a time keeps `capacity` cached conversations
+        self.max_active = capacity
         self.free_slots = set(range(capacity))
         self.slot_keys = {}
         self.slot_last_used = {}
@@ -306,9 +309,17 @@ class GenerationScheduler:
             self.paused = False
             self.condition.notify_all()
 
+    def set_concurrency(self, n):
+        """At most `n` requests run at once (1 to the slots): the engine's CAPS `concurrent`."""
+        with self.condition:
+            self.max_active = max(1, min(int(n), self.capacity))
+            self.condition.notify_all()
+
     def _available_slot(self, slot, ticket=None, prefer=None, cache_key=None):
         # Caller holds the condition lock. Pinned waiters reserve only their
         # target; an older any-slot waiter has priority over every free slot.
+        if self.active >= self.max_active:
+            return None
         # For any-slot waiters with a cache_key: exact prefix hit first, then
         # an unused slot (preferring `prefer`), then the LRU cold slot so a
         # hash collision or busy slot never evicts a recently active conversation.
@@ -8388,6 +8399,25 @@ def is_image_engine(engine):
     return getattr(engine, "modality", "text") == "image"
 
 
+def engine_concurrency(engine, kv_slots):
+    """The requests an engine runs at once: CAPS `concurrent=N` when it says so, else its slots. glm53 serves
+    one request at a time over its KV_SLOTS conversations: four requests at once on four slots had three
+    answered SLOT_BUSY (HTTP 500) before the scheduler kept them in its queue."""
+    caps = getattr(engine, "caps", None) or {}
+    try:
+        n = int(caps.get("concurrent", kv_slots))
+    except (TypeError, ValueError):
+        n = kv_slots
+    return max(1, min(n, kv_slots))
+
+
+def engine_gone_error(error):
+    """The error a request gets when its engine's process ended under it (the dispatcher saw it go,
+    or the request was written to an engine already gone): the engine's, not the request's."""
+    text = str(error)
+    return text.startswith("colibri engine exited unexpectedly") or text.startswith("colibri engine dispatcher stopped")
+
+
 def engine_alive(engine):
     """False once the served engine has died: Engine and ImageEngine say so through
     `alive`; an object without it (a test double, an embedder's engine) is taken as running."""
@@ -8485,6 +8515,7 @@ class APIServer(ThreadingHTTPServer):
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
+        self.scheduler.set_concurrency(engine_concurrency(engine, kv_slots))
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         # Extra Host header values trusted past the DNS-rebinding guard, for a
@@ -8603,13 +8634,42 @@ class APIServer(ThreadingHTTPServer):
 
         if kwargs.get("on_tool") is not None:
             kwargs["on_tool"] = measured(kwargs["on_tool"])
+        engine = self.engine
         try:
-            stats = self.engine.generate(prompt, max_tokens, temperature, top_p,
-                                         measured(on_text), *args, **kwargs)
+            try:
+                stats = engine.generate(prompt, max_tokens, temperature, top_p,
+                                        measured(on_text), *args, **kwargs)
+            except RuntimeError as error:
+                # The engine went before this request produced anything (it exits for a fresh device after
+                # losing one, a crash between two requests): keep_engine starts it again, and the request
+                # runs there once instead of failing. A second failure, or one after output, is the request's.
+                if first_output or not engine_gone_error(error):
+                    raise
+                fresh = self.await_fresh_engine(engine)
+                if fresh is None:
+                    raise
+                print(f"[gateway] the request runs on the engine started again ({error})", file=sys.stderr)
+                stats = fresh.generate(prompt, max_tokens, temperature, top_p,
+                                       measured(on_text), *args, **kwargs)
         finally:
             self.scheduler.observe_timing("engine_call_seconds", time.monotonic() - started)
         self.note_prompt_size(prompt, stats, kwargs.get("image") is not None)
         return stats
+
+    # How long a request whose engine went before it started waits for keep_engine's next one:
+    # an engine's load (a model in RAM, its expert tier's warm start) takes seconds to minutes.
+    ENGINE_RETRY_WAIT_S = _positive_env("COLI_ENGINE_RETRY_WAIT", 900)
+
+    def await_fresh_engine(self, old, timeout=None):
+        """The engine keep_engine put in place of `old` once it runs; None past the timeout
+        (no watchdog, a start that keeps failing) or while the server stops."""
+        deadline = time.monotonic() + (self.ENGINE_RETRY_WAIT_S if timeout is None else timeout)
+        while time.monotonic() < deadline:
+            now = self.engine
+            if now is not old and engine_alive(now):
+                return now
+            time.sleep(0.25)
+        return None
 
     def note_prompt_size(self, prompt, stats, image=False):
         """Tokens per prompt character, measured on the prompts served (a picture's
@@ -11056,6 +11116,7 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
             if not stopping.is_set():
                 server.engine, fresh = fresh, None
                 server.engine_restarts += 1
+                server.scheduler.set_concurrency(engine_concurrency(server.engine, server.kv_slots))
                 # its RAM plan ran again (chat_context_env), so the context it holds may differ
                 server.context_limit = getattr(server.engine, "context_limit", None)
                 server.max_tokens = getattr(server.engine, "max_tokens", None) or server.max_tokens
@@ -11150,7 +11211,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 # takes the engine down with this server, however the server ends.
                 image._win_job = _win_kill_on_close_job(getattr(image.process, "pid", None))
                 return image
-            return Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+            # COLI_ENGINE_SUPERVISED: keep_engine starts this engine again when it ends, so an engine whose GPU was
+            # lost for real may exit to come back on a fresh device (vkc_restart_if_lost); one run without it stays
+            return Engine(engine,model,cap,max_tokens,dict(env or os.environ, COLI_ENGINE_SUPERVISED="1"),kv_slots,family)
 
         if family.modality == "image":
             runtime = start_engine()
@@ -11167,6 +11230,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                       file=sys.stderr)
                 sys.exit(1)
         server.engine = runtime
+        server.scheduler.set_concurrency(engine_concurrency(runtime, kv_slots))   # its CAPS, read at its start
         server.context_limit = getattr(runtime, "context_limit", None)
         if not max_tokens:   # the engine resolved it: the context it holds
             server.max_tokens = getattr(runtime, "max_tokens", None) or 1024

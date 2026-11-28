@@ -3249,8 +3249,13 @@ static float *k3_step_rows(Model *m, const K3Row *rows, const int *ids, int S){
     return logits;
 }
 
+#include "coli_kv_plan.h"   /* the KV cache for the whole context at once (COLI_KV_PLAN) */
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
+    {   /* planned (coli_kv_plan.h): the whole context (K3_MAXT) at the first, where the RAM holds it */
+        int top=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):8192;
+        if(max_t<top && coli_kv_plan_host((double)top*c->n_layers*(c->kv_lora+c->qk_rope)*4.0,compat_mem_available_gb()*1e9)) max_t=top;
+    }
     /* Serve calls this once per request, and it used to calloc Lc/Rc over the
      * old pointers without freeing them: n_layers x max_t x (kv_lora +
      * qk_rope) floats leaked every turn, hundreds of MB over a conversation on
@@ -4703,6 +4708,9 @@ static void serve_loop(Model *m, Tok *T){
     if(g_k3_mux_slots>1){ serve_mux(m,T); coli_ps_report(&g_k3_ps); return; }
     for(;;){
         ServeReq q={0}; int r;
+#ifdef COLI_VULKAN
+vkc_restart_if_lost("kimi_k3");   /* a device lost for real: a fresh engine (the gateway) */
+#endif
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r==0);
         if(r<0){ coli_ps_report(&g_k3_ps); return; }
         if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0){ coli_ps_report(&g_k3_ps); return; } serve_emap(m); }

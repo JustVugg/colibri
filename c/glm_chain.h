@@ -855,7 +855,7 @@ static int glmc_forward_seg(Model *m, GlmChain *ch, float *xh, int S, int pos_ba
     return N;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     free(inv); free(outs);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("glm", pos_base, S);   /* the device lost only when it said so (#2793) */
     g_vk_chain = 0; ch->failed = 1;
     { GlmChain *o = glmc_of(m, !ch->d); if (o) o->failed = 1; }
     fprintf(stderr, "[VK] %s chain: the device was lost; the CPU runs this forward again and from here on "
@@ -1174,7 +1174,7 @@ static int glmc_mux_seg(Model *m, GlmChain *ch, float *xh, int S, KVState *const
     return N;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     free(mir); free(cl); free(inv);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("glm", -1, S);   /* the device lost only when it said so (#2793) */
     g_vk_chain = 0; ch->failed = 1;
     { GlmChain *o = glmc_of(m, !ch->d); if (o) o->failed = 1; }
     fprintf(stderr, "[VK] %s chain: the device was lost in a multiplexed step; the CPU runs it again and from here on "

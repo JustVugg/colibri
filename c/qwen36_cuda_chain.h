@@ -46,6 +46,7 @@
  * recurrent state on the CPU from the prefix record and runs there from then on
  * (q36cc_recover, as q36c_recover). COLI_CUDA_CHAIN_FAULT=n fakes it at the n-th
  * frame, for the tests. */
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "cuda_chain.h"
 #include "qwen36_cuda_profile.h"
 #include "qwen36_cuda_checkpoint.h"
@@ -364,7 +365,7 @@ static size_t q36cc_mirror_at(Model *m, int ctx) {
 }
 static size_t q36cc_mirror_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
-    if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
+    if (ctx < 1 || !(c->win_layer || c->attn_sinks || coli_kv_plan())) return 0;   /* planned: every model's (coli_kv_plan.h) */
     size_t kv = q36cc_mirror_at(m, ctx), fr = 0, tot = 0;
     if (coli_cuda_mem_info(0, &fr, &tot) && tot && kv > tot / 2) kv = tot / 2;
     return kv;
@@ -713,6 +714,7 @@ static int q36cc_mirror(Q36CChain *ch, Model *m) {
     int need = m->kv_cap > Q36CC_CONV_ROWS ? m->kv_cap : Q36CC_CONV_ROWS;
     if (need > top) need = top;
     int cap = ch->cap;
+    if (cap < need && coli_kv_plan()) cap = top;   /* planned: the whole context at the first, never grown (coli_kv_plan.h) */
     if (cap < need) {
         cap = need + (need / 8 > 1024 ? need / 8 : 1024);
         cap = (cap + 1023) / 1024 * 1024;
@@ -887,6 +889,23 @@ static void q36cc_room_from_tier(Q36CChain *ch, size_t need) {
         if (fr >= need || !qt_chain_give_back(need - fr, q36cc_tensor_addr)) return;
     }
 }
+/* the room the planned places past the chain's own take (q36_places_plan), out of the expert budget: sized from
+ * the room the trunk leaves on the card when the tier places it (qt_reserve_fn; before the tier starts the backend
+ * has no device to ask, and the trunk's room is never theirs: the 27B's 8 places of 1.15 GiB, taken from the whole
+ * free memory, left a shared expert's gate off the card and the chain off, 1.1 tok/s). With experts on the card the
+ * places take half of that room; without (a dense model), all of it but 1 GiB for the prompts' buffers. */
+static Model *g_q36cc_plan_model;
+static size_t q36cc_places_reserve(size_t room, int experts) {
+    size_t b = 0;
+    const size_t gib = (size_t)1 << 30;
+    if (g_q36cc_plan_model && g_q36_mux_slots > 1 && coli_kv_plan())
+        q36_places_plan(g_q36cc_plan_model, q36cc_kves(), experts ? room : (room > gib ? 2 * (room - gib) : 0), &b);
+    return b;
+}
+static void q36cc_places_plan_at_tier(Model *m) {
+    g_q36cc_plan_model = m;
+    qt_reserve_fn(q36cc_places_reserve);
+}
 /* room for `bytes` more (and 512 MiB): the least recently used places' KV mirrors go first */
 static int q36cc_conv_room(Q36CChain *ch, Model *m, int keep, size_t bytes) {
     const size_t margin = (size_t)512 << 20;
@@ -897,7 +916,7 @@ static int q36cc_conv_room(Q36CChain *ch, Model *m, int keep, size_t bytes) {
             if (j == keep || v->used == ch->conv_clock || !v->cap || j == ch->conv_cur) continue;
             if (k < 0 || v->used < ch->conv[k].used) k = j;
         }
-        if (k < 0) {   /* no other place's mirrors left to take: the expert tier's memory */
+        if (k < 0 || coli_kv_plan()) {   /* no other place's mirrors left to take (planned: none taken): the expert tier's memory */
             if (q36cc_conv_avail(ch) < bytes + margin) q36cc_room_from_tier(ch, bytes + margin);
             return q36cc_conv_avail(ch) >= bytes + margin;
         }
@@ -916,7 +935,7 @@ static int q36cc_conv_grow(Q36CChain *ch, Model *m, int k, int need) {
     Cfg *c = &m->c; int KV = c->kv_heads, kvd = c->k_head_dim;
     int cap = v->cap ? 2 * v->cap : Q36CC_CONV_ROWS;
     if (cap < need) cap = (need + 1023) / 1024 * 1024;
-    if (cap > m->kv_cap) cap = m->kv_cap;
+    if (cap > m->kv_cap || coli_kv_plan()) cap = m->kv_cap;   /* planned: the whole context at once */
     if (cap < need) return 0;
     if (!q36cc_conv_room(ch, m, k, q36cc_conv_kv_bytes(m, cap) - q36cc_conv_kv_bytes(m, v->cap))) return 0;
     for (int i = 0; i < c->n_layers; i++) {
@@ -940,11 +959,12 @@ static int q36cc_conv_new(Q36CChain *ch, Model *m) {
     const char *e = getenv("COLI_VK_CHAIN_MUX");
     int most = e && *e ? 1 + atoi(e) : g_q36_mux_slots;
     if (most > g_q36_mux_slots) most = g_q36_mux_slots;
+    if (g_q36_places_plan > 0 && most > g_q36_places_plan) most = g_q36_places_plan;
     if (ch->conv_full || ch->nconv >= most) return -1;
     size_t nr = q36_rec_cells(c) * sizeof(float);
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float), dn = 0;
     for (int i = 0; i < L; i++) if (!c->is_attn[i]) dn += nr + nc;
-    int cap0 = m->kv_cap < Q36CC_CONV_ROWS ? m->kv_cap : Q36CC_CONV_ROWS;
+    int cap0 = m->kv_cap < Q36CC_CONV_ROWS || coli_kv_plan() ? m->kv_cap : Q36CC_CONV_ROWS;
     size_t need = dn + q36cc_conv_kv_bytes(m, cap0), avail = q36cc_free_bytes(ch);
     Q36ccConv v = {.slot = -1, .dn_where = Q36CC_HOST};
     int ok = need + ((size_t)512 << 20) <= avail;
@@ -974,8 +994,11 @@ static int q36cc_conv_get(Q36CChain *ch, Model *m, int slot, int evict) {
     for (int j = 0; j < ch->nconv && k < 0; j++) if (ch->conv[j].slot < 0) k = j;
     if (k < 0) k = q36cc_conv_new(ch, m);
     if (k < 0 && evict) {
-        for (int j = 0; j < ch->nconv; j++)
+        for (int j = 0; j < ch->nconv; j++) {
+            const int s = ch->conv[j].slot;
+            if (g_q36_mux_busy && s >= 0 && s < g_q36_mux_slots && g_q36_mux_busy[s]) continue;   /* a running conversation's */
             if (ch->conv[j].used != ch->conv_clock && (k < 0 || ch->conv[j].used < ch->conv[k].used)) k = j;
+        }
         if (k < 0) return -1;
         if (k == ch->conv_cur) q36cc_conv_save(ch);
         if (!q36cc_conv_down(ch, m, &ch->conv[k])) return -1;
@@ -1055,6 +1078,19 @@ static void q36cc_mux_leave(Model *m) {
     Q36CChain *ch = q36cc_of(m);
     if (ch && ch->conv && q36cc_pool_ok(ch)) { q36cc_conv_save(ch); return; }
     q36cc_cpu_step(m, m->kv_len);
+}
+/* KV_SLOTS: can slot's conversation start now with its state on the device? Its own place, a free one, one more
+ * (opened now), or the place of a conversation whose request is not running (g_q36_mux_busy; its state goes to the
+ * host when the place is taken). Without places (a second device, a partial chain, the split) every conversation
+ * goes through the host anyway: 1. */
+static int q36cc_mux_room(Model *m, int slot) {
+    Q36CChain *ch = q36cc_of(m);
+    if (!ch || !ch->ok || !ch->conv || !q36cc_pool_ok(ch)) return 1;
+    for (int k = 0; k < ch->nconv; k++) {
+        const int s = ch->conv[k].slot;
+        if (s == slot || s < 0 || s >= g_q36_mux_slots || !g_q36_mux_busy || !g_q36_mux_busy[s]) return 1;
+    }
+    return q36cc_conv_new(ch, m) >= 0;
 }
 static void q36cc_mux_enter(Model *m, int slot) {
     Q36CChain *ch = q36cc_of(m);

@@ -1059,13 +1059,14 @@ static void vk_window_decide(VkUp *u, VkPhysicalDevice phys, uint32_t memtype, i
         }
         for (int i = 0; i < got; i++) vkFreeMemory(u->dev, blk[i], NULL);
 #ifdef VK_EXT_memory_budget
-        /* Trunk first: the blocks are back, but a driver that reports the budget of the freed
-         * blocks only after a while would hand the tier that sizes itself next the hole they
-         * left (0 of 4.6 GiB free on a RADV 6900 XT, once). Wait, bounded, for the heap's free
+        /* The blocks are back, but a driver that reports the budget of the freed blocks only
+         * after a while would hand the tier that sizes itself next the hole they left (trunk
+         * first: 0 of 4.6 GiB free on a RADV 6900 XT, once). Wait, bounded, for the heap's free
          * to come back to what it was before the loop asked — at most 3 s, then the tier takes
-         * what the driver says. The ask that runs at the start (not trunk first) needs none of
-         * this: seconds of loading sit between it and the first reader. */
-        if (trunk_first && has_budget && got > 0)
+         * what the driver says. The ask at the start needs it too: an engine that reads a GGUF
+         * in place can size its tier within a second of it (Inkling-2-Mini UD-Q3_K_XL on a RADV
+         * RX 9060 XT: a budget of 0, every expert on the CPU, on two starts of four). */
+        if (has_budget && got > 0)
             for (int i = 0; i < 150 && vk_heap_free_now(phys, &bud0, &mp20, hi) + ((VkDeviceSize)64 << 20) < free0; i++) {
 #ifdef _WIN32
                 Sleep(20);

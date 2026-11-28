@@ -87,6 +87,7 @@
  * primary's layers, then the second device's from the streams it hands over. A second
  * device that is lost, or declines a forward, leaves the CPU to run its layers from
  * there (the host's state is current: nothing to rebuild); lost, both chains go off. */
+#include "coli_kv_plan.h"   /* COLI_KV_PLAN: the KV for the whole context at once */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
@@ -800,10 +801,19 @@ params:
 }
 static int v4c_setup(ColiV4Engine *engine) { return v4c_setup_dev(engine, 0); }
 
+/* the context the engine serves (runtime.context_tokens, 4096 unset), at most the model's: the planned rows' */
+static int v4c_ctx(const V4Chain *ch) {
+    const int top = ch->engine->config.max_position_embeddings, t = ch->engine->runtime.context_tokens > 0 ? ch->engine->runtime.context_tokens : 4096;
+    return t < top ? t : top;
+}
 /* room on the device for `rows` compressed rows (and keys) of layer i; growing drops them */
 static int v4c_cache(V4Chain *ch, V4cLayer *ly, int rows) {
+    /* planned (coli_kv_plan.h): the served context's compressed rows at the first, never grown (the model's
+     * own ceiling would size them for contexts no request reaches) */
+    const int host = ly->ratio > 0 ? v4c_ctx(ch) / ly->ratio + 1 : 0;
     if (ly->ratio > 0 && ly->ccap < rows && !ch->ks.on) {   /* under the split the rows keep their ks.rows */
         int cap = 64; while (cap < rows) cap *= 2;
+        if (coli_kv_plan() && host > cap) cap = host;
         vkc_free(ly->ckv);
         ly->ckv = vkc_buf((size_t)cap * ch->hd * sizeof(float), VKC_DEV);
         ly->kv_valid = 0; ly->ccap = ly->ckv ? cap : 0;
@@ -811,6 +821,7 @@ static int v4c_cache(V4Chain *ch, V4cLayer *ly, int rows) {
     }
     if (ly->idx && ly->icap < rows) {
         int cap = 64; while (cap < rows) cap *= 2;
+        if (coli_kv_plan() && host > cap) cap = host;
         vkc_free(ly->ikey);
         ly->ikey = vkc_buf((size_t)cap * ch->ID * sizeof(float), VKC_DEV);
         ly->ik_valid = 0; ly->icap = ly->ikey ? cap : 0;
@@ -862,9 +873,10 @@ static int v4c_plan(V4Chain *ch, int E) {
         V4cLayer *ly = &ch->ly[i];
         if (ly->ratio <= 0) continue;
         int want = E / ly->ratio + 1, cap = ly->ccap, host = ch->engine->config.max_position_embeddings / ly->ratio + 1;
+        const int served = v4c_ctx(ch) / ly->ratio + 1;   /* planned: the served context's rows */
         if (host < want) host = want;
         if (host > tcap) tcap = host;
-        if (cap < want) { cap = 64; while (cap < want) cap *= 2; grow = 1; }
+        if (cap < want) { cap = 64; while (cap < want) cap *= 2; if (coli_kv_plan() && served > cap) cap = served; if (cap > host) cap = host; grow = 1; }
         need += (size_t)cap * hd * sizeof(float); held += (size_t)ly->ccap * hd * sizeof(float);
     }
     if (!grow) return 1;
@@ -1426,7 +1438,7 @@ host_oom:   /* the host state half written: as a failed CPU forward leaves it, a
 lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(cs); free(wl); free(cos_); free(sin_);
     if (pool) coli_v4_expert_store_prefill_pool(experts, -1);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_frame_failed("deepseek_v4", start, n);   /* the device lost only when it said so (#2793) */
     *lost = 1;
     return 0;
 }
