@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "hypothesis": "A prompt chunk's two ratio-4 compressors advance token by token, each fourth token pooling eight rows and running the emit's norm, RoPE and quantization serially. Every emit's rows are known before the chunk starts, so pooling all of the chunk's emits in one parallel pass, in the serial expression order per column, and running the emits' tails in parallel shortens the compressor stage and the time to the first token once the prompt is no longer waiting for its expert bank.",
+  "commit": "f49a75efbe8a1dca0f01d5fab981ce6b56eeca47",
+  "model": "DeepSeek-V4-Flash-0731 architecture, abliterated weights (same shapes), safetensors, native FP8/FP4",
+  "command": "make -C c -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 DEEPGEMM=1 CUDA_HOME=/usr/local/cuda-13.3 ARCH=native; deepseek_v4 <model> --prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16 with the environment in config; the arms alternate (baseline, trial) three times on one binary; tok_s = 3278 prompt tokens / time_to_first_token from the engine's `timing` line (prompt throughput)",
+  "prompt_hash": "3def6f25ca23ac992efe343ea4eec2c4a71ffe48dc66a95c93de91014b6923da",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X, 12 cores / 24 threads",
+    "ram": "94 GiB (--memory-gb 16)",
+    "storage": "Samsung 990 PRO 4TB + 980 PRO 2TB NVMe in one LVM volume, ext4, direct aligned reads",
+    "os": "Ubuntu 26.04.1, Linux 7.0.0-43, gcc 15.2.0, CUDA 13.3, driver 595.91.07, RTX 5080 16 GB"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "V4_COMP_BATCH"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native (one binary, the DeepGEMM sm_120a flavour linked in)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_LAYER_FUSED": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_PREFILL_CHAIN": "1",
+      "V4_BANK_READ_LANES": "2",
+      "V4_COMP_BATCH": "unset"
+    },
+    "samples": {
+      "tok_s": [
+        102.6074,
+        102.5529,
+        101.9501
+      ]
+    },
+    "median_tok_s": 102.5529,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the trial's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-comp-batch-2026-11-17/baseline_runs.txt",
+      "sha256": "b81bdfacd98bfcf644afb29f1c772d0b4baf7ab023f563313471459de32e6d07"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native (one binary, the DeepGEMM sm_120a flavour linked in)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_LAYER_FUSED": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_PREFILL_CHAIN": "1",
+      "V4_BANK_READ_LANES": "2",
+      "V4_COMP_BATCH": "1"
+    },
+    "samples": {
+      "tok_s": [
+        104.6014,
+        104.4614,
+        104.4182
+      ]
+    },
+    "median_tok_s": 104.4614,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the baseline's (md5 of stdout); V4_COMP_BATCH=2 (on a build of this commit, without the prompt switches) ran the batch on a copy of the attention compressor and compared every emit and the final state with the per-token walk: 16,380 emits over 520 chunk-layers, no difference (512 ratio-128 chunk-layers declined, as designed); the timed runs are on a build of 54a09113, this commit merged with V4_PREFILL_CHAIN (#2905) and V4_BANK_READ_LANES, which the baseline also runs with (docs/experiments/v4-comp-batch-2026-11-17/verify_run.txt, sha256 67b3cc29af8bf9580acc154fadb6646c94be8d112930252e04d6d92bec4118e0)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-comp-batch-2026-11-17/trial_runs.txt",
+      "sha256": "b4a54a988e738966c05062cddf4204e636fae324a55c65dc1bf6b5e028bc9e99"
+    }
+  },
+  "outcome": "improvement"
+}
