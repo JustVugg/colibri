@@ -1912,6 +1912,107 @@ __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict
         for (int k = 0; k < KD; k++) st[sb + k * p.VD + v] = col[k];
     }
 }
+/* cc_dnrec_k with the column split (COLI_CUDA_DNREC_SMEM=1): k < KR in registers, the rest in
+ * dynamic shared memory, [k - KR][128] so a warp's 32 columns are 32 banks. The same operations
+ * in the same order as cc_dnrec_k, only where col[k] lives differs: eliminates register spills at
+ * KD 128 and KD 256 while keeping bit-identical outputs, carried state, and snapshots. */
+template <int KD, int KR>
+__global__ static void __launch_bounds__(128) cc_dnrec_sm_k(const float *__restrict__ cv, const float *__restrict__ ab,
+        const float *__restrict__ z, float *__restrict__ st, const float *__restrict__ prm, float *__restrict__ y,
+        float *__restrict__ snap, CcDnRec p) {
+    COLI_PDL_WAIT();
+    __shared__ float qn[KD];
+    __shared__ float kn[KD];
+    __shared__ float red[128];
+    __shared__ float red2[128];
+    extern __shared__ float cc_dnrec_cs[];
+    int h = blockIdx.x, v = threadIdx.x;
+    bool own = v < p.VD;
+    int kh = (p.flags & 4) ? h % p.KH : h / (p.VH / p.KH);
+    float colr[KR];
+    float *cs = cc_dnrec_cs + v;
+/* a loop over k in order, split where col[k] moves to shared memory: the registers first, then
+ * the shared part, so every sum over k keeps cc_dnrec_k's order */
+#define CC_COLS(BODY) do { _Pragma("unroll") for (int k = 0; k < KR; k++) { float &c_ = colr[k]; BODY; } \
+                           _Pragma("unroll 4") for (int k = KR; k < KD; k++) { float &c_ = cs[(k - KR) * 128]; BODY; } } while (0)
+    int sb = p.st_off + h * KD * p.VD, nb = p.snap_off + h * KD * p.VD;
+    CC_COLS(c_ = own ? st[sb + k * p.VD + v] : 0.f);
+    float alog = prm[p.prm_off + h], dtb = prm[p.prm_off + p.VH + h];
+    float nw = own ? prm[p.prm_off + 2 * p.VH + v] : 0.f;
+    for (int s = 0; s < p.S; s++) {
+        int cb = p.cv_off + s * p.cv_row;
+        float qa = 0.f, ka = 0.f;
+        for (int k = v; k < KD; k += 128) {
+            float qv = cv[cb + kh * KD + k], kv = cv[cb + p.Ktot + kh * KD + k];
+            qn[k] = qv; kn[k] = kv;
+            qa += qv * qv; ka += kv * kv;
+        }
+        red[v] = qa; red2[v] = ka;
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (v < off) { red[v] += red[v + off]; red2[v] += red2[v + off]; }
+            __syncthreads();
+        }
+        float qsc = 1.f / sqrtf(red[0] + 1e-6f) * p.qscale;
+        float ksc = 1.f / sqrtf(red2[0] + 1e-6f);
+        __syncthreads();
+        for (int k = v; k < KD; k += 128) { qn[k] *= qsc; kn[k] *= ksc; }
+        __syncthreads();
+        float bv = ab[p.b_off + s * p.b_row + h], av = ab[p.a_off + s * p.a_row + h];
+        float beta = 1.f / (1.f + expf(-bv));
+        float decay = expf(((p.flags & 2) ? alog : -expf(alog)) * cc_softplus(av + dtb));
+        float o = 0.f;
+        if (own) {
+            float vin = cv[cb + 2 * p.Ktot + h * p.VD + v];
+            float kvs = 0.f;
+            CC_COLS(c_ *= decay; kvs += kn[k] * c_);
+            float delta = (vin - kvs) * beta;
+            CC_COLS(c_ += kn[k] * delta);
+            CC_COLS(o += qn[k] * c_);
+        }
+        red[v] = o * o;
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (v < off) red[v] += red[v + off];
+            __syncthreads();
+        }
+        float r = 1.f / sqrtf(red[0] / (float)p.VD + p.eps);
+        if (own) {
+            float zv = z[p.z_off + s * p.z_row + h * p.VD + v];
+            float g = (p.flags & 1) ? 1.f / (1.f + expf(-zv)) : zv / (1.f + expf(-zv));
+            y[p.y_off + s * p.y_row + h * p.VD + v] = o * r * nw * g;
+            if (s == p.snap_row) {
+                CC_COLS(snap[nb + k * p.VD + v] = c_);
+            }
+            if (s < p.snap_n) {
+                float *dst = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s] + h * KD * p.VD;
+                CC_COLS(dst[k * p.VD + v] = c_);
+            }
+        }
+        __syncthreads();
+    }
+    if (own) {
+        CC_COLS(st[sb + k * p.VD + v] = c_);
+    }
+#undef CC_COLS
+}
+/* KR: the registers the column keeps; the rest is (KD - KR) * 128 * 4 bytes of dynamic shared memory
+ * (KD 128: 16 KiB, KD 256: 80 KiB). With the shared part's loop fully unrolled ptxas hoists its loads
+ * and spills again, hence unroll 4 there. */
+#define CC_DNREC_SM_KR(KD) 96
+template <int KD>
+static int cc_dnrec_sm_launch(dim3 g, cudaStream_t st, const float *a, const float *b, const float *zz, float *s,
+                              const float *pr, float *yy, float *sn, const CcDnRec &p) {
+    constexpr int KR = CC_DNREC_SM_KR(KD);
+    const size_t sm = (size_t)(KD - KR) * 128 * sizeof(float);
+    static int raised = -1;   /* past 48 KiB the kernel asks for it, once */
+    if (raised < 0)
+        raised = sm <= 48 * 1024 ||
+                 cudaFuncSetAttribute(cc_dnrec_sm_k<KD, KR>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess;
+    if (!raised) { (void)cudaGetLastError(); return 0; }
+    coli_launch(cc_dnrec_sm_k<KD, KR>, g, 128, sm, st, a, b, zz, s, pr, yy, sn, p);
+    return 1;
+}
 #define CC_DNREC_ROWS 8   /* rows from which cc_dnrec takes cc_dnrec_rows_k (COLI_CUDA_DNREC_ROWS=0 never) */
 /* A prompt chunk's rows (cc_dnrec from CC_DNREC_ROWS rows): cc_dnrec_k's arithmetic, R
  * rows at a time. cc_dnrec_k takes about eighteen barriers a row (the tree sums of the q, k
@@ -4488,6 +4589,16 @@ rows:
         }
     }
 one:
+#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__))
+    {   /* COLI_CUDA_DNREC_SMEM=1: KD 128 and 256 with the column split (cc_dnrec_sm_k), default off */
+        const char *e = getenv("COLI_CUDA_DNREC_SMEM");   /* re-read per call, like COLI_CUDA_F8_WARP (tests flip it) */
+        const int sm_on = e && *e == '1';
+        if (sm_on && (KD == 128 || KD == 256) &&
+            (KD == 128 ? cc_dnrec_sm_launch<128>((unsigned)p->VH, c->stream, a, b, zz, s, pr, yy, sn, *p)
+                       : cc_dnrec_sm_launch<256>((unsigned)p->VH, c->stream, a, b, zz, s, pr, yy, sn, *p)))
+            return launched(c, "dnrec sm");
+    }
+#endif
 #define CC_DR(KD_) do { if (p->snap_n > 0) coli_launch(cc_dnrec_k<KD_, true>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); \
                         else coli_launch(cc_dnrec_k<KD_, false>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); } while (0)
     switch (KD) {

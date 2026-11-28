@@ -1343,6 +1343,33 @@ int main(void) {
            maxdiff(down(sb, snap.size()).data(), rs.data(), snap.size()) == 0, "LFM3's order 2: C * conv(B * x), the ring of B * x, the snapshot after row 1");
         T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(sb);
     }
+    /* COLI_CUDA_DNREC_SMEM=1 (cc_dnrec_sm_k): KD 128 and 256, the column split between registers and
+     * shared memory, the same bits as cc_dnrec_k and parity with ref_dnrec: outputs, carried state,
+     * snapshot, one row (a decode step) and four (a verify's run), both gates */
+    printf("dnrec with the column split (COLI_CUDA_DNREC_SMEM)\n");
+    for (int it = 0; it < 4; it++) {
+        const int KD = it & 1 ? 256 : 128, S = it < 2 ? 1 : 4, VH = 4, KH = 2, VD = 128, Ktot = KH * KD, CD = 2 * Ktot + VH * VD, vd = VH * VD;
+        std::vector<float> cv = rnd((size_t)S * CD, 161 + it), ab = rnd((size_t)S * 2 * VH, 171), z = rnd((size_t)S * vd, 172), st = rnd((size_t)VH * KD * VD, 173, 0.1f);
+        std::vector<float> prm(2 * VH + VD); unsigned sd = 174; for (int h = 0; h < VH; h++) { prm[h] = -1.f + 0.5f * frand(&sd); prm[VH + h] = 0.2f * frand(&sd); } for (int v = 0; v < VD; v++) prm[2 * VH + v] = 1.f + 0.2f * frand(&sd);
+        std::vector<float> rst = st, ry((size_t)S * vd), rs(st.size());
+        CcDnRec p = {S, VH, KH, VD, Ktot, 0, CD, 0, 2 * VH, VH, 2 * VH, 0, vd, 0, vd, S - 1, it >= 2 ? 1 : 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 0, 0};
+        ref_dnrec(KD, cv.data(), ab.data(), z.data(), rst.data(), prm.data(), ry.data(), rs.data(), &p);
+        std::vector<float> ys[2], sts[2], sns[2];
+        for (int sm = 0; sm < 2; sm++) {
+            setenv("COLI_CUDA_DNREC_SMEM", sm ? "1" : "0", 1);
+            CcBuf *cb = up(cv), *bb = up(ab), *zb = up(z), *sb = up(st), *pb = up(prm), *yb = T->buf((size_t)S * vd * 4, CC_DEV), *nb = T->buf(st.size() * 4, CC_DEV);
+            ck(T->begin() && T->dnrec(KD, cb, bb, zb, sb, pb, yb, nb, &p) && T->submit(1), sm ? "the split kernel ran" : "cc_dnrec_k ran");
+            ys[sm] = down(yb, (size_t)S * vd); sts[sm] = down(sb, st.size()); sns[sm] = down(nb, st.size());
+            T->free(cb); T->free(bb); T->free(zb); T->free(sb); T->free(pb); T->free(yb); T->free(nb);
+        }
+        unsetenv("COLI_CUDA_DNREC_SMEM");
+        char what[128];
+        snprintf(what, sizeof what, "KD %d, %d row%s: the split's bits are cc_dnrec_k's and match CPU ref (outputs, state, snapshot)", KD, S, S > 1 ? "s" : "");
+        ck(ys[0] == ys[1] && sts[0] == sts[1] && sns[0] == sns[1] &&
+           maxdiff(ys[1].data(), ry.data(), ry.size()) < 1e-4 &&
+           maxdiff(sts[1].data(), rst.data(), rst.size()) < 1e-4 &&
+           maxdiff(sns[1].data(), rs.data(), rs.size()) < 1e-4, what);
+    }
     printf("dnrec\n");
     /* four rows (cc_dnrec_k) and 37 (the prompt's kernels: cc_dnrec_rows_k for KD 8, cc_dnrec_split_k
      * for 64 and 128; blocks of rows past the first, the last part full, the snapshot inside one) */
