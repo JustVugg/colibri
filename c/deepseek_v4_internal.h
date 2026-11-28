@@ -754,6 +754,10 @@ int coli_deepseek_v4_expert_store_open(
  * with fewer slots each layer's most used ones in the history (#2109). Counts no
  * use; runs once per store. Returns the experts it could not read. */
 int coli_v4_expert_store_prewarm(ColiExpertStore *store);
+/* Opt-in (COLI_V4_TIER_PREWARM=1): fill VRAM mirrors globally by usage history
+ * before READY, dropping temporary RAM copies once mirrored, then fill RAM with
+ * the remaining ranked experts. Clean no-op when disabled or without history. */
+int coli_v4_expert_store_prewarm_tiers(ColiExpertStore *store);
 
 /* Plain SSD implementation underneath the optional hot-row/autopin wrapper.
  * Segment adapters use it so opening a layer range never warms experts from
@@ -1246,6 +1250,14 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
  * fp4 path. Only block_rows==1 views are mirrored; rows16-packed slots are
  * skipped. */
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
+/* Grow-only prewarm upload: mirrors `view` into VRAM without recycling existing
+ * residents; returns 0 on success or non-zero when capacity/reserve is reached. */
+int coli_v4_gpu_expert_warm(ColiExpertStore *store, ColiExpertView *view);
+/* Populates caller-zeroed bitmap `bits` (bit layer*cols + expert) for every
+ * expert currently mirrored in VRAM (primary caches and peer pool) without
+ * touching LRU stamps. `bits` may be NULL to query the count only. */
+int coli_v4_gpu_mirror_bitmap(ColiExpertStore *store, uint8_t *bits, int rows,
+                              int cols);
 /* lookup-only twin: reports residency, never uploads (hybrid q* split) */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
 /* 1 while a peer mirror pool (DSV4_CUDA_PEER_DEVICE) is in use, 0 without

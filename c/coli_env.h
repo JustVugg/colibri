@@ -390,6 +390,8 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_V4_ROWS16",                   CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"COLI_V4_SAVE_USAGE",               CE_BOOL  , CE_DSV4                                         , 0             , NULL},
     {"COLI_V4_SHARED_BATCH",             CE_STR   , CE_DSV4                                         , 0             , NULL},
+    {"COLI_V4_TIER_PREWARM",             CE_BOOL  , CE_DSV4                                         , 0             , NULL},
+    {"COLI_V4_TIER_PREWARM_AHEAD",       CE_INT   , CE_DSV4                                         , 0             , NULL},
     {"COLI_VK_ATTN",                     CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_VK_ATTN_BLOCK", CE_INT, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_VK_ATTN_BLOCK_FIXED", CE_BOOL, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
