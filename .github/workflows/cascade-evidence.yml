@@ -1,0 +1,20 @@
+name: Cascade evidence
+on:
+  pull_request:
+    paths:
+      - 'c/tools/cascade/**'
+      - 'docs/experiments/cascade/**'
+      - 'docs/experiments/dory-native/TRANSFER_REGISTRY.json'
+      - '.github/workflows/cascade-evidence.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python c/tools/cascade/test_registry.py -v

@@ -25,11 +25,7 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cc", required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
+def generate_header():
     baseline = (ROOT / "c/qwen36_sample.h").read_bytes()
     donor = run(["git", "show", f"{DORY}:c/qwen36_sample.h"], cwd=ROOT)
     text = donor.decode()
@@ -43,6 +39,15 @@ def main():
         "qsort(rank,(size_t)m,sizeof(SampleProb),sample_prob_desc);",
         "sample_prob_sort(rank,(size_t)m);")
     assert candidate.count("sample_prob_sort(rank,") == 2
+    return baseline, donor, candidate
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cc", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    baseline, donor, candidate = generate_header()
     env = dict(os.environ)
     env.pop("COLI_LOGIT_DUMP", None)
     env.pop("DORY_CPU_SAMPLE_RADIX", None)

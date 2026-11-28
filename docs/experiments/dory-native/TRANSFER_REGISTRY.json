@@ -1,0 +1,2000 @@
+{
+  "schema_version": 1,
+  "registry_id": "DORY-STATIC-TRANSFER-2026-11-28",
+  "source_base": "ab96adbff95aadfbdae20989ae599dfa5038c948",
+  "source_equivalent_revision": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+  "source_equivalence_scope": "git diff between revisions -- c is empty; direct main source inspection; no equivalence claim for isolated candidates",
+  "scope": "Static source/evidence reuse only; no recipient inference, builds, GPU work, benchmarks, downloads, commits or pushes",
+  "process_owner": "parent; owns CALR_ROUTE/RVR definitions, admission, preservation, DoE, streak accounting, publication and closure",
+  "promotion_authorized": false,
+  "new_governance_file_claims": [],
+  "paths": "All source and evidence paths are repository-root-relative; symbols rather than volatile line numbers are primary anchors.",
+  "snapshot_truth": {
+    "packed_prefill": "qualified_opt_in_default_off",
+    "serial_packed": "qualified_opt_in_default_off",
+    "radix": "qualified_opt_in_default_off",
+    "grouped": "rejected_G2_isolated",
+    "graphs": "deferred_source_feasibility_only",
+    "q_norm_scale": "standalone_280_bitwise_24_invalid_passed; isolated_integrated_source_returned_unbuilt",
+    "default_packed_candidate": "parent reports separate-worktree build running; not main and not qualified here"
+  },
+  "prior_policy": {
+    "type": "conditional qualitative similarity inference, not a fitted posterior or measured recipient gain",
+    "range_semantics": "sign/range descriptions concern same-arithmetic incremental end-to-end effect against the recipient's own matched baseline; no numeric recipient interval is justified",
+    "numeric_ranges": null,
+    "bound": "If eligible time fraction f is later measured and eligible-kernel speedup k established, ideal total speedup is 1/(1-f+f/k); overhead/interactions can make net effect negative.",
+    "prediction_error": null,
+    "no_runs_authorized": true,
+    "cold_start_savings": {
+      "classification": "ESTIMATED",
+      "qualitative": "Reuse dispatch exclusions, source identity, primitive oracles, rejected neighbors and matched-plan templates before requesting any recipient run.",
+      "hours": null,
+      "gpu_runs_avoided": null,
+      "tokens_avoided": null,
+      "measured_savings": null
+    }
+  },
+  "evidence": [
+    {
+      "id": "E01",
+      "path": "docs/experiments/dory-native/STATUS.md",
+      "kind": "local_qualified_history",
+      "revision": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "scope": "Combined opt-in G5 plus fixture supplement: 3080 unique passes/4040 subtests, 806 remaining skips; not actual-default or agent-latency qualification"
+    },
+    {
+      "id": "E02",
+      "path": "docs/experiments/dory-native/matrix-packed-g2-screen.json",
+      "kind": "local_Dory_measurement",
+      "scope": "Packed multirow short/long G2; not recipient result"
+    },
+    {
+      "id": "E03",
+      "path": "docs/experiments/dory-native/matrix-packed-batch-doe.json",
+      "kind": "local_Dory_interaction",
+      "scope": "Decoder x batch; full-vector hashes; batch policy is separate"
+    },
+    {
+      "id": "E04",
+      "path": "docs/experiments/dory-native/matrix-serial-packed-g2-screen.json",
+      "kind": "local_Dory_measurement",
+      "scope": "Serial packed short/long G2"
+    },
+    {
+      "id": "E05",
+      "path": "docs/experiments/dory-native/matrix-serial-packed-counters.json",
+      "kind": "local_replay_diagnostic",
+      "scope": "Aligned launches; not production timing; offset-sample artifact is diagnostic only"
+    },
+    {
+      "id": "E06",
+      "path": "docs/experiments/dory-native/sampling-radix-g2-corrected.json",
+      "kind": "synthetic_CPU_measurement",
+      "scope": "Independent original-equation qsort oracle; corrected executable; invalid predecessor not a failed algorithm"
+    },
+    {
+      "id": "E07",
+      "path": "docs/experiments/dory-native/packed-weight-arena-memory.json",
+      "kind": "local_memory_measurement",
+      "scope": "Dory allocation saving, not throughput or recipient capacity"
+    },
+    {
+      "id": "E08",
+      "path": "docs/experiments/dory-native/q-norm-scale-g1-gpu.json",
+      "kind": "standalone_primitive_correctness",
+      "revision": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "scope": "280 complete-buffer bitwise cases,24 invalid,1874472 checks; not production integration"
+    },
+    {
+      "id": "E09",
+      "path": "docs/experiments/dory-native/q-norm-scale-integration-g1.md",
+      "kind": "isolated_source_handoff",
+      "revision": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "scope": "Optional ABI and Q-only integration returned, not built; standalone body identity does not test new DLL"
+    },
+    {
+      "id": "E10",
+      "path": "docs/experiments/dory-native/grouped-g2-screen.json",
+      "kind": "local_rejected_measurement",
+      "scope": "-6.64% short/-5.38% long; four contrasts negative; grouping plus old-decoder format folding, not serial-packed incremental effect"
+    },
+    {
+      "id": "E11",
+      "path": "docs/experiments/dory-native/cuda-graph-feasibility-manifest.md",
+      "kind": "source_count",
+      "revision": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "scope": "289-481 mutable updates/token in archived L4 geometry; no implemented capture"
+    },
+    {
+      "id": "E12",
+      "path": "docs/experiments/dory-native/matrix-serial-head-counters.json",
+      "kind": "local_replay_diagnostic",
+      "scope": "Selected BF16 head94.18% DRAM/8.23% SM; approximately4% short decode traced time"
+    },
+    {
+      "id": "E13",
+      "path": "docs/experiments/dory-native/reference-inkling-findings.md",
+      "kind": "pinned_reference_review",
+      "revision": "6b2aa2fb291ac47f486240e76bf2cf6378d6e8af",
+      "scope": "Resident paths and expert-contention failure; external-to-Dory timings"
+    },
+    {
+      "id": "E14",
+      "path": "docs/experiments/dory-native/reference-kernel-findings.md",
+      "kind": "pinned_reference_review",
+      "pins": {
+        "llama_cpp": "2881150433e320c3167fd54745d37b993863da2c",
+        "cutlass": "5c179edeb3e2abd0dd1da18bd1aa88ee98e4f8ee",
+        "flash_attention": "4b6dee0c070a169a770f2ee3ebc18f2f2a9ed558"
+      },
+      "scope": "No new literature survey or local reproduction"
+    },
+    {
+      "id": "E15",
+      "path": "docs/experiments/dory-native/reference-recurrent-findings.md",
+      "kind": "pinned_reference_review",
+      "pins": {
+        "llama_Dory": "8481bd0fde646c3f0423cd09320fe9b85b5fb0a5",
+        "vllm_Dory": "75fc05a53a366068f534a61ab3ee6b50485419f2",
+        "ExactLoop": "arXiv:2611.05150v1"
+      },
+      "scope": "Ouro/Huginn exactness and failures; incompatible hardware/arithmetic and incomplete campaign artifacts"
+    },
+    {
+      "id": "E16",
+      "path": "docs/experiments/dory-native/recurrent-cache-candidate-g0.md",
+      "kind": "pinned_source_review",
+      "pins": {
+        "vllm_rlt": "4821d47cec92aa1d7d2ec4be5f589d19b2794ae3"
+      },
+      "scope": "Dory/Ouro prepared recurrence, live slots, prefix rejection and rollback guards"
+    },
+    {
+      "id": "E17",
+      "path": "docs/experiments/dory-native/inventory.json",
+      "kind": "checkpoint_metadata",
+      "checkpoint_sha256": "96080be49ffd67b916018b7bdef8c484762576fb52780e10ab98ac4978a660e0",
+      "scope": "D2560/F7168/H16/KV4/hd256,72 physical sublayers,16/40/16 boundaries/core,4 loops,window1024"
+    },
+    {
+      "id": "E18",
+      "path": "docs/experiments/dory-native/OPTIMIZATION_LEDGER.md",
+      "kind": "decision_index",
+      "scope": "Rejected sum-cache/global-row/unbounded-attention/half-shared trials and progressive evidence"
+    },
+    {
+      "id": "E19",
+      "path": "docs/experiments/dory-native/SEQUENTIAL_DOE.md",
+      "kind": "existing_plan",
+      "scope": "Parent-owned DoE process reference, not authority to run recipients"
+    }
+  ],
+  "recipient_maps": [
+    {
+      "id": "INK2",
+      "family": "inkling",
+      "routing_source": "c/family_registry.py",
+      "engine_artifact": "inkling",
+      "sources": [
+        "c/inkling.c",
+        "c/inkling2_cuchain.h",
+        "c/cuda_chain.cu",
+        "c/backend_cuda.cu",
+        "c/cuda_bd.cuh"
+      ],
+      "route": [
+        "Inkling-2 CUDA build",
+        "ink2cc_wanted / ink2cc_geometry_ok / ink2cc_setup",
+        "ink2cc_mat",
+        "cc_matmul",
+        "coli_cuda_tensor_gemm_async / bd_tensor_gemv",
+        "bd_gemv_launch / bd_gemv_f_launch"
+      ],
+      "selector": "COLI_CUDA_CHAIN=1 on,2 prompt-only,0 off; unset loop Mini with capability; exact float requires GQ_EXACT=1 or COLI_CUDA_BD_FLOAT=1",
+      "formats": {
+        "F32": 0,
+        "BF16": 130,
+        "GGUF": "100+base type after gq_r16_unpack; existing W.cut reused",
+        "packed_eligible": [
+          113,
+          114
+        ]
+      },
+      "validated_shape_contract": "x2, hd1..256,H%KV=0,d_rel1..64,conv1..9,local window positive,sparse,no shared experts,maxb<=15; actual installed tensor inventory unknown",
+      "metadata": "inkling.c Cfg/load validation: hidden_size,num_hidden_layers,num_attention_heads,num_key_value_heads,head_dim,SWA overrides; loop_config(core_start,core_end,num_passes,gate_rank) or flat loop keys; n_state=layers+(passes-1)*core_width",
+      "norm_route": "generic cc_norm and Inkling clipping/convolution; not Dory FP64 justnorm",
+      "sampler_route": "inkling.c sample_logits: probability-only pi_desc qsort and rng_next; NOT qwen36_sample.h",
+      "eligible_mechanisms": [
+        "M01",
+        "M02",
+        "M04"
+      ],
+      "conditional_adaptations": [
+        "M03 requires preserving original tie and rng_next behavior, not blind replacement",
+        "M05 requires a separate matching arithmetic sequence, not source-level family similarity"
+      ],
+      "negative_transfer_flags": [
+        "nonexact_path_interception",
+        "format_miss_BF16_F32_other_quants",
+        "MoE_not_same_matrix_dispatch",
+        "expert_contention",
+        "norm_tree_mismatch",
+        "sampler_tie_RNG_mismatch"
+      ],
+      "measured_recipient_gain": null,
+      "prediction_error": null,
+      "inference_run_authorized": false
+    },
+    {
+      "id": "Q36",
+      "family": "qwen36",
+      "routing_source": "c/family_registry.py",
+      "engine_artifact": "qwen36",
+      "sources": [
+        "c/qwen36.c",
+        "c/qwen36_cuda_chain.h",
+        "c/qwen36_tier.c",
+        "c/qwen36_sample.h"
+      ],
+      "route": [
+        "q36cc_env_on / q36cc_setup",
+        "qt_dense_tensor / qt_dnproj_tensor / qt_lmhead_tensor",
+        "cc_matmul",
+        "shared backend format dispatch"
+      ],
+      "selector": "Chain on unless COLI_CUDA_CHAIN=0, subject to capability/tier/one-device placement; qpack/PILOT decline; exact selector still required for packed float",
+      "formats": {
+        "int8": 1,
+        "GGUF": "tier qt_dense_init_fmt preserves 100+type",
+        "packed_eligible": [
+          113,
+          114
+        ]
+      },
+      "validated_shape_contract": "Planner layer_types plus hidden/KV/head dimensions and DeltaNet key/value/conv dimensions; setup requires relevant projection/head tensors on one device. Real recipient inventory unknown.",
+      "norm_route": "generic chain RMSNorm/DeltaNet gated norm, not cc_dory_norm",
+      "sampler_route": "qwen36.c includes qwen36_sample.h and calls serve_sample; same code as Dory; DORY_CPU_SAMPLE_RADIX=1 startup opt-in",
+      "arena_route": "qwen36_tier.c already uses coli_cuda_tensor_upload_at; no new Dory-sized capacity saving inferred",
+      "eligible_mechanisms": [
+        "M01",
+        "M02",
+        "M03"
+      ],
+      "already_shared": [
+        "M04"
+      ],
+      "negative_transfer_flags": [
+        "format_miss_int8",
+        "nonexact_path_interception",
+        "host_expert_crossings",
+        "DeltaNet_state_not_Dory_KV",
+        "generic_norm_mismatch",
+        "greedy_no_sort",
+        "nucleus_small_sort"
+      ],
+      "measured_recipient_gain": null,
+      "prediction_error": null,
+      "inference_run_authorized": false
+    },
+    {
+      "id": "Q38",
+      "family": "qwen38",
+      "routing_source": "c/family_registry.py",
+      "engine_artifact": "qwen38",
+      "sources": [
+        "c/qwen38.c",
+        "c/qwen38_core.h",
+        "c/qwen38_cuda_chain.h",
+        "c/qwen36_tier.c"
+      ],
+      "route": [
+        "q38cc_env_on / q38cc_setup",
+        "q38cc_t / qt_dense_tensor",
+        "cc_matmul",
+        "shared backend format dispatch"
+      ],
+      "selector": "COLI_CUDA_CHAIN=1 explicitly,0 off,unset g_q38_gguf; one-device tier/chain placement; startup exact selector needed for packed float",
+      "formats": {
+        "int8": 1,
+        "GGUF": "q38_cuda_gq_fmt; row16 unpack if needed",
+        "BF16_general": "expanded F32 fmt0",
+        "PLE_BF16_special": 130,
+        "packed_eligible": [
+          113,
+          114
+        ]
+      },
+      "validated_shape_contract": "qwen38 planner validates own QSA/index/hyperconnection/PLE/DeltaNet geometry; q38cc_t uses weight cols/rows. No real tensor inventory or eligible fraction measured.",
+      "norm_route": "generic norms/hyperconnections, not Dory post-RoPE justnorm epilogue",
+      "sampler_route": "private qwen38.c serve_sample; full distribution uses unsorted token-ID CDF, nucleus threshold subsets use qsort; NOT shared radix header",
+      "eligible_mechanisms": [
+        "M01",
+        "M02"
+      ],
+      "already_shared": [
+        "M04"
+      ],
+      "negative_transfer_flags": [
+        "format_miss_int8_F32_BF16",
+        "fused_GLU_hcmix_routes_not_audited_as_packed_float",
+        "nonexact_path_interception",
+        "private_sampler_CDF_order",
+        "QSA_MTP_rollback_not_Dory_recurrence",
+        "pool_bus_contention"
+      ],
+      "measured_recipient_gain": null,
+      "prediction_error": null,
+      "inference_run_authorized": false
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "M01",
+      "name": "packed Q5_K/Q6_K multirow extraction",
+      "layer": "shared_backend",
+      "owner": "shared CUDA maintainer; parent qualification",
+      "sources": [
+        {
+          "path": "c/cuda_bd.cuh",
+          "symbols": [
+            "bdf_decode_packed",
+            "bd_gemv_f_packed_k",
+            "bd_gemv_f_launch"
+          ]
+        },
+        {
+          "path": "c/backend_cuda.cu",
+          "symbols": [
+            "bd_tensor_gemv"
+          ]
+        }
+      ],
+      "commit_anchor": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "tested_decoder_blob": "ae56c89e5ce6d08d07085b2128097197b34f1e8b",
+      "status": "qualified_Dory_opt_in_default_off",
+      "dependencies": [
+        "exact_float_dispatch",
+        "fmt113_or114",
+        "effective_nr_gt1",
+        "COLI_CUDA_BD_FLOAT_STATIC_not0",
+        "COLI_CUDA_BD_FLOAT_PACKED=1"
+      ],
+      "interactions": [
+        "batch rows and shared memory can change nr",
+        "M02 shares extraction but distinct serial arm",
+        "M04 storage must retain bytes/layout",
+        "larger batches affect cancellation responsiveness"
+      ],
+      "evidence": [
+        "E01",
+        "E02",
+        "E03",
+        "E14"
+      ],
+      "local_observation": "Dory G2 +31.17% short/+22.49% long; not recipient prediction",
+      "conditional_prior": {
+        "direction": "positive plausible only on reached packed-float calls; zero direct effect on excluded formats/routes",
+        "range": "unknown, including slowdown from resource/traffic interactions",
+        "interaction": "eligible time share and batch geometry dominate"
+      },
+      "reuse": "Use existing extractor/float dispatch/oracles, not llama Q8-activation MMQ.",
+      "adaptation": "No kernel copy for existing shared calls; first resolve actual format/selector/shape eligibility.",
+      "minimal_matched_test_plan": "Deferred only: existing primitive oracle for one actual eligible113/114 shape, tail and resource boundary, full bits/guards; if admitted and useful, same-binary separate-process off/on short/long blocks with fixed batches/checkpoint/precision and full hashes.",
+      "negative_transfer_flags": [
+        "nonexact_intercept",
+        "format_miss",
+        "nr_reduced_to1",
+        "resource_pressure"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M02",
+      "name": "serial packed extraction",
+      "layer": "shared_backend",
+      "owner": "shared CUDA maintainer; parent qualification",
+      "sources": [
+        {
+          "path": "c/cuda_bd.cuh",
+          "symbols": [
+            "bd_gemv_f_fixed_launch",
+            "bd_gemv_f_launch",
+            "bd_gemv_f_packed_k"
+          ]
+        }
+      ],
+      "commit_anchor": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "status": "qualified_Dory_opt_in_default_off",
+      "dependencies": [
+        "exact_float_dispatch",
+        "fmt113_or114",
+        "effective_nr1",
+        "COLI_CUDA_BD_FLOAT_PACKED_DECODE=1"
+      ],
+      "interactions": [
+        "M01 different row regime",
+        "sampler fraction increases after matrix acceleration",
+        "BF16 head unaffected"
+      ],
+      "evidence": [
+        "E01",
+        "E04",
+        "E05"
+      ],
+      "local_observation": "Dory G2 +26.49%/+19.12%; instructions31.1-37.0% of generic; no recipient gain",
+      "conditional_prior": {
+        "direction": "positive plausible with exact same kernel family/shape; diluted or absent when expert/host work dominates",
+        "range": "unknown signed end-to-end range",
+        "interaction": "Do not multiply Dory decode gain into recurrent depth or add it to M01"
+      },
+      "reuse": "Existing fixed packed<1,113/114> launcher and code/scale-bit oracle.",
+      "adaptation": "Static inventory first; no change to recipient activation regime merely to reach candidate.",
+      "minimal_matched_test_plan": "Deferred: matched actual serial shape complete vectors/guards; only later short/long same-regime off/on with exact output and startup flag attribution.",
+      "negative_transfer_flags": [
+        "format_miss",
+        "precision_regime_change_to_force_route",
+        "MoE_bottleneck",
+        "bandwidth_floor"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M03",
+      "name": "CPU stable radix probability sorting",
+      "layer": "shared_sampler",
+      "owner": "shared sampler maintainer; parent preservation",
+      "sources": [
+        {
+          "path": "c/qwen36_sample.h",
+          "symbols": [
+            "sample_prob_sort",
+            "sample_prob_binary32",
+            "sample_prob_radix_enabled",
+            "serve_sample"
+          ]
+        },
+        {
+          "path": "c/dory_serve.h",
+          "symbols": [
+            "serve_sample"
+          ]
+        },
+        {
+          "path": "c/qwen36.c",
+          "symbols": [
+            "serve_sample"
+          ]
+        }
+      ],
+      "commit_anchor": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "status": "qualified_Dory_opt_in_default_off",
+      "dependencies": [
+        "DORY_CPU_SAMPLE_RADIX=1",
+        "ascending token IDs",
+        "finite nonnegative binary32 probabilities",
+        "unchanged expf FP64 CDF and libc rand"
+      ],
+      "interactions": [
+        "greedy bypasses sorting",
+        "nucleus subset size controls overhead",
+        "M02 changes CPU/GPU time balance",
+        "Inkling and Q38 use private samplers"
+      ],
+      "evidence": [
+        "E01",
+        "E06"
+      ],
+      "local_observation": "Dory new-prompt full-sort +43.11%/+28.59%; nucleus+0.51%/+1.12% is small-control-drift scale",
+      "conditional_prior": {
+        "direction": "likely positive sort-path reduction for Q36 full sort; zero greedy; near-zero or negative possible for small nucleus",
+        "range": "unknown recipient end-to-end; no transferred Dory percentage",
+        "interaction": "allocator/TLS/libc/RNG and rank size; Inkling/Q38 seeded semantics block blind replacement"
+      },
+      "reuse": "Already shared Q36 code; independent original-equation qsort oracle and fallback checks.",
+      "adaptation": "Inkling needs original tie/RNG proof; Q38 unsorted full-distribution CDF must remain unchanged. Neither adaptation implemented.",
+      "minimal_matched_test_plan": "Deferred: synthetic actual-vocab vectors, ties/subnormals/invalid/fallbacks and exact RNG draw/state oracle; only parent-admitted matched serving for actual sample regime.",
+      "negative_transfer_flags": [
+        "CDF_order_change",
+        "tie_change",
+        "RNG_change",
+        "greedy",
+        "small_nucleus",
+        "wrong_executable_attribution"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M04",
+      "name": "borrowed packed tensor arenas",
+      "layer": "shared_infrastructure_with_model_planner",
+      "owner": "backend allocation maintainer and model lifetime owner",
+      "sources": [
+        {
+          "path": "c/backend_cuda.cu",
+          "symbols": [
+            "coli_cuda_tensor_upload_at",
+            "bd_file_row_bytes"
+          ]
+        },
+        {
+          "path": "c/dory_cuda_weights.h",
+          "symbols": [
+            "dory_arena_advance",
+            "dory_device_prepare_weight_arena"
+          ]
+        },
+        {
+          "path": "c/qwen36_tier.c",
+          "symbols": [
+            "coli_cuda_tensor_upload_at"
+          ]
+        }
+      ],
+      "commit_anchor": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "status": "qualified_Dory_opt_in_memory_improvement",
+      "dependencies": [
+        "original packed rows",
+        "metadata byte/overflow checks",
+        "256-byte slots/word-padded rows",
+        "descriptor-before-arena destruction",
+        "Dory resident fresh slots"
+      ],
+      "interactions": [
+        "prefix/KV capacity",
+        "initial placement accounting",
+        "tier arena already present",
+        "upload stream settling"
+      ],
+      "evidence": [
+        "E07",
+        "E13"
+      ],
+      "local_observation": "396361728 additional free VRAM bytes; throughput effectively unchanged",
+      "conditional_prior": {
+        "direction": "capacity positive only where allocator charging/duplication remains; zero incremental tier saving if already arena-backed",
+        "range": "unknown bytes and cold-start latency; no universal throughput gain",
+        "interaction": "larger available KV is capacity, not permission to change matched context"
+      },
+      "reuse": "Borrowed backend API, size/ownership preflight; adapt model planner rather than copy Dory slot enumeration.",
+      "adaptation": "Inkling has mixed F32/BF16/GGUF ownership and already migrates without duplicate dense weights; Qwen already has arena.",
+      "minimal_matched_test_plan": "Deferred: static padded-byte ledger and lifetime/failure mocks first; if admitted verify uploaded bytes, allocation accounting and same-context state/API, not a broad speed campaign.",
+      "negative_transfer_flags": [
+        "already_present",
+        "native_F32_unsupported_by_Dory_arena",
+        "lifetime_double_free",
+        "capacity_throughput_conflation"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M05",
+      "name": "Q norm then scale epilogue",
+      "layer": "Dory_arithmetic_specific_on_shared_chain_infrastructure",
+      "owner": "parent and isolated QNS workstream",
+      "sources": [
+        {
+          "path": "c/dory_cuda_kernels.cuh",
+          "symbols": [
+            "dory_cuda_norm_kernel",
+            "dory_cuda_sum",
+            "dory_cuda_inverse_norm"
+          ]
+        },
+        {
+          "path": "c/dory_cuda_attention.cuh",
+          "symbols": [
+            "dory_point_kernel"
+          ]
+        },
+        {
+          "path": "c/dory_cuda_resident.h",
+          "symbols": [
+            "dory_device_forward_rows"
+          ]
+        }
+      ],
+      "commit_anchor": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "status": "standalone_G1_passed_isolated_integration_unbuilt_not_main",
+      "dependencies": [
+        "unchanged256-thread FP64 sum tree",
+        "FP32 squares and distinct rounded multiplies",
+        "scale after norm",
+        "contiguous token/head/column mapping",
+        "optional ABI capability and explicit failure statuses"
+      ],
+      "interactions": [
+        "one removed launch per virtual attention layer per batch",
+        "M10 node count changes",
+        "generic cc_norm recipients have different equations"
+      ],
+      "evidence": [
+        "E08",
+        "E09"
+      ],
+      "local_observation": "280 bitwise+24 invalid primitive cases; no integration or throughput result",
+      "conditional_prior": {
+        "direction": "small positive launch/IO reduction plausible for Dory; recipient arithmetic eligibility unestablished",
+        "range": "unknown including overhead/regression; no gain percentage assigned",
+        "interaction": "kernel launch count is not chain-op count; only fixed norm/point fraction affected"
+      },
+      "reuse": "Qualified primitive body/oracle and shape/alias preflight as recipe; actual ABI translation unit still needs proof.",
+      "adaptation": "No direct Inkling/Qwen routing; establish exact target normalization tree and post-norm scale location first.",
+      "minimal_matched_test_plan": "Parent-only pending actual-DLL ABI/legacy-tail/status and280 full-buffer cases, then Dory same-build full-model off/on at both caches/depths/boundaries before timing. No recipient plan admitted.",
+      "negative_transfer_flags": [
+        "generic_norm_not_Dory",
+        "stale_host_or_DLL",
+        "standalone_not_integration",
+        "unbuilt"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M06",
+      "name": "physical weight to virtual recurrence/cache mapping",
+      "layer": "Dory_model_checkpoint_semantics",
+      "owner": "Dory model/state maintainer; parent preservation",
+      "sources": [
+        {
+          "path": "c/dory.h",
+          "symbols": [
+            "dory_physical",
+            "dory_cache_slot",
+            "dory_state_init"
+          ]
+        },
+        {
+          "path": "c/dory_cuda_resident.h",
+          "symbols": [
+            "dory_device_init",
+            "dory_device_forward_rows"
+          ]
+        }
+      ],
+      "commit_anchor": "ab96adbff95aadfbdae20989ae599dfa5038c948",
+      "status": "retained_not_new_optimization",
+      "dependencies": [
+        "input/output stages once",
+        "all target loops",
+        "per_loop versus last_loop semantics",
+        "metadata attention pattern"
+      ],
+      "interactions": [
+        "M01 already batches per_loop prompt rows",
+        "M07 aliases/rings",
+        "speculative rollback deferred"
+      ],
+      "evidence": [
+        "E16",
+        "E17"
+      ],
+      "local_observation": "Source-derived live per_loop slots16+20L; last_loop36; no redundant boundary/MLP KV allocation found",
+      "conditional_prior": {
+        "direction": "zero new dead-slot gain in inspected Dory; not a shared-backend optimization",
+        "range": "no speed estimate",
+        "interaction": "Inkling ink_wl/ink_sl shares weights but has separate gate/conv state; Ouro has no Dory boundary attention"
+      },
+      "reuse": "Physical/virtual/state namespace audit method and live-byte formula.",
+      "adaptation": "Keep recipient's own recurrence/DeltaNet/conv/cache semantics; never reuse Dory slot formula as generic allocation.",
+      "minimal_matched_test_plan": "Source-only map physical weights, virtual execution, live histories and alias owners; later any semantic change would require explicit separate authorization, not transfer timing.",
+      "negative_transfer_flags": [
+        "already_live_packed",
+        "cache_mode_changes_predictions",
+        "loop_skipping",
+        "dependent_loop_batching"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M07",
+      "name": "single-owner prefix checkpoint and ring restoration",
+      "layer": "Dory_state_checkpoint",
+      "owner": "Dory state/API maintainer",
+      "sources": [
+        {
+          "path": "c/dory_prefix.h",
+          "symbols": [
+            "dory_prefix_key",
+            "dory_prefix_save",
+            "dory_prefix_prepare"
+          ]
+        }
+      ],
+      "commit_anchor": "ab96adbff95aadfbdae20989ae599dfa5038c948",
+      "status": "retained_single_entry_not_general_rollback",
+      "dependencies": [
+        "complete saved prefix/logits/hidden",
+        "key identities including row policy",
+        "restore overwritten sliding rings once per alias",
+        "single owner"
+      ],
+      "interactions": [
+        "M04 VRAM",
+        "M06 alias mapping",
+        "speculation needs per-round undo and target CODA ordering beyond saved-prefix restore"
+      ],
+      "evidence": [
+        "E01",
+        "E16"
+      ],
+      "conditional_prior": {
+        "direction": "positive repeated-prefix prefill only; zero direct decode-only effect",
+        "range": "unknown recipient hits/bytes/latency",
+        "interaction": "prefix enabled must be matched against enabled, not cold baseline"
+      },
+      "reuse": "Key identity, dirty-ring restore and conservative reset obligations.",
+      "adaptation": "Inkling adds convolution/message state; Qwen recovery/DeltaNet snapshots already distinct; pinned RLT rejects Dory boundary prefix.",
+      "minimal_matched_test_plan": "Deferred: deterministic state transition/overwritten-byte ledger first; if admitted exact/extension/mismatch/shorter/trace and wrapped-ring state plus API checks.",
+      "negative_transfer_flags": [
+        "not_arbitrary_rollback",
+        "hit_rate_unknown",
+        "speculative_ring_overwrite",
+        "multiowner_not_supported"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M08",
+      "name": "bounded exact attention fusion",
+      "layer": "Dory_attention_on_shared_chain",
+      "owner": "Dory attention maintainer",
+      "sources": [
+        {
+          "path": "c/dory_cuda_attention.cuh",
+          "symbols": [
+            "dory_attention_fused_kernel",
+            "dory_scores_kernel",
+            "dory_softmax_kernel"
+          ]
+        },
+        {
+          "path": "c/cuda_chain.cu",
+          "symbols": [
+            "cc_dory_attention"
+          ]
+        }
+      ],
+      "commit_anchor": "ab96adbff95aadfbdae20989ae599dfa5038c948",
+      "status": "bounded_retained_unbounded_rejected",
+      "dependencies": [
+        "visible<=64",
+        "shared bytes<=32768",
+        "same dot/softmax/value tree",
+        "FP64 softmax sum"
+      ],
+      "interactions": [
+        "context and ring saturation",
+        "M10 fused-to-three-stage transition",
+        "long context traffic/resource pressure"
+      ],
+      "evidence": [
+        "E11",
+        "E14",
+        "E18"
+      ],
+      "local_observation": "Historical bounded+6.70% decode/+11.05% prefill; unbounded-10.90%/-45.57% prefill",
+      "conditional_prior": {
+        "direction": "conditional benefit only with matched math/resource/live-range; not generic FlashAttention speed",
+        "range": "unknown signed range",
+        "interaction": "online/split softmax or FP16/BF16 attention changes regime"
+      },
+      "reuse": "Bounded dispatch and arithmetic-preserving fusion discipline, not a copy over generic recipient attention.",
+      "adaptation": "Recipient norm, softmax/value order, window/sinks/QSA semantics need separate proof.",
+      "minimal_matched_test_plan": "Deferred: source visible64/65,W-1/W/W+1 and full-vector intermediate tree checks before any matched timing.",
+      "negative_transfer_flags": [
+        "long_context_regression",
+        "online_softmax_reorder",
+        "recipient_attention_mismatch"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M09",
+      "name": "group independent projections prototype",
+      "layer": "isolated_shared_backend_candidate",
+      "owner": "parent archive; no active promotion",
+      "sources": [
+        {
+          "path": "docs/experiments/dory-native/grouped-projection-rejected.patch",
+          "symbols": [
+            "archived grouped projection source and ABI delta"
+          ]
+        }
+      ],
+      "commit_anchor": "6b2aa2fb291ac47f486240e76bf2cf6378d6e8af",
+      "status": "rejected_closed_G2",
+      "dependencies": [
+        "independent projections/common input",
+        "matched format attribution not completed"
+      ],
+      "interactions": [
+        "old decoder format folding confounded isolated grouping",
+        "serial packed integration cancelled",
+        "fewer ops did not improve end-to-end"
+      ],
+      "evidence": [
+        "E10",
+        "E15"
+      ],
+      "local_observation": "-6.64% short/-5.38% long, all four paired contrasts negative; G1 correctness passed",
+      "conditional_prior": {
+        "direction": "negative for tested implementation; generic grouping remains unknown on different hardware/arithmetic",
+        "range": "do not project external Ouro1.06-1.12x or vLLM grouping into local result",
+        "interaction": "resource/traffic occupancy can exceed saved launches"
+      },
+      "reuse": "Failure, preflight and optional-ABI lessons only.",
+      "adaptation": "A materially different design requires new G0; adjacent tuning/recipient sampling not warranted.",
+      "minimal_matched_test_plan": "None admitted; retain negative result and cancel G3-G5/packed integration.",
+      "negative_transfer_flags": [
+        "measured_negative",
+        "format_attribution_confound",
+        "external_grouping_not_local_proof"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M10",
+      "name": "cached CUDA Graph replay",
+      "layer": "shared_orchestration_not_implemented",
+      "owner": "parent/backend lifetime owner",
+      "sources": [
+        {
+          "path": "c/cuda_chain.cu",
+          "symbols": [
+            "cc_begin",
+            "cc_submit"
+          ]
+        },
+        {
+          "path": "c/backend_cuda.cu",
+          "symbols": [
+            "dory_embedding_k",
+            "coli_cuda_dory_embedding_async"
+          ]
+        },
+        {
+          "path": "c/dory_cuda_resident.h",
+          "symbols": [
+            "dory_device_forward_rows"
+          ]
+        }
+      ],
+      "commit_anchor": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "status": "deferred_source_only",
+      "dependencies": [
+        "backend stream access/lifetime",
+        "warm selectors and tables",
+        "embedding row pointer update",
+        "RoPE/attention position and visible extent",
+        "topology and shared-memory transitions",
+        "cancel/error propagation"
+      ],
+      "interactions": [
+        "M05 removes nodes",
+        "M08 topology64/65",
+        "parameter blocks require interface changes",
+        "cannot remove matrix duration"
+      ],
+      "evidence": [
+        "E11",
+        "E14",
+        "E16"
+      ],
+      "local_observation": "1936-2128 nodes,289-481 distinct mutable updates/token in archived L4 geometry; no graph benchmark",
+      "conditional_prior": {
+        "direction": "positive only if recoverable host gaps exceed capture/update/amortization costs; negative possible",
+        "range": "unknown; external eager/Python graph ratios not portable",
+        "interaction": "fixed pointers are not fixed position arguments; nonkernel traced ROI not pure launch budget"
+      },
+      "reuse": "Mutation/lifetime manifest and pinned llama graph lifecycle; no implemented graph to copy.",
+      "adaptation": "Recipient schedule/host expert crossings, state and capture budget differ.",
+      "minimal_matched_test_plan": "Deferred parent-only bounded attention-island feasibility/update-cost gate; no full-token or recipient capture campaign authorized.",
+      "negative_transfer_flags": [
+        "hundreds_updates",
+        "capture_lifetime",
+        "host_gap_overclaim",
+        "external_eager_baseline"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M11",
+      "name": "BF16 head arithmetic-only tuning",
+      "layer": "shared_matrix_residual_bottleneck",
+      "owner": "parent residual analysis",
+      "sources": [
+        {
+          "path": "c/dory_cuda_resident.h",
+          "symbols": [
+            "dory_device_forward_rows"
+          ]
+        },
+        {
+          "path": "c/cuda_bd.cuh",
+          "symbols": [
+            "bd_gemv_f_launch"
+          ]
+        }
+      ],
+      "commit_anchor": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+      "status": "arithmetic_only_closed_deprioritized",
+      "dependencies": [
+        "same stored BF16 head",
+        "FP32 activation regime"
+      ],
+      "interactions": [
+        "packed layers faster increases residual share",
+        "last-row-only prefill head already retained"
+      ],
+      "evidence": [
+        "E12"
+      ],
+      "local_observation": "One selected capture94.18% DRAM/8.23% SM; about4% short decode traced duration",
+      "conditional_prior": {
+        "direction": "little arithmetic-only headroom in measured case",
+        "range": "unknown for recipients; no universal DRAM ceiling",
+        "interaction": "representation/IO changes are distinct proposals with separate proof"
+      },
+      "reuse": "Bottleneck exclusion and counter-scope discipline.",
+      "adaptation": "Need actual recipient format/time share; do not substitute INT8 head or reduced-precision activations.",
+      "minimal_matched_test_plan": "None for arithmetic-only sweep; new representation design must first establish precision and traffic feasibility.",
+      "negative_transfer_flags": [
+        "bandwidth_floor",
+        "small_time_share",
+        "INT8_head_not_admissible"
+      ],
+      "prediction_error": null
+    },
+    {
+      "id": "M12",
+      "name": "representation-aware exact compute research",
+      "layer": "shared_backend_research",
+      "owner": "parent representation/proof owner",
+      "sources": [
+        {
+          "path": "c/cuda_bd.cuh",
+          "symbols": [
+            "bdf_decode_packed",
+            "bd_gemv_f_packed_k"
+          ]
+        },
+        {
+          "path": "c/backend_cuda.cu",
+          "symbols": [
+            "bd_tensor_gemv"
+          ]
+        }
+      ],
+      "commit_anchor": "ab96adbff95aadfbdae20989ae599dfa5038c948",
+      "status": "conditional_research_not_promoted",
+      "dependencies": [
+        "original checkpoint bytes and scales",
+        "strict FP32 products/FP64 required trees",
+        "hardware/rounding/subnormal proof",
+        "no activation requantization"
+      ],
+      "interactions": [
+        "M01/M02 existing packed work",
+        "full F32 expansion memory pressure",
+        "tile shape and register/shared-memory resources"
+      ],
+      "evidence": [
+        "E14",
+        "E17",
+        "E18"
+      ],
+      "conditional_prior": {
+        "direction": "unknown; exact work elimination may help, reduced-precision headline gains inadmissible",
+        "range": "full-F32 ceiling and exact-emulation cost unknown",
+        "interaction": "CUTLASS3xTF32 omits small product; BF16x9 is SM100a not SM120; NVFP4 changes weights"
+      },
+      "reuse": "Packed original-format decoder, static shape checks and feasibility exclusions.",
+      "adaptation": "No hardware/format threshold copied from5090/GB10/B300/GH200 to5080 or recipients without qualification.",
+      "minimal_matched_test_plan": "Source representation/rounding/cost proof before code; existing primitive complete-bit or numerical oracle only after parent admits distinct design.",
+      "negative_transfer_flags": [
+        "precision_contract_violation",
+        "architecture_mismatch",
+        "unknown_full_F32_ceiling",
+        "requantization_changes_checkpoint"
+      ],
+      "prediction_error": null
+    }
+  ],
+  "failure_groups": [
+    {
+      "id": "F01",
+      "name": "arithmetic_or_semantics",
+      "members": [
+        "Q8_activation",
+        "TF32_FP16_BF16_substitution",
+        "CDF_tie_RNG_change",
+        "per_loop_to_last_loop",
+        "early_exit"
+      ]
+    },
+    {
+      "id": "F02",
+      "name": "resource_or_traffic",
+      "members": [
+        "activation_sum_cache_-15.0_decode_-5.9_prefill",
+        "half_shared_-9.05_prefill",
+        "global_row_input_sweeps",
+        "unbounded_attention",
+        "grouped_G2_negative"
+      ]
+    },
+    {
+      "id": "F03",
+      "name": "orchestration_or_lifetime",
+      "members": [
+        "graph_mutable_updates",
+        "capture_budget_fallback",
+        "stream_ownership",
+        "borrowed_arena_lifetime"
+      ]
+    },
+    {
+      "id": "F04",
+      "name": "attribution_or_provenance",
+      "members": [
+        "invalid_radix_screen_wrong_executable",
+        "offset_misaligned_counter_sample",
+        "stale_inline_host_binary",
+        "standalone_not_new_DLL"
+      ]
+    },
+    {
+      "id": "F05",
+      "name": "workload_nontransfer",
+      "members": [
+        "expert_contention",
+        "nucleus_small_sort",
+        "concurrency_or_early_exit_not_singleton_full_depth",
+        "external_eager_host_bound_baseline"
+      ]
+    },
+    {
+      "id": "F06",
+      "name": "state_rollback",
+      "members": [
+        "sliding_ring_overwrite",
+        "all_loop_and_boundary_KV",
+        "target_CODA_order",
+        "hidden_injection_RNG_control_state"
+      ]
+    }
+  ],
+  "obligation_trace": [
+    {
+      "id": "R1",
+      "source_ids": [
+        "M01",
+        "M02",
+        "M03",
+        "M05",
+        "M06",
+        "M08"
+      ],
+      "output_id": "O01",
+      "output": "LANDSCAPE.md dispatch/preservation boundary and mechanism dependencies",
+      "owner": "parent preservation"
+    },
+    {
+      "id": "R2",
+      "source_ids": [
+        "E02",
+        "E03",
+        "E04",
+        "E05",
+        "E10",
+        "E12"
+      ],
+      "output_id": "O02",
+      "output": "local observations separated from recipient priors",
+      "owner": "parent performance"
+    },
+    {
+      "id": "R3",
+      "source_ids": [
+        "E03",
+        "E19"
+      ],
+      "output_id": "O03",
+      "output": "minimal_matched_test_plan and interactions per mechanism; no run authorization",
+      "owner": "parent DoE"
+    },
+    {
+      "id": "R4",
+      "source_ids": [
+        "E01",
+        "E08",
+        "E09"
+      ],
+      "output_id": "O04",
+      "output": "qualified scope versus isolated-unbuilt distinction",
+      "owner": "parent proof"
+    },
+    {
+      "id": "R5",
+      "source_ids": [
+        "E01",
+        "E13",
+        "E14",
+        "E15",
+        "E16"
+      ],
+      "output_id": "O05",
+      "output": "pinned source/evidence index; no publication claim for this handoff",
+      "owner": "parent publication"
+    },
+    {
+      "id": "R6",
+      "source_ids": [
+        "INK2",
+        "Q36",
+        "Q38"
+      ],
+      "output_id": "O06",
+      "output": "static recipient eligibility, priors, negative flags and null prediction errors",
+      "owner": "parent deferred transfer"
+    },
+    {
+      "id": "R7",
+      "source_ids": [
+        "M12",
+        "E14",
+        "E17"
+      ],
+      "output_id": "O07",
+      "output": "representation constraints and unknown ceiling",
+      "owner": "parent representation"
+    },
+    {
+      "id": "R8",
+      "source_ids": [
+        "F01",
+        "F02",
+        "F03",
+        "F04",
+        "F05",
+        "F06",
+        "E01"
+      ],
+      "output_id": "O08",
+      "output": "failure groups/skips; streak count unknown, no all-pass claim",
+      "owner": "parent streak assurance"
+    },
+    {
+      "id": "R9",
+      "source_ids": [
+        "E01",
+        "E09",
+        "E11",
+        "M12"
+      ],
+      "output_id": "O09",
+      "output": "explicit unknowns and deferred closure",
+      "owner": "parent closure"
+    }
+  ],
+  "unknowns": [
+    "unconstrained full F32 hardware ceiling",
+    "Linux qualification",
+    "other GPUs and per-device resource thresholds",
+    "806 remaining frozen combined-suite skips",
+    "actual HTTP/OpenCode complete-agent TTFT ITL latency",
+    "integrated Q norm scale build full-model correctness throughput",
+    "separate-worktree default-packed candidate build outcome",
+    "recipient actual tensor format shape offload capability inventories",
+    "recipient exact eligible-time fractions and workload distributions",
+    "recipient measured gains and prediction errors",
+    "parent streak/closure decision",
+    "measured engineering or GPU cold-start savings"
+  ],
+  "cascade": {
+    "schema_version": 1,
+    "registry_id": "COLIBRI-CASCADE-001",
+    "integration_base": "ab98f29f8acef3a48dc37838c3d896c9acc9b908",
+    "branch": "feat/colibri-optimisation-cascade",
+    "ownership": {
+      "source_evidence": "Dory",
+      "cross_model_tests": "Cascade",
+      "shared_code_integration_owner": "parent (Dory coordinating session); Cascade submits isolated proposals",
+      "review_gate": "Colibri maintainer; no self-review or deployment claim"
+    },
+    "deduplication": "source registry ID + original mechanism ID + source Git blob; revisions append, never overwrite original",
+    "required_cue_fields": [
+      "id",
+      "version",
+      "source_commit",
+      "source_locus",
+      "model_backend_hardware",
+      "workload",
+      "bottleneck",
+      "hypothesis",
+      "baseline",
+      "measurements",
+      "uncertainty",
+      "constraints",
+      "failures",
+      "evidence_links",
+      "proposed_transfer_scope",
+      "provenance",
+      "cascade"
+    ],
+    "required_cascade_fields": [
+      "candidate_targets",
+      "predicted_effects",
+      "minimum_test",
+      "actual_results",
+      "regression",
+      "confidence",
+      "acceptance_status",
+      "pr",
+      "next_actions"
+    ],
+    "cues": [
+      {
+        "id": "DORY-M01",
+        "version": 1,
+        "original_mechanism_id": "M01",
+        "source_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+        "source_registry_id": "DORY-STATIC-TRANSFER-2026-11-28",
+        "source_locus": [
+          {
+            "path": "c/cuda_bd.cuh",
+            "symbols": [
+              "bdf_decode_packed",
+              "bd_gemv_f_packed_k",
+              "bd_gemv_f_launch"
+            ]
+          },
+          {
+            "path": "c/backend_cuda.cu",
+            "symbols": [
+              "bd_tensor_gemv"
+            ]
+          }
+        ],
+        "model_backend_hardware": {
+          "model": "Dory",
+          "backend": "CUDA",
+          "hardware": "unknown in imported record; do not infer from recipient"
+        },
+        "workload": "See immutable original local_observation and evidence scope",
+        "bottleneck": "packed Q5_K/Q6_K multirow extraction",
+        "hypothesis": {
+          "direction": "positive plausible only on reached packed-float calls; zero direct effect on excluded formats/routes",
+          "range": "unknown, including slowdown from resource/traffic interactions",
+          "interaction": "eligible time share and batch geometry dominate"
+        },
+        "baseline": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+        "measurements": {
+          "kind": "donor reported, not independently rerun",
+          "summary": "Dory G2 +31.17% short/+22.49% long; not recipient prediction"
+        },
+        "uncertainty": "unknown, including slowdown from resource/traffic interactions",
+        "constraints": [
+          "exact_float_dispatch",
+          "fmt113_or114",
+          "effective_nr_gt1",
+          "COLI_CUDA_BD_FLOAT_STATIC_not0",
+          "COLI_CUDA_BD_FLOAT_PACKED=1"
+        ],
+        "failures": [
+          "nonexact_intercept",
+          "format_miss",
+          "nr_reduced_to1",
+          "resource_pressure"
+        ],
+        "evidence_links": [
+          {
+            "id": "E01",
+            "path": "docs/experiments/dory-native/STATUS.md",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "7f51cecd0f76821d080a5d17b5be31cbe95e4ac98da5b7025b508e53a3940751",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          },
+          {
+            "id": "E02",
+            "path": "docs/experiments/dory-native/matrix-packed-g2-screen.json",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "ef0147b2f53cd8d7bba259651dfeb9e7af490a269d0bd269c81567af0733304b",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          },
+          {
+            "id": "E03",
+            "path": "docs/experiments/dory-native/matrix-packed-batch-doe.json",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "80054b77e3f42767f451d48051d1fc12495ab806776860c9522e98b46fc659db",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          },
+          {
+            "id": "E14",
+            "path": "docs/experiments/dory-native/reference-kernel-findings.md",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "a6da820399bb746198727ab29805a368066ac54b4d24c5c12fb8a9725b4da4b0",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          }
+        ],
+        "proposed_transfer_scope": "No kernel copy for existing shared calls; first resolve actual format/selector/shape eligibility.",
+        "provenance": {
+          "registry_git_blob": "a0b3798fdfe7bd9d011d3be4443b98ededc810d1",
+          "registry_sha256": "b68bc8511ddae8c730c57bb16b579fcef429616cd0e2a0e75e7b5c01bbc85529",
+          "verified": "Registry Git object read; donor source loci are references, not exhaustive independent code audit; donor performance not rerun"
+        },
+        "cascade": {
+          "owner": "Cascade",
+          "candidate_targets": [
+            "Q36",
+            "INK2",
+            "Q38"
+          ],
+          "predicted_effects": {
+            "direction": "positive plausible only on reached packed-float calls; zero direct effect on excluded formats/routes",
+            "range": "unknown, including slowdown from resource/traffic interactions",
+            "interaction": "eligible time share and batch geometry dominate"
+          },
+          "minimum_test": "Deferred only: existing primitive oracle for one actual eligible113/114 shape, tail and resource boundary, full bits/guards; if admitted and useful, same-binary separate-process off/on short/long blocks with fixed batches/checkpoint/precision and full hashes.",
+          "actual_results": null,
+          "regression": null,
+          "confidence": "source-only",
+          "acceptance_status": "deferred",
+          "pr": null,
+          "next_actions": [
+            "Resolve recipient dispatch/identity before timing"
+          ]
+        }
+      },
+      {
+        "id": "DORY-M02",
+        "version": 1,
+        "original_mechanism_id": "M02",
+        "source_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+        "source_registry_id": "DORY-STATIC-TRANSFER-2026-11-28",
+        "source_locus": [
+          {
+            "path": "c/cuda_bd.cuh",
+            "symbols": [
+              "bd_gemv_f_fixed_launch",
+              "bd_gemv_f_launch",
+              "bd_gemv_f_packed_k"
+            ]
+          }
+        ],
+        "model_backend_hardware": {
+          "model": "Dory",
+          "backend": "CUDA",
+          "hardware": "unknown in imported record; do not infer from recipient"
+        },
+        "workload": "See immutable original local_observation and evidence scope",
+        "bottleneck": "serial packed extraction",
+        "hypothesis": {
+          "direction": "positive plausible with exact same kernel family/shape; diluted or absent when expert/host work dominates",
+          "range": "unknown signed end-to-end range",
+          "interaction": "Do not multiply Dory decode gain into recurrent depth or add it to M01"
+        },
+        "baseline": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+        "measurements": {
+          "kind": "donor reported, not independently rerun",
+          "summary": "Dory G2 +26.49%/+19.12%; instructions31.1-37.0% of generic; no recipient gain"
+        },
+        "uncertainty": "unknown signed end-to-end range",
+        "constraints": [
+          "exact_float_dispatch",
+          "fmt113_or114",
+          "effective_nr1",
+          "COLI_CUDA_BD_FLOAT_PACKED_DECODE=1"
+        ],
+        "failures": [
+          "format_miss",
+          "precision_regime_change_to_force_route",
+          "MoE_bottleneck",
+          "bandwidth_floor"
+        ],
+        "evidence_links": [
+          {
+            "id": "E01",
+            "path": "docs/experiments/dory-native/STATUS.md",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "7f51cecd0f76821d080a5d17b5be31cbe95e4ac98da5b7025b508e53a3940751",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          },
+          {
+            "id": "E04",
+            "path": "docs/experiments/dory-native/matrix-serial-packed-g2-screen.json",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "7510db8962aaf9343ade60847b3eef4f47e256bbcbca2278097e01461255fa4c",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          },
+          {
+            "id": "E05",
+            "path": "docs/experiments/dory-native/matrix-serial-packed-counters.json",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "aa2c79e13fabcf03ed4ec244fc9cab533226a6299f6690c260fa425504adba70",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          }
+        ],
+        "proposed_transfer_scope": "Static inventory first; no change to recipient activation regime merely to reach candidate.",
+        "provenance": {
+          "registry_git_blob": "a0b3798fdfe7bd9d011d3be4443b98ededc810d1",
+          "registry_sha256": "b68bc8511ddae8c730c57bb16b579fcef429616cd0e2a0e75e7b5c01bbc85529",
+          "verified": "Registry Git object read; donor source loci are references, not exhaustive independent code audit; donor performance not rerun"
+        },
+        "cascade": {
+          "owner": "Cascade",
+          "candidate_targets": [
+            "Q36",
+            "INK2",
+            "Q38"
+          ],
+          "predicted_effects": {
+            "direction": "positive plausible with exact same kernel family/shape; diluted or absent when expert/host work dominates",
+            "range": "unknown signed end-to-end range",
+            "interaction": "Do not multiply Dory decode gain into recurrent depth or add it to M01"
+          },
+          "minimum_test": "Deferred: matched actual serial shape complete vectors/guards; only later short/long same-regime off/on with exact output and startup flag attribution.",
+          "actual_results": null,
+          "regression": null,
+          "confidence": "source-only",
+          "acceptance_status": "deferred",
+          "pr": null,
+          "next_actions": [
+            "Resolve recipient dispatch/identity before timing"
+          ]
+        }
+      },
+      {
+        "id": "DORY-M03",
+        "version": 1,
+        "original_mechanism_id": "M03",
+        "source_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+        "source_registry_id": "DORY-STATIC-TRANSFER-2026-11-28",
+        "source_locus": [
+          {
+            "path": "c/qwen36_sample.h",
+            "symbols": [
+              "sample_prob_sort",
+              "sample_prob_binary32",
+              "sample_prob_radix_enabled",
+              "serve_sample"
+            ]
+          },
+          {
+            "path": "c/dory_serve.h",
+            "symbols": [
+              "serve_sample"
+            ]
+          },
+          {
+            "path": "c/qwen36.c",
+            "symbols": [
+              "serve_sample"
+            ]
+          }
+        ],
+        "model_backend_hardware": {
+          "model": "Dory",
+          "backend": "CPU",
+          "hardware": "unknown in imported record; do not infer from recipient"
+        },
+        "workload": "See immutable original local_observation and evidence scope",
+        "bottleneck": "CPU stable radix probability sorting",
+        "hypothesis": {
+          "direction": "likely positive sort-path reduction for Q36 full sort; zero greedy; near-zero or negative possible for small nucleus",
+          "range": "unknown recipient end-to-end; no transferred Dory percentage",
+          "interaction": "allocator/TLS/libc/RNG and rank size; Inkling/Q38 seeded semantics block blind replacement"
+        },
+        "baseline": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+        "measurements": {
+          "kind": "donor reported, not independently rerun",
+          "summary": "Dory new-prompt full-sort +43.11%/+28.59%; nucleus+0.51%/+1.12% is small-control-drift scale"
+        },
+        "uncertainty": "unknown recipient end-to-end; no transferred Dory percentage",
+        "constraints": [
+          "DORY_CPU_SAMPLE_RADIX=1",
+          "ascending token IDs",
+          "finite nonnegative binary32 probabilities",
+          "unchanged expf FP64 CDF and libc rand"
+        ],
+        "failures": [
+          "CDF_order_change",
+          "tie_change",
+          "RNG_change",
+          "greedy",
+          "small_nucleus",
+          "wrong_executable_attribution"
+        ],
+        "evidence_links": [
+          {
+            "id": "E01",
+            "path": "docs/experiments/dory-native/STATUS.md",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "7f51cecd0f76821d080a5d17b5be31cbe95e4ac98da5b7025b508e53a3940751",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          },
+          {
+            "id": "E06",
+            "path": "docs/experiments/dory-native/sampling-radix-g2-corrected.json",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "7dc62e90bfd437bea40099aa3ed854ec6313d46102ebb04b5a2befeb056ef9de",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          }
+        ],
+        "proposed_transfer_scope": "Inkling needs original tie/RNG proof; Q38 unsorted full-distribution CDF must remain unchanged. Neither adaptation implemented.",
+        "provenance": {
+          "registry_git_blob": "a0b3798fdfe7bd9d011d3be4443b98ededc810d1",
+          "registry_sha256": "b68bc8511ddae8c730c57bb16b579fcef429616cd0e2a0e75e7b5c01bbc85529",
+          "verified": "Registry Git object read; donor source loci are references, not exhaustive independent code audit; donor performance not rerun"
+        },
+        "cascade": {
+          "owner": "Cascade",
+          "candidate_targets": [
+            "Q36",
+            "INK2",
+            "Q38"
+          ],
+          "predicted_effects": {
+            "direction": "likely positive sort-path reduction for Q36 full sort; zero greedy; near-zero or negative possible for small nucleus",
+            "range": "unknown recipient end-to-end; no transferred Dory percentage",
+            "interaction": "allocator/TLS/libc/RNG and rank size; Inkling/Q38 seeded semantics block blind replacement"
+          },
+          "minimum_test": "Deferred: synthetic actual-vocab vectors, ties/subnormals/invalid/fallbacks and exact RNG draw/state oracle; only parent-admitted matched serving for actual sample regime.",
+          "actual_results": "sample-screen.json",
+          "regression": "three sampler oracle runs; no full model regression",
+          "confidence": "bounded synthetic evidence",
+          "acceptance_status": "qualified_component_only",
+          "pr": null,
+          "next_actions": [
+            "Matched Q36 serving and peak RAM before promotion"
+          ]
+        }
+      },
+      {
+        "id": "DORY-M04",
+        "version": 1,
+        "original_mechanism_id": "M04",
+        "source_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+        "source_registry_id": "DORY-STATIC-TRANSFER-2026-11-28",
+        "source_locus": [
+          {
+            "path": "c/backend_cuda.cu",
+            "symbols": [
+              "coli_cuda_tensor_upload_at",
+              "bd_file_row_bytes"
+            ]
+          },
+          {
+            "path": "c/dory_cuda_weights.h",
+            "symbols": [
+              "dory_arena_advance",
+              "dory_device_prepare_weight_arena"
+            ]
+          },
+          {
+            "path": "c/qwen36_tier.c",
+            "symbols": [
+              "coli_cuda_tensor_upload_at"
+            ]
+          }
+        ],
+        "model_backend_hardware": {
+          "model": "Dory",
+          "backend": "CUDA",
+          "hardware": "unknown in imported record; do not infer from recipient"
+        },
+        "workload": "See immutable original local_observation and evidence scope",
+        "bottleneck": "borrowed packed tensor arenas",
+        "hypothesis": {
+          "direction": "capacity positive only where allocator charging/duplication remains; zero incremental tier saving if already arena-backed",
+          "range": "unknown bytes and cold-start latency; no universal throughput gain",
+          "interaction": "larger available KV is capacity, not permission to change matched context"
+        },
+        "baseline": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+        "measurements": {
+          "kind": "donor reported, not independently rerun",
+          "summary": "396361728 additional free VRAM bytes; throughput effectively unchanged"
+        },
+        "uncertainty": "unknown bytes and cold-start latency; no universal throughput gain",
+        "constraints": [
+          "original packed rows",
+          "metadata byte/overflow checks",
+          "256-byte slots/word-padded rows",
+          "descriptor-before-arena destruction",
+          "Dory resident fresh slots"
+        ],
+        "failures": [
+          "already_present",
+          "native_F32_unsupported_by_Dory_arena",
+          "lifetime_double_free",
+          "capacity_throughput_conflation"
+        ],
+        "evidence_links": [
+          {
+            "id": "E07",
+            "path": "docs/experiments/dory-native/packed-weight-arena-memory.json",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "e9cf37b32a01b1aff47e425792fe45ac16a4f6a6db4aaac7407b71c2b0c66217",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          },
+          {
+            "id": "E13",
+            "path": "docs/experiments/dory-native/reference-inkling-findings.md",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "9639b8be7ea1cf973073f342c5a6e514e3802e7643c27fce1352eccec7fb2e6a",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          }
+        ],
+        "proposed_transfer_scope": "Inkling has mixed F32/BF16/GGUF ownership and already migrates without duplicate dense weights; Qwen already has arena.",
+        "provenance": {
+          "registry_git_blob": "a0b3798fdfe7bd9d011d3be4443b98ededc810d1",
+          "registry_sha256": "b68bc8511ddae8c730c57bb16b579fcef429616cd0e2a0e75e7b5c01bbc85529",
+          "verified": "Registry Git object read; donor source loci are references, not exhaustive independent code audit; donor performance not rerun"
+        },
+        "cascade": {
+          "owner": "Cascade",
+          "candidate_targets": [
+            "Q36",
+            "INK2",
+            "Q38"
+          ],
+          "predicted_effects": {
+            "direction": "capacity positive only where allocator charging/duplication remains; zero incremental tier saving if already arena-backed",
+            "range": "unknown bytes and cold-start latency; no universal throughput gain",
+            "interaction": "larger available KV is capacity, not permission to change matched context"
+          },
+          "minimum_test": "Deferred: static padded-byte ledger and lifetime/failure mocks first; if admitted verify uploaded bytes, allocation accounting and same-context state/API, not a broad speed campaign.",
+          "actual_results": null,
+          "regression": null,
+          "confidence": "source-only",
+          "acceptance_status": "deferred",
+          "pr": null,
+          "next_actions": [
+            "Resolve recipient dispatch/identity before timing"
+          ]
+        }
+      },
+      {
+        "id": "DORY-M05",
+        "version": 1,
+        "original_mechanism_id": "M05",
+        "source_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+        "source_registry_id": "DORY-STATIC-TRANSFER-2026-11-28",
+        "source_locus": [
+          {
+            "path": "c/dory_cuda_kernels.cuh",
+            "symbols": [
+              "dory_cuda_norm_kernel",
+              "dory_cuda_sum",
+              "dory_cuda_inverse_norm"
+            ]
+          },
+          {
+            "path": "c/dory_cuda_attention.cuh",
+            "symbols": [
+              "dory_point_kernel"
+            ]
+          },
+          {
+            "path": "c/dory_cuda_resident.h",
+            "symbols": [
+              "dory_device_forward_rows"
+            ]
+          }
+        ],
+        "model_backend_hardware": {
+          "model": "Dory",
+          "backend": "CUDA",
+          "hardware": "unknown in imported record; do not infer from recipient"
+        },
+        "workload": "See immutable original local_observation and evidence scope",
+        "bottleneck": "Q norm then scale epilogue",
+        "hypothesis": {
+          "direction": "small positive launch/IO reduction plausible for Dory; recipient arithmetic eligibility unestablished",
+          "range": "unknown including overhead/regression; no gain percentage assigned",
+          "interaction": "kernel launch count is not chain-op count; only fixed norm/point fraction affected"
+        },
+        "baseline": "1af3c5d520790325569f32a3d5819bd95fb7194b",
+        "measurements": {
+          "kind": "donor reported, not independently rerun",
+          "summary": "280 bitwise+24 invalid primitive cases; no integration or throughput result"
+        },
+        "uncertainty": "unknown including overhead/regression; no gain percentage assigned",
+        "constraints": [
+          "unchanged256-thread FP64 sum tree",
+          "FP32 squares and distinct rounded multiplies",
+          "scale after norm",
+          "contiguous token/head/column mapping",
+          "optional ABI capability and explicit failure statuses"
+        ],
+        "failures": [
+          "generic_norm_not_Dory",
+          "stale_host_or_DLL",
+          "standalone_not_integration",
+          "unbuilt"
+        ],
+        "evidence_links": [
+          {
+            "id": "E08",
+            "path": "docs/experiments/dory-native/q-norm-scale-g1-gpu.json",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "f6abef2d4414190da8b950ae6e29eb81fd2a4a3da1924e25d1f331735364c0ab",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          },
+          {
+            "id": "E09",
+            "path": "docs/experiments/dory-native/q-norm-scale-integration-g1.md",
+            "snapshot_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+            "sha256": "936e2c7004a2843bc9446daf58b4cba230875416fa01fdaf99afa110c10fbb4d",
+            "status": "Git object exists and bytes hashed; measurement not independently reproduced"
+          }
+        ],
+        "proposed_transfer_scope": "No direct Inkling/Qwen routing; establish exact target normalization tree and post-norm scale location first.",
+        "provenance": {
+          "registry_git_blob": "a0b3798fdfe7bd9d011d3be4443b98ededc810d1",
+          "registry_sha256": "b68bc8511ddae8c730c57bb16b579fcef429616cd0e2a0e75e7b5c01bbc85529",
+          "verified": "Registry Git object read; donor source loci are references, not exhaustive independent code audit; donor performance not rerun"
+        },
+        "cascade": {
+          "owner": "Cascade",
+          "candidate_targets": [
+            "Q36",
+            "INK2",
+            "Q38"
+          ],
+          "predicted_effects": {
+            "direction": "small positive launch/IO reduction plausible for Dory; recipient arithmetic eligibility unestablished",
+            "range": "unknown including overhead/regression; no gain percentage assigned",
+            "interaction": "kernel launch count is not chain-op count; only fixed norm/point fraction affected"
+          },
+          "minimum_test": "Parent-only pending actual-DLL ABI/legacy-tail/status and280 full-buffer cases, then Dory same-build full-model off/on at both caches/depths/boundaries before timing. No recipient plan admitted.",
+          "actual_results": null,
+          "regression": null,
+          "confidence": "source-only",
+          "acceptance_status": "deferred",
+          "pr": null,
+          "next_actions": [
+            "Resolve recipient dispatch/identity before timing"
+          ]
+        }
+      }
+    ],
+    "compatibility": {
+      "Q36": {
+        "M01": "conditional_exact_float_Q5_Q6",
+        "M02": "conditional_exact_float_Q5_Q6",
+        "M03": "synthetic_qualified_not_model_qualified",
+        "M04": "already_present",
+        "M05": "arithmetic_mismatch"
+      },
+      "INK2": {
+        "M01": "conditional_dispatch",
+        "M02": "conditional_dispatch",
+        "M03": "reject_blind_transfer_RNG_ties",
+        "M04": "lifetime_audit_required",
+        "M05": "arithmetic_mismatch"
+      },
+      "Q38": {
+        "M01": "conditional_dispatch",
+        "M02": "conditional_dispatch",
+        "M03": "reject_blind_transfer_CDF_order",
+        "M04": "already_present",
+        "M05": "arithmetic_mismatch"
+      },
+      "llama.cpp": {
+        "M03": "different_sampler_RNG_contract_no_drop_in_transfer"
+      }
+    },
+    "dependency_edges": [
+      [
+        "provenance",
+        "dispatch"
+      ],
+      [
+        "dispatch",
+        "oracle"
+      ],
+      [
+        "oracle",
+        "screen"
+      ],
+      [
+        "screen",
+        "model_correctness"
+      ],
+      [
+        "model_correctness",
+        "serving"
+      ],
+      [
+        "serving",
+        "regression"
+      ],
+      [
+        "regression",
+        "review"
+      ],
+      [
+        "review",
+        "promotion"
+      ],
+      [
+        "M02",
+        "reassess_sampler_fraction"
+      ],
+      [
+        "M04",
+        "batch_capacity"
+      ],
+      [
+        "batch_capacity",
+        "cancel_memory_gates"
+      ]
+    ],
+    "ranking": [
+      {
+        "id": "DORY-M03",
+        "rank": 1,
+        "coverage": "Q36; others excluded",
+        "benefit": "conditional sort work reduction",
+        "confidence": "highest source equivalence",
+        "cost": "low CPU-only",
+        "risk": "scratch/portability; no production edit"
+      },
+      {
+        "id": "DORY-M01",
+        "rank": 2,
+        "coverage": "eligible CUDA formats",
+        "benefit": "unknown recipient",
+        "confidence": "conditional",
+        "cost": "inventory then GPU",
+        "risk": "resource/precision"
+      },
+      {
+        "id": "DORY-M02",
+        "rank": 3,
+        "coverage": "eligible CUDA serial formats",
+        "benefit": "unknown recipient",
+        "confidence": "conditional",
+        "cost": "inventory then GPU",
+        "risk": "dispatch"
+      },
+      {
+        "id": "DORY-M04",
+        "rank": 4,
+        "coverage": "Qwen already present",
+        "benefit": "no duplicate implementation",
+        "confidence": "source audit",
+        "cost": "lifetime audit",
+        "risk": "double free"
+      },
+      {
+        "id": "DORY-M05",
+        "rank": 5,
+        "coverage": "Dory arithmetic only",
+        "benefit": "unknown recipient",
+        "confidence": "low",
+        "cost": "new arithmetic proof",
+        "risk": "normalization mismatch"
+      }
+    ],
+    "feedback": [
+      {
+        "id": "CASCADE-FB-001",
+        "to": "Dory",
+        "kind": "negative_transfer",
+        "finding": "Q36-size peaked nucleus same-build median -3.60%; noisy pairs cross zero, no useful gain established",
+        "evidence": "contrasts.json",
+        "next": "Use reached rank size/sample regime, not vocabulary alone, to select follow-on"
+      },
+      {
+        "id": "CASCADE-FB-002",
+        "to": "Dory",
+        "kind": "opportunity",
+        "finding": "Q36-size sort-heavy synthetic paths improve with exact tokens/RNG; forward and serving effects unknown",
+        "evidence": "sample-screen.json",
+        "next": "One held-out matched Q36 serving test; preserve upstream dump behavior"
+      },
+      {
+        "id": "CASCADE-FB-003",
+        "to": "Dory",
+        "kind": "provenance_gap",
+        "finding": "Archived llama pin requested sampling source returned 404; independent current pin uses src/llama-sampler.cpp",
+        "evidence": "LANDSCAPE.md",
+        "next": "Repair external source locators without rewriting historical results"
+      }
+    ],
+    "coverage": {
+      "synthetic_cases": 18,
+      "oracle_runs": 3,
+      "full_model_runs": 0,
+      "production_changes": 0,
+      "overall_model_gain": null,
+      "experimental_effort_saved": null,
+      "efficiency": "Bounded one mechanism and two vocabulary sizes; avoided unsupported Inkling/Q38 sweeps, no time saving quantified"
+    },
+    "open_risks": [
+      "model prefill/decode tokens/s",
+      "HTTP end-to-end/tail latency",
+      "total model throughput",
+      "peak VRAM/RAM",
+      "load time",
+      "model quality",
+      "serving/recovery/cancellation stability",
+      "external human review pending",
+      "no cross-hardware qualification"
+    ],
+    "procedure": {
+      "reuse": "ADAPTIVE_TRANSFER_DOE; existing Dory G0-G5",
+      "governance_source_commit": "f84e14b1631d27cf5c9b20cd0fb7cdcf2fc97bbb",
+      "governance_paths": [
+        "DORY_OPTIMISATION.pdl.json",
+        "SEQUENTIAL_DOE.md",
+        "CAUSAL_MODEL.md",
+        "OPTIMIZATION_LEDGER.md",
+        "COORDINATION.md",
+        "ROADMAP.md",
+        "LANDSCAPE.md",
+        "TRANSFER_REGISTRY.json",
+        "CALR_ROUTE.md",
+        "WORKLOAD_MANIFEST.json"
+      ],
+      "gate_status": {
+        "G0": "partial: source applicability; model affected fraction unknown",
+        "G1": "bounded PASS: 1612-draw oracle in three arms; complete ranks/edge/fallback/RNG/TLS 609 checks in three selector modes",
+        "G2": "not run: no short/long model inference",
+        "G3": "not run",
+        "G4": "not run",
+        "G5": "not run"
+      },
+      "assurance_streak_credits": 0,
+      "canonical_compliance": "not claimed",
+      "NO_CHANGE": "retained production baseline; selected pending serving evidence",
+      "minimal_fix": "test-only sort substitution, preserving upstream compat/dump",
+      "alternative": "device sampling deferred: RNG/arithmetic/ABI cost exceeds this pilot",
+      "affected_fraction": null,
+      "Amdahl_bound": "1/(1-f+f/k); recipient end-to-end fraction f unknown, no numeric aggregate prediction",
+      "interaction_design": "one algorithm factor only; sample regimes/vocabulary are workload blocks, not replicates; no combined factor claim",
+      "governance_sha256": {
+        "DORY_OPTIMISATION.pdl.json": "1f4283cdcc3f32f8ea4aec1fb929336fc0e0bb712386825d0453963bdfff8acb",
+        "SEQUENTIAL_DOE.md": "417ddb4281dae677dce81d2781fe64784412bc6057d33e342af56338a6246714",
+        "CAUSAL_MODEL.md": "c63c7ec594effd0fa5bac1fe1e7b8be7b72c929cd6c67cec24d6d650af46be83",
+        "OPTIMIZATION_LEDGER.md": "2d4dbf9a0a4d9c2139dbee742cd8771a4e0797e857f29e3910e6d592c19b56bb",
+        "COORDINATION.md": "3836f383fbe420f4470b1a42a2afd3cf5f008a70913f0d1c53f8d1e24baa055a",
+        "ROADMAP.md": "c630222a45814ca11a4cdf526e1cf53b51e7b5d6e59f24f8cb027035b2ad1584",
+        "LANDSCAPE.md": "044438888fc37cd2032a6d36b76693578b8e04cf81f8d0a659722ee71cbb210b",
+        "TRANSFER_REGISTRY.json": "b68bc8511ddae8c730c57bb16b579fcef429616cd0e2a0e75e7b5c01bbc85529",
+        "CALR_ROUTE.md": "ecaa49da22abdf544c3d95e47df088956c68aab0adaa60351169a24d81a209d6",
+        "WORKLOAD_MANIFEST.json": "c22e3b2b614f536bdd55132fbc961fd4feaa641f4e5e4e56623219db9a673e6a"
+      }
+    },
+    "source_snapshot_sha256": "b68bc8511ddae8c730c57bb16b579fcef429616cd0e2a0e75e7b5c01bbc85529",
+    "source_canonical_sha256": "72ad476fc033122bdd215f00804adf936f8843a692e4b653ae3623caf7d0f21e",
+    "evidence_cost": [
+      {
+        "fresh_timed_processes": 270,
+        "timed_draws": 810,
+        "gpu_jobs": 0,
+        "timed_sampler_roi_seconds": 3.1556398999560002,
+        "total_setup_build_wall_seconds": null,
+        "failures": [
+          "Windows large-file flag missing before timing; repaired",
+          "Edge fixture invocation omitted mode; corrected; no test result from invalid invocation"
+        ],
+        "interference": "No live process monitor during timings; queue documented idle on initial inspection. End-of-test process check found no Dory/Colibri/compiler/profiler processes. This is not continuous isolation proof.",
+        "uncertainty": "Five fresh paired processes per block, raw pairs/dispersion retained; no fitted posterior or cross-model aggregate"
+      }
+    ],
+    "live_recheck": {
+      "dory_head": "6e39487b9ff9c7c5b811b4298b944c81955da520",
+      "relation": "One concurrent UI/model-switch repair after frozen donor; git diff is empty for shared sampler, transfer registry and GPU coordination",
+      "decision": "Keep original frozen evidence; do not merge concurrent Dory changes"
+    },
+    "recipient_hardware_receipt": {
+      "cpu": "AMD Ryzen Threadripper PRO 9955WX 16-Cores",
+      "cores": 16,
+      "logical_processors": 32,
+      "source": "Win32_Processor read after screen, same host; no continuous load monitor",
+      "gpu": "not used"
+    }
+  }
+}

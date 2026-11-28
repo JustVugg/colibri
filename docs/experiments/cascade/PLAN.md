@@ -3,7 +3,8 @@
 Integration base: `ab98f29f` (`upstream/dev`), independent branch
 `feat/colibri-optimisation-cascade`. No Dory commits are merged.
 
-Single shared-code integration owner: Cascade session on this branch.
+Single shared-code integration owner: parent (Dory coordinating session);
+Cascade submits isolated proposals for parent integration and maintainer review.
 Dory retains ownership of its evidence and experiments. Cascade owns only
 `docs/experiments/cascade/` and `c/tools/cascade/` in this proposal.
 No shared production edits, GPU jobs, model downloads or installed changes.
