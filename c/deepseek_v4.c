@@ -18969,6 +18969,8 @@ void coli_v4_session_destroy(ColiV4Session *session) {
     free(session);
 }
 
+static void v4_ckpt_disk_forget(void);
+
 int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
                            const ColiV4SessionCreateOptions *options,
                            char *error, size_t error_size) {
@@ -18985,6 +18987,7 @@ int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
         return -1;
     }
     session->engine = engine;
+    if (!engine->active_sessions) v4_ckpt_disk_forget();   /* a new engine: its own file identity */
     coli_v4_engine_attach_session(engine);
     session->config = *coli_v4_engine_config(engine);
     session->max_prompt_tokens =
@@ -19164,132 +19167,327 @@ static V4PrefixCkpt v4_ckpt_slots[V4_CKPT_MAX_SLOTS];
 static uint64_t v4_ckpt_clock;
 
 static int v4_ckpt_slot_count(void) {
-    static int count = -1;
-    if (count < 0) {
-        const char *setting = getenv("V4_PREFIX_CKPT_SLOTS");
-        count = setting ? atoi(setting) : 4;
-        if (count < 1) count = 1;
-        if (count > V4_CKPT_MAX_SLOTS) count = V4_CKPT_MAX_SLOTS;
-    }
+    const char *setting = getenv("V4_PREFIX_CKPT_SLOTS");
+    int count = setting ? atoi(setting) : 4;
+    if (count < 0) count = 0;
+    if (count > V4_CKPT_MAX_SLOTS) count = V4_CKPT_MAX_SLOTS;
     return count;
 }
 
-/* ---- On-disk checkpoint slots: <model>/.coli_ckpt/ckpt_<fingerprint>_<n>.bin
- * The in-memory slots die with the process; the shared system prefix would
- * then cost a full ~minutes prefill again on the first turn after every serve
- * restart. Prefix (plan/hint) captures are persisted by default; prompt-end
- * captures too with V4_PREFIX_CKPT_DISK=2 (one write per request);
- * V4_PREFIX_CKPT_DISK=0 disables. Loaded lazily on the first generate; a
- * config fingerprint (layers, window, head dims, topk) guards mismatches. */
+/* ---- On-disk checkpoints: <model>/.coli_ckpt/ck2_<identity>_<ids hash>.bin ----
+ * The in-memory slots die with the process, and V4_PREFIX_CKPT_SLOTS=0 may give
+ * them all up: the shared system prefix (and, with V4_PREFIX_CKPT_DISK=2, each
+ * turn's prompt end) would then cost a full ~minutes prefill again after every
+ * restart. A file is named by what it holds, so it outlives the slot it came
+ * from: the identity (format, config fingerprint, execution tier, the model's
+ * shards by name and size, this build) and a hash of the prefix ids. A restore
+ * takes the longest stored prefix, RAM slot or file.
+ *   V4_PREFIX_CKPT_DISK     0 off, 1 (default) prefix captures, 2 prompt ends too
+ *   V4_PREFIX_CKPT_DISK_MB  directory cap (default 4096): least recently used go
+ *   V4_PREFIX_CKPT_DIR      the directory (default <model>/.coli_ckpt)
+ * Written as temp + rename with a SHA-256 trailer; a file that fails it is
+ * deleted, never restored. Layers stream through a transient snapshot, so the
+ * disk tier costs one layer's state in RAM, not a slot's. The trim and the
+ * old-format sweep touch only names the engine writes (V4_PREFIX_CKPT_DIR may
+ * point at a shared folder). */
+#include <sys/stat.h>
+#include <utime.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <process.h>
 #define v4_ckpt_mkdir(p) _mkdir(p)
+#define v4_ckpt_pid() _getpid()
+#define v4_ckpt_seek(f, offset, whence) _fseeki64((f), (offset), (whence))
+#define v4_ckpt_tell(f) ((int64_t)_ftelli64(f))
 #else
-#include <sys/stat.h>
+#include <unistd.h>
+#define v4_ckpt_pid() getpid()
 #define v4_ckpt_mkdir(p) mkdir((p), 0755)
+#define v4_ckpt_seek(f, offset, whence) fseeko((f), (off_t)(offset), (whence))
+#define v4_ckpt_tell(f) ((int64_t)ftello(f))
 #endif
 #include "own_file.h"      /* the checkpoints sit in a downloaded model dir */
+#include "evidence_digest.h"   /* SHA-256: the files' trailer */
+
+#define V4_CKPT_MAGIC "COLIV4C2"
+#define V4_CKPT_FNV0 0xcbf29ce484222325ull
+enum { V4_CKPT_VERSION = 2, V4_CKPT_IDS_AT = 32 };   /* magic, identity, head[4], then ids */
 static void v4_ckpt_slot_free(V4PrefixCkpt *slot);
-static char v4_ckpt_dir[1024];
-static uint32_t v4_ckpt_fingerprint;
-static int v4_ckpt_disk_mode = -1;
-static int v4_ckpt_disk_loaded;
+static char v4_ckpt_dir[1024];   /* "" not looked up yet, "-" none */
+static uint64_t v4_ckpt_identity;
 
 static int v4_ckpt_disk_wanted(void) {
-    if (v4_ckpt_disk_mode < 0) {
-        const char *setting = getenv("V4_PREFIX_CKPT_DISK");
-        v4_ckpt_disk_mode = setting ? atoi(setting) : 1;
-    }
-    return v4_ckpt_disk_mode;
+    const char *setting = getenv("V4_PREFIX_CKPT_DISK");
+    return setting ? atoi(setting) : 1;
 }
 
-static void v4_ckpt_disk_init(ColiV4Session *session) {
-    if (v4_ckpt_dir[0] || !session || !session->engine) return;
-    const char *model = coli_v4_engine_target_model_dir(session->engine);
-    if (!model || !*model) { v4_ckpt_dir[0] = '-'; return; }
-    snprintf(v4_ckpt_dir, sizeof(v4_ckpt_dir), "%s/.coli_ckpt", model);
-    /* The engine makes this directory itself; one that is a link came with the
-     * model, and the checkpoints would land wherever it points. */
-    if (coli_own_is_link(v4_ckpt_dir)) {
-        fprintf(stderr, "v4_ckpt: %s is a link, not the engine's directory: "
-                        "checkpoints stay in memory\n", v4_ckpt_dir);
-        v4_ckpt_dir[0] = '-'; return;
-    }
-    const ColiDeepSeekV4Config *c = &session->config;
-    uint32_t h = 2166136261u;
-    int fields[] = {c->num_hidden_layers, c->hidden_size, c->head_dim,
-                    c->index_head_dim, c->index_topk, c->index_n_heads,
-                    c->hc_mult};
-    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
-        h ^= (uint32_t)fields[i]; h *= 16777619u;
-    }
-    v4_ckpt_fingerprint = h;
+static uint64_t v4_ckpt_fnv(uint64_t h, const void *data, size_t size) {
+    const unsigned char *p = data;
+    while (size--) h = (h ^ *p++) * 0x100000001b3ull;
+    return h;
 }
 
-static void v4_ckpt_disk_path(char *out, size_t size, int index) {
-    snprintf(out, size, "%s/ckpt_%08x_%d.bin", v4_ckpt_dir, v4_ckpt_fingerprint, index);
+/* The directory and the identity, worked out once per engine; 0 when there is no directory. */
+static int v4_ckpt_disk_on(ColiV4Session *session) {
+    if (!v4_ckpt_dir[0] && session && session->engine) {
+        ColiV4Engine *engine = session->engine;
+        const char *model = coli_v4_engine_target_model_dir(engine);
+        const char *dir = getenv("V4_PREFIX_CKPT_DIR");
+        if (dir && *dir) snprintf(v4_ckpt_dir, sizeof(v4_ckpt_dir), "%s", dir);
+        else if (model && *model) snprintf(v4_ckpt_dir, sizeof(v4_ckpt_dir), "%s/.coli_ckpt", model);
+        else v4_ckpt_dir[0] = '-';
+        /* The engine makes this directory itself; one that is a link came with the
+         * model, and the checkpoints would land wherever it points. */
+        if (v4_ckpt_dir[0] != '-' && coli_own_is_link(v4_ckpt_dir)) {
+            fprintf(stderr, "v4_ckpt: %s is a link, not the engine's directory: "
+                            "checkpoints stay in memory\n", v4_ckpt_dir);
+            v4_ckpt_dir[0] = '-';
+        }
+        const ColiDeepSeekV4Config *c = &session->config;
+        uint32_t fingerprint = 2166136261u;
+        int fields[] = {c->num_hidden_layers, c->hidden_size, c->head_dim,
+                        c->index_head_dim, c->index_topk, c->index_n_heads,
+                        c->hc_mult};
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+            fingerprint ^= (uint32_t)fields[i];
+            fingerprint *= 16777619u;
+        }
+        uint64_t h = v4_ckpt_fnv(V4_CKPT_FNV0, V4_CKPT_MAGIC, 8);
+        h = v4_ckpt_fnv(h, &fingerprint, sizeof(fingerprint));
+        /* the tier: a CUDA or Vulkan prefill's bits are not the CPU's */
+        const char *vk = getenv("COLI_VULKAN");
+        int32_t tiers[2] = {engine->gpu.enabled, vk && atoi(vk) != 0};
+        h = v4_ckpt_fnv(h, tiers, sizeof(tiers));
+        /* the model: its shards by name and size, in any order (mirrors move them) */
+        const ColiSafetensorsIndex *index = coli_v4_engine_target_index(engine);
+        uint64_t shards = 0;
+        for (int i = 0; index && i < index->nfd; i++) {
+            const char *name = index->paths[i], *slash;
+            if ((slash = strrchr(name, '/'))) name = slash + 1;
+            if ((slash = strrchr(name, '\\'))) name = slash + 1;
+            shards += v4_ckpt_fnv(v4_ckpt_fnv(V4_CKPT_FNV0, name, strlen(name)),
+                                  &index->sizes[i], sizeof(index->sizes[i]));
+        }
+        h = v4_ckpt_fnv(h, &shards, sizeof(shards));
+        /* this build: a kernel change can change a state's bits */
+        h = v4_ckpt_fnv(h, __DATE__ " " __TIME__, sizeof(__DATE__ " " __TIME__));
+        v4_ckpt_identity = h;
+    }
+    return v4_ckpt_dir[0] && v4_ckpt_dir[0] != '-';
 }
 
-/* Write slot i to disk (its file index = slot index; overwrite in place via
- * temp + rename so a crash never leaves a torn file). */
-static void v4_ckpt_disk_write(int i) {
-    if (v4_ckpt_dir[0] == '-' || !v4_ckpt_dir[0]) return;
-    V4PrefixCkpt *slot = &v4_ckpt_slots[i];
-    if (!slot->ids) return;
+/* The next v4_ckpt_disk_on works the directory and the identity out again. */
+static void v4_ckpt_disk_forget(void) { v4_ckpt_dir[0] = 0; }
+
+static void v4_ckpt_disk_path(char *out, size_t size, const int *ids, int len) {
+    snprintf(out, size, "%s/ck2_%016llx_%016llx.bin", v4_ckpt_dir,
+             (unsigned long long)v4_ckpt_identity,
+             (unsigned long long)v4_ckpt_fnv(V4_CKPT_FNV0, ids, (size_t)len * sizeof(int)));
+}
+
+/* SHA-256 of the file's first `bytes`; leaves the stream there. */
+static int v4_ckpt_sha(FILE *f, int64_t bytes, unsigned char digest[32]) {
+    enum { CHUNK = 1 << 20 };
+    unsigned char *buffer = malloc(CHUNK);
+    EvidenceSha256 sha;
+    evidence_sha256_init(&sha);
+    int ok = buffer && !v4_ckpt_seek(f, 0, SEEK_SET);
+    while (ok && bytes > 0) {
+        size_t n = bytes < CHUNK ? (size_t)bytes : (size_t)CHUNK;
+        ok = fread(buffer, 1, n, f) == n;
+        if (ok) evidence_sha256_update(&sha, buffer, n);
+        bytes -= (int64_t)n;
+    }
+    free(buffer);
+    if (ok) evidence_sha256_final(&sha, digest);
+    return ok ? 0 : -1;
+}
+
+typedef struct { char name[64]; int64_t bytes; time_t used; } V4CkptFile;
+static int v4_ckpt_older(const void *a, const void *b) {
+    time_t x = ((const V4CkptFile *)a)->used, y = ((const V4CkptFile *)b)->used;
+    return (x > y) - (x < y);
+}
+
+/* A name the engine writes: 1 ck2_<16 hex>_<16 hex>.bin or its temp (.<pid>.tmp),
+ * 2 the slot-indexed ckpt_<8 hex>_<slot>.bin before ck2, 0 anything else. */
+static int v4_ckpt_engine_name(const char *name) {
+    static const char hex[] = "0123456789abcdef", digits[] = "0123456789";
+    size_t n = strlen(name);
+    if (!strncmp(name, "ckpt_", 5))
+        return n > 18 && strspn(name + 5, hex) == 8 && name[13] == '_' &&
+               strspn(name + 14, digits) == n - 18 && !strcmp(name + n - 4, ".bin") ? 2 : 0;
+    if (n < 41 || strncmp(name, "ck2_", 4) || strspn(name + 4, hex) != 16 || name[20] != '_' ||
+        strspn(name + 21, hex) != 16 || strncmp(name + 37, ".bin", 4)) return 0;
+    return n == 41 || (n > 46 && name[41] == '.' && strspn(name + 42, digits) == n - 46 &&
+                       !strcmp(name + n - 4, ".tmp"));
+}
+
+/* Hold the directory under V4_PREFIX_CKPT_DISK_MB: the least recently used files
+ * (mtime: written or restored) go first; `keep`, the file just written, stays. */
+static void v4_ckpt_disk_trim(const char *keep) {
+    const char *setting = getenv("V4_PREFIX_CKPT_DISK_MB");
+    double cap = (setting && *setting ? atof(setting) : 4096.0) * 1048576.0, total = 0;
+    DIR *dir = opendir(v4_ckpt_dir);
+    if (!dir) return;
+    V4CkptFile *files = NULL;
+    int count = 0, room = 0;
+    char path[1200];
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        struct stat st;
+        int ours = v4_ckpt_engine_name(entry->d_name);
+        if (!ours || strlen(entry->d_name) >= sizeof(files->name)) continue;
+        snprintf(path, sizeof(path), "%s/%s", v4_ckpt_dir, entry->d_name);
+        if (stat(path, &st) || !S_ISREG(st.st_mode)) continue;
+        if (ours == 2) {   /* the slot-indexed format before ck2: this build cannot read it */
+            remove(path);
+            continue;
+        }
+        total += (double)st.st_size;
+        if (!strcmp(path, keep)) continue;
+        if (count == room) {
+            V4CkptFile *grown = realloc(files, (size_t)(room ? 2 * room : 64) * sizeof(*files));
+            if (!grown) break;
+            files = grown;
+            room = room ? 2 * room : 64;
+        }
+        snprintf(files[count].name, sizeof(files->name), "%s", entry->d_name);
+        files[count].bytes = (int64_t)st.st_size;
+        files[count++].used = st.st_mtime;
+    }
+    closedir(dir);
+    if (count) qsort(files, (size_t)count, sizeof(*files), v4_ckpt_older);
+    for (int i = 0; i < count && total > cap; i++) {
+        snprintf(path, sizeof(path), "%s/%s", v4_ckpt_dir, files[i].name);
+        if (remove(path)) continue;
+        total -= (double)files[i].bytes;
+        fprintf(stderr, "v4_ckpt disk evict %s\n", files[i].name);
+    }
+    free(files);
+}
+
+/* The session's state at `len` (its prompt's first ids) to disk: the slot's
+ * snapshots when the RAM tier took them, else one transient layer at a time. */
+static void v4_ckpt_disk_write(ColiV4Session *session, int len, int kind,
+                               ColiV4AttentionSnapshot *const *snapshots) {
+    if (!v4_ckpt_disk_on(session)) return;
     char path[1200], tmp[1240];
-    v4_ckpt_disk_path(path, sizeof(path), i);
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE *f = coli_own_fopen(tmp, "wb");
+    v4_ckpt_disk_path(path, sizeof(path), session->prompt_ids, len);
+    if (!utime(path, NULL)) return;   /* stored already (same ids, same state): it only gets younger */
+    /* its own temp: two engines writing one prefix at once never mix bytes */
+    snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)v4_ckpt_pid());
+    FILE *f = coli_own_fopen(tmp, "w+b");
     if (!f) {
         v4_ckpt_mkdir(v4_ckpt_dir);
-        f = coli_own_fopen(tmp, "wb");
-        if (!f) return;
+        if (!(f = coli_own_fopen(tmp, "w+b"))) return;
     }
-    static const char magic[9] = "COLIV4CK";
-    int32_t head[4] = {1, slot->kind, slot->len, slot->layers};
-    int ok = fwrite(magic, 8, 1, f) == 1 &&
-             fwrite(&v4_ckpt_fingerprint, sizeof(v4_ckpt_fingerprint), 1, f) == 1 &&
+    int layers = session->config.num_hidden_layers;
+    int32_t head[4] = {V4_CKPT_VERSION, kind, len, layers};
+    int ok = fwrite(V4_CKPT_MAGIC, 8, 1, f) == 1 &&
+             fwrite(&v4_ckpt_identity, sizeof(v4_ckpt_identity), 1, f) == 1 &&
              fwrite(head, sizeof(head), 1, f) == 1 &&
-             fwrite(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len;
-    for (int layer = 0; ok && layer < slot->layers; layer++)
-        ok = coli_v4_attention_snapshot_write(slot->snapshots[layer], f) == 0;
-    ok = ok && fclose(f) == 0;
-    if (!ok) { fclose(f); remove(tmp); return; }
-    remove(path);
-    if (rename(tmp, path)) { remove(tmp); return; }
-    fprintf(stderr, "v4_ckpt disk write %s=%d\n", slot->kind ? "prompt_end" : "prefix", slot->len);
+             fwrite(session->prompt_ids, sizeof(int), (size_t)len, f) == (size_t)len;
+    for (int layer = 0; ok && layer < layers; layer++) {
+        ColiV4AttentionSnapshot *own = NULL;
+        const ColiV4AttentionSnapshot *snapshot = snapshots ? snapshots[layer] : NULL;
+        if (!snapshot)
+            ok = !coli_v4_attention_snapshot_create(session->attention[layer], &own);
+        ok = ok && !coli_v4_attention_snapshot_write(snapshot ? snapshot : own, f);
+        coli_v4_attention_snapshot_destroy(own);
+    }
+    unsigned char digest[32];
+    int64_t payload = ok ? v4_ckpt_tell(f) : -1;
+    ok = ok && payload > 0 && !fflush(f) && !v4_ckpt_sha(f, payload, digest) &&
+         !v4_ckpt_seek(f, payload, SEEK_SET) && fwrite(digest, sizeof(digest), 1, f) == 1;
+    ok = !fclose(f) && ok;
+    if (ok) remove(path);   /* Windows' rename does not replace */
+    if (!ok || rename(tmp, path)) {
+        remove(tmp);
+        return;
+    }
+    fprintf(stderr, "v4_ckpt disk write %s=%d\n", kind ? "prompt_end" : "prefix", len);
+    v4_ckpt_disk_trim(path);
 }
 
-/* Load every readable file into empty slots (once per process). */
-static void v4_ckpt_disk_load(void) {
-    if (v4_ckpt_disk_loaded || v4_ckpt_dir[0] == '-' || !v4_ckpt_dir[0]) return;
-    v4_ckpt_disk_loaded = 1;
-    for (int i = 0; i < v4_ckpt_slot_count(); i++) {
-        if (v4_ckpt_slots[i].ids) continue;
-        char path[1200];
-        v4_ckpt_disk_path(path, sizeof(path), i);
+/* The longest file prefix of the prompt with floor < length < ceiling under this
+ * identity: its length (its path in `out`), or 0. Reads only the heads and ids. */
+static int v4_ckpt_disk_find(const ColiV4Session *session, int floor, int ceiling,
+                             char *out, size_t size) {
+    char want[32];
+    int want_length = snprintf(want, sizeof(want), "ck2_%016llx_",
+                               (unsigned long long)v4_ckpt_identity);
+    DIR *dir = opendir(v4_ckpt_dir);
+    if (!dir) return 0;
+    int best = 0, *ids = NULL;
+    char path[1200];
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        size_t n = strlen(entry->d_name);
+        if (strncmp(entry->d_name, want, (size_t)want_length) || n < 4 ||
+            strcmp(entry->d_name + n - 4, ".bin")) continue;
+        snprintf(path, sizeof(path), "%s/%s", v4_ckpt_dir, entry->d_name);
         FILE *f = coli_own_fopen(path, "rb");
         if (!f) continue;
-        char magic[8]; uint32_t fp = 0; int32_t head[4];
-        V4PrefixCkpt *slot = &v4_ckpt_slots[i];
-        int ok = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "COLIV4CK", 8) &&
-                 fread(&fp, sizeof(fp), 1, f) == 1 && fp == v4_ckpt_fingerprint &&
-                 fread(head, sizeof(head), 1, f) == 1 && head[0] == 1 &&
-                 head[2] > 0 && head[2] < (1 << 22) && head[3] > 0 && head[3] <= 256;
-        if (ok) {
-            slot->kind = head[1]; slot->len = head[2]; slot->layers = head[3];
-            slot->ids = malloc((size_t)slot->len * sizeof(int));
-            slot->snapshots = calloc((size_t)slot->layers, sizeof(*slot->snapshots));
-            ok = slot->ids && slot->snapshots &&
-                 fread(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len;
-            for (int layer = 0; ok && layer < slot->layers; layer++)
-                ok = coli_v4_attention_snapshot_read(f, &slot->snapshots[layer]) == 0;
-        }
+        char magic[8];
+        uint64_t identity = 0;
+        int32_t head[4] = {0};
+        int ok = fread(magic, 8, 1, f) == 1 && !memcmp(magic, V4_CKPT_MAGIC, 8) &&
+                 fread(&identity, sizeof(identity), 1, f) == 1 &&
+                 identity == v4_ckpt_identity && fread(head, sizeof(head), 1, f) == 1 &&
+                 head[0] == V4_CKPT_VERSION && head[2] > floor && head[2] > best &&
+                 head[2] < ceiling && head[3] == session->config.num_hidden_layers;
+        int *grown = ok ? realloc(ids, (size_t)head[2] * sizeof(int)) : NULL;
+        if (grown) ids = grown;
+        ok = grown && fread(ids, sizeof(int), (size_t)head[2], f) == (size_t)head[2] &&
+             !memcmp(ids, session->prompt_ids, (size_t)head[2] * sizeof(int));
         fclose(f);
-        if (!ok) { v4_ckpt_slot_free(slot); remove(path); continue; }
-        slot->used = ++v4_ckpt_clock;
-        fprintf(stderr, "v4_ckpt disk load %s=%d\n", slot->kind ? "prompt_end" : "prefix", slot->len);
+        if (ok) {
+            best = head[2];
+            snprintf(out, size, "%s", path);
+        }
     }
+    closedir(dir);
+    free(ids);
+    return best;
+}
+
+/* The file at `path` (a prefix of `len` ids) checked against its SHA-256 trailer,
+ * then restored layer by layer into the session: 0 done; 1 refused (deleted, the
+ * session untouched); -1 failed part way (the file checked out, so the session's
+ * side failed, e.g. out of memory: the file stays; the caller overwrites or
+ * resets the session). */
+static int v4_ckpt_disk_restore(ColiV4Session *session, const char *path, int len) {
+    FILE *f = coli_own_fopen(path, "rb");
+    if (!f) return 1;
+    unsigned char digest[32], stored[32];
+    int32_t head[4] = {0};
+    int64_t payload = v4_ckpt_seek(f, 0, SEEK_END) ? -1 : v4_ckpt_tell(f) - 32;
+    int ok = payload > V4_CKPT_IDS_AT && !v4_ckpt_sha(f, payload, digest) &&
+             fread(stored, sizeof(stored), 1, f) == 1 && !memcmp(digest, stored, sizeof(stored)) &&
+             !v4_ckpt_seek(f, 16, SEEK_SET) && fread(head, sizeof(head), 1, f) == 1 &&
+             head[2] == len &&
+             !v4_ckpt_seek(f, V4_CKPT_IDS_AT + (int64_t)len * (int64_t)sizeof(int), SEEK_SET);
+    int restored = ok;
+    for (int layer = 0; restored && layer < session->config.num_hidden_layers; layer++) {
+        ColiV4AttentionSnapshot *snapshot = NULL;
+        restored = !coli_v4_attention_snapshot_read(f, &snapshot) &&
+                   !coli_v4_attention_snapshot_restore(session->attention[layer], snapshot);
+        coli_v4_attention_snapshot_destroy(snapshot);
+    }
+    fclose(f);
+    if (!ok) {
+        remove(path);
+        fprintf(stderr, "v4_ckpt disk drop %s: corrupt\n", path);
+        return 1;
+    }
+    if (!restored) {
+        fprintf(stderr, "v4_ckpt disk load failed %s: the file is kept\n", path);
+        return -1;
+    }
+    utime(path, NULL);   /* the age the trim goes by */
+    fprintf(stderr, "v4_ckpt disk load %s=%d\n", head[1] ? "prompt_end" : "prefix", len);
+    return 0;
 }
 
 static int v4_ckpt_have(const int *ids, int len) {
@@ -19304,6 +19502,7 @@ static int v4_ckpt_prev_len;
 
 static int v4_ckpt_min_tokens(void) {
     static int minimum = -1;
+    if (!v4_ckpt_slot_count() && !v4_ckpt_disk_wanted()) return 0;
     if (minimum < 0) {
         const char *setting = getenv("V4_PREFIX_CKPT");
         if (setting && atoi(setting) == 0) { minimum = 0; return 0; }
@@ -19324,10 +19523,10 @@ static void v4_ckpt_slot_free(V4PrefixCkpt *slot) {
     memset(slot, 0, sizeof(*slot));
 }
 
-/* Longest stored prefix of these ids restored into the session; 0 = none. */
+/* Longest stored prefix of these ids (RAM slots, then the files) restored into
+ * the session; 0 = none. */
 static int v4_ckpt_restore(ColiV4Session *session, int prompt_count) {
     if (!v4_ckpt_min_tokens()) return 0;
-    if (v4_ckpt_disk_wanted()) { v4_ckpt_disk_init(session); v4_ckpt_disk_load(); }
     int layers = session->config.num_hidden_layers;
     int best = -1, best_len = 0;
     for (int i = 0; i < v4_ckpt_slot_count(); i++) {
@@ -19338,7 +19537,11 @@ static int v4_ckpt_restore(ColiV4Session *session, int prompt_count) {
                    (size_t)slot->len * sizeof(int))) continue;
         best = i; best_len = slot->len;
     }
-    if (best < 0) return 0;
+    char path[1200];
+    int disk_len = v4_ckpt_disk_wanted() && v4_ckpt_disk_on(session)
+                   ? v4_ckpt_disk_find(session, best_len, prompt_count, path, sizeof(path))
+                   : 0;
+    if (best < 0 && !disk_len) return 0;
 #ifdef COLI_V4_GPU_TIER
     coli_v4_gpu_kv_cache_invalidate_all();
 #endif
@@ -19359,20 +19562,31 @@ static int v4_ckpt_restore(ColiV4Session *session, int prompt_count) {
             if (rc) return 0;
         }
     }
-    for (int layer = 0; layer < layers; layer++)
-        if (coli_v4_attention_snapshot_restore(
-                session->attention[layer], v4_ckpt_slots[best].snapshots[layer])) {
-            fprintf(stderr, "v4_ckpt restore failed layer=%d\n", layer);
-            return 0;   /* partial restore is harmless: caller full-resets */
-        }
+    while (disk_len) {   /* a refused file is gone: the next longest, down to the slot's */
+        int rc = v4_ckpt_disk_restore(session, path, disk_len);
+        if (rc < 0) disk_len = 0;   /* part way: the slot's restore below writes every layer */
+        if (rc <= 0) break;
+        disk_len = v4_ckpt_disk_find(session, best_len, disk_len, path, sizeof(path));
+    }
+    int reused = disk_len;
+    if (!reused) {
+        if (best < 0) return 0;
+        for (int layer = 0; layer < layers; layer++)
+            if (coli_v4_attention_snapshot_restore(
+                    session->attention[layer], v4_ckpt_slots[best].snapshots[layer])) {
+                fprintf(stderr, "v4_ckpt restore failed layer=%d\n", layer);
+                return 0;   /* partial restore is harmless: caller full-resets */
+            }
+        v4_ckpt_slots[best].used = ++v4_ckpt_clock;
+        reused = best_len;
+    }
 #ifdef COLI_VULKAN
     v4c_reset();   /* a snapshot from another history: the chain's copies go */
 #endif
     kv_prefix_clear(&session->fed);
-    kv_prefix_record(&session->fed, v4_ckpt_slots[best].ids, 0, best_len);
-    v4_ckpt_slots[best].used = ++v4_ckpt_clock;
-    fprintf(stderr, "v4_ckpt hit prefix=%d\n", best_len);
-    return best_len;
+    kv_prefix_record(&session->fed, session->prompt_ids, 0, reused);
+    fprintf(stderr, "v4_ckpt hit prefix=%d\n", reused);
+    return reused;
 }
 
 /* Absolute position to snapshot at during this fresh prefill, or 0. */
@@ -19406,48 +19620,43 @@ static int v4_ckpt_plan(const int *ids, int count) {
 static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
     int layers = session->config.num_hidden_layers;
     int slots = v4_ckpt_slot_count();
-    /* Victim: an empty slot, else the LRU prompt-end slot, else the LRU
-     * slot overall (plan captures are the last to go). */
-    int victim = -1;
-    for (int i = 0; i < slots && victim < 0; i++)
-        if (!v4_ckpt_slots[i].ids) victim = i;
-    for (int pass = 1; victim < 0 && pass >= 0; pass--)
-        for (int i = 0; i < slots; i++)
-            if (v4_ckpt_slots[i].kind >= pass &&
-                (victim < 0 ||
-                 v4_ckpt_slots[i].used < v4_ckpt_slots[victim].used))
-                victim = i;
-    V4PrefixCkpt *slot = &v4_ckpt_slots[victim];
-    v4_ckpt_slot_free(slot);
-    slot->ids = malloc((size_t)len * sizeof(int));
-    slot->snapshots = calloc((size_t)layers, sizeof(*slot->snapshots));
-    if (!slot->ids || !slot->snapshots) { v4_ckpt_slot_free(slot); return; }
-    for (int layer = 0; layer < layers; layer++)
-        if (coli_v4_attention_snapshot_create(session->attention[layer],
-                                              &slot->snapshots[layer])) {
+    V4PrefixCkpt *slot = NULL;
+    if (slots > 0) {   /* 0: no RAM slots, only the disk keeps it */
+        /* Victim: an empty slot, else the LRU prompt-end slot, else the LRU
+         * slot overall (plan captures are the last to go). */
+        int victim = -1;
+        for (int i = 0; i < slots && victim < 0; i++)
+            if (!v4_ckpt_slots[i].ids) victim = i;
+        for (int pass = 1; victim < 0 && pass >= 0; pass--)
+            for (int i = 0; i < slots; i++)
+                if (v4_ckpt_slots[i].kind >= pass &&
+                    (victim < 0 ||
+                     v4_ckpt_slots[i].used < v4_ckpt_slots[victim].used))
+                    victim = i;
+        slot = &v4_ckpt_slots[victim];
+        v4_ckpt_slot_free(slot);
+        slot->ids = malloc((size_t)len * sizeof(int));
+        slot->snapshots = calloc((size_t)layers, sizeof(*slot->snapshots));
+        slot->layers = layers;   /* before the snapshots: a failure frees the ones made */
+        int ok = slot->ids && slot->snapshots;
+        for (int layer = 0; ok && layer < layers; layer++)
+            ok = !coli_v4_attention_snapshot_create(session->attention[layer],
+                                                    &slot->snapshots[layer]);
+        if (ok) {
+            memcpy(slot->ids, session->prompt_ids, (size_t)len * sizeof(int));
+            slot->len = len;
+            slot->used = ++v4_ckpt_clock;
+            slot->kind = kind;
+            fprintf(stderr, "v4_ckpt store %s=%d\n",
+                    kind ? "prompt_end" : "prefix", len);
+        } else {
             v4_ckpt_slot_free(slot);
-            return;
-        }
-    memcpy(slot->ids, session->prompt_ids, (size_t)len * sizeof(int));
-    slot->len = len;
-    slot->layers = layers;
-    slot->used = ++v4_ckpt_clock;
-    slot->kind = kind;
-    fprintf(stderr, "v4_ckpt store %s=%d\n",
-            kind ? "prompt_end" : "prefix", len);
-    int disk = v4_ckpt_disk_wanted();
-    if (disk && (kind == 0 || disk >= 2)) {
-        v4_ckpt_disk_init(session);
-        v4_ckpt_disk_write(victim);
-    } else if (disk) {
-        /* This slot's file (if any) now describes a different capture. */
-        char path[1200];
-        v4_ckpt_disk_init(session);
-        if (v4_ckpt_dir[0] && v4_ckpt_dir[0] != '-') {
-            v4_ckpt_disk_path(path, sizeof(path), victim);
-            remove(path);
+            slot = NULL;
         }
     }
+    int disk = v4_ckpt_disk_wanted();
+    if (disk && (kind == 0 || disk >= 2))
+        v4_ckpt_disk_write(session, len, kind, slot ? slot->snapshots : NULL);
 }
 
 /* A short request between two turns of the session's conversation (park.h's conditions):

@@ -944,11 +944,12 @@ record is in `docs/experiments/v4-route-forced-only-2026-11-18/`.
   reuse fails at the reply boundary. `V4_PREFIX_CKPT_SLOTS` (4) in-memory
   slots, LRU with prompt-end evicted first. Log lines: `v4_ckpt store
   prefix=N` / `prompt_end=N`, `v4_ckpt hit prefix=N`.
-- **Persistence.** Prefix captures are written to `<model>/.coli_ckpt/`
-  (`V4_PREFIX_CKPT_DISK`=1; `2` also persists prompt-end captures, `0` off;
-  ~140 MB for an 8.3k-token prefix, config-fingerprinted, temp+rename) and
-  loaded lazily on the first request after a restart — a fresh serve no
-  longer re-prefills the system prompt.
+- **Persistence.** Prefix captures are written as content-keyed files
+  `ck2_<identity>_<ids>.bin` in `V4_PREFIX_CKPT_DIR` (default
+  `<model>/.coli_ckpt/`; `V4_PREFIX_CKPT_DISK`=1 for prefix captures, `2` also
+  persists prompt-end captures, `0` off; `V4_PREFIX_CKPT_DISK_MB`=4096 LRU cap;
+  temp+rename with a SHA-256 trailer). Files outlive evicted RAM slots and
+  process restarts, and work even with `V4_PREFIX_CKPT_SLOTS=0`.
 
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
@@ -1201,7 +1202,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 |---|---|
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
-| `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |
+| `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) / `V4_PREFIX_CKPT_DIR` / `V4_PREFIX_CKPT_DISK_MB` (4096) | prefix checkpoints, see above |
 | `V4_PREFIX_LOG` | log hint boundary / reuse decisions |
 | `V4_IDX_BATCH` (1) | batched indexer selection in prefill; `0` = legacy per-token |
 | `V4_IDX_IDENTITY` (0) | `1` = skip indexer scoring when every candidate fits under `index_topk` (index order instead of upstream's score order; ~8 % faster prefill, changes rounding) |
