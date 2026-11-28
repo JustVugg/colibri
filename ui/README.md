@@ -35,9 +35,13 @@ passes on). That gives anyone who can reach the port those routes, with no key.
   choice kept), Markdown, copy, regenerate and continue, conversations kept in the browser.
   A turn stopped while it was still reasoning continues inside its open block (Qwen3.6 and
   Qwen3.8). HTML code blocks open as a page in the right panel.
-- **Pictures**: "attach an image" appears only when the model card lists image input, which
-  the gateway does only when the engine loaded its vision tower; pictures are resized to
-  1280 px in the browser.
+- **Pictures**: in vision chat, the browser limits the longest side of each image to
+  1280 px. To edit a picture, choose a model with `image_editing`, attach one PNG, JPEG
+  or WebP, and describe the change. Regenerate sends the same original file again.
+  A text prompt alone generates a new image.
+  The gateway accepts up to 4 MiB per request by default, including base64 encoding
+  (`COLI_MAX_BODY`). Large references can fill the browser's conversation storage.
+  If a conversation no longer fits, reloading restores only the last version that fit.
 - **Documents**: "attach a document" (or a file dropped on the chat) reads a PDF, a Word
   (`.docx`), OpenDocument (`.odt`) or PowerPoint (`.pptx`) file, a web page or any text file
   (`docs.py`, `POST /doc/extract`, this page only) and puts its text in the message, with the
