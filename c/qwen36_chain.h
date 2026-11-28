@@ -1936,10 +1936,11 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 /* LFM3: the MLP's output normalised (post_ffn_norm) before the combine adds it */
                 if (ok && c->lfm3) ok = q36c_norm(ch->ds, 0, ch->prm, ch->o_pff[i], ch->ds, 0, n, D, c->eps);
                 /* A dense backbone has no expert readback to end the frame.
-                 * Keep each layer in its own submission: a full 27B prompt in
-                 * one submission can exceed the driver's watchdog. The next
-                 * frame's barrier orders its residual add after this MLP. */
-                if (ok && i + 1 < hi) ok = vkc_submit(0) && vkc_begin();
+                 * On multi-row prompts, keep each layer in its own submission so a
+                 * full 27B prompt stays under the driver's watchdog; on single-token
+                 * decode, batch layers via vkc_layer_recorded() like the device-MoE
+                 * path above (hazard() orders the next layer's residual add). */
+                if (ok && i + 1 < hi) ok = n > 1 ? (vkc_submit(0) && vkc_begin()) : vkc_layer_recorded(&sent);
             }
             pending = 1;
         }
