@@ -5,7 +5,7 @@
   "procedure": "ADAPTIVE_TRANSFER_DOE, existing G0-G5",
   "status": "REQUESTED_NOT_ADMITTED",
   "admission_owner": "parent (Dory coordinating session)",
-  "request_url": null,
+  "request_url": "https://github.com/JustVugg/colibri/pull/3161#issuecomment-7239912265",
   "approval_receipt": null,
   "gpu_jobs_launched": 0,
   "measured_model_results": null,

@@ -2012,7 +2012,7 @@
       "plan": "docs/experiments/cascade/serving-admission.json",
       "status": "REQUESTED_NOT_ADMITTED",
       "approval_receipt": null,
-      "request_url": null,
+      "request_url": "https://github.com/JustVugg/colibri/pull/3161#issuecomment-7239912265",
       "inventory": "docs/experiments/cascade/recipient-inventory.json",
       "local_candidate_catalog": "docs/experiments/cascade/local-model-candidates.json",
       "model": "Qwen3.5-9B",
