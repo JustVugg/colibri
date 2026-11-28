@@ -89,12 +89,13 @@ tensors, and a Turbo one by `turbo` in its name (`--variant turbo|base` when the
 name does not say). ComfyUI's copy of the VAE (Comfy-Org) is laid out otherwise
 and is refused with the name of the one to use.
 
-The transformer's and the text encoder's matrices stay in the file's blocks
-(Q2_K to Q6_K, IQ4_XS and the others under 8 bits a weight) and are decoded
-while the products run, so in RAM they weigh what they weigh on disk; Q8_0, F16
-and BF16 matrices become int8 rows, as the checkpoint's bf16 ones do (smaller
-than Q8_0's 8.5 bits a weight, and nothing to decode). `COLI_IMG_NATIVE=0`
-makes every type int8 rows.
+With the default `COLI_IMG_BITS=8`, the loader keeps supported sub-8-bit
+weights such as Q4_K and IQ4_XS in their GGUF blocks when the row width
+allows it. The matrix kernels decode those blocks during multiplication.
+Q8_0 can also stay packed for float32 activations. With INT8 activations,
+the loader converts Q8_0 to signed INT8 rows. It uses INT8 rows for large
+F16 and BF16 matrices too. Set `COLI_IMG_NATIVE=0` to convert the packed
+matrices to INT8 rows at load time.
 
 ### Metal projections (experimental)
 
@@ -107,11 +108,11 @@ COLI_IMG_METAL=1 c/qwenimage --model ~/Models/Qwen-Image-2.1-Turbo \
   --steps 8 --seed 42 --out fox.png
 ```
 
-Metal reads Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL and IQ4_XS directly from the
-GGUF blocks. Signed INT8 rows also run on Metal when both widths are multiples
-of 32. Both paths use float32 activations and require more than eight input
-rows. The engine reports how many projections ran on Metal and how many used
-GGUF blocks.
+The Metal kernel reads Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL and IQ4_XS weights
+in their GGUF layout. For signed INT8 rows, the input and output widths must
+both be multiples of 32. Both kernels take float32 activations in batches
+of more than eight rows. The engine reports the total GPU projection count
+and how many of those projections used GGUF blocks.
 
 The CPU handles other block types, smaller batches, attention, the text encoder
 and the VAE. Metal's accumulation order can change the last bits of the result.
