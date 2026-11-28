@@ -1188,11 +1188,14 @@ def parse_k3_tool_calls(reply, tools=None):
                         args[key] = val
                     else:
                         try:
-                            args[key] = json.loads(val)
+                            parsed = json.loads(val)
+                            if not _json_shaped(parsed):    # NaN, Infinity, 1e999
+                                raise ValueError(val)
+                            args[key] = parsed
                         except (json.JSONDecodeError, ValueError):
                             container = _literal_container(val, (typ,))
                             args[key] = val if container is None else container
-                arguments = json.dumps(args, ensure_ascii=False)
+                arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
             calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                           "function": {"name": name, "arguments": arguments}})
     if THINK_CLOSE in text:
@@ -1724,10 +1727,10 @@ def parse_inkling2_tool_calls(reply, tools=None):
         if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
             continue
         args = obj.get("args", {})
-        if not isinstance(args, dict) or (tools and obj["name"] not in names):
+        if not isinstance(args, dict) or not _json_shaped(args) or (tools and obj["name"] not in names):
             continue
         calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                      "function": {"name": obj["name"], "arguments": json.dumps(args, ensure_ascii=False)}})
+                      "function": {"name": obj["name"], "arguments": json.dumps(args, ensure_ascii=False, allow_nan=False)}})
     text = "".join(content).replace(INK2_CALL_OPEN, "").replace(INK2_CALL_CLOSE, "")
     return text.strip(), calls
 
@@ -5097,7 +5100,8 @@ def parse_mistral_tool_calls(reply, tools=None):
             args, end = decoder.raw_decode(rest.lstrip())
         except ValueError:
             return reply.strip(), []
-        if not isinstance(args, dict) or rest.lstrip()[end:].strip().replace(ML4_EOS, ""):
+        if (not isinstance(args, dict) or not _json_shaped(args)   # 1e999 reads as inf
+                or rest.lstrip()[end:].strip().replace(ML4_EOS, "")):
             return reply.strip(), []
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
                       "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False, allow_nan=False)}})
