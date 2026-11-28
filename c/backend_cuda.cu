@@ -5,6 +5,9 @@
 #include "fp8_format.h"   /* FP8_BLOCK: the shared fmt=8 scale-block edge (see that header) */
 
 #include "backend_gpu_compat.h"
+#include <cstdlib>
+static inline const char *bd_gemv_blocks_env(void) { return getenv("COLI_CUDA_BD_BLOCKS"); }
+#define BD_GEMV_BLOCKS_ENV bd_gemv_blocks_env
 #include "cuda_bd.cuh"        /* a GGUF's block formats: fmt 100 + ggml type (blockdec_host.h's table) */
 #include "ledger_map.h"       /* LEDGER_OUT: the memory map and the window Ledger reads */
 #if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__))
