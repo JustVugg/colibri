@@ -1,0 +1,28 @@
+# ab.sh: <tag> <prompt tokens> <prefill s> <prompt tok/s>
+hab-q3-dev-r1 8021 110.49 72.6
+hab-q3-fix-r1 8021 105.65 75.9
+hab-q4-dev-r1 8021 114.27 70.2
+hab-q4-fix-r1 8021 112.16 71.5
+hab-q3-dev-r2 8021 110.03 72.9
+hab-q3-fix-r2 8021 106.02 75.7
+hab-q4-dev-r2 8021 114.28 70.2
+hab-q4-fix-r2 8021 111.56 71.9
+hab-q3-dev-r3 8021 110.57 72.5
+hab-q3-fix-r3 8021 105.57 76.0
+hab-q4-dev-r3 8021 114.3 70.2
+hab-q4-fix-r3 8021 112.33 71.4
+done 18:01:01
+
+# the timed builds (handoff-timers.patch), the 8K prompt on Q3: dev, then dev + this change
+--- handoff-8k
+[HANDOFF] 48 prompt layer steps: chain wait 0.03 s, kv_down 0.00 s, routing 0.00 s, prep 0.00 s, issue 0.01 s, cpu pairs 0.00 s, join 0.22 s, host sum 0.00 s, routed copy 0.00 s
+--- handoff-8k-opt
+[HANDOFF] 48 prompt layer steps: chain wait 0.03 s, kv_down 0.00 s, routing 0.00 s, prep 0.00 s, issue 0.01 s, cpu pairs 0.00 s, join 0.23 s, host sum 0.00 s, routed copy 0.00 s
+
+# exactness: greedy (temperature 0, thinking on) text md5, Q3: unchanged dev (yesterday) and this change
+code: dev 92e0073b, change 92e0073b
+needle8k: dev 32b56f25, change 32b56f25
+# Q4 (2472 of 3072 experts on the device): the 8K needle greedy, md5 of the text
+q4-dev: e214c6d9 (514 tokens, needle 5/5)
+q4-dev2: 677132fa (545 tokens, needle 5/5)
+q4-fix: 87a2912c (840 tokens, needle 5/5)
